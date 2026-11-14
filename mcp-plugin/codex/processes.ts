@@ -3,7 +3,8 @@ import { promisify } from "node:util";
 
 export interface ProcessRow { pid: number; ppid: number; command: string }
 export function parseProcesses(text: string): ProcessRow[] {
-  return text.split(/\r?\n/).flatMap(line => {
+  return text.split(/\r?\n/, 65_536).flatMap(line => {
+    if (/[\x00-\x1f\x7f]/.test(line)) return [];
     const m = /^\s*(\d+)\s+(\d+)\s+(.+)$/.exec(line);
     if (!m) return [];
     const pid = Number(m[1]), ppid = Number(m[2]);
@@ -23,8 +24,19 @@ function commandBasename(cmd: string): string {
 }
 export function externalCodexPresent(rows: ProcessRow[], managerPid: number): boolean {
   const children = new Set<number>(Number.isSafeInteger(managerPid) && managerPid > 0 ? [managerPid] : []);
-  let changed = true;
-  while (changed) { changed = false; for (const row of rows) if (children.has(row.ppid) && !children.has(row.pid)) { children.add(row.pid); changed = true; } }
+  const byParent = new Map<number, number[]>();
+  for (const row of rows) {
+    const siblings = byParent.get(row.ppid);
+    if (siblings) siblings.push(row.pid);
+    else byParent.set(row.ppid, [row.pid]);
+  }
+  const queue = [...children];
+  for (let i = 0; i < queue.length; i++) {
+    for (const pid of byParent.get(queue[i]!) ?? []) {
+      if (children.has(pid)) continue;
+      children.add(pid); queue.push(pid);
+    }
+  }
   return rows.some(r => !children.has(r.pid) && commandBasename(r.command) === "codex");
 }
 export async function codexPresent(managerPid = process.pid): Promise<boolean> {

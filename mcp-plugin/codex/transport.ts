@@ -5,6 +5,26 @@ import { HeartbeatMonitor } from "../src/heartbeat.ts";
 import { resolveDrainReconnectDelay } from "../src/reconnect.ts";
 import { InboxSync } from "./inbox-sync.ts";
 
+function safeChannel(channel: unknown): channel is string {
+  return typeof channel === "string" && channel.trim().length > 0 && channel.length <= 128 &&
+    !/[.\/\\\x00-\x1f\x7f]/.test(channel) && !/^(?:__proto__|constructor|prototype)$/i.test(channel);
+}
+function requireChannel(channel: unknown): asserts channel is string {
+  if (!safeChannel(channel)) throw new Error("Invalid AgentsChat channel");
+}
+function apiUrl(path: string, base: string): URL {
+  const invalid = () => new Error("Invalid AgentsChat API path");
+  if (typeof path !== "string" || !path.startsWith("/") || path.startsWith("//") || /[\x00-\x1f\x7f\\]/.test(path)) throw invalid();
+  try {
+    const pathname = path.split(/[?#]/, 1)[0]!;
+    const decoded = decodeURIComponent(pathname);
+    if ([pathname, decoded].some(value => value.split("/").includes("..")) || /[\x00-\x1f\x7f\\]/.test(decoded)) throw invalid();
+    const origin = new URL(base).origin, resolved = new URL(path, base);
+    if (resolved.origin !== origin) throw invalid();
+    return resolved;
+  } catch { throw invalid(); }
+}
+
 export class AgentsChatTransport {
   private socket?: WebSocket;
   private authenticated = false;
@@ -24,9 +44,10 @@ export class AgentsChatTransport {
       () => !this.closed && this.authenticated, log);
   }
   async api(path: string, body?: unknown) {
+    const resolved = apiUrl(path, this.config.apiUrl);
     let response: Response;
     try {
-      response = await fetch(this.config.apiUrl + path, { method: body ? "POST" : "GET", redirect: "error",
+      response = await fetch(resolved, { method: body ? "POST" : "GET", redirect: "error",
         headers: { Authorization: `Bearer ${this.config.token}`, "Content-Type": "application/json" },
         ...(body ? { body: JSON.stringify(body) } : {}), signal: AbortSignal.timeout(15_000) });
     } catch { throw new Error("AgentsChat request failed or timed out"); }
@@ -55,8 +76,10 @@ export class AgentsChatTransport {
     finally { reader?.releaseLock(); }
   }
   setTyping(channel: string, active: boolean) {
+    requireChannel(channel);
     clearInterval(this.typing.get(channel)); this.typing.delete(channel);
     if (!active || this.closed) return;
+    if (this.typing.size >= 64) throw new Error("AgentsChat typing limit reached");
     const pulse = () => {
       if (this.authenticated && this.socket?.readyState === WebSocket.OPEN) {
         try { this.socket.send(JSON.stringify({ type: "typing", channel_id: channel, sender_id: this.config.agentId, cross_pod: true })); }
@@ -77,18 +100,20 @@ export class AgentsChatTransport {
     this.pending.clear();
   }
   async send(channel: string, text: string) {
+    requireChannel(channel);
     // Use the authenticated connection and wait for the server's delivery ACK.
     // Never fall back after an attempted send: an ACK may have been lost.
     if (this.authenticated && this.socket?.readyState === WebSocket.OPEN) {
+      if (this.pending.size >= 256) throw new Error("AgentsChat pending message limit reached");
       const id = randomUUID();
       await new Promise<void>((resolve, reject) => {
         const timer = setTimeout(() => { this.pending.delete(id); reject(new Error("AgentsChat acknowledgement timed out")); }, 15000);
         timer.unref?.();
         this.pending.set(id, { resolve, reject, timer });
-        this.socket!.send(JSON.stringify({ type: "message", id, channel_id: channel,
+        try { this.socket!.send(JSON.stringify({ type: "message", id, channel_id: channel,
           sender_id: this.config.agentId, sender_type: "agent", content_type: "text", content: text }), error => {
           if (error) { clearTimeout(timer); this.pending.delete(id); reject(new Error("AgentsChat socket send failed")); }
-        });
+        }); } catch { clearTimeout(timer); this.pending.delete(id); reject(new Error("AgentsChat socket send failed")); }
       });
       return;
     }
@@ -113,7 +138,7 @@ export class AgentsChatTransport {
       }
     };
     const join = (channel: string) => {
-      if (!this.config.channels.length || this.config.channels.includes(channel)) {
+      if (safeChannel(channel) && (!this.config.channels.length || this.config.channels.includes(channel))) {
         this.inboxSync?.watch(channel);
         send({ type: "join_channel", channel_id: channel, agent_id: this.config.agentId });
       }
@@ -125,6 +150,7 @@ export class AgentsChatTransport {
     socket.on("message", raw => {
       if (!current()) return;
       let data: any; try { data = JSON.parse(String(raw)); } catch { return; }
+      if (!data || typeof data !== "object" || Array.isArray(data)) return;
       if (data.type !== "auth_error") this.heartbeat?.receivedPong();
       if (data.type === "auth_ok") {
         this.authenticated = true; this.delay = 1000; this.log(`AgentsChat connected as ${this.config.agentId}`);
@@ -136,7 +162,7 @@ export class AgentsChatTransport {
           if (!current()) return;
           const channels = Array.isArray(body) ? body : body.channels;
           if (!Array.isArray(channels)) throw new Error("Invalid membership response");
-          const ids = channels.map((c: any) => c.id ?? c.channel_id).filter((id: any) => typeof id === "string" &&
+          const ids = channels.map((c: any) => c?.id ?? c?.channel_id).filter((id: any) => safeChannel(id) &&
             (!this.config.channels.length || this.config.channels.includes(id)));
           this.inboxSync?.memberships(ids);
           for (const id of ids) join(id);
