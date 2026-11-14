@@ -194,8 +194,13 @@ class MuseBridge {
 
 // src/reconnect.ts
 function safeUnitRand(rand) {
-  const r = rand();
-  if (!Number.isFinite(r) || r < 0)
+  let r;
+  try {
+    r = rand();
+  } catch {
+    return 0;
+  }
+  if (!Number.isFinite(r) || r <= 0)
     return 0;
   return r >= 1 ? 0.999999 : r;
 }
@@ -204,7 +209,8 @@ function computePleaseReconnectDelay(jitterMs, rand = Math.random) {
   return 200 + Math.floor(safeUnitRand(rand) * maxJitter);
 }
 function resolveDrainReconnectDelay(frame, rand = Math.random) {
-  return computePleaseReconnectDelay(frame?.jitter_ms ?? frame?.within_ms, rand);
+  const safeFrame = frame && typeof frame === "object" && !Array.isArray(frame) && !Object.prototype.hasOwnProperty.call(frame, "__proto__") ? frame : null;
+  return computePleaseReconnectDelay(safeFrame?.jitter_ms ?? safeFrame?.within_ms, rand);
 }
 
 // muse/src/client.ts

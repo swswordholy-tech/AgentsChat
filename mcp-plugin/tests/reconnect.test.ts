@@ -84,3 +84,24 @@ test("Campaign #102: computeReconnectDelay guards NaN/negative attempts & out-of
     cleanup();
   }
 });
+
+test("Campaign #121 KR3: throwing rand() falls back safely, own-__proto__ drain frames are ignored, and double-abort does not overwrite TimeoutError", async () => {
+  expect(
+    computeReconnectDelay(2, () => {
+      throw new Error("broken rng");
+    }),
+  ).toBe(4000);
+  const protoFrame = JSON.parse('{"__proto__":{"polluted":1},"jitter_ms":9000}');
+  expect(resolveDrainReconnectDelay(protoFrame, () => 0.5)).toBe(1200);
+
+  const parent = new AbortController();
+  const { signal, cleanup } = withTimeoutController(parent.signal, 20);
+  try {
+    await new Promise((r) => setTimeout(r, 40));
+    expect((signal.reason as Error)?.name).toBe("TimeoutError");
+    parent.abort(new Error("late_parent"));
+    expect((signal.reason as Error)?.name).toBe("TimeoutError");
+  } finally {
+    cleanup();
+  }
+});

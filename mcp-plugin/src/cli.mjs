@@ -151,6 +151,10 @@ async function runSupervised(childArgs) {
     return Math.min(Math.max(minMs, Math.floor(num)), MAX_TIMER_MS);
   };
 
+  const stopGraceMs = clampTimerMs(process.env.AGENTCHAT_SUPERVISE_STOP_GRACE_MS, 25, 5_000);
+  /** @type {ReturnType<typeof setTimeout> | null} */
+  let killTimer = null;
+
   const requestStop = () => {
     stopping = true;
     if (cancelSleep) {
@@ -162,6 +166,20 @@ async function runSupervised(childArgs) {
         child.kill("SIGTERM");
       } catch {
         /* ignore */
+      }
+      if (!killTimer) {
+        const target = child;
+        killTimer = setTimeout(() => {
+          killTimer = null;
+          if (target.exitCode === null && target.signalCode === null) {
+            try {
+              target.kill("SIGKILL");
+            } catch {
+              /* ignore */
+            }
+          }
+        }, stopGraceMs);
+        killTimer.unref?.();
       }
     }
   };
@@ -214,6 +232,10 @@ async function runSupervised(childArgs) {
       child.on("error", () => resolve(1));
     });
     const ranMs = Date.now() - startedAt;
+    if (killTimer) {
+      clearTimeout(killTimer);
+      killTimer = null;
+    }
     child = null;
     if (stopping) process.exit(exitCode);
     if (ranMs >= healthyResetMs) {
@@ -269,7 +291,7 @@ if (typeof globalThis.Bun !== "undefined") {
     const selfPath = fileURLToPath(import.meta.url);
     const childEnv = { ...process.env, NODE_USE_ENV_PROXY: "1" };
     for (const key of ["NO_PROXY", "no_proxy"]) {
-      const cur = childEnv[key]?.trim() || "";
+      const cur = (childEnv[key] || "").replace(/[\x00-\x1f\x7f]+/g, "").trim();
       const items = cur ? cur.split(",").map((s) => s.trim()).filter(Boolean) : [];
       for (const host of ["localhost", "127.0.0.1", "::1", "[::1]"]) {
         if (!items.includes(host)) items.push(host);

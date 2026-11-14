@@ -101,4 +101,36 @@ describe("cli.mjs --supervise lifecycle hygiene", () => {
     const restartMatches = stderrBuf.match(/supervise: restarting after exit/g) ?? [];
     expect(restartMatches.length).toBe(1);
   });
+
+  test("Campaign #121 KR3: supervisor enforces AGENTCHAT_SUPERVISE_STOP_GRACE_MS on running child and rejects multi-mode flags", async () => {
+    const cliPath = resolve(import.meta.dir, "../src/cli.mjs");
+    const conflictProc = Bun.spawn([process.execPath, cliPath, "--connector", "--muse"], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(await conflictProc.exited).not.toBe(0);
+
+    // Spawn a live supervised connector on port 0 (random ephemeral port) and stop it with short grace window
+    const liveProc = Bun.spawn([process.execPath, cliPath, "--supervise", "--connector"], {
+      env: {
+        ...process.env,
+        RELAY_PORT: "0",
+        RELAY_HOST: "127.0.0.1",
+        AGENTCHAT_API_URL: "http://127.0.0.1:9",
+        AGENTCHAT_WS_URL: "ws://127.0.0.1:9/ws",
+        AGENTCHAT_AGENT_ID: "bot-sup-test",
+        AGENTCHAT_TOKEN: "ac_test_token_1234567890",
+        RELAY_GATEWAY_ID: "gw-sup-test",
+        RELAY_GATEWAY_SECRET: "secret_1234567890abcdef",
+        AGENTCHAT_SUPERVISE_STOP_GRACE_MS: "80",
+      },
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    await new Promise((r) => setTimeout(r, 150));
+    const t0 = Date.now();
+    liveProc.kill("SIGTERM");
+    await liveProc.exited;
+    expect(Date.now() - t0).toBeLessThan(2000);
+  });
 });

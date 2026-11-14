@@ -15,8 +15,9 @@
  * So: the write reports success, and the dirty flag is cleared ONLY once it lands.
  */
 import { randomBytes } from "crypto";
-import { chmodSync, lstatSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "fs";
-import { dirname, join } from "path";
+import { chmodSync, lstatSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "fs";
+import { dirname, isAbsolute, join, sep } from "path";
+import { redactSecrets } from "./redact.ts";
 
 export type Warn = (message: string) => void;
 
@@ -26,7 +27,46 @@ const RESERVED_PROTO_KEY = /^(?:__proto__|constructor|prototype)$/i;
 let tmpCounter = 0;
 
 function scrubDiag(value: unknown): string {
-  return String(value ?? "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
+  return redactSecrets(String(value ?? ""))
+    .replace(/\b(?:Bearer|Basic)\s+[^\s"'<>\\]+/gi, "[REDACTED]")
+    .replace(/(?:agent_key_|sk-|whsec_|gh[pousr]_|github_pat_|AIza|AKIA|ASIA)[A-Za-z0-9+/=_-]{12,}/g, "[REDACTED]")
+    .replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
+}
+
+function hasSafeAncestorDirs(targetFile: string): boolean {
+  let dir = dirname(isAbsolute(targetFile) ? targetFile : `${process.cwd()}${sep}${targetFile}`);
+  while (true) {
+    let st;
+    try {
+      st = lstatSync(dir);
+    } catch {
+      return false;
+    }
+    const isDarwinRootLink =
+      process.platform === "darwin" &&
+      (dir === "/var" || dir === "/tmp" || dir === "/etc") &&
+      st.isSymbolicLink() &&
+      (() => {
+        try {
+          return (
+            realpathSync(dir) === `/private${dir}` &&
+            !lstatSync("/private").isSymbolicLink() &&
+            lstatSync("/private").isDirectory() &&
+            !lstatSync(`/private${dir}`).isSymbolicLink() &&
+            lstatSync(`/private${dir}`).isDirectory()
+          );
+        } catch {
+          return false;
+        }
+      })();
+    if (!isDarwinRootLink && (st.isSymbolicLink() || !st.isDirectory())) {
+      return false;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return true;
 }
 
 /**
@@ -56,6 +96,17 @@ export function cursorFileForAgent(configDir: string, agentId: string): string {
  */
 export function loadCursor(file: string, warn: Warn): Map<string, string> {
   try {
+    if (!hasSafeAncestorDirs(file)) {
+      let exists = false;
+      try {
+        lstatSync(file);
+        exists = true;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") exists = true;
+      }
+      if (!exists) return new Map();
+      throw new Error("cursor parent path must be a real directory");
+    }
     const st = lstatSync(file);
     if (st.isSymbolicLink() || !st.isFile()) {
       throw new Error("cursor path must be a regular file");
@@ -94,7 +145,7 @@ export function loadCursor(file: string, warn: Warn): Map<string, string> {
 export function persistCursor(file: string, cursor: Map<string, string>, warn: Warn): boolean {
   try {
     const parentStat = lstatSync(dirname(file));
-    if (parentStat.isSymbolicLink() || !parentStat.isDirectory()) {
+    if (parentStat.isSymbolicLink() || !parentStat.isDirectory() || !hasSafeAncestorDirs(file)) {
       warn(`[agentchat] WARNING: failed to persist read cursor to ${scrubDiag(file)}: parent is not a real directory\n`);
       return false;
     }
@@ -114,11 +165,19 @@ export function persistCursor(file: string, cursor: Map<string, string>, warn: W
       return false;
     }
   }
-  const payloadObj: Record<string, string> = Object.create(null);
+  const validEntries: Array<[string, string]> = [];
   for (const [k, v] of cursor) {
     if (!k || k.length > 256 || RESERVED_PROTO_KEY.test(k) || /[\x00-\x1f\x7f]/.test(k) || typeof v !== "string" || /[\x00-\x1f\x7f]/.test(v) || v.length > 256) {
       continue;
     }
+    validEntries.push([k, v]);
+  }
+  const boundedEntries =
+    validEntries.length > MAX_CURSOR_ENTRIES
+      ? validEntries.slice(validEntries.length - MAX_CURSOR_ENTRIES)
+      : validEntries;
+  const payloadObj: Record<string, string> = Object.create(null);
+  for (const [k, v] of boundedEntries) {
     payloadObj[k] = v;
   }
   const tmp = `${file}.${process.pid}.${Date.now()}.${++tmpCounter}.${randomBytes(4).toString("hex")}.tmp`;

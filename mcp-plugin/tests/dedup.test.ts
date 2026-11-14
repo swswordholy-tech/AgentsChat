@@ -67,3 +67,12 @@ test("Campaign #112 KR3: rejects control chars and oversized IDs/keys and caps m
   expect(d.recordOrSkip("k".repeat(1025))).toBe(false);
   expect(d.size).toBe(0);
 });
+
+test("Campaign #121 KR3: rejects dot, double-dot, reserved prototype IDs, and own-__proto__ payloads", () => {
+  for (const bad of [".", "..", "__proto__", "constructor", "prototype", "__PROTO__"]) {
+    expect(messageDedupKey({ channel_id: bad, id: "m-1" })).toBeNull();
+    expect(messageDedupKey({ channel_id: "room-1", id: bad })).toBeNull();
+  }
+  const protoPayload = JSON.parse('{"__proto__":{"polluted":1},"channel_id":"room-1","id":"m-1"}');
+  expect(messageDedupKey(protoPayload)).toBeNull();
+});

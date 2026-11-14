@@ -9,8 +9,13 @@
 const MAX_TIMEOUT_MS = 2_147_483_647;
 
 function safeUnitRand(rand: () => number): number {
-  const r = rand();
-  if (!Number.isFinite(r) || r < 0) return 0;
+  let r: number;
+  try {
+    r = rand();
+  } catch {
+    return 0;
+  }
+  if (!Number.isFinite(r) || r <= 0) return 0;
   return r >= 1 ? 0.999999 : r;
 }
 
@@ -37,7 +42,11 @@ export function resolveDrainReconnectDelay(
   frame?: { jitter_ms?: unknown; within_ms?: unknown } | null,
   rand: () => number = Math.random,
 ): number {
-  return computePleaseReconnectDelay(frame?.jitter_ms ?? frame?.within_ms, rand);
+  const safeFrame =
+    frame && typeof frame === "object" && !Array.isArray(frame) && !Object.prototype.hasOwnProperty.call(frame, "__proto__")
+      ? frame
+      : null;
+  return computePleaseReconnectDelay(safeFrame?.jitter_ms ?? safeFrame?.within_ms, rand);
 }
 
 /**
@@ -56,7 +65,9 @@ export function withTimeoutController(
       clearTimeout(timer);
       timer = null;
     }
-    controller.abort(parentSignal?.reason);
+    if (!controller.signal.aborted) {
+      controller.abort(parentSignal?.reason);
+    }
   };
   if (parentSignal) {
     if (parentSignal.aborted) {

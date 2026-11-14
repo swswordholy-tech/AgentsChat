@@ -145,4 +145,42 @@ describe("persistCursor reports failures instead of swallowing them", () => {
     expect(loadCursor(protoFile, (m) => loadWarns.push(m))).toEqual(new Map([["good", "2026-07-10T00:00:00Z"]]));
     expect(loadWarns).toEqual([]);
   });
+
+  test("Campaign #121 KR3: blocks ancestor symlink directories on both load & persist, scrubs secrets in warnings, and bounds >50,000 entries on persist", () => {
+    const realRoot = join(dir, "real-root");
+    const realNested = join(realRoot, "nested");
+    mkdirSync(realNested, { recursive: true });
+    writeFileSync(join(realNested, "c.json"), JSON.stringify({ room: "2026-11-15T00:00:00Z" }));
+
+    const symAnc = join(dir, "sym-anc");
+    symlinkSync(realRoot, symAnc);
+    const viaAnc = join(symAnc, "nested", "c.json");
+
+    const loadWarnings: string[] = [];
+    expect(loadCursor(viaAnc, (m) => loadWarnings.push(m)).size).toBe(0);
+    expect(loadWarnings.join("")).toMatch(/could not read/);
+
+    const persistWarnings: string[] = [];
+    expect(persistCursor(viaAnc, new Map([["room", "2026-11-15T01:00:00Z"]]), (m) => persistWarnings.push(m))).toBe(false);
+    expect(persistWarnings.join("")).toMatch(/parent is not a real directory/);
+
+    // Secret tokens in warning paths/errors are scrubbed before emission
+    const secretWarns: string[] = [];
+    const badPath = join(dir, "missing-dir-mcp_at_secret1234567890", "c.json");
+    expect(persistCursor(badPath, new Map([["room", "ts"]]), (m) => secretWarns.push(m))).toBe(false);
+    expect(secretWarns.join("")).not.toContain("secret1234567890");
+    expect(secretWarns.join("")).toContain("REDACTED");
+
+    // Persisting 50,005 entries trims oldest 5 so loadCursor (MAX_CURSOR_ENTRIES=50,000) round-trips cleanly!
+    const bigMap = new Map<string, string>();
+    for (let i = 0; i < 50_005; i++) bigMap.set(`ch-${i}`, "2026-11-15T00:00:00Z");
+    const bigFile = join(dir, "big.json");
+    const bigWarns: string[] = [];
+    expect(persistCursor(bigFile, bigMap, (m) => bigWarns.push(m))).toBe(true);
+    const reloaded = loadCursor(bigFile, (m) => bigWarns.push(m));
+    expect(bigWarns).toEqual([]);
+    expect(reloaded.size).toBe(50_000);
+    expect(reloaded.has("ch-0")).toBe(false);
+    expect(reloaded.has("ch-50004")).toBe(true);
+  });
 });
