@@ -60,10 +60,23 @@ function normalizeProfileSlug(s: string): string {
 
 const MAX_GROK_BIND_ENTRIES = 1024;
 const MAX_GROK_BINDS_PATH_LEN = 4096;
+const RESERVED_BIND_BASENAMES = new Set([
+  "profile",
+  "grok-binds",
+  "grok-binds.meta",
+  "session-binds",
+  "agy-session-binds",
+]);
+
+function hasPathOrTraversalSyntax(s: string): boolean {
+  return /[\/\\]/.test(s) || s === "." || s.includes("..");
+}
 
 function isSafeProfileBindName(name: string): boolean {
   if (!name || name.length > 256 || hasControlChars(name)) return false;
-  if (isUnsafeObjectKey(name) || name === "." || name.includes("..") || /[\/\\]/.test(name)) return false;
+  if (isUnsafeObjectKey(name) || hasPathOrTraversalSyntax(name)) return false;
+  const base = name.replace(/\.json$/i, "").trim().toLowerCase();
+  if (!base || isUnsafeObjectKey(base) || RESERVED_BIND_BASENAMES.has(base)) return false;
   return true;
 }
 
@@ -179,10 +192,11 @@ export function gateSwitchProfile(input: {
   const reqRaw =
     typeof input.requestedProfileName === "string" ? input.requestedProfileName.trim() : "";
   if (!reqRaw) return { kind: "allow" };
+  const reqHasPath = hasPathOrTraversalSyntax(reqRaw);
   const reqSlug = normalizeProfileSlug(reqRaw);
 
   const binds = input.binds && typeof input.binds === "object" ? input.binds : {};
-  const bindValues = Object.values(binds).filter((v) => typeof v === "string" && v.trim().length > 0 && !hasControlChars(v));
+  const bindValues = Object.values(binds).filter((v) => typeof v === "string" && isSafeProfileBindName(v.trim()));
   if (bindValues.length === 0) return { kind: "allow" };
 
   const lockedMessage = (lockedName: string) => {
@@ -195,7 +209,7 @@ export function gateSwitchProfile(input: {
 
   const bound = boundProfileForConversation(input.conversationId, binds);
   if (bound) {
-    if (reqSlug === normalizeProfileSlug(bound)) return { kind: "allow" };
+    if (!reqHasPath && reqSlug === normalizeProfileSlug(bound)) return { kind: "allow" };
     return {
       kind: "locked",
       boundProfileName: bound,
@@ -208,11 +222,63 @@ export function gateSwitchProfile(input: {
     typeof input.currentProfileName === "string" ? input.currentProfileName.trim() : "";
   const currentSlug = current ? normalizeProfileSlug(current) : "";
   if (current && bindValues.some((v) => normalizeProfileSlug(v) === currentSlug)) {
-    if (reqSlug === currentSlug) return { kind: "allow" };
+    if (!reqHasPath && reqSlug === currentSlug) return { kind: "allow" };
     return {
       kind: "locked",
       boundProfileName: current.replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 128),
       requestedProfileName: reqRaw.replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 128),
+      message: lockedMessage(current),
+    };
+  }
+
+  return { kind: "allow" };
+}
+
+/**
+ * Gate `disconnect` / `disconnect_profile` and `register_name` mutations when
+ * a grok outbound bind owns this shared MCP identity.
+ */
+export function gateGrokProfileMutation(input: {
+  conversationId: string | undefined;
+  binds: Record<string, string>;
+  currentProfileName?: string | null;
+  action: "disconnect" | "register";
+  requestedName?: string | null;
+}): SwitchProfileGate {
+  const binds = input.binds && typeof input.binds === "object" ? input.binds : {};
+  const bindValues = Object.values(binds).filter((v) => typeof v === "string" && isSafeProfileBindName(v.trim()));
+  if (bindValues.length === 0) return { kind: "allow" };
+
+  const reqLabel =
+    typeof input.requestedName === "string" && input.requestedName.trim()
+      ? input.requestedName.trim().replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 128)
+      : `(${input.action})`;
+  const lockedMessage = (lockedName: string) => {
+    const clean = lockedName.replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 128);
+    return (
+      `Outbound identity is locked to grok-bind profile "${clean}" on this shared MCP; ` +
+      `use a separate MCP process / wake daemon, do not switch_profile or disconnect_profile.`
+    );
+  };
+
+  const bound = boundProfileForConversation(input.conversationId, binds);
+  if (bound) {
+    return {
+      kind: "locked",
+      boundProfileName: bound,
+      requestedProfileName: reqLabel,
+      message: lockedMessage(bound),
+    };
+  }
+
+  const current =
+    typeof input.currentProfileName === "string" ? input.currentProfileName.trim() : "";
+  const currentSlug = current ? normalizeProfileSlug(current) : "";
+  if (current && bindValues.some((v) => normalizeProfileSlug(v) === currentSlug)) {
+    return {
+      kind: "locked",
+      boundProfileName: current.replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 128),
+      requestedProfileName: reqLabel,
       message: lockedMessage(current),
     };
   }

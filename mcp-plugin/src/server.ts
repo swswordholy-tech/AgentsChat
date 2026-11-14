@@ -97,6 +97,7 @@ import {
   resolveGrokBindsPath,
   DEFAULT_GROK_BINDS_FILENAME,
   boundProfileForConversation,
+  gateGrokProfileMutation,
   gateSwitchProfile,
   grokBindApplies,
   nonGrokWakeReason,
@@ -332,15 +333,16 @@ let dshRouteWarned = false;
 function profileNameToPaths(name: string): string[] {
   if (name.startsWith("~/")) return [join(homeDir, name.slice(2))];
   if (name.includes("/") || name.includes("\\")) return [name]; // explicit path
-  name = name.replace(/\.json$/, "");
+  name = name.replace(/\.json$/i, "");
   const safeName = name.replace(/[^a-zA-Z0-9_-]/g, "_");
   return profileDirs.map((dir) => join(dir, `${safeName}.json`));
 }
 
 function nameToPath(name: string): string {
   const candidates = profileNameToPaths(name);
-  const nested = join(configDir, "profiles", name.replace(/\.json$/, "") + ".json");
-  if (!name.includes("/") && !name.includes("\\") && existsSync(nested)) return nested;
+  const safeBase = name.replace(/\.json$/i, "").replace(/[^a-zA-Z0-9_-]/g, "_");
+  const nested = join(configDir, "profiles", safeBase + ".json");
+  if (!name.includes("/") && !name.includes("\\") && safeBase && existsSync(nested)) return nested;
   return candidates.find((path) => existsSync(path)) || candidates[0];
 }
 
@@ -349,15 +351,16 @@ function listProfileFiles(): Array<{ name: string; path: string }> {
   const profiles: Array<{ name: string; path: string }> = [];
   for (const dir of [join(configDir, "profiles"), ...profileDirs]) {
     let files: string[] = [];
-    try { files = readdirSync(dir).filter((f: string) => f.endsWith(".json")); } catch {}
+    try { files = readdirSync(dir).filter((f: string) => /\.json$/i.test(f)); } catch {}
     for (const file of files) {
+      const lowerFile = file.toLowerCase();
       if (
-        file === DEFAULT_GROK_BINDS_FILENAME ||
-        file === GROK_BINDS_META_FILENAME ||
-        file === DEFAULT_SESSION_BINDS_FILENAME ||
-        file === LEGACY_AGY_BINDS_FILENAME
+        lowerFile === DEFAULT_GROK_BINDS_FILENAME.toLowerCase() ||
+        lowerFile === GROK_BINDS_META_FILENAME.toLowerCase() ||
+        lowerFile === DEFAULT_SESSION_BINDS_FILENAME.toLowerCase() ||
+        lowerFile === LEGACY_AGY_BINDS_FILENAME.toLowerCase()
       ) continue; // bind map, not a profile
-      const name = file.replace(/\.json$/, "");
+      const name = file.replace(/\.json$/i, "");
       if (seen.has(name)) continue;
       seen.add(name);
       profiles.push({ name, path: join(dir, file) });
@@ -3895,12 +3898,22 @@ async function registerAndConnectProfile(
   if (!cleanName) {
     return { content: [{ type: "text", text: "Error: register_name / profile_name must be a non-empty string." }], isError: true };
   }
-  const safeBase = cleanName.replace(/\.json$/, "").replace(/[^a-zA-Z0-9_-]/g, "_");
-  if (safeBase.toLowerCase() === "profile") {
+  const safeBase = cleanName.replace(/\.json$/i, "").replace(/[^a-zA-Z0-9_-]/g, "_");
+  const reservedRegisterBases = new Set([
+    "profile",
+    "grok-binds",
+    "grok-binds_meta",
+    "session-binds",
+    "agy-session-binds",
+    "__proto__",
+    "constructor",
+    "prototype",
+  ]);
+  if (!safeBase || reservedRegisterBases.has(safeBase.toLowerCase())) {
     return {
       content: [{
         type: "text",
-        text: 'Error: "profile" (profile.json) is reserved and cannot be registered as a named agent profile. Choose a distinct profile name (e.g. "Antigravity", "Claude_Work", "Codex_Dev").',
+        text: `Error: "${safeBase || cleanName}" is reserved and cannot be registered as a named agent profile. Choose a distinct profile name (e.g. "Antigravity", "Claude_Work", "Codex_Dev").`,
       }],
       isError: true,
     };
@@ -3997,7 +4010,28 @@ async function handleProfileSwitchOrConnect(args: any): Promise<{ content: any[]
     conversation_id?: string;
   };
 
+  // Shared Cursor MCP: grok-binds lock outbound identity — via conversation id
+  // when set, or via current profile when Cursor stdio started with --profile
+  // and no CURSOR_CONVERSATION_ID. Refuse switches, disconnects, and fresh
+  // registrations that leave the locked identity. No-op allowed.
+  // Non-Grok wakes (Antigravity / ZCode) and explicit --profile ≠ bound
+  // profile are exempt: an inherited CURSOR_CONVERSATION_ID must not lock them.
+  const switchBinds = loadGrokBinds();
+  const bindApplies = currentGrokBindApplicability(switchBinds);
+  const currentBoundProfile = profileNameFromPath(activeProfileFile);
+
   if (disconnect) {
+    if (bindApplies.applies) {
+      const discGate = gateGrokProfileMutation({
+        conversationId: process.env.CURSOR_CONVERSATION_ID,
+        binds: switchBinds,
+        currentProfileName: currentBoundProfile,
+        action: "disconnect",
+      });
+      if (discGate.kind === "locked") {
+        return { content: [{ type: "text", text: discGate.message }], isError: true };
+      }
+    }
     const { prevAgentId, prevProfileName } = disconnectCurrentProfile();
     return {
       content: [{
@@ -4011,6 +4045,18 @@ async function handleProfileSwitchOrConnect(args: any): Promise<{ content: any[]
 
   const explicitSessionId = typeof conversation_id === "string" && conversation_id.trim() ? conversation_id.trim() : null;
   if (typeof register_name === "string" && register_name.trim()) {
+    if (bindApplies.applies) {
+      const regGate = gateGrokProfileMutation({
+        conversationId: process.env.CURSOR_CONVERSATION_ID,
+        binds: switchBinds,
+        currentProfileName: currentBoundProfile,
+        action: "register",
+        requestedName: register_name.trim(),
+      });
+      if (regGate.kind === "locked") {
+        return { content: [{ type: "text", text: regGate.message }], isError: true };
+      }
+    }
     return await registerAndConnectProfile(register_name.trim(), explicitSessionId);
   }
 
@@ -4018,19 +4064,11 @@ async function handleProfileSwitchOrConnect(args: any): Promise<{ content: any[]
     return { content: [{ type: "text", text: formatProfileList() }] };
   }
 
-  // Shared Cursor MCP: grok-binds lock outbound identity — via conversation id
-  // when set, or via current profile when Cursor stdio started with --profile
-  // and no CURSOR_CONVERSATION_ID. Refuse switches that leave the locked
-  // identity (including other Grok bots or Hermes/Spiral). No-op allowed.
-  // Non-Grok wakes (Antigravity / ZCode) and explicit --profile ≠ bound
-  // profile are exempt: an inherited CURSOR_CONVERSATION_ID must not lock them.
-  const switchBinds = loadGrokBinds();
-  const bindApplies = currentGrokBindApplicability(switchBinds);
   const switchGate = !bindApplies.applies ? ({ kind: "allow" } as const) : gateSwitchProfile({
     conversationId: process.env.CURSOR_CONVERSATION_ID,
     binds: switchBinds,
     requestedProfileName: profile_name,
-    currentProfileName: profileNameFromPath(activeProfileFile),
+    currentProfileName: currentBoundProfile,
   });
   if (switchGate.kind === "locked") {
     return { content: [{ type: "text", text: switchGate.message }], isError: true };
@@ -4108,6 +4146,19 @@ async function handleProfileSwitchOrConnect(args: any): Promise<{ content: any[]
 
 HANDLERS.set("connect_profile", async (args) => handleProfileSwitchOrConnect(args));
 HANDLERS.set("disconnect_profile", async (args) => {
+  const switchBinds = loadGrokBinds();
+  const bindApplies = currentGrokBindApplicability(switchBinds);
+  if (bindApplies.applies) {
+    const discGate = gateGrokProfileMutation({
+      conversationId: process.env.CURSOR_CONVERSATION_ID,
+      binds: switchBinds,
+      currentProfileName: profileNameFromPath(activeProfileFile),
+      action: "disconnect",
+    });
+    if (discGate.kind === "locked") {
+      return { content: [{ type: "text", text: discGate.message }], isError: true };
+    }
+  }
   const { keep_binding } = (args || {}) as { keep_binding?: boolean };
   const { prevAgentId, prevProfileName } = disconnectCurrentProfile({ keepBinding: keep_binding });
   return {

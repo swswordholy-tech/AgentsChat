@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   boundProfileForConversation,
   decideGrokBind,
+  gateGrokProfileMutation,
   gateSwitchProfile,
   grokBindApplies,
   nonGrokWakeReason,
@@ -533,5 +534,93 @@ describe("nonGrokWakeReason / grokBindApplies — non-Grok wakes are exempt", ()
     expect(resolveGrokBindsPath("/home/u/.agentschat", "/" + "x".repeat(5000))).toBe(
       "/home/u/.agentschat/grok-binds.json",
     );
+  });
+
+  test("Campaign #119 KR3: blocks path-basename /tmp/evil/Jack.json bypass, disconnect/register_name lock bypass, and reserved sidecar/default bind names", () => {
+    const binds = parseGrokBinds({
+      "uuid-jack": "Jack",
+      "uuid-default": "profile.json",
+      "uuid-sidecar1": "grok-binds.json",
+      "uuid-sidecar2": "grok-binds.meta.json",
+      "uuid-sidecar3": "session-binds.json",
+      "uuid-proto-json": "CONSTRUCTOR.JSON",
+    });
+    expect(binds).toEqual({ "uuid-jack": "Jack" });
+
+    // Bare "Jack" or "Jack.json" or "Jack.JSON" stays allowed as a no-op:
+    expect(
+      gateSwitchProfile({
+        conversationId: "uuid-jack",
+        binds,
+        requestedProfileName: "Jack.JSON",
+      }),
+    ).toEqual({ kind: "allow" });
+
+    // Explicit paths / traversals sharing the bound basename MUST be locked (never load /tmp/evil/Jack.json):
+    for (const bypassAttempt of [
+      "/tmp/evil/Jack.json",
+      "~/evil/Jack.json",
+      "../Jack.json",
+      "sub\\Jack.json",
+      "sub/Jack",
+    ]) {
+      expect(
+        gateSwitchProfile({
+          conversationId: "uuid-jack",
+          binds,
+          requestedProfileName: bypassAttempt,
+        }).kind,
+      ).toBe("locked");
+      expect(
+        gateSwitchProfile({
+          conversationId: undefined,
+          binds,
+          currentProfileName: "Jack",
+          requestedProfileName: bypassAttempt,
+        }).kind,
+      ).toBe("locked");
+    }
+
+    // disconnect / disconnect_profile and register_name mutations are locked when bound, allowed otherwise:
+    expect(
+      gateGrokProfileMutation({
+        conversationId: "uuid-jack",
+        binds,
+        action: "disconnect",
+      }).kind,
+    ).toBe("locked");
+    expect(
+      gateGrokProfileMutation({
+        conversationId: "uuid-jack",
+        binds,
+        action: "register",
+        requestedName: "AttackerBot",
+      }).kind,
+    ).toBe("locked");
+    expect(
+      gateGrokProfileMutation({
+        conversationId: undefined,
+        binds,
+        currentProfileName: "Jack",
+        action: "disconnect",
+      }).kind,
+    ).toBe("locked");
+    expect(
+      gateGrokProfileMutation({
+        conversationId: undefined,
+        binds,
+        currentProfileName: "Antigravity",
+        action: "disconnect",
+      }),
+    ).toEqual({ kind: "allow" });
+    expect(
+      gateGrokProfileMutation({
+        conversationId: "uuid-unknown",
+        binds,
+        currentProfileName: "Antigravity",
+        action: "register",
+        requestedName: "NewBot",
+      }),
+    ).toEqual({ kind: "allow" });
   });
 });
