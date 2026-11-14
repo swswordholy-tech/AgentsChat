@@ -516,6 +516,14 @@ import { createHash } from "node:crypto";
 
 // src/identity.ts
 var RESERVED_IDENTITY_IDS = new Set(["__proto__", "constructor", "prototype"]);
+var MAX_AGENT_ID_LEN = 128;
+var MAX_CAPABILITIES_LEN = 64;
+function isValidProfileAgentId(raw) {
+  if (typeof raw !== "string" || /[\x00-\x1f\x7f/\\\s]/.test(raw))
+    return false;
+  const trimmed = raw.trim();
+  return trimmed.length > 0 && trimmed === raw && trimmed.length <= MAX_AGENT_ID_LEN && trimmed !== "." && !trimmed.includes("..") && !RESERVED_IDENTITY_IDS.has(trimmed.toLowerCase());
+}
 function sanitizeDiagnosticField(raw, fallback = "(unknown)") {
   if (typeof raw !== "string")
     return fallback;
@@ -523,9 +531,9 @@ function sanitizeDiagnosticField(raw, fallback = "(unknown)") {
   return cleaned.length > 0 ? cleaned.slice(0, 256) : fallback;
 }
 function validateIdentityProfile(profile, file, allowDevToken = false) {
-  const cleanNonempty = (value) => typeof value === "string" && value.trim().length > 0 && !/[\x00-\x1f\x7f]/.test(value);
+  const cleanNonempty = (value) => typeof value === "string" && value.trim().length > 0 && value.length <= 4096 && !/[\x00-\x1f\x7f]/.test(value);
   const safeFile = sanitizeDiagnosticField(file, "(unknown-path)");
-  if (!profile || typeof profile !== "object" || Array.isArray(profile) || !cleanNonempty(profile.agent_id) || RESERVED_IDENTITY_IDS.has(profile.agent_id.trim()) || !cleanNonempty(profile.token) || !allowDevToken && profile.token.trim() === "dev-token" || profile.capabilities !== undefined && (!Array.isArray(profile.capabilities) || !profile.capabilities.every(cleanNonempty))) {
+  if (!profile || typeof profile !== "object" || Array.isArray(profile) || !isValidProfileAgentId(profile.agent_id) || !cleanNonempty(profile.token) || !allowDevToken && profile.token.trim() === "dev-token" || profile.capabilities !== undefined && (!Array.isArray(profile.capabilities) || profile.capabilities.length > MAX_CAPABILITIES_LEN || !profile.capabilities.every((c) => cleanNonempty(c) && c.length <= 64))) {
     throw new Error(`Invalid identity profile at ${safeFile}. Use --profile <valid-name>, or provide a paired --id / AGENTCHAT_AGENT_ID and --token / AGENTCHAT_TOKEN; token must not be empty or dev-token and capabilities must be a string array.`);
   }
 }
@@ -1828,6 +1836,10 @@ class AppServer {
     });
     this.rl = createInterface({ input: this.child.stdout });
     this.rl.on("line", (line) => {
+      if (line.length > 8 * 1024 * 1024) {
+        this.fatal(new Error("Oversized app-server response"));
+        return;
+      }
       let parsed;
       try {
         parsed = JSON.parse(line);
@@ -1916,17 +1928,20 @@ class AppServer {
     }
     if ((p.turnId ?? p.turn?.id) !== a.turn)
       return;
-    if (message.method === "item/completed" && p.item?.type === "agentMessage" && (!p.item.phase || p.item.phase === "final_answer"))
-      a.items.set(p.item.id, p.item.text);
+    const recordItem = (item) => {
+      if (item?.type === "agentMessage" && (!item.phase || item.phase === "final_answer") && typeof item.id === "string" && item.id.length > 0 && typeof item.text === "string" && (a.items.has(item.id) || a.items.size < 512))
+        a.items.set(item.id, item.text);
+    };
+    if (message.method === "item/completed")
+      recordItem(p.item);
     if (message.method === "turn/completed") {
       this.active = undefined;
       if (p.turn?.status !== "completed") {
         a.reject(new Error(`Codex turn ${p.turn?.status ?? "unknown"}`));
         return;
       }
-      for (const item of p.turn.items ?? [])
-        if (item.type === "agentMessage" && (!item.phase || item.phase === "final_answer"))
-          a.items.set(item.id, item.text);
+      for (const item of Array.isArray(p.turn.items) ? p.turn.items : [])
+        recordItem(item);
       const text = [...a.items.values()].join(`
 `).trim();
       text ? a.resolve(text) : a.reject(new Error("Codex completed without a final reply"));
@@ -1939,8 +1954,10 @@ class AppServer {
     }
     const result = await this.request("config/read", { includeLayers: false, cwd });
     this.disabledMcp = {};
-    for (const name of Object.keys(result.config?.mcp_servers ?? {}))
-      this.disabledMcp[name] = { enabled: false };
+    for (const name of Object.keys(result.config?.mcp_servers ?? {})) {
+      if (!/^(?:__proto__|constructor|prototype)$/i.test(name))
+        this.disabledMcp[name] = { enabled: false };
+    }
     const r = await this.request(existing ? "thread/resume" : "thread/start", {
       ...existing ? { threadId: existing } : { ephemeral },
       cwd,
@@ -1953,6 +1970,8 @@ class AppServer {
     if (typeof r.thread?.id !== "string")
       throw new Error("App-server returned no thread ID");
     this.threadPermissions.set(r.thread.id, permissions);
+    if (this.threadPermissions.size > 1024)
+      this.threadPermissions.delete(this.threadPermissions.keys().next().value);
     return r.thread.id;
   }
   async readThread(thread) {
@@ -2541,10 +2560,27 @@ var isPrototypeKey = (key) => /^(?:__proto__|constructor|prototype)$/i.test(key)
 function isPlainObject(value) {
   return value !== null && typeof value === "object" && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
 }
+function safeMessageId(value) {
+  return typeof value === "string" && !!value.trim() && !/[\x00-\x1f\x7f]/.test(value) && !isPrototypeKey(value);
+}
+function validMentions(value) {
+  return value === undefined || Array.isArray(value) && value.length <= 128 && [...value].every((id) => typeof id === "string");
+}
+function checkStateDir(dir, allowMissing = false) {
+  try {
+    const stat = lstatSync10(dir);
+    if (stat.isSymbolicLink() || !stat.isDirectory())
+      throw new Error("Unsafe bridge state directory");
+  } catch (error) {
+    if (!allowMissing || error.code !== "ENOENT")
+      throw error;
+  }
+}
+var entryStatuses = new Set(["pending", "running", "ready", "sending", "sent", "failed", "uncertain", "blocked", "skipped"]);
 function addressed(m, c) {
   if (!m || ["id", "channel_id", "sender_id", "content"].some((k) => typeof m[k] !== "string" || !m[k].trim()))
     return false;
-  if (isPrototypeKey(m.channel_id))
+  if (![m.id, m.channel_id, m.sender_id].every(safeMessageId) || !validMentions(m.mentions) || !validMentions(m.mentioned_ids))
     return false;
   if (m.content === "__typing__" || m.content.length > 32000)
     return false;
@@ -2583,7 +2619,9 @@ class Bridge {
     this.activity = activity;
     this.owner = owner;
     this.loops = loops;
+    checkStateDir(config.stateDir, true);
     mkdirSync6(config.stateDir, { recursive: true, mode: 448 });
+    checkStateDir(config.stateDir);
     this.file = join10(config.stateDir, "state.json");
     this.lock = join10(config.stateDir, "bridge.lock");
     try {
@@ -2619,6 +2657,8 @@ class Bridge {
       if (this.state?.version !== 1 || !isPlainObject(this.state.threads) || !Array.isArray(this.state.entries) || Object.prototype.hasOwnProperty.call(this.state, "channels") && !isPlainObject(this.state.channels))
         throw new Error("Invalid bridge state");
       for (const e of this.state.entries) {
+        if (!isPlainObject(e) || !entryStatuses.has(e.status) || !isPlainObject(e.message) || ![e.message.id, e.message.channel_id, e.message.sender_id].every(safeMessageId) || typeof e.message.content !== "string" || !validMentions(e.message.mentions) || !validMentions(e.message.mentioned_ids))
+          throw new Error("Invalid bridge entry");
         if (e.status === "sending")
           e.status = "uncertain";
         if (e.status === "running")
@@ -2656,7 +2696,9 @@ class Bridge {
     }
     const tmp = `${this.file}.tmp.${process.pid}.${Date.now()}.${randomBytes2(16).toString("hex")}`;
     try {
-      writeFileSync4(tmp, JSON.stringify(this.state), { mode: 384, flag: "wx" });
+      const serialized = JSON.stringify(this.state);
+      checkStateDir(this.config.stateDir);
+      writeFileSync4(tmp, serialized, { mode: 384, flag: "wx" });
       try {
         if (lstatSync10(this.file).isSymbolicLink())
           throw new Error("Bridge state must not be a symlink");
@@ -2664,6 +2706,7 @@ class Bridge {
         if (error.code !== "ENOENT")
           throw error;
       }
+      checkStateDir(this.config.stateDir);
       renameSync4(tmp, this.file);
     } catch (err) {
       try {
@@ -2829,11 +2872,13 @@ AgentsChat message:
           e.error = error.message;
           this.save();
           this.log("Conversation in use; queued message will resume in the same task");
-          if (!this.stopped)
+          if (!this.stopped) {
             this.retry = setTimeout(() => {
               this.retry = undefined;
               this.drain();
             }, 5000);
+            this.retry.unref?.();
+          }
           return;
         }
         e.error = this.redact(error instanceof Error ? error.message : "Bridge operation failed").slice(0, 240);

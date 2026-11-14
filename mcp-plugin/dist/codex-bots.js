@@ -24,6 +24,14 @@ import { createHash } from "node:crypto";
 
 // src/identity.ts
 var RESERVED_IDENTITY_IDS = new Set(["__proto__", "constructor", "prototype"]);
+var MAX_AGENT_ID_LEN = 128;
+var MAX_CAPABILITIES_LEN = 64;
+function isValidProfileAgentId(raw) {
+  if (typeof raw !== "string" || /[\x00-\x1f\x7f/\\\s]/.test(raw))
+    return false;
+  const trimmed = raw.trim();
+  return trimmed.length > 0 && trimmed === raw && trimmed.length <= MAX_AGENT_ID_LEN && trimmed !== "." && !trimmed.includes("..") && !RESERVED_IDENTITY_IDS.has(trimmed.toLowerCase());
+}
 function sanitizeDiagnosticField(raw, fallback = "(unknown)") {
   if (typeof raw !== "string")
     return fallback;
@@ -31,9 +39,9 @@ function sanitizeDiagnosticField(raw, fallback = "(unknown)") {
   return cleaned.length > 0 ? cleaned.slice(0, 256) : fallback;
 }
 function validateIdentityProfile(profile, file, allowDevToken = false) {
-  const cleanNonempty = (value) => typeof value === "string" && value.trim().length > 0 && !/[\x00-\x1f\x7f]/.test(value);
+  const cleanNonempty = (value) => typeof value === "string" && value.trim().length > 0 && value.length <= 4096 && !/[\x00-\x1f\x7f]/.test(value);
   const safeFile = sanitizeDiagnosticField(file, "(unknown-path)");
-  if (!profile || typeof profile !== "object" || Array.isArray(profile) || !cleanNonempty(profile.agent_id) || RESERVED_IDENTITY_IDS.has(profile.agent_id.trim()) || !cleanNonempty(profile.token) || !allowDevToken && profile.token.trim() === "dev-token" || profile.capabilities !== undefined && (!Array.isArray(profile.capabilities) || !profile.capabilities.every(cleanNonempty))) {
+  if (!profile || typeof profile !== "object" || Array.isArray(profile) || !isValidProfileAgentId(profile.agent_id) || !cleanNonempty(profile.token) || !allowDevToken && profile.token.trim() === "dev-token" || profile.capabilities !== undefined && (!Array.isArray(profile.capabilities) || profile.capabilities.length > MAX_CAPABILITIES_LEN || !profile.capabilities.every((c) => cleanNonempty(c) && c.length <= 64))) {
     throw new Error(`Invalid identity profile at ${safeFile}. Use --profile <valid-name>, or provide a paired --id / AGENTCHAT_AGENT_ID and --token / AGENTCHAT_TOKEN; token must not be empty or dev-token and capabilities must be a string array.`);
   }
 }

@@ -1798,6 +1798,21 @@ ${rawBody}`;
 
 // src/identity.ts
 var RESERVED_IDENTITY_IDS = new Set(["__proto__", "constructor", "prototype"]);
+var MAX_DISPLAY_NAME_LEN = 128;
+var MAX_AGENT_ID_LEN = 128;
+var MAX_CAPABILITIES_LEN = 64;
+function isValidDisplayName(raw) {
+  if (typeof raw !== "string" || /[\x00-\x1f\x7f]/.test(raw))
+    return false;
+  const trimmed = raw.trim();
+  return trimmed.length > 0 && trimmed.length <= MAX_DISPLAY_NAME_LEN && !RESERVED_IDENTITY_IDS.has(trimmed.toLowerCase());
+}
+function isValidProfileAgentId(raw) {
+  if (typeof raw !== "string" || /[\x00-\x1f\x7f/\\\s]/.test(raw))
+    return false;
+  const trimmed = raw.trim();
+  return trimmed.length > 0 && trimmed === raw && trimmed.length <= MAX_AGENT_ID_LEN && trimmed !== "." && !trimmed.includes("..") && !RESERVED_IDENTITY_IDS.has(trimmed.toLowerCase());
+}
 function sanitizeDiagnosticField(raw, fallback = "(unknown)") {
   if (typeof raw !== "string")
     return fallback;
@@ -1815,13 +1830,13 @@ function decideIdentity(i) {
   if (i.hasToken)
     return { mode: "env-creds" };
   if (i.cliName !== undefined) {
-    if (typeof i.cliName !== "string" || /[\x00-\x1f\x7f]/.test(i.cliName) || i.cliName.trim().length === 0) {
-      return { mode: "error", message: `invalid --name value: display name must be non-empty and free of control characters.` };
+    if (!isValidDisplayName(i.cliName)) {
+      return { mode: "error", message: `invalid --name value: display name must be 1..${MAX_DISPLAY_NAME_LEN} chars, non-reserved, and free of control characters.` };
     }
     return { mode: "register", displayName: i.cliName.trim() };
   }
   if (i.registerFlag) {
-    if (typeof i.fallbackName !== "string" || /[\x00-\x1f\x7f]/.test(i.fallbackName) || i.fallbackName.trim().length === 0) {
+    if (!isValidDisplayName(i.fallbackName)) {
       return { mode: "error", message: `invalid fallback display name for --register.` };
     }
     return { mode: "register", displayName: i.fallbackName.trim() };
@@ -1849,9 +1864,9 @@ function decideIdentity(i) {
   };
 }
 function validateIdentityProfile(profile, file, allowDevToken = false) {
-  const cleanNonempty = (value) => typeof value === "string" && value.trim().length > 0 && !/[\x00-\x1f\x7f]/.test(value);
+  const cleanNonempty = (value) => typeof value === "string" && value.trim().length > 0 && value.length <= 4096 && !/[\x00-\x1f\x7f]/.test(value);
   const safeFile = sanitizeDiagnosticField(file, "(unknown-path)");
-  if (!profile || typeof profile !== "object" || Array.isArray(profile) || !cleanNonempty(profile.agent_id) || RESERVED_IDENTITY_IDS.has(profile.agent_id.trim()) || !cleanNonempty(profile.token) || !allowDevToken && profile.token.trim() === "dev-token" || profile.capabilities !== undefined && (!Array.isArray(profile.capabilities) || !profile.capabilities.every(cleanNonempty))) {
+  if (!profile || typeof profile !== "object" || Array.isArray(profile) || !isValidProfileAgentId(profile.agent_id) || !cleanNonempty(profile.token) || !allowDevToken && profile.token.trim() === "dev-token" || profile.capabilities !== undefined && (!Array.isArray(profile.capabilities) || profile.capabilities.length > MAX_CAPABILITIES_LEN || !profile.capabilities.every((c) => cleanNonempty(c) && c.length <= 64))) {
     throw new Error(`Invalid identity profile at ${safeFile}. Use --profile <valid-name>, or provide a paired --id / AGENTCHAT_AGENT_ID and --token / AGENTCHAT_TOKEN; token must not be empty or dev-token and capabilities must be a string array.`);
   }
 }
@@ -2348,29 +2363,64 @@ function formatWakeAttachments(attachments) {
   }
   return lines.length > 0 ? ` [附件: ${lines.join("; ")}]` : "";
 }
+function sanitizeWakeHeaderToken(raw, maxLen = 128) {
+  if (typeof raw !== "string")
+    return;
+  const cleaned = raw.replace(/[\x00-\x1f\x7f]+/g, "").trim().slice(0, maxLen);
+  return cleaned.length > 0 ? cleaned : undefined;
+}
+function isAllowedWakeHttpUrl(rawUrl) {
+  if (!rawUrl || rawUrl.length > 4096 || /[\x00-\x1f\x7f]/.test(rawUrl))
+    return false;
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:")
+    return false;
+  if (parsed.port) {
+    const port = Number(parsed.port);
+    if (!Number.isInteger(port) || port < 1 || port > 65535)
+      return false;
+  }
+  return true;
+}
 function buildWakePayload(msg, opts = {}) {
   const redactOpts = msg.same_owner_direct === true ? { preserveAcKeys: true } : undefined;
   const content = typeof msg.content === "string" ? redactSecrets2(msg.content.slice(0, WAKE_CONTENT_MAX), redactOpts) : undefined;
-  const attachments = Array.isArray(msg.attachments) && msg.attachments.length > 0 ? msg.attachments.filter((a) => a && typeof a === "object" && typeof a.url === "string").map((a) => ({
-    type: typeof a.type === "string" ? a.type : undefined,
-    url: a.url,
-    mime: typeof a.mime === "string" ? a.mime : undefined,
-    size: typeof a.size === "number" ? a.size : undefined,
-    width: typeof a.width === "number" ? a.width : undefined,
-    height: typeof a.height === "number" ? a.height : undefined,
-    duration_ms: typeof a.duration_ms === "number" ? a.duration_ms : undefined,
-    transcript: typeof a.transcript === "string" ? redactSecrets2(a.transcript.slice(0, 300), redactOpts) : undefined
-  })) : undefined;
-  const targetSessionId = typeof opts.targetSessionId === "string" && opts.targetSessionId.length > 0 ? opts.targetSessionId : undefined;
+  const attachments = Array.isArray(msg.attachments) && msg.attachments.length > 0 ? msg.attachments.slice(0, 16).map((a) => {
+    if (!a || typeof a !== "object")
+      return null;
+    const safeUrl = sanitizeWakeAttachmentUrl(a.url);
+    if (!safeUrl)
+      return null;
+    return {
+      type: sanitizeWakeHeaderToken(a.type, 32),
+      url: safeUrl,
+      mime: sanitizeWakeHeaderToken(a.mime, 128),
+      size: typeof a.size === "number" && Number.isFinite(a.size) && a.size >= 0 ? a.size : undefined,
+      width: typeof a.width === "number" && Number.isFinite(a.width) && a.width >= 0 ? a.width : undefined,
+      height: typeof a.height === "number" && Number.isFinite(a.height) && a.height >= 0 ? a.height : undefined,
+      duration_ms: typeof a.duration_ms === "number" && Number.isFinite(a.duration_ms) && a.duration_ms >= 0 ? a.duration_ms : undefined,
+      transcript: typeof a.transcript === "string" ? redactSecrets2(a.transcript.slice(0, 300), redactOpts) : undefined
+    };
+  }).filter((x) => x !== null) : undefined;
+  const targetSessionId = sanitizeWakeHeaderToken(opts.targetSessionId, 256);
+  const channelId = sanitizeWakeHeaderToken(msg.channel_id, 128);
+  const messageId = sanitizeWakeHeaderToken(msg.id, 128);
+  const senderId = sanitizeWakeHeaderToken(msg.sender_id, 128);
+  const mentionedIds = Array.isArray(msg.mentioned_ids) ? msg.mentioned_ids.slice(0, 64).map((x) => sanitizeWakeHeaderToken(x, 128)).filter((x) => Boolean(x)) : undefined;
   return {
-    type: typeof msg.type === "string" ? msg.type : "message",
-    channel_id: msg.channel_id,
-    message_id: msg.id,
-    sender_id: msg.sender_id,
+    type: sanitizeWakeHeaderToken(msg.type, 64) ?? "message",
+    channel_id: channelId,
+    message_id: messageId,
+    sender_id: senderId,
     content,
     ...attachments && attachments.length > 0 ? { attachments } : {},
-    mentioned_ids: Array.isArray(msg.mentioned_ids) ? msg.mentioned_ids.filter((x) => typeof x === "string") : undefined,
-    timestamp: typeof msg.timestamp === "string" ? msg.timestamp : undefined,
+    mentioned_ids: mentionedIds,
+    timestamp: sanitizeWakeHeaderToken(msg.timestamp, 64),
     ...targetSessionId ? { target_session_id: targetSessionId } : {}
   };
 }
@@ -2395,6 +2445,11 @@ async function fireWake(msg, cfg) {
   const url = (cfg.url ?? "").trim();
   if (!url)
     return;
+  const safeLogUrl = sanitizeWakeLogUrl(url);
+  if (!isAllowedWakeHttpUrl(url)) {
+    log(`[agentchat] wake POST rejected invalid or non-HTTP(S) URL: ${safeLogUrl}`);
+    return;
+  }
   const payload = buildWakePayload(msg, { targetSessionId: cfg.targetSessionId });
   if (!payload.timestamp)
     payload.timestamp = new Date().toISOString();
@@ -2402,7 +2457,6 @@ async function fireWake(msg, cfg) {
   const headers = { "Content-Type": "application/json" };
   if (cfg.secret)
     headers[WAKE_SIG_HEADER] = signWakeBody(body, cfg.secret);
-  const safeLogUrl = sanitizeWakeLogUrl(url);
   const timeoutMs = clampWakeTimerMs(cfg.timeoutMs, 5000);
   const doPost = async () => {
     const f = cfg.fetchImpl ?? fetch;
@@ -2410,7 +2464,7 @@ async function fireWake(msg, cfg) {
     const t = setTimeout(() => ctrl.abort(), timeoutMs);
     t.unref?.();
     try {
-      const res = await f(url, { method: "POST", headers, body, signal: ctrl.signal });
+      const res = await f(url, { method: "POST", headers, body, signal: ctrl.signal, redirect: "error" });
       if (!res.ok)
         log(`[agentchat] wake POST ${safeLogUrl} → HTTP ${res.status}`);
       await res.body?.cancel().catch(() => {});
@@ -2434,9 +2488,9 @@ function buildGrokPrompt(msg, agentId, contextPrefix = "") {
   const redactOpts = msg.same_owner_direct === true ? { preserveAcKeys: true } : undefined;
   const content = rawContent ? redactSecrets2(rawContent.slice(0, NATIVE_WAKE_CONTENT_MAX), redactOpts) : "";
   const cleanPrefix = contextPrefix ? redactSecrets2(contextPrefix.trim(), redactOpts) : "";
-  const channel = msg.channel_id ?? "?";
-  const sender = msg.sender_id ?? "someone";
-  const msgId = msg.id ?? msg.message_id ?? "";
+  const channel = sanitizeWakeHeaderToken(msg.channel_id, 128) ?? "?";
+  const sender = sanitizeWakeHeaderToken(msg.sender_id, 128) ?? "someone";
+  const msgId = sanitizeWakeHeaderToken(msg.id ?? msg.message_id, 128) ?? "";
   const isDm = DIRECT_CHANNEL_RE.test(channel);
   const where = isDm ? "私聊 (DM)" : `频道 ${channel}`;
   const actionHint = isTruncated ? `——消息已截断，可调 get_history 查看全文，再用 reply 回复` : `——请直接用 reply 回复；仅需更早历史时调 get_history`;
@@ -2449,11 +2503,10 @@ function buildGrokPrompt(msg, agentId, contextPrefix = "") {
 function grokBearerFromGatewayConfig(cfg) {
   if (!cfg || typeof cfg !== "object")
     return null;
-  if (typeof cfg.token === "string" && cfg.token)
-    return cfg.token;
-  if (cfg.auth && typeof cfg.auth.bearer === "string" && cfg.auth.bearer)
-    return cfg.auth.bearer;
-  return null;
+  const candidate = typeof cfg.token === "string" && cfg.token ? cfg.token.trim() : cfg.auth && typeof cfg.auth.bearer === "string" && cfg.auth.bearer ? cfg.auth.bearer.trim() : "";
+  if (!candidate || candidate.length > 4096 || /[\x00-\x1f\x7f]/.test(candidate))
+    return null;
+  return candidate;
 }
 function grokPortFromGatewayConfig(cfg, fallback = 1340) {
   const p = cfg?.port;
@@ -2553,9 +2606,9 @@ function buildWakePrompt(msg, contextPrefix = "") {
   const redactOpts = msg.same_owner_direct === true ? { preserveAcKeys: true } : undefined;
   const content = rawContent ? redactSecrets2(rawContent.slice(0, NATIVE_WAKE_CONTENT_MAX), redactOpts) : "";
   const cleanPrefix = contextPrefix ? redactSecrets2(contextPrefix.trim(), redactOpts) : "";
-  const channel = msg.channel_id ?? "?";
-  const sender = msg.sender_id ?? "someone";
-  const msgId = msg.id ?? msg.message_id ?? "";
+  const channel = sanitizeWakeHeaderToken(msg.channel_id, 128) ?? "?";
+  const sender = sanitizeWakeHeaderToken(msg.sender_id, 128) ?? "someone";
+  const msgId = sanitizeWakeHeaderToken(msg.id ?? msg.message_id, 128) ?? "";
   const isDm = DIRECT_CHANNEL_RE.test(channel);
   const where = isDm ? `私聊 (${channel})` : `频道 ${channel}`;
   const actionHint = isTruncated ? ` —— 消息过长已截断，可调用 get_history(chat_id, message_id) 查看全文，再用 reply 回复并 mark_read 标记已读` : ` —— 请直接用 reply 回复并用 mark_read 标记已读；仅在需要更早上下文时调用 get_history`;
@@ -2568,8 +2621,8 @@ async function fireAntigravityWake(msg, cfg) {
   const log = cfg.logger ?? (() => {});
   const conversationId = (cfg.conversationId ?? "").trim();
   const csrfToken = (cfg.csrfToken ?? "").trim();
-  if (!conversationId || !csrfToken) {
-    log(`[agentchat] antigravity wake: missing conversationId or csrfToken, skipping`);
+  if (!conversationId || conversationId.length > 128 || /[\x00-\x1f\x7f]/.test(conversationId) || !csrfToken || csrfToken.length > 1024 || /[\x00-\x1f\x7f]/.test(csrfToken)) {
+    log(`[agentchat] antigravity wake: missing or unsafe conversationId or csrfToken, skipping`);
     return false;
   }
   const addresses = [];
@@ -2728,7 +2781,10 @@ function fireZcodeWake(msg, cfg) {
       const { cmd, prefixArgs } = await resolveZcodeCommand(cfg.zcodeBin);
       const rawArgs = [...prefixArgs, "-p", prompt, "--resume", sessionId];
       if (cfg.workspacePath && cfg.workspacePath.trim()) {
-        rawArgs.push("--cwd", cfg.workspacePath.trim());
+        const wsPath = cfg.workspacePath.trim();
+        if (!wsPath.startsWith("-") && !/[\x00-\x1f\x7f]/.test(wsPath)) {
+          rawArgs.push("--cwd", wsPath);
+        }
       }
       const env = {
         ...process.env,
@@ -4958,6 +5014,12 @@ function formatWakeAttachments2(attachments) {
   }
   return lines.length > 0 ? ` [附件: ${lines.join("; ")}]` : "";
 }
+function sanitizeWakeHeaderToken2(raw, maxLen = 128) {
+  if (typeof raw !== "string")
+    return;
+  const cleaned = raw.replace(/[\x00-\x1f\x7f]+/g, "").trim().slice(0, maxLen);
+  return cleaned.length > 0 ? cleaned : undefined;
+}
 var GROK_GATEWAY_PATH_CANDIDATES2 = [
   join11(process.env.HOME || process.env.USERPROFILE || homedir5(), ".grok", "gateway.json"),
   "/home/box/sand-data/gateway.json"
@@ -4968,9 +5030,9 @@ function buildWakePrompt2(msg, contextPrefix = "") {
   const redactOpts = msg.same_owner_direct === true ? { preserveAcKeys: true } : undefined;
   const content = rawContent ? redactSecrets2(rawContent.slice(0, NATIVE_WAKE_CONTENT_MAX2), redactOpts) : "";
   const cleanPrefix = contextPrefix ? redactSecrets2(contextPrefix.trim(), redactOpts) : "";
-  const channel = msg.channel_id ?? "?";
-  const sender = msg.sender_id ?? "someone";
-  const msgId = msg.id ?? msg.message_id ?? "";
+  const channel = sanitizeWakeHeaderToken2(msg.channel_id, 128) ?? "?";
+  const sender = sanitizeWakeHeaderToken2(msg.sender_id, 128) ?? "someone";
+  const msgId = sanitizeWakeHeaderToken2(msg.id ?? msg.message_id, 128) ?? "";
   const isDm = DIRECT_CHANNEL_RE2.test(channel);
   const where = isDm ? `私聊 (${channel})` : `频道 ${channel}`;
   const actionHint = isTruncated ? ` —— 消息过长已截断，可调用 get_history(chat_id, message_id) 查看全文，再用 reply 回复并 mark_read 标记已读` : ` —— 请直接用 reply 回复并用 mark_read 标记已读；仅在需要更早上下文时调用 get_history`;
