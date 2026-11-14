@@ -22,7 +22,7 @@ function payload(result: any): any {
 }
 function validTarget(value: unknown): value is string {
   return typeof value === "string" && value.trim() === value && value.length >= 1 && value.length <= 256 &&
-    !/[\x00-\x1f\x7f]/.test(value) && !["__proto__", "prototype", "constructor"].includes(value);
+    !/[\x00-\x1f\x7f]/.test(value) && !["__proto__", "prototype", "constructor"].includes(value.toLowerCase());
 }
 /** Private durable outbox. An authorized GUI host calls dispatch; enqueue is NOT delivery. */
 export class GuiChannel {

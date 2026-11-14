@@ -135,7 +135,7 @@ function redactSecrets(text, opts) {
   if (typeof text !== "string" || !text)
     return "";
   const step = opts?.preserveAcKeys ? text : text.replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***");
-  return step.replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
+  return step.replace(/mcp_(?:at|rt|code)_[A-Za-z0-9_-]{16,}/g, "mcp_***REDACTED***").replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
 }
 
 // codex/owner.ts
@@ -349,6 +349,9 @@ function payload(result) {
   }
   return result;
 }
+function validTarget(value) {
+  return typeof value === "string" && value.trim() === value && value.length >= 1 && value.length <= 256 && !/[\x00-\x1f\x7f]/.test(value) && !["__proto__", "prototype", "constructor"].includes(value.toLowerCase());
+}
 
 class GuiChannel {
   directory;
@@ -393,7 +396,7 @@ class GuiChannel {
     if (stat.size > 1048576)
       throw new Error("GUI receipt exceeds size limit");
     const entry = JSON.parse(readFileSync(path, "utf8"));
-    if (!entry || typeof entry !== "object" || Array.isArray(entry) || entry.id !== id || typeof entry.threadId !== "string" || !entry.threadId.trim() || typeof entry.prompt !== "string" || typeof entry.createdAt !== "string" || !["pending", "sending", "submitted", "delivered", "uncertain"].includes(entry.status) || entry.hostId !== undefined && typeof entry.hostId !== "string" || entry.turnId !== undefined && typeof entry.turnId !== "string" || entry.deliveredAt !== undefined && typeof entry.deliveredAt !== "string")
+    if (!entry || typeof entry !== "object" || Array.isArray(entry) || Object.prototype.hasOwnProperty.call(entry, "__proto__") || entry.id !== id || !validTarget(entry.threadId) || typeof entry.prompt !== "string" || typeof entry.createdAt !== "string" || !["pending", "sending", "submitted", "delivered", "uncertain"].includes(entry.status) || entry.hostId !== undefined && !validTarget(entry.hostId) || entry.turnId !== undefined && typeof entry.turnId !== "string" || entry.deliveredAt !== undefined && typeof entry.deliveredAt !== "string")
       throw new Error("Invalid GUI receipt");
     return entry;
   }
@@ -409,6 +412,8 @@ class GuiChannel {
     return entries;
   }
   enqueue(threadId, text, hostId) {
+    if (!validTarget(threadId) || hostId !== undefined && !validTarget(hostId))
+      throw new Error("Invalid GUI target");
     if (!this.allowedThreads.includes(threadId))
       throw new Error("GUI target is not allowed");
     if (!text.trim() || text.length > 24000)
@@ -3592,6 +3597,9 @@ async function main() {
     return;
   }
   if (values["gui-thread"] || values["gui-message-file"] || values["gui-status"]) {
+    const parent = lstatSync12(join12(homedir6(), ".agentschat"), { throwIfNoEntry: false });
+    if (parent && (parent.isSymbolicLink() || !parent.isDirectory()))
+      throw new Error("GUI parent must be a real directory, not a symlink");
     const channel = new GuiChannel(join12(homedir6(), ".agentschat/codex-gui-outbox"), values["gui-thread"] ? [values["gui-thread"]] : []);
     if (values["gui-status"]) {
       console.log(JSON.stringify(channel.list().map(({ prompt: prompt2, ...receipt2 }) => receipt2)));
@@ -3619,7 +3627,7 @@ async function main() {
     timer.unref?.();
     process.once("message", (config) => {
       clearTimeout(timer);
-      if (!isPlainObject2(config) || !Object.keys(config).length) {
+      if (!isPlainObject2(config) || Object.prototype.hasOwnProperty.call(config, "__proto__") || typeof config.cwd !== "string" || !config.cwd.length || typeof config.stateDir !== "string" || !config.stateDir.length || typeof config.agentId !== "string" || !config.agentId.length || typeof config.token !== "string" || !config.token.length || typeof config.apiUrl !== "string" || typeof config.wsUrl !== "string") {
         reject(new Error("Invalid parent configuration"));
         return;
       }
@@ -3645,7 +3653,15 @@ async function main() {
   const runtime = prepareRuntimeHome(c.stateDir, undefined, c.codexHomeMode, c.codexBin);
   codex = new AppServer(c.codexBin, undefined, undefined, c.permissions, runtime, c.effort, c.model, { profileFile: c.profileFile, agentId: c.agentId, apiUrl: c.apiUrl, wsUrl: c.wsUrl });
   if (values.conversations || values["read-conversation"]) {
-    const state = JSON.parse(readFileSync11(join12(c.stateDir, "state.json"), "utf8"));
+    const dir = lstatSync12(c.stateDir), stateFile = join12(c.stateDir, "state.json");
+    if (dir.isSymbolicLink() || !dir.isDirectory())
+      throw new Error("Conversation state must use a real directory");
+    const stat = lstatSync12(stateFile);
+    if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 16 * 1024 * 1024)
+      throw new Error("Unsafe conversation state file");
+    const state = JSON.parse(readFileSync11(stateFile, "utf8"));
+    if (!isPlainObject2(state) || Object.prototype.hasOwnProperty.call(state, "__proto__"))
+      throw new Error("Invalid conversation state");
     const channels = state?.channels === undefined ? {} : state.channels;
     if (!isPlainObject2(channels))
       throw new Error("Invalid conversation channels");

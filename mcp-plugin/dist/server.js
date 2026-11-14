@@ -145,7 +145,7 @@ function redactSecrets(text, opts) {
   if (typeof text !== "string" || !text)
     return "";
   const step = opts?.preserveAcKeys ? text : text.replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***");
-  return step.replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
+  return step.replace(/mcp_(?:at|rt|code)_[A-Za-z0-9_-]{16,}/g, "mcp_***REDACTED***").replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
 }
 var PHONE_PII_RE = /^\+?\d[\d\s()-]{5,}[\d)]$/;
 function isPhoneShapedPii(s) {
@@ -162,7 +162,7 @@ function isHumanPiiHandle(rawId) {
   return false;
 }
 function redactParticipantPii(rawId) {
-  const s = String(rawId ?? "").trim();
+  const s = String(rawId ?? "").replace(/[\x00-\x1f\x7f]+/g, "").trim();
   if (!s)
     return "unknown";
   const atIdx = s.indexOf("@");
@@ -174,7 +174,7 @@ function redactParticipantPii(rawId) {
     const digits = s.replace(/\D/g, "");
     return `user:phone_***${digits.slice(-2) || "00"}`;
   }
-  return s;
+  return s.slice(0, 128);
 }
 
 // src/mentions.ts
@@ -2015,19 +2015,33 @@ function normalizeProfileSlug(s) {
   const base = profileNameFromPath(s) ?? s;
   return base.replace(/[^a-zA-Z0-9_-]/g, "_");
 }
+var MAX_GROK_BIND_ENTRIES = 1024;
+var MAX_GROK_BINDS_PATH_LEN = 4096;
+function isSafeProfileBindName(name) {
+  if (!name || name.length > 256 || hasControlChars(name))
+    return false;
+  if (isUnsafeObjectKey(name) || name === "." || name.includes("..") || /[\/\\]/.test(name))
+    return false;
+  return true;
+}
 function parseGrokBinds(raw) {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw))
     return {};
   const out = {};
+  let count = 0;
   for (const [k, v] of Object.entries(raw)) {
+    if (count >= MAX_GROK_BIND_ENTRIES)
+      break;
     if (typeof v !== "string")
       continue;
     const name = v.trim();
-    if (!name || name.length > 256 || hasControlChars(name))
+    if (!isSafeProfileBindName(name))
       continue;
     const key = k.trim();
     if (!key || key.length > 256 || isUnsafeObjectKey(key) || hasControlChars(key))
       continue;
+    if (!Object.hasOwn(out, key))
+      count++;
     out[key] = name;
   }
   return out;
@@ -2044,8 +2058,9 @@ function parseGrokBindsText(text) {
 }
 function resolveGrokBindsPath(configDir, envOverride) {
   const trimmed = typeof envOverride === "string" ? envOverride.trim() : "";
-  if (trimmed.length > 0 && !hasControlChars(trimmed))
+  if (trimmed.length > 0 && trimmed.length <= MAX_GROK_BINDS_PATH_LEN && !trimmed.startsWith("-") && !hasControlChars(trimmed)) {
     return trimmed;
+  }
   return join2(configDir, DEFAULT_GROK_BINDS_FILENAME);
 }
 function decideGrokBind(input) {
@@ -2056,7 +2071,7 @@ function decideGrokBind(input) {
     return { kind: "skip" };
   const binds = input.binds && typeof input.binds === "object" ? input.binds : {};
   const profileName = Object.hasOwn(binds, id) ? binds[id] : undefined;
-  if (typeof profileName === "string" && profileName.trim().length > 0 && !hasControlChars(profileName)) {
+  if (typeof profileName === "string" && isSafeProfileBindName(profileName.trim())) {
     return { kind: "hit", conversationId: id, profileName: profileName.trim() };
   }
   return { kind: "miss", conversationId: id };
@@ -2068,7 +2083,7 @@ function boundProfileForConversation(conversationId, binds) {
   if (!binds || typeof binds !== "object")
     return null;
   const name = Object.hasOwn(binds, id) ? binds[id] : undefined;
-  return typeof name === "string" && name.trim().length > 0 && !hasControlChars(name) ? name.trim() : null;
+  return typeof name === "string" && isSafeProfileBindName(name.trim()) ? name.trim() : null;
 }
 function profileNameFromPath(profilePath) {
   if (!profilePath || typeof profilePath !== "string")
@@ -2279,14 +2294,14 @@ function redactSecrets2(text, opts) {
   if (typeof text !== "string" || !text)
     return "";
   const step = opts?.preserveAcKeys ? text : text.replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***");
-  return step.replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
+  return step.replace(/mcp_(?:at|rt|code)_[A-Za-z0-9_-]{16,}/g, "mcp_***REDACTED***").replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
 }
 var PHONE_PII_RE2 = /^\+?\d[\d\s()-]{5,}[\d)]$/;
 function isPhoneShapedPii2(s) {
   return PHONE_PII_RE2.test(s) && s.replace(/\D/g, "").length >= 7;
 }
 function redactParticipantPii2(rawId) {
-  const s = String(rawId ?? "").trim();
+  const s = String(rawId ?? "").replace(/[\x00-\x1f\x7f]+/g, "").trim();
   if (!s)
     return "unknown";
   const atIdx = s.indexOf("@");
@@ -2298,7 +2313,7 @@ function redactParticipantPii2(rawId) {
     const digits = s.replace(/\D/g, "");
     return `user:phone_***${digits.slice(-2) || "00"}`;
   }
-  return s;
+  return s.slice(0, 128);
 }
 
 // src/wake.ts

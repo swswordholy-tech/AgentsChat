@@ -1287,6 +1287,10 @@ function save(rootDir = root) {
     }
     writeFileSync(tmp, JSON.stringify({ pid: process.pid, updated_at: new Date().toISOString(), bots: [...workers.values()].map((w) => ({ name: w.config.name, agent_id: w.config.agentId, workdir: w.config.cwd, effort: w.config.effort, model: w.config.model, pid: w.child?.pid, status: w.status })) }, null, 2), { mode: 384, flag: "wx" });
     created = true;
+    const currentDir = lstatSync3(rootDir);
+    const currentFile = lstatSync3(statusFile2, { throwIfNoEntry: false });
+    if (currentDir.isSymbolicLink() || !currentDir.isDirectory() || currentFile && (currentFile.isSymbolicLink() || !currentFile.isFile()))
+      throw new Error("Unsafe status destination");
     renameSync(tmp, statusFile2);
   } catch {
     if (created)
@@ -1422,7 +1426,7 @@ Watch polls external Codex processes every 5 seconds.`);
   if (values.status) {
     try {
       const stat = lstatSync3(statusFile);
-      if (stat.isSymbolicLink() || !stat.isFile())
+      if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 1048576)
         throw new Error("Unsafe status file");
       console.log(readFileSync3(statusFile, "utf8"));
     } catch {
@@ -1436,8 +1440,18 @@ Watch polls external Codex processes every 5 seconds.`);
     console.log(JSON.stringify(configs.map((c) => ({ name: c.name, agent_id: c.agentId, workdir: c.cwd, profile: c.profileFile }))));
     return;
   }
+  for (const directory of [join3(homedir3(), ".agentschat"), root]) {
+    const stat = lstatSync3(directory, { throwIfNoEntry: false });
+    if (stat && (stat.isSymbolicLink() || !stat.isDirectory()))
+      throw new Error("Unsafe manager directory");
+  }
   mkdirSync2(root, { recursive: true, mode: 448 });
+  const dir = lstatSync3(root);
+  if (dir.isSymbolicLink() || !dir.isDirectory())
+    throw new Error("Unsafe manager directory");
   removeDeadLock(lock);
+  if (lstatSync3(lock, { throwIfNoEntry: false })?.isSymbolicLink())
+    throw new Error("Unsafe manager lock");
   const fd = openSync(lock, "wx", 384);
   writeFileSync(fd, String(process.pid));
   closeSync(fd);

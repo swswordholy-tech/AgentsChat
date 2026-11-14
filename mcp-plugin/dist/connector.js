@@ -632,7 +632,7 @@ function redactSecrets(text, opts) {
   if (typeof text !== "string" || !text)
     return "";
   const step = opts?.preserveAcKeys ? text : text.replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***");
-  return step.replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
+  return step.replace(/mcp_(?:at|rt|code)_[A-Za-z0-9_-]{16,}/g, "mcp_***REDACTED***").replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
 }
 
 // src/read-cursor.ts
