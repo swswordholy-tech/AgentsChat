@@ -10,6 +10,35 @@ const isStatus = (url: RequestInfo | URL) => String(url).endsWith("/api/account/
 const respond = (status: unknown = STATUS, entitlement: unknown = ENTITLEMENT) =>
   (async (url: RequestInfo | URL) => Response.json(isStatus(url) ? status : entitlement)) as typeof fetch;
 
+test("rejects unsafe transports and credentials before authenticated network IO", async () => {
+  let calls = 0;
+  const request = (async (_url: RequestInfo | URL) => { calls++; return Response.json(STATUS); }) as typeof fetch;
+  for (const base of ["http://remote.invalid", "http://localhost.evil.invalid", "ftp://localhost",
+    "https://user:password@test.invalid", "https://user@test.invalid", BASE + "?key=secret",
+    BASE + "#fragment", BASE + "\n", "\t" + BASE, "invalid URL"]) {
+    expect(await getBotOwner(base, BOT, TOKEN, request)).toBeNull();
+  }
+  for (const invalid of ["", " ", " padded", "padded ", "bad\nvalue", "bad\x00value", "bad\x7fvalue"]) {
+    expect(await getBotOwner(BASE, invalid, TOKEN, request)).toBeNull();
+    expect(await getBotOwner(BASE, BOT, invalid, request)).toBeNull();
+  }
+  expect(calls).toBe(0);
+});
+
+test("allows HTTPS and loopback HTTP owner lookups", async () => {
+  for (const base of [BASE, "https://remote.invalid:8443/prefix/", "http://localhost:1234",
+    "http://127.0.0.1:1234", "http://[::1]:1234"]) {
+    expect(await getBotOwner(base, BOT, TOKEN, respond())).toBe("real-owner");
+  }
+});
+
+test("reserved prototype owners and invalid owner IDs cannot authorize", async () => {
+  for (const owner of ["__proto__", "__PROTO__", "constructor", "Constructor", "prototype", "PROTOTYPE",
+    " owner", "owner ", "owner\nother", "owner\x7f"]) {
+    expect(await getBotOwner(BASE, BOT, TOKEN, respond(STATUS, { owner_account_id: owner }))).toBeNull();
+  }
+});
+
 test("uses the bot's own authenticated endpoints and returns the authoritative owner", async () => {
   const calls: Array<{ url: string; options?: RequestInit }> = [];
   const request = (async (url: RequestInfo | URL, options?: RequestInit) => {

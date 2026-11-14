@@ -1,6 +1,7 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { createHmac } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import * as crypto from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -9,7 +10,9 @@ import {
   mergeDshCordisPatch,
   resolveDshPatchPath,
 } from "../src/patch.ts";
-import { loadDshConfig, runDshHeadlessResponder, safeDshConfig } from "../src/cli.ts";
+import { loadDshConfig, main, registerOnly, runDshHeadlessResponder, safeDshConfig } from "../src/cli.ts";
+import { MuseBridge } from "../../muse/src/bridge.ts";
+import { MuseAgentChatClient } from "../../muse/src/client.ts";
 import {
   apply as applyInboundBridge,
   isAllowedLocalOrigin,
@@ -18,6 +21,99 @@ import {
 } from "../inbound-bridge/index.js";
 
 const ROOT = resolve(import.meta.dir, "../..");
+
+test("DSH rejects embedded URL credentials in configuration and patch arguments", () => {
+  const env = { AGENTCHAT_AGENT_ID: "bot", AGENTCHAT_TOKEN: "test-token" };
+  for (const auth of ["user:secret@", "user@", ":secret@"]) {
+    expect(() => buildMcpAgentsChatArgs({ apiUrl: `https://${auth}test.invalid` })).toThrow(/Invalid/);
+    expect(() => loadDshConfig({ ...env, AGENTCHAT_REST_URL: `https://${auth}test.invalid` })).toThrow(/Invalid/);
+    expect(() => loadDshConfig({ ...env, AGENTCHAT_WS_URL: `wss://${auth}test.invalid/ws` })).toThrow(/Invalid/);
+  }
+});
+
+test("patch and registration reject symlinked parents and ancestors without changing victims", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "dsh-parent-"));
+  const request = spyOn(globalThis, "fetch").mockImplementation(async () => Response.json({ agentId: "bot", token: "test-token" }));
+  try {
+    const real = join(dir, "real");
+    mkdirSync(real);
+    symlinkSync(real, join(dir, "link"));
+    for (const home of [join(dir, "link"), join(dir, "link", "missing")]) {
+      expect(() => applyDshCordisPatchFile({ dshHome: home })).toThrow(/parent/);
+      await expect(registerOnly("bot", "https://test.invalid", join(home, "dsh.json"))).rejects.toThrow(/parent/);
+    }
+    expect(request).not.toHaveBeenCalled();
+    expect(readdirSync(real)).toEqual([]);
+    applyDshCordisPatchFile({ dshHome: real });
+    await registerOnly("bot", "https://test.invalid", join(real, "dsh.json"));
+    expect(readdirSync(real).sort()).toEqual(["cordis.patch.yml", "dsh.json"]);
+    expect(JSON.parse(readFileSync(join(real, "dsh.json"), "utf8"))).toEqual({ agentId: "bot", token: "test-token" });
+  } finally { request.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("CLI missing values reject a following flag without network IO", async () => {
+  const request = spyOn(globalThis, "fetch").mockRejectedValue(new Error("unexpected network"));
+  try {
+    await expect(main(["--register-only", "--name", "--send", "channel"])).rejects.toThrow(/requires --name/);
+    expect(request).not.toHaveBeenCalled();
+  } finally { request.mockRestore(); }
+});
+
+test("exclusive temporary writes preserve colliding symlinks and their targets", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "dsh-exclusive-"));
+  const random = spyOn(crypto, "randomBytes").mockImplementation((() => Buffer.from("12345678", "hex")) as typeof crypto.randomBytes);
+  const request = spyOn(globalThis, "fetch").mockImplementation(async () => Response.json({ agentId: "bot", token: "test-token" }));
+  try {
+    const victim = join(dir, "victim");
+    writeFileSync(victim, "untouched");
+    for (const name of ["cordis.patch.yml", "dsh.json"]) {
+      const target = join(dir, name);
+      const temp = `${target}.${process.pid}.12345678.tmp`;
+      symlinkSync(victim, temp);
+      if (name === "dsh.json") {
+        await expect(registerOnly("bot", "https://test.invalid", target)).rejects.toThrow(/EEXIST/);
+      } else {
+        expect(() => applyDshCordisPatchFile({ dshHome: dir })).toThrow(/EEXIST/);
+      }
+      expect(readFileSync(victim, "utf8")).toBe("untouched");
+      expect(existsSync(temp)).toBe(true);
+      expect(existsSync(target)).toBe(false);
+    }
+  } finally { random.mockRestore(); request.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("headless responder defaults invalid timeouts and clamps overflow without killing a valid child", async () => {
+  if (process.platform === "win32") return;
+  const dir = mkdtempSync(join(tmpdir(), "dsh-timeout-"));
+  try {
+    const bin = join(dir, "responder");
+    writeFileSync(bin, "#!/bin/sh\nsleep 0.03\nprintf 'reply'\n", { mode: 0o700 });
+    for (const timeoutMs of [NaN, Infinity, -Infinity, 0, -1, 2 ** 31, Number.MAX_VALUE]) {
+      expect(await runDshHeadlessResponder("hello", { dshBin: bin, timeoutMs })).toBe("reply");
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("listen classifies uppercase legacy DMs as direct channels", async () => {
+  const priorId = process.env.AGENTCHAT_AGENT_ID;
+  const priorToken = process.env.AGENTCHAT_TOKEN;
+  process.env.AGENTCHAT_AGENT_ID = "dsh-test-bot";
+  process.env.AGENTCHAT_TOKEN = "test-token";
+  let kinds: unknown;
+  const start = spyOn(MuseBridge.prototype, "start").mockImplementation(async function (this: MuseBridge) {
+    kinds = (this as unknown as { opts: { channelKinds: unknown } }).opts.channelKinds;
+  });
+  const closed = spyOn(MuseAgentChatClient.prototype, "waitUntilClosed").mockResolvedValue();
+  try {
+    await main(["--listen", "--channel", "DM-legacy", "--channel", "dm-lower", "--channel", "group"]);
+    expect(kinds).toEqual({ "DM-legacy": "direct", "dm-lower": "direct", group: "group" });
+    await expect(main(["--send", "--text", "hi"])).rejects.toThrow(/requires a channel id/);
+  } finally {
+    start.mockRestore(); closed.mockRestore();
+    if (priorId === undefined) delete process.env.AGENTCHAT_AGENT_ID; else process.env.AGENTCHAT_AGENT_ID = priorId;
+    if (priorToken === undefined) delete process.env.AGENTCHAT_TOKEN; else process.env.AGENTCHAT_TOKEN = priorToken;
+  }
+});
 
 describe("DeepSeek Harness (dsh) integration", () => {
   test("package.json declares full dsh bundle (host + client + cordis.patch.yml) and ships all entrypoints", () => {
