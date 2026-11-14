@@ -27,8 +27,10 @@ function grants(
   try {
     const platform = opts?.platform ?? process.platform;
     const getuid = opts && "getuid" in opts ? opts.getuid : process.getuid;
+    const directory = lstatSync(config.stateDir);
+    if (directory.isSymbolicLink() || !directory.isDirectory()) return [];
     const file = join(config.stateDir, "loop-grants.json"), stat = lstatSync(file);
-    if (!stat.isFile()) return [];
+    if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 1_048_576) return [];
     if (platform !== "win32") {
       if (typeof getuid !== "function" || (stat.mode & 0o077) !== 0 || stat.uid !== getuid()) return [];
     }
@@ -36,6 +38,8 @@ function grants(
     if (doc?.version !== 1 || !Array.isArray(doc.grants)) return [];
     return doc.grants.filter((g: any) => g &&
       [g.loop_id, g.channel_id, g.agent_id, g.owner_id, g.prompt].every(v => typeof v === "string" && v.trim()) &&
+      /^loop_[A-Za-z0-9_-]+$/.test(g.loop_id) &&
+      [g.loop_id, g.channel_id, g.agent_id, g.owner_id].every(v => !/[\x00-\x1f\x7f]/.test(v)) &&
       g.agent_id === config.agentId && g.prompt.length <= 4000 &&
       Number.isSafeInteger(g.interval_ms) && g.interval_ms >= 60_000 && g.interval_ms <= 86_400_000);
   } catch { return []; }
@@ -59,8 +63,9 @@ export function authorizedLoopTick(
 }
 
 export async function verifyLoopTick(raw: any, config: BridgeConfig, owner: string | null,
-  list: () => Promise<unknown>): Promise<LoopGrant | null> {
-  const grant = authorizedLoopTick(raw, config);
+  list: () => Promise<unknown>,
+  opts?: { platform?: NodeJS.Platform; getuid?: (() => number) | undefined }): Promise<LoopGrant | null> {
+  const grant = authorizedLoopTick(raw, config, opts);
   if (!grant || owner !== grant.owner_id || config.permissions !== "full-access") return null;
   let response: any;
   try { response = await list(); } catch { return null; }
@@ -74,6 +79,6 @@ export async function verifyLoopTick(raw: any, config: BridgeConfig, owner: stri
     !Number.isSafeInteger(loop.next_tick_ms) ||
     loop.next_tick_ms !== raw.meta.next_tick_ms || loop.last_tick_at + grant.interval_ms !== loop.next_tick_ms) return null;
   // Re-read after network I/O so local revocation during verification takes effect.
-  const current = authorizedLoopTick(raw, config);
+  const current = authorizedLoopTick(raw, config, opts);
   return current && current.owner_id === owner ? current : null;
 }

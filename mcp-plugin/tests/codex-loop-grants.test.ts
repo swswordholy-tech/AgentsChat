@@ -4,21 +4,21 @@
  * Migration: keep with bridge; stub only external hub/model boundaries.
  */
 import { test, expect, afterEach } from "bun:test";
-import { mkdtempSync, writeFileSync, rmSync, chmodSync, readFileSync, symlinkSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, chmodSync, readFileSync, symlinkSync, mkdirSync, lstatSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Bridge, addressed, type Generator } from "../codex/bridge.ts";
-import { verifyLoopTick } from "../codex/loop-grants.ts";
+import { authorizedLoopTick, verifyLoopTick } from "../codex/loop-grants.ts";
 import type { BridgeConfig } from "../codex/config.ts";
 const dirs: string[] = [];
 afterEach(() => dirs.splice(0).forEach(d => rmSync(d, { recursive: true, force: true })));
 function fixture(channel = "dm-owner") {
   const stateDir = mkdtempSync(join(tmpdir(), "loop-grant-")); dirs.push(stateDir);
   const c: BridgeConfig = { stateDir, agentId: "bot", cwd: stateDir, permissions: "full-access", token: "test-token", profileFile: "unused", source: "test", apiUrl: "https://example.com", wsUrl: "wss://example.com/ws", channels: [], senders: [], codexBin: "unused" };
-  const grant = { loop_id: "loop-one", channel_id: channel, agent_id: "bot", owner_id: "owner", interval_ms: 1800000, prompt: "Review assigned work." };
+  const grant = { loop_id: "loop_one", channel_id: channel, agent_id: "bot", owner_id: "owner", interval_ms: 1800000, prompt: "Review assigned work." };
   const file = join(stateDir, "loop-grants.json");
   const save = (grants = [grant]) => writeFileSync(file, JSON.stringify({ version: 1, grants }), { mode: 0o600 }); save();
-  const tick = { id: "tick1", channel_id: channel, sender_id: "bot", content: "UNTRUSTED WIRE CONTENT", meta: { kind: "loop_tick" as const, loop_id: "loop-one", interval_ms: 1800000, next_tick_ms: 2800000, prompt: "Review assigned work." } };
+  const tick = { id: "tick1", channel_id: channel, sender_id: "bot", content: "UNTRUSTED WIRE CONTENT", meta: { kind: "loop_tick" as const, loop_id: "loop_one", interval_ms: 1800000, next_tick_ms: 2800000, prompt: "Review assigned work." } };
   const row = { ...grant, status: "active", expires_at: null, last_tick_at: 1000000, next_tick_ms: 2800000 };
   return { c, grant, tick, row, file, save };
 }
@@ -79,4 +79,45 @@ test("group loop and group mentions resume the same conversation and reply only 
     expect(deliveries).toEqual(["original-group","original-group"]);
     expect(addressed({...tick,id:"wrong-channel",channel_id:"dm-owner"},c)).toBe(false);
   } finally {await bridge.stop();}
+});
+
+
+test("grants enforce loop ID syntax and reject controls in every routing identity", () => {
+  const { c, grant, tick, save } = fixture();
+  for (const loop_id of ["loop_", "loop-one", "LOOP_one", "loop_one/other", "loop_one\n"]) {
+    save([{ ...grant, loop_id }]); expect(authorizedLoopTick({ ...tick, meta: { ...tick.meta, loop_id } }, c)).toBeNull();
+  }
+  for (const loop_id of ["loop_a", "loop_A0_-z"]) {
+    save([{ ...grant, loop_id }]); expect(authorizedLoopTick({ ...tick, meta: { ...tick.meta, loop_id } }, c)).not.toBeNull();
+  }
+  for (const field of ["channel_id", "agent_id", "owner_id"] as const) {
+    for (const control of ["\0", "\n", "\r", "\x1f", "\x7f"]) {
+      const changed = { ...grant, [field]: grant[field] + control };
+      save([changed]);
+      const config = { ...c, agentId: changed.agent_id };
+      expect(authorizedLoopTick({ ...tick, channel_id: changed.channel_id, sender_id: changed.agent_id }, config)).toBeNull();
+    }
+  }
+});
+
+test("grants bound file bytes and reject linked state directories and non-files", () => {
+  const { c, tick, file } = fixture(); const doc = readFileSync(file, "utf8");
+  writeFileSync(file, doc + " ".repeat(1_048_576 - Buffer.byteLength(doc)));
+  expect(authorizedLoopTick(tick, c)).not.toBeNull();
+  writeFileSync(file, " ", { flag: "a" }); expect(authorizedLoopTick(tick, c)).toBeNull();
+  writeFileSync(file, doc);
+  const link = c.stateDir + "-link"; dirs.push(link); symlinkSync(c.stateDir, link, "dir");
+  expect(authorizedLoopTick(tick, { ...c, stateDir: link })).toBeNull();
+  rmSync(file); mkdirSync(file); expect(authorizedLoopTick(tick, c)).toBeNull();
+});
+
+test("verifyLoopTick forwards platform and UID options on both authorization reads", async () => {
+  const { c, tick, row, file } = fixture(); const uid = lstatSync(file).uid;
+  chmodSync(file, 0o644);
+  expect(await verifyLoopTick(tick, c, "owner", async () => ({ loops: [row] }), { platform: "win32", getuid: undefined })).not.toBeNull();
+  expect(await verifyLoopTick(tick, c, "owner", async () => ({ loops: [row] }), { platform: "linux", getuid: undefined })).toBeNull();
+  chmodSync(file, 0o600); let reads = 0;
+  expect(await verifyLoopTick(tick, c, "owner", async () => ({ loops: [row] }), { platform: "linux", getuid: () => ++reads === 1 ? uid : uid + 1 })).toBeNull();
+  expect(reads).toBe(2);
+  expect(await verifyLoopTick(tick, c, "owner", async () => { chmodSync(file, 0o644); return { loops: [row] }; }, { platform: "linux", getuid: () => uid })).toBeNull();
 });
