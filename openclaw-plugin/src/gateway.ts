@@ -1,4 +1,4 @@
-import { appendFileSync } from "node:fs";
+import { closeSync, constants, fchmodSync, fstatSync, ftruncateSync, lstatSync, openSync, writeSync } from "node:fs";
 import type { ChannelAccountSnapshot, ChannelPlugin, PluginRuntime } from "openclaw/plugin-sdk/core";
 import type { ChannelGatewayContext } from "openclaw/plugin-sdk/channel-contract";
 
@@ -10,12 +10,35 @@ import { CHANNEL_ID, type AgentChatGatewayState, type AgentChatResolvedAccount }
 
 type AgentChatGatewayAdapter = NonNullable<ChannelPlugin<AgentChatResolvedAccount>["gateway"]>;
 type AgentChatGatewayContext = ChannelGatewayContext<AgentChatResolvedAccount>;
-type PendingStart = Promise<AgentChatGatewayState>;
+type PendingStart = { promise?: Promise<AgentChatGatewayState>; cancel?: () => void; cancelled: boolean };
+const MAX_TRACE_BYTES = 1024 * 1024;
+
+function redact(value: string) {
+  return value.replace(/\bBearer\s+[^\s"'<>\\]+|(?:ac_|sk-)[A-Za-z0-9_-]+/gi, "[REDACTED]");
+}
 
 function trace(line: string) {
   const debugLogPath = process.env.AGENTCHAT_OPENCLAW_DEBUG_LOG?.trim();
   if (!debugLogPath) return;
-  try { appendFileSync(debugLogPath, `${new Date().toISOString()} ${line}\n`); } catch {}
+  let fd: number | undefined;
+  try {
+    try {
+      const stat = lstatSync(debugLogPath);
+      if (!stat.isFile() || stat.isSymbolicLink()) return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return;
+    }
+    // Verify the opened descriptor too; NOFOLLOW closes the lstat/open race.
+    fd = openSync(debugLogPath, constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o600);
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) return;
+    fchmodSync(fd, 0o600);
+    const data = Buffer.from(`${new Date().toISOString()} ${redact(line)}\n`).subarray(0, MAX_TRACE_BYTES);
+    if (stat.size + data.length > MAX_TRACE_BYTES) ftruncateSync(fd, 0);
+    writeSync(fd, data);
+  } catch {} finally {
+    if (fd !== undefined) closeSync(fd);
+  }
 }
 
 const pendingStarts = new Map<string, PendingStart>();
@@ -24,8 +47,8 @@ function log(ctx: unknown, level: "info" | "warn" | "error" | "debug", message: 
   const sink = (ctx as { log?: Record<string, (...args: unknown[]) => void> }).log;
   const fn = sink?.[level];
   if (typeof fn === "function") {
-    if (meta) fn(message, meta);
-    else fn(message);
+    if (meta) fn(redact(message), JSON.parse(redact(JSON.stringify(meta))));
+    else fn(redact(message));
   }
 }
 
@@ -193,7 +216,7 @@ export const agentChatGateway: AgentChatGatewayAdapter = {
     if (existing) return existing;
 
     const pending = pendingStarts.get(ctx.accountId);
-    if (pending) return pending;
+    if (pending?.promise) return pending.promise;
 
     if (ctx.abortSignal?.aborted) {
       setConnectedStatus(ctx, {
@@ -204,7 +227,22 @@ export const agentChatGateway: AgentChatGatewayAdapter = {
       throw new Error("AgentChat gateway start aborted");
     }
 
-    const startPromise: PendingStart = (async () => {
+    const start: PendingStart = { cancelled: false };
+    pendingStarts.set(ctx.accountId, start);
+    const ownsStart = () => pendingStarts.get(ctx.accountId) === start;
+    const clearOwnedState = () => {
+      if (!ownsStart()) return false;
+      deleteGatewayState(ctx.accountId);
+      return true;
+    };
+    const startPromise = Promise.resolve().then(async () => {
+      if (start.cancelled || ctx.abortSignal?.aborted) {
+        if (ownsStart()) {
+          pendingStarts.delete(ctx.accountId);
+          setConnectedStatus(ctx, { running: false, connected: false, lastStopAt: Date.now() });
+        }
+        throw new Error("AgentChat gateway start aborted");
+      }
       // Forward-declared so onReconnect (defined inside createGatewayClient
       // below) can reference the client we're about to create. The client
       // wires onReconnect at construction time so we need the reference
@@ -271,9 +309,11 @@ export const agentChatGateway: AgentChatGatewayAdapter = {
       });
 
       const abortHandler = () => {
+        start.cancelled = true;
         client.disconnect();
-        deleteGatewayState(ctx.accountId);
+        if (!clearOwnedState()) return;
         pendingStarts.delete(ctx.accountId);
+        ctx.abortSignal?.removeEventListener("abort", abortHandler);
         setConnectedStatus(ctx, {
           running: false,
           connected: false,
@@ -281,11 +321,12 @@ export const agentChatGateway: AgentChatGatewayAdapter = {
         });
       };
 
+      start.cancel = abortHandler;
       ctx.abortSignal?.addEventListener("abort", abortHandler, { once: true });
 
       try {
         await client.connect();
-        if (ctx.abortSignal?.aborted) {
+        if (start.cancelled || ctx.abortSignal?.aborted) {
           abortHandler();
           throw new Error("AgentChat gateway start aborted");
         }
@@ -309,7 +350,7 @@ export const agentChatGateway: AgentChatGatewayAdapter = {
         });
 
         await client.waitUntilClosed();
-        deleteGatewayState(ctx.accountId);
+        if (!clearOwnedState()) return state;
         setConnectedStatus(ctx, {
           running: false,
           connected: false,
@@ -321,11 +362,11 @@ export const agentChatGateway: AgentChatGatewayAdapter = {
         return state;
       } catch (error) {
         client.disconnect();
-        deleteGatewayState(ctx.accountId);
+        if (!clearOwnedState()) throw error;
         setConnectedStatus(ctx, {
           running: false,
           connected: false,
-          lastError: error instanceof Error ? error.message : String(error),
+          lastError: redact(error instanceof Error ? error.message : String(error)),
         });
         log(ctx, "error", "AgentChat gateway failed to connect", {
           accountId: ctx.accountId,
@@ -334,15 +375,23 @@ export const agentChatGateway: AgentChatGatewayAdapter = {
         throw error;
       } finally {
         ctx.abortSignal?.removeEventListener("abort", abortHandler);
-        pendingStarts.delete(ctx.accountId);
+        if (ownsStart()) pendingStarts.delete(ctx.accountId);
       }
-    })();
+    });
 
-    pendingStarts.set(ctx.accountId, startPromise);
+    start.promise = startPromise;
     return startPromise;
   },
 
   async stopAccount(ctx: AgentChatGatewayContext) {
+    const pending = pendingStarts.get(ctx.accountId);
+    if (pending) {
+      pending.cancelled = true;
+      if (pending.cancel) pending.cancel();
+      else pendingStarts.delete(ctx.accountId);
+      setConnectedStatus(ctx, { running: false, connected: false, lastStopAt: Date.now() });
+      return;
+    }
     const state = getGatewayState(ctx.accountId);
     if (!state) return;
 

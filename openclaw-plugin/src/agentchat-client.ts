@@ -32,6 +32,20 @@ import type { ChatMessage, ClientOptions, MessageHandler } from "./agentchat-pro
  */
 const MAX_WS_PAYLOAD_BYTES = 2 * 1024 * 1024;
 const MAX_PENDING_OUTBOUND = 64;
+const MAX_JOINED_CHANNELS = 256;
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
+
+function safeDelay(value: number | undefined, fallback: number) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? Math.min(value, MAX_TIMER_DELAY_MS)
+    : fallback;
+}
+
+function normalizeChannelId(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const id = value.trim();
+  return id && id.length <= 128 && !/[\x00-\x20\x7f]/.test(id) ? id : undefined;
+}
 const DRAIN_MIN_DELAY_MS = 200;
 const DRAIN_JITTER_MS = 2_000;
 
@@ -84,11 +98,11 @@ export class AgentChatClient {
     this.agentId = options.agentId;
     this.token = options.token ?? "dev-token";
     this.capabilities = options.capabilities ?? [];
-    this.heartbeatInterval = options.heartbeatInterval ?? 30_000;
-    this.connectTimeoutMs = options.connectTimeoutMs ?? 15_000;
+    this.heartbeatInterval = safeDelay(options.heartbeatInterval, 30_000);
+    this.connectTimeoutMs = safeDelay(options.connectTimeoutMs, 15_000);
     this.reconnectEnabled = options.reconnect ?? true;
-    this.initialReconnectDelayMs = options.initialReconnectDelayMs ?? 1_000;
-    this.maxReconnectDelayMs = options.maxReconnectDelayMs ?? 60_000;
+    this.initialReconnectDelayMs = safeDelay(options.initialReconnectDelayMs, 1_000);
+    this.maxReconnectDelayMs = safeDelay(options.maxReconnectDelayMs, 60_000);
     this.onDebug = options.onDebug;
     this.onReconnect = options.onReconnect;
   }
@@ -147,6 +161,7 @@ export class AgentChatClient {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
     }
+    this.rejectConnect(new Error("AgentChat connection aborted by disconnect"));
     this.ws?.close();
     this.ws = null;
     this.sessionId = null;
@@ -207,14 +222,18 @@ export class AgentChatClient {
   }
 
   joinChannel(channelId: string) {
-    if (!channelId) return;
+    const id = normalizeChannelId(channelId);
+    if (!id || (!this.joinedChannels.has(id) && this.joinedChannels.size >= MAX_JOINED_CHANNELS)) return;
+    channelId = id;
     this.joinedChannels.add(channelId);
     this.debug("send:join_channel", { channelId });
     this.send({ type: "join_channel", channel_id: channelId, agent_id: this.agentId });
   }
 
   leaveChannel(channelId: string) {
-    if (!channelId) return;
+    const id = normalizeChannelId(channelId);
+    if (!id) return;
+    channelId = id;
     this.joinedChannels.delete(channelId);
     this.debug("send:leave_channel", { channelId });
     this.send({ type: "leave_channel", channel_id: channelId, agent_id: this.agentId });
@@ -302,7 +321,7 @@ export class AgentChatClient {
     let data: Record<string, unknown>;
     try {
       const parsed = JSON.parse(raw);
-      if (!parsed || typeof parsed !== "object") {
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
         this.debug("recv:invalid_json");
         return;
       }
@@ -479,7 +498,7 @@ export class AgentChatClient {
       this.reconnectAttempt += 1;
       // Exponential backoff: initial × 2^(attempt-1), capped at max.
       // 1s, 2s, 4s, 8s, 16s, 32s, 60s, 60s, 60s, …
-      const raw = this.initialReconnectDelayMs * Math.pow(2, this.reconnectAttempt - 1);
+      const raw = this.initialReconnectDelayMs * Math.pow(2, Math.min(Math.max(0, this.reconnectAttempt - 1), 30));
       delay = Math.min(raw, this.maxReconnectDelayMs);
     }
     this.debug("reconnect:scheduled", { attempt: this.reconnectAttempt, delayMs: delay });
