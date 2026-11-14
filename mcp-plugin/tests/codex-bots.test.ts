@@ -3,7 +3,7 @@
 // Goal: detect duplicate accounts and prevent orphan workers or app-server processes.
 // Migration: legacy single-bot profiles remain supported; registry mode is explicit.
 import { test, expect } from "bun:test";
-import { realpathSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { realpathSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { loadBots } from "../codex/bots-config.ts";
@@ -108,3 +108,34 @@ test("manager snapshot survives broken registry; parent death cleans workers", a
   await wait(()=>dead(worker)); expect(dead(worker)).toBe(true); await wait(()=>dead(secondApp)); expect(dead(secondApp)).toBe(true);
  } finally {manager.kill("SIGKILL");if(worker&&!dead(worker))process.kill(worker,"SIGKILL"); for(const c of ws.clients)c.terminate();ws.close();hub.stop(true);rmSync(home,{recursive:true,force:true});}
 },40000);
+
+
+test("registry rejects links, directories and oversized files while allowing exactly 1 MiB", () => {
+ const home=mkdtempSync(join(tmpdir(),"bots-file-"));
+ try {
+  const file=join(home,"bots.json"), link=join(home,"linked.json");
+  const json=JSON.stringify({version:1,bots:[]});
+  writeFileSync(file,json.padEnd(1_048_576," "));
+  expect(loadBots(file,home)).toEqual([]);
+  symlinkSync(file,link);
+  expect(()=>loadBots(link,home)).toThrow("Cannot read bot registry JSON");
+  expect(()=>loadBots(home,home)).toThrow("Cannot read bot registry JSON");
+  writeFileSync(file,json.padEnd(1_048_577," "));
+  expect(()=>loadBots(file,home)).toThrow("Cannot read bot registry JSON");
+ } finally {rmSync(home,{recursive:true,force:true});}
+});
+
+test("registry expands both home path separators for workdir and state root", () => {
+ const home=mkdtempSync(join(tmpdir(),"bots-home-path-"));
+ try {
+  mkdirSync(join(home,".agentschat/profiles"),{recursive:true}); mkdirSync(join(home,"project"));
+  writeFileSync(join(home,".agentschat/profiles/one.json"),JSON.stringify({agent_id:"test-bot",token:"ac_test_bot_token"}),{mode:0o600});
+  const file=join(home,"bots.json");
+  for(const prefix of ["~/","~\\"]) for(const workdir of [false,true]) {
+   writeFileSync(file,JSON.stringify({version:1,...(!workdir?{default_workdir:prefix+"project"}:{}),bots:[{name:"one",profile:"one",...(workdir?{workdir:prefix+"project"}:{}),state_root:prefix+"state"}]}));
+   const bot=loadBots(file,home)[0]!;
+   expect(bot.cwd).toBe(realpathSync(join(home,"project")));
+   expect(bot.stateDir.startsWith(join(home,"state")+"/")).toBe(true);
+  }
+ } finally {rmSync(home,{recursive:true,force:true});}
+});

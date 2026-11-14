@@ -1,4 +1,4 @@
-import { readFileSync, realpathSync, mkdirSync } from "node:fs";
+import { readFileSync, realpathSync, mkdirSync, lstatSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { resolveConfig, type BridgeConfig, type IdentitySettings } from "./config.ts";
@@ -7,7 +7,11 @@ export interface BotConfig extends BridgeConfig { name: string }
 export function defaultRegistry(home = homedir()) { return join(home, ".agentschat/codex-bots.json"); }
 export function loadBots(file = defaultRegistry(), home = homedir()): BotConfig[] {
   let doc: any;
-  try { doc = JSON.parse(readFileSync(file, "utf8")); } catch { throw new Error("Cannot read bot registry JSON"); }
+  try {
+    const info = lstatSync(file);
+    if (info.isSymbolicLink() || !info.isFile() || info.size > 1_048_576) throw new Error("Invalid registry file");
+    doc = JSON.parse(readFileSync(file, "utf8"));
+  } catch { throw new Error("Cannot read bot registry JSON"); }
   const object = (x: any) => x && typeof x === "object" && !Array.isArray(x);
   const fields = (x: any, keys: string[]) => {
     if (!object(x) || Object.keys(x).some(k => !keys.includes(k))) throw new Error("Unknown or invalid bot registry field");
@@ -17,7 +21,7 @@ export function loadBots(file = defaultRegistry(), home = homedir()): BotConfig[
   fields(doc, ["version", "default_workdir", "codex_bin", "bots"]);
   if (doc.version !== 1 || !Array.isArray(doc.bots)) throw new Error("Registry requires version 1 and bots array");
   for (const k of ["default_workdir", "codex_bin"]) if (doc[k] !== undefined && !text(doc[k])) throw new Error(`Invalid ${k}`);
-  const path = (value: string) => value.startsWith("~/") ? join(home, value.slice(2)) : isAbsolute(value) ? value : resolve(dirname(file), value);
+  const path = (value: string) => /^~[\\/]/.test(value) ? join(home, value.slice(2)) : isAbsolute(value) ? value : resolve(dirname(file), value);
   const defaultDir = doc.default_workdir ? path(doc.default_workdir) : join(home, ".agentschat/workspace");
   const names = new Set<string>(), identities = new Set<string>();
   const bots: BotConfig[] = [];
