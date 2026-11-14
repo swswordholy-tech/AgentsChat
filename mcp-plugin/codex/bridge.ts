@@ -1,7 +1,8 @@
 import { ThreadBusyError } from "./app-server.ts";
 import { TEAM_LEAD_SKILL_ID, TEAM_LEAD_SKILL_BODY, TEAM_LEAD_NO_UPDATE, isTeamLeadSkillInvocation } from "../src/team-lead-skill.ts";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, openSync, closeSync, unlinkSync } from "node:fs";
+import { lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync, openSync, closeSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
+import { randomBytes } from "node:crypto";
 import { priorChannelThreads, preserveChannelHistory, type ThreadHistory } from "./thread-history.ts";
 import type { BridgeConfig, PermissionMode } from "./config.ts";
 import { redactSecrets } from "../src/redact.ts";
@@ -18,15 +19,21 @@ function permitted(m: ChatMessage, c: BridgeConfig) {
   if (m.meta?.kind === "loop_tick") return authorizedLoopTick(m, c) !== null;
   return (!c.channels.length || c.channels.includes(m.channel_id)) && (!c.senders.length || c.senders.includes(m.sender_id));
 }
+const isPrototypeKey = (key: string) => /^(?:__proto__|constructor|prototype)$/i.test(key);
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" &&
+    (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
+}
 export function addressed(m: any, c: BridgeConfig): m is ChatMessage {
   if (!m || ["id", "channel_id", "sender_id", "content"].some(k => typeof m[k] !== "string" || !m[k].trim())) return false;
+  if (isPrototypeKey(m.channel_id)) return false;
   if (m.content === "__typing__" || m.content.length > 32_000) return false;
   if (["slash_input", "loop_status", "slash_response"].includes(m.meta?.kind)) return false;
   if (m.meta?.kind === "loop_tick") return authorizedLoopTick(m, c) !== null;
   if (m.sender_id === c.agentId) return false;
   if (!permitted(m, c)) return false;
   const escaped = c.agentId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return m.channel_id.startsWith("dm-") || [m.mentions, m.mentioned_ids].some(a => Array.isArray(a) && a.includes(c.agentId)) ||
+  return /^dm[-:]/i.test(m.channel_id) || [m.mentions, m.mentioned_ids].some(a => Array.isArray(a) && a.includes(c.agentId)) ||
     new RegExp(`@${escaped}(?![\\w-])|@[^\\n(]+\\(${escaped}\\)`).test(m.content);
 }
 export class Bridge {
@@ -44,19 +51,28 @@ export class Bridge {
     private loops: () => Promise<unknown> = async () => null) {
     mkdirSync(config.stateDir, { recursive: true, mode: 0o700 });
     this.file = join(config.stateDir, "state.json"); this.lock = join(config.stateDir, "bridge.lock");
-    if (existsSync(this.lock)) {
-      try {
-        const holderPid = Number(readFileSync(this.lock, "utf8").trim());
-        if (!Number.isInteger(holderPid) || holderPid <= 0 || !isPidAlive(holderPid)) unlinkSync(this.lock);
-      } catch {}
-    }
+    try {
+      const stat = lstatSync(this.lock);
+      if (!stat.isSymbolicLink() && stat.isFile() && stat.size <= 64 * 1024) {
+        const content = readFileSync(this.lock, "utf8");
+        const holderPid = /^\d+$/.test(content) && content.trim() === content ? Number(content) : NaN;
+        if (!Number.isSafeInteger(holderPid) || holderPid <= 0 || !isPidAlive(holderPid)) unlinkSync(this.lock);
+      }
+    } catch {}
     try { const fd = openSync(this.lock, "wx", 0o600); writeFileSync(fd, String(process.pid)); closeSync(fd); }
     catch { throw new Error(`Bridge already locked: ${this.lock}. If its process has exited, remove that lock manually.`); }
     const homeDir = process.env.HOME || process.env.USERPROFILE || ".";
     const lockDir = resolveLockDir(homeDir, process.env);
     try {
-      this.state = existsSync(this.file) ? JSON.parse(readFileSync(this.file, "utf8")) : { version: 1, threads: {}, entries: [] };
-      if (this.state.version !== 1 || !this.state.threads || !Array.isArray(this.state.entries)) throw new Error("Invalid bridge state");
+      let hasState = false;
+      try {
+        const stat = lstatSync(this.file);
+        if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 16 * 1024 * 1024) throw new Error("Unsafe bridge state");
+        hasState = true;
+      } catch (error: any) { if (error.code !== "ENOENT") throw error; }
+      this.state = hasState ? JSON.parse(readFileSync(this.file, "utf8")) : { version: 1, threads: {}, entries: [] };
+      if (this.state?.version !== 1 || !isPlainObject(this.state.threads) || !Array.isArray(this.state.entries) ||
+        (Object.prototype.hasOwnProperty.call(this.state, "channels") && !isPlainObject(this.state.channels))) throw new Error("Invalid bridge state");
       for (const e of this.state.entries) {
         if (e.status === "sending") e.status = "uncertain";
         if (e.status === "running") e.status = "failed";
@@ -89,9 +105,12 @@ export class Bridge {
         return true;
       });
     }
-    const tmp = `${this.file}.tmp.${process.pid}.${Date.now()}`;
+    const tmp = `${this.file}.tmp.${process.pid}.${Date.now()}.${randomBytes(16).toString("hex")}`;
     try {
-      writeFileSync(tmp, JSON.stringify(this.state), { mode: 0o600 });
+      writeFileSync(tmp, JSON.stringify(this.state), { mode: 0o600, flag: "wx" });
+      try {
+        if (lstatSync(this.file).isSymbolicLink()) throw new Error("Bridge state must not be a symlink");
+      } catch (error: any) { if (error.code !== "ENOENT") throw error; }
       renameSync(tmp, this.file);
     } catch (err) {
       try { unlinkSync(tmp); } catch {}
@@ -119,7 +138,7 @@ export class Bridge {
     this.state.entries.push({ message, status: "pending" }); this.save();
     void this.drain(); return true;
   }
-  redact(text: string) { return redactSecrets(text.split(this.config.token).join("[REDACTED]")); }
+  redact(text: string) { return redactSecrets(this.config.token ? text.split(this.config.token).join("[REDACTED]") : text); }
   /** History cursors may advance past ignored/known messages, never a full inbox. */
   recover(raw: unknown): boolean {
     if (this.stopped) return false;
@@ -137,8 +156,9 @@ export class Bridge {
   }
   /** Can be called while idle to migrate existing channels without sending messages. */
   async prepareChannel(chat: string): Promise<ChannelThread> {
+    if (isPrototypeKey(chat)) throw new Error("Invalid channel ID");
     this.state.channels ??= {};
-    let channel = this.state.channels[chat];
+    let channel = Object.prototype.hasOwnProperty.call(this.state.channels, chat) ? this.state.channels[chat] : undefined;
     if (!this.loaded.has(chat)) {
       const namespace = this.codex.namespace;
       if (channel?.namespace && channel.namespace !== namespace)
@@ -223,7 +243,11 @@ export class Bridge {
   async stop() {
     this.pause();
     await this.draining;
-    if (existsSync(this.lock)) unlinkSync(this.lock);
+    try {
+      const stat = lstatSync(this.lock);
+      if (!stat.isSymbolicLink() && stat.isFile() && stat.size <= 64 * 1024 &&
+        readFileSync(this.lock, "utf8") === String(process.pid)) unlinkSync(this.lock);
+    } catch (error: any) { if (error.code !== "ENOENT") throw error; }
     const homeDir = process.env.HOME || process.env.USERPROFILE || ".";
     releaseAgentLock({ lockDir: resolveLockDir(homeDir, process.env), agentId: this.config.agentId });
   }

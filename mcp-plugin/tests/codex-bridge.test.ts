@@ -4,7 +4,7 @@
  * Migration: retain with the Codex bridge; fake only the external hub and model process.
  */
 import { test, expect, afterEach } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, chmodSync, realpathSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, chmodSync, realpathSync, existsSync, symlinkSync, lstatSync, readdirSync, truncateSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
@@ -712,4 +712,109 @@ test("transport backs off 30s on auth_error, honors please_reconnect jitter_ms, 
     http.closeAllConnections();
     await new Promise<void>(r => http.close(() => r()));
   }
+});
+
+
+test("DM aliases are addressed and prototype channel names are rejected", () => {
+  const { c } = fixture();
+  for (const channel of ["dm-owner", "DM-owner", "dm:owner", "Dm:owner"]) expect(addressed(message("m", channel), c)).toBe(true);
+  for (const channel of ["__proto__", "constructor", "prototype", "__PROTO__", "Constructor", "PROTOTYPE"])
+    expect(addressed({ ...message("m", channel), mentions: [c.agentId] }, c)).toBe(false);
+});
+
+test("bridge lock refuses symlinks, directories and oversized files without modifying them", () => {
+  const generator = { thread: async () => "t", generate: async () => "ok" };
+  for (const kind of ["symlink", "dangling", "directory", "oversize"]) {
+    const { c, root } = fixture(); mkdirSync(c.stateDir, { recursive: true });
+    const lock = join(c.stateDir, "bridge.lock"), target = join(root, "target");
+    if (kind === "symlink" || kind === "dangling") {
+      if (kind === "symlink") writeFileSync(target, "0");
+      symlinkSync(target, lock);
+    } else if (kind === "directory") mkdirSync(lock);
+    else { writeFileSync(lock, "0"); truncateSync(lock, 64 * 1024 + 1); }
+    expect(() => ownedBridge(c, generator, async () => {}, () => {})).toThrow("locked");
+    expect(lstatSync(lock).isSymbolicLink()).toBe(kind === "symlink" || kind === "dangling");
+    if (kind === "symlink") expect(readFileSync(target, "utf8")).toBe("0");
+    if (kind === "oversize") expect(lstatSync(lock).size).toBe(64 * 1024 + 1);
+  }
+});
+
+test("bridge lock validates decimal positive PIDs before liveness checks", async () => {
+  const { c } = fixture(); mkdirSync(c.stateDir, { recursive: true });
+  const lock = join(c.stateDir, "bridge.lock"), generator = { thread: async () => "t", generate: async () => "ok" };
+  writeFileSync(lock, String(process.pid));
+  expect(() => ownedBridge(c, generator, async () => {}, () => {})).toThrow("locked");
+  for (const invalid of ["", "0", "-1", `${process.pid}e0`, `+${process.pid}`, ` ${process.pid}`, "999999999999999999999"]) {
+    writeFileSync(lock, invalid);
+    const bridge = ownedBridge(c, generator, async () => {}, () => {});
+    try { expect(readFileSync(lock, "utf8")).toBe(String(process.pid)); } finally { await bridge.stop(); }
+  }
+});
+
+test("stop removes only its own regular bridge lock", async () => {
+  for (const kind of ["other", "symlink", "dangling", "directory", "own"]) {
+    const { c, root } = fixture();
+    const bridge = ownedBridge(c, { thread: async () => "t", generate: async () => "ok" }, async () => {}, () => {});
+    const lock = join(c.stateDir, "bridge.lock"), target = join(root, "target");
+    rmSync(lock);
+    if (kind === "symlink" || kind === "dangling") {
+      if (kind === "symlink") writeFileSync(target, String(process.pid));
+      symlinkSync(target, lock);
+    } else if (kind === "directory") mkdirSync(lock);
+    else writeFileSync(lock, kind === "own" ? String(process.pid) : "other-owner");
+    await bridge.stop();
+    if (kind === "own") expect(existsSync(lock)).toBe(false);
+    else expect(lstatSync(lock)).toBeDefined();
+    if (kind === "symlink") expect(readFileSync(target, "utf8")).toBe(String(process.pid));
+  }
+});
+
+test("state load rejects unsafe files and non-object thread/channel maps", () => {
+  const valid = { version: 1, threads: {}, entries: [] };
+  for (const kind of ["symlink", "dangling", "directory", "oversize", "threads-array", "threads-string", "channels-array", "channels-null"]) {
+    const { c, root } = fixture(); mkdirSync(c.stateDir, { recursive: true });
+    const file = join(c.stateDir, "state.json"), target = join(root, "target");
+    if (kind === "symlink" || kind === "dangling") {
+      if (kind === "symlink") writeFileSync(target, JSON.stringify(valid));
+      symlinkSync(target, file);
+    } else if (kind === "directory") mkdirSync(file);
+    else if (kind === "oversize") { writeFileSync(file, JSON.stringify(valid)); truncateSync(file, 16 * 1024 * 1024 + 1); }
+    else writeFileSync(file, JSON.stringify({ ...valid, ...(kind.startsWith("threads") ? { threads: kind.endsWith("array") ? [] : "bad" } : { channels: kind.endsWith("array") ? [] : null }) }));
+    expect(() => ownedBridge(c, { thread: async () => "t", generate: async () => "ok" }, async () => {}, () => {})).toThrow("Cannot load bridge state");
+    expect(existsSync(join(c.stateDir, "bridge.lock"))).toBe(false);
+    if (kind === "symlink") expect(readFileSync(target, "utf8")).toBe(JSON.stringify(valid));
+  }
+});
+
+test("16 MiB state loads; snapshots avoid predictable temp files and reject symlink replacement", async () => {
+  const { c, root } = fixture(); mkdirSync(c.stateDir, { recursive: true });
+  const file = join(c.stateDir, "state.json"), doc = JSON.stringify({ version: 1, threads: {}, entries: [] });
+  writeFileSync(file, doc + " ".repeat(16 * 1024 * 1024 - Buffer.byteLength(doc)));
+  const now = Date.now; Date.now = () => 123456;
+  const predictable = `${file}.tmp.${process.pid}.123456`;
+  writeFileSync(predictable, "preserve-existing-file");
+  let bridge: Bridge | undefined;
+  try {
+    bridge = ownedBridge(c, { thread: async () => "t", generate: async () => "ok" }, async () => {}, () => {});
+    await bridge.prepareChannel("dm-one"); await bridge.prepareChannel("dm-two");
+    expect(readFileSync(predictable, "utf8")).toBe("preserve-existing-file");
+    if (process.platform !== "win32") expect(lstatSync(file).mode & 0o777).toBe(0o600);
+    const target = join(root, "target"); writeFileSync(target, "preserve-target"); rmSync(file); symlinkSync(target, file);
+    await expect(bridge.prepareChannel("dm-three")).rejects.toThrow("symlink");
+    expect(lstatSync(file).isSymbolicLink()).toBe(true);
+    expect(readFileSync(target, "utf8")).toBe("preserve-target");
+    expect(readdirSync(c.stateDir).filter(name => name.startsWith("state.json.tmp."))).toEqual([predictable.split("/").pop()!]);
+  } finally { Date.now = now; await bridge?.stop(); }
+});
+
+test("empty token redaction preserves text and channel lookup ignores inherited properties", async () => {
+  const { c } = fixture(); c.token = ""; let existing: string | undefined;
+  const bridge = ownedBridge(c, { thread: async (_cwd, prior) => { existing = prior; return "new-thread"; }, generate: async () => "ok" }, async () => {}, () => {});
+  try {
+    expect(bridge.redact("hello world")).toBe("hello world");
+    expect(bridge.redact("token ac_" + "x".repeat(30))).not.toContain("x".repeat(30));
+    for (const key of ["__proto__", "CONSTRUCTOR", "prototype"]) await expect(bridge.prepareChannel(key)).rejects.toThrow("Invalid channel");
+    expect((await bridge.prepareChannel("toString")).thread).toBe("new-thread");
+    expect(existing).toBeUndefined();
+  } finally { await bridge.stop(); }
 });
