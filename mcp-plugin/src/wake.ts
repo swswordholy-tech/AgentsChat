@@ -144,6 +144,28 @@ export function formatWakeAttachments(attachments: unknown): string {
   return lines.length > 0 ? ` [附件: ${lines.join("; ")}]` : "";
 }
 
+function sanitizeWakeHeaderToken(raw: unknown, maxLen = 128): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const cleaned = raw.replace(/[\x00-\x1f\x7f]+/g, "").trim().slice(0, maxLen);
+  return cleaned.length > 0 ? cleaned : undefined;
+}
+
+function isAllowedWakeHttpUrl(rawUrl: string): boolean {
+  if (!rawUrl || rawUrl.length > 4096 || /[\x00-\x1f\x7f]/.test(rawUrl)) return false;
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+  if (parsed.port) {
+    const port = Number(parsed.port);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return false;
+  }
+  return true;
+}
+
 /**
  * Build the wake body: the fields the receiver needs to wake + decide + optionally
  * skip a history fetch. Credential-shaped fields are never carried across.
@@ -157,29 +179,43 @@ export function buildWakePayload(msg: WakeMessage, opts: { targetSessionId?: str
   const content = typeof msg.content === "string" ? redactSecrets(msg.content.slice(0, WAKE_CONTENT_MAX), redactOpts) : undefined;
   const attachments = Array.isArray(msg.attachments) && msg.attachments.length > 0
     ? msg.attachments
-        .filter((a) => a && typeof a === "object" && typeof a.url === "string")
-        .map((a) => ({
-          type: typeof a.type === "string" ? a.type : undefined,
-          url: a.url,
-          mime: typeof a.mime === "string" ? a.mime : undefined,
-          size: typeof a.size === "number" ? a.size : undefined,
-          width: typeof a.width === "number" ? a.width : undefined,
-          height: typeof a.height === "number" ? a.height : undefined,
-          duration_ms: typeof a.duration_ms === "number" ? a.duration_ms : undefined,
-          transcript: typeof a.transcript === "string" ? redactSecrets(a.transcript.slice(0, 300), redactOpts) : undefined,
-        }))
+        .slice(0, 16)
+        .map((a) => {
+          if (!a || typeof a !== "object") return null;
+          const safeUrl = sanitizeWakeAttachmentUrl(a.url);
+          if (!safeUrl) return null;
+          return {
+            type: sanitizeWakeHeaderToken(a.type, 32),
+            url: safeUrl,
+            mime: sanitizeWakeHeaderToken(a.mime, 128),
+            size: typeof a.size === "number" && Number.isFinite(a.size) && a.size >= 0 ? a.size : undefined,
+            width: typeof a.width === "number" && Number.isFinite(a.width) && a.width >= 0 ? a.width : undefined,
+            height: typeof a.height === "number" && Number.isFinite(a.height) && a.height >= 0 ? a.height : undefined,
+            duration_ms: typeof a.duration_ms === "number" && Number.isFinite(a.duration_ms) && a.duration_ms >= 0 ? a.duration_ms : undefined,
+            transcript: typeof a.transcript === "string" ? redactSecrets(a.transcript.slice(0, 300), redactOpts) : undefined,
+          };
+        })
+        .filter((x): x is NonNullable<typeof x> => x !== null)
     : undefined;
-  const targetSessionId =
-    typeof opts.targetSessionId === "string" && opts.targetSessionId.length > 0 ? opts.targetSessionId : undefined;
+  const targetSessionId = sanitizeWakeHeaderToken(opts.targetSessionId, 256);
+  const channelId = sanitizeWakeHeaderToken(msg.channel_id, 128);
+  const messageId = sanitizeWakeHeaderToken(msg.id, 128);
+  const senderId = sanitizeWakeHeaderToken(msg.sender_id, 128);
+  const mentionedIds = Array.isArray(msg.mentioned_ids)
+    ? msg.mentioned_ids
+        .slice(0, 64)
+        .map((x) => sanitizeWakeHeaderToken(x, 128))
+        .filter((x): x is string => Boolean(x))
+    : undefined;
   return {
-    type: typeof msg.type === "string" ? msg.type : "message",
-    channel_id: msg.channel_id,
-    message_id: msg.id,
-    sender_id: msg.sender_id,
+    type: sanitizeWakeHeaderToken(msg.type, 64) ?? "message",
+    channel_id: channelId,
+    message_id: messageId,
+    sender_id: senderId,
     content,
     ...(attachments && attachments.length > 0 ? { attachments } : {}),
-    mentioned_ids: Array.isArray(msg.mentioned_ids) ? msg.mentioned_ids.filter((x) => typeof x === "string") : undefined,
-    timestamp: typeof msg.timestamp === "string" ? msg.timestamp : undefined,
+    mentioned_ids: mentionedIds,
+    timestamp: sanitizeWakeHeaderToken(msg.timestamp, 64),
     ...(targetSessionId ? { target_session_id: targetSessionId } : {}),
   };
 }
@@ -239,6 +275,11 @@ export async function fireWake(msg: WakeMessage, cfg: WakeConfig): Promise<void>
   const log = cfg.logger ?? (() => {});
   const url = (cfg.url ?? "").trim();
   if (!url) return; // not configured — the wake path is opt-in
+  const safeLogUrl = sanitizeWakeLogUrl(url);
+  if (!isAllowedWakeHttpUrl(url)) {
+    log(`[agentchat] wake POST rejected invalid or non-HTTP(S) URL: ${safeLogUrl}`);
+    return;
+  }
 
   const payload = buildWakePayload(msg, { targetSessionId: cfg.targetSessionId });
   if (!payload.timestamp) payload.timestamp = new Date().toISOString();
@@ -246,7 +287,6 @@ export async function fireWake(msg: WakeMessage, cfg: WakeConfig): Promise<void>
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (cfg.secret) headers[WAKE_SIG_HEADER] = signWakeBody(body, cfg.secret);
 
-  const safeLogUrl = sanitizeWakeLogUrl(url);
   const timeoutMs = clampWakeTimerMs(cfg.timeoutMs, 5000);
   const doPost = async (): Promise<void> => {
     const f = cfg.fetchImpl ?? fetch;
@@ -254,7 +294,7 @@ export async function fireWake(msg: WakeMessage, cfg: WakeConfig): Promise<void>
     const t = setTimeout(() => ctrl.abort(), timeoutMs);
     t.unref?.();
     try {
-      const res = await f(url, { method: "POST", headers, body, signal: ctrl.signal });
+      const res = await f(url, { method: "POST", headers, body, signal: ctrl.signal, redirect: "error" });
       if (!res.ok) log(`[agentchat] wake POST ${safeLogUrl} → HTTP ${res.status}`);
       await res.body?.cancel().catch(() => {});
     } finally {
@@ -299,9 +339,9 @@ export function buildGrokPrompt(msg: WakeMessage, agentId: string, contextPrefix
   const redactOpts = msg.same_owner_direct === true ? { preserveAcKeys: true } : undefined;
   const content = rawContent ? redactSecrets(rawContent.slice(0, NATIVE_WAKE_CONTENT_MAX), redactOpts) : "";
   const cleanPrefix = contextPrefix ? redactSecrets(contextPrefix.trim(), redactOpts) : "";
-  const channel = msg.channel_id ?? "?";
-  const sender = msg.sender_id ?? "someone";
-  const msgId = (msg.id ?? (msg as any).message_id ?? "") as string;
+  const channel = sanitizeWakeHeaderToken(msg.channel_id, 128) ?? "?";
+  const sender = sanitizeWakeHeaderToken(msg.sender_id, 128) ?? "someone";
+  const msgId = sanitizeWakeHeaderToken(msg.id ?? (msg as any).message_id, 128) ?? "";
   const isDm = DIRECT_CHANNEL_RE.test(channel);
   const where = isDm ? "私聊 (DM)" : `频道 ${channel}`;
   const actionHint = isTruncated
@@ -325,9 +365,14 @@ export function buildGrokPrompt(msg: WakeMessage, agentId: string, contextPrefix
  */
 export function grokBearerFromGatewayConfig(cfg: any): string | null {
   if (!cfg || typeof cfg !== "object") return null;
-  if (typeof cfg.token === "string" && cfg.token) return cfg.token;
-  if (cfg.auth && typeof cfg.auth.bearer === "string" && cfg.auth.bearer) return cfg.auth.bearer;
-  return null;
+  const candidate =
+    typeof cfg.token === "string" && cfg.token
+      ? cfg.token.trim()
+      : cfg.auth && typeof cfg.auth.bearer === "string" && cfg.auth.bearer
+        ? cfg.auth.bearer.trim()
+        : "";
+  if (!candidate || candidate.length > 4096 || /[\x00-\x1f\x7f]/.test(candidate)) return null;
+  return candidate;
 }
 
 /** Extract the gateway port (for the loopback URL) from a parsed gateway.json. */
@@ -485,9 +530,9 @@ export function buildWakePrompt(msg: WakeMessage, contextPrefix = ""): string {
   const redactOpts = msg.same_owner_direct === true ? { preserveAcKeys: true } : undefined;
   const content = rawContent ? redactSecrets(rawContent.slice(0, NATIVE_WAKE_CONTENT_MAX), redactOpts) : "";
   const cleanPrefix = contextPrefix ? redactSecrets(contextPrefix.trim(), redactOpts) : "";
-  const channel = msg.channel_id ?? "?";
-  const sender = msg.sender_id ?? "someone";
-  const msgId = (msg.id ?? (msg as any).message_id ?? "") as string;
+  const channel = sanitizeWakeHeaderToken(msg.channel_id, 128) ?? "?";
+  const sender = sanitizeWakeHeaderToken(msg.sender_id, 128) ?? "someone";
+  const msgId = sanitizeWakeHeaderToken(msg.id ?? (msg as any).message_id, 128) ?? "";
   const isDm = DIRECT_CHANNEL_RE.test(channel);
   const where = isDm ? `私聊 (${channel})` : `频道 ${channel}`;
   const actionHint = isTruncated
@@ -531,8 +576,15 @@ export async function fireAntigravityWake(msg: WakeMessage, cfg: AntigravityWake
   const log = cfg.logger ?? (() => {});
   const conversationId = (cfg.conversationId ?? "").trim();
   const csrfToken = (cfg.csrfToken ?? "").trim();
-  if (!conversationId || !csrfToken) {
-    log(`[agentchat] antigravity wake: missing conversationId or csrfToken, skipping`);
+  if (
+    !conversationId ||
+    conversationId.length > 128 ||
+    /[\x00-\x1f\x7f]/.test(conversationId) ||
+    !csrfToken ||
+    csrfToken.length > 1024 ||
+    /[\x00-\x1f\x7f]/.test(csrfToken)
+  ) {
+    log(`[agentchat] antigravity wake: missing or unsafe conversationId or csrfToken, skipping`);
     return false;
   }
 
@@ -758,7 +810,10 @@ export function fireZcodeWake(msg: WakeMessage, cfg: ZcodeWakeConfig): Promise<b
       const { cmd, prefixArgs } = await resolveZcodeCommand(cfg.zcodeBin);
       const rawArgs = [...prefixArgs, "-p", prompt, "--resume", sessionId];
       if (cfg.workspacePath && cfg.workspacePath.trim()) {
-        rawArgs.push("--cwd", cfg.workspacePath.trim());
+        const wsPath = cfg.workspacePath.trim();
+        if (!wsPath.startsWith("-") && !/[\x00-\x1f\x7f]/.test(wsPath)) {
+          rawArgs.push("--cwd", wsPath);
+        }
       }
       const env: Record<string, string | undefined> = {
         ...process.env,

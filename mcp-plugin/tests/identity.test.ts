@@ -141,4 +141,18 @@ describe("Campaign #100 — identity.ts input & credential hardening", () => {
     expect(() => validateIdentityProfile({ agent_id: "bot", token: "ac_valid123", capabilities: ["chat", "bad\x00cap"] }, "/tmp/p.json")).toThrow();
     expect(() => validateIdentityProfile({ agent_id: "bot-ok", token: "ac_valid123", capabilities: ["chat"] }, "/tmp/p.json")).not.toThrow();
   });
+
+  test("Campaign #115 KR3: rejects case-variant prototype IDs, path/dotdot/overlong agent_ids, and oversized display names/capabilities", () => {
+    for (const badId of ["__PROTO__", "Constructor", "PROTOTYPE", ".", "..", "a..b", "bot/evil", "bot\\evil", "bot space", "a".repeat(129)]) {
+      expect(() => validateIdentityProfile({ agent_id: badId, token: "ac_valid123" }, "/tmp/p.json")).toThrow();
+    }
+    expect(() =>
+      validateIdentityProfile(
+        { agent_id: "bot-ok", token: "ac_valid123", capabilities: Array.from({ length: 65 }, (_, i) => `cap-${i}`) },
+        "/tmp/p.json",
+      ),
+    ).toThrow();
+    expect(decideIdentity({ ...base, source: "flag-name", cliName: "Constructor" }).mode).toBe("error");
+    expect(decideIdentity({ ...base, source: "flag-name", cliName: "x".repeat(129) }).mode).toBe("error");
+  });
 });

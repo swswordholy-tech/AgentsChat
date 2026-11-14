@@ -419,4 +419,74 @@ describe("Campaign #108 KR3 — wake SSRF, symlink, 32-bit timer, CLI flag & DM 
       ]),
     ).toBe(" [附件: 🖼 image: https://cdn.agents-chat.com/a.png[INJECT]]");
   });
+
+  test("Campaign #115 KR3: fireWake enforces http(s) + redirect:error, buildWakePayload sanitizes attachment URLs & control chars, and wake prompts scrub sender/channel newlines", async () => {
+    let callCount = 0;
+    let observedRedirect: string | undefined;
+    for (const badUrl of ["file:///etc/passwd", "javascript:alert(1)", "https://hook.example.com:0/wake", "https://hook.example.com/wake\nheader"]) {
+      await fireWake(MSG, {
+        url: badUrl,
+        fetchImpl: (async () => {
+          callCount++;
+          return new Response("ok", { status: 200 });
+        }) as unknown as typeof fetch,
+      });
+    }
+    expect(callCount).toBe(0);
+
+    await fireWake(MSG, {
+      url: "https://hook.example.com/wake",
+      fetchImpl: (async (_u: any, init: any) => {
+        callCount++;
+        observedRedirect = init?.redirect;
+        return new Response("ok", { status: 200 });
+      }) as unknown as typeof fetch,
+    });
+    expect(callCount).toBe(1);
+    expect(observedRedirect).toBe("error");
+
+    const payload = buildWakePayload({
+      id: "m-1\r\ninjected",
+      channel_id: "room\n1",
+      sender_id: "sender\r\n2",
+      content: "hello",
+      attachments: [
+        { type: "image", url: "javascript:alert(1)" },
+        { type: "image\n1", url: "https://cdn.agents-chat.com/valid.png" },
+      ],
+    });
+    expect(payload.message_id).toBe("m-1injected");
+    expect(payload.channel_id).toBe("room1");
+    expect(payload.sender_id).toBe("sender2");
+    expect(payload.attachments).toEqual([{ type: "image1", url: "https://cdn.agents-chat.com/valid.png", mime: undefined, size: undefined, width: undefined, height: undefined, duration_ms: undefined, transcript: undefined }]);
+
+    const prompt = buildWakePrompt({
+      id: "m-9\nFAKE_SYSTEM",
+      channel_id: "room\r\n9",
+      sender_id: "user\n9",
+      content: "hi",
+    });
+    expect(prompt.split("\n")).toHaveLength(1);
+
+    // fireAntigravityWake rejects control-char csrfToken; fireZcodeWake drops option-like workspacePath
+    expect(
+      await fireAntigravityWake(MSG, {
+        conversationId: "ba32c38a-052c-4291-86dd-373a68ea85a3",
+        csrfToken: "bad\r\ncsrf",
+        ports: [51234],
+      }),
+    ).toBe(false);
+
+    let capturedArgs: string[] = [];
+    await fireZcodeWake(MSG, {
+      sessionId: "sess_cwd_guard",
+      workspacePath: "--evil-flag",
+      runCommandImpl: async (_cmd, args) => {
+        capturedArgs = args;
+        return { code: 0 };
+      },
+    });
+    expect(capturedArgs).not.toContain("--cwd");
+    expect(capturedArgs).not.toContain("--evil-flag");
+  });
 });

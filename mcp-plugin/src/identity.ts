@@ -60,6 +60,28 @@ export interface IdentityInputs {
 }
 
 const RESERVED_IDENTITY_IDS = new Set(["__proto__", "constructor", "prototype"]);
+const MAX_DISPLAY_NAME_LEN = 128;
+const MAX_AGENT_ID_LEN = 128;
+const MAX_CAPABILITIES_LEN = 64;
+
+function isValidDisplayName(raw: unknown): raw is string {
+  if (typeof raw !== "string" || /[\x00-\x1f\x7f]/.test(raw)) return false;
+  const trimmed = raw.trim();
+  return trimmed.length > 0 && trimmed.length <= MAX_DISPLAY_NAME_LEN && !RESERVED_IDENTITY_IDS.has(trimmed.toLowerCase());
+}
+
+function isValidProfileAgentId(raw: unknown): raw is string {
+  if (typeof raw !== "string" || /[\x00-\x1f\x7f/\\\s]/.test(raw)) return false;
+  const trimmed = raw.trim();
+  return (
+    trimmed.length > 0 &&
+    trimmed === raw &&
+    trimmed.length <= MAX_AGENT_ID_LEN &&
+    trimmed !== "." &&
+    !trimmed.includes("..") &&
+    !RESERVED_IDENTITY_IDS.has(trimmed.toLowerCase())
+  );
+}
 
 function sanitizeDiagnosticField(raw: string | undefined, fallback = "(unknown)"): string {
   if (typeof raw !== "string") return fallback;
@@ -87,13 +109,13 @@ export function decideIdentity(i: IdentityInputs): IdentityDecision {
 
   // Explicit opt-in to creating a new account.
   if (i.cliName !== undefined) {
-    if (typeof i.cliName !== "string" || /[\x00-\x1f\x7f]/.test(i.cliName) || i.cliName.trim().length === 0) {
-      return { mode: "error", message: `invalid --name value: display name must be non-empty and free of control characters.` };
+    if (!isValidDisplayName(i.cliName)) {
+      return { mode: "error", message: `invalid --name value: display name must be 1..${MAX_DISPLAY_NAME_LEN} chars, non-reserved, and free of control characters.` };
     }
     return { mode: "register", displayName: i.cliName.trim() };
   }
   if (i.registerFlag) {
-    if (typeof i.fallbackName !== "string" || /[\x00-\x1f\x7f]/.test(i.fallbackName) || i.fallbackName.trim().length === 0) {
+    if (!isValidDisplayName(i.fallbackName)) {
       return { mode: "error", message: `invalid fallback display name for --register.` };
     }
     return { mode: "register", displayName: i.fallbackName.trim() };
@@ -130,15 +152,15 @@ export function decideIdentity(i: IdentityInputs): IdentityDecision {
 /** Validate effective credentials without including credential values in errors. */
 export function validateIdentityProfile(profile: any, file: string, allowDevToken = false): void {
   const cleanNonempty = (value: unknown): value is string =>
-    typeof value === "string" && value.trim().length > 0 && !/[\x00-\x1f\x7f]/.test(value);
+    typeof value === "string" && value.trim().length > 0 && value.length <= 4096 && !/[\x00-\x1f\x7f]/.test(value);
   const safeFile = sanitizeDiagnosticField(file, "(unknown-path)");
   if (!profile || typeof profile !== "object" || Array.isArray(profile) ||
-      !cleanNonempty(profile.agent_id) ||
-      RESERVED_IDENTITY_IDS.has(profile.agent_id.trim()) ||
+      !isValidProfileAgentId(profile.agent_id) ||
       !cleanNonempty(profile.token) ||
       (!allowDevToken && profile.token.trim() === "dev-token") ||
       (profile.capabilities !== undefined && (!Array.isArray(profile.capabilities) ||
-        !profile.capabilities.every(cleanNonempty)))) {
+        profile.capabilities.length > MAX_CAPABILITIES_LEN ||
+        !profile.capabilities.every((c: unknown) => cleanNonempty(c) && (c as string).length <= 64)))) {
     throw new Error(`Invalid identity profile at ${safeFile}. Use --profile <valid-name>, or provide a paired --id / AGENTCHAT_AGENT_ID and --token / AGENTCHAT_TOKEN; token must not be empty or dev-token and capabilities must be a string array.`);
   }
 }
