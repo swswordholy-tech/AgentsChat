@@ -14,7 +14,7 @@
  *    crashed/closed processes automatically release their lock (never deadlocks).
  */
 import { createHash } from "node:crypto";
-import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import { closeSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, unlinkSync, type Stats } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -68,8 +68,18 @@ export function resolveLockDir(homeDir: string, env: Record<string, string | und
 }
 
 const LOCK_FILE_MAX_BYTES = 64 * 1024;
+const LOCK_KEY_MAX_CHARS = 128;
 const SESSION_BINDS_MAX_BYTES = 1024 * 1024;
+const MAX_SESSION_BINDS_ENTRIES = 1024;
 const CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
+
+function safeLstat(path: string): Stats | null {
+  try {
+    return lstatSync(path);
+  } catch {
+    return null;
+  }
+}
 
 function readBoundedRegularJson(path: string, maxBytes: number): unknown | null {
   try {
@@ -104,7 +114,15 @@ function isValidBindToken(value: string): boolean {
 }
 
 export function lockFilePath(lockDir: string, agentId: string): string {
-  const safe = String(agentId || "").trim().replace(/[^a-zA-Z0-9_-]/g, "_");
+  const trimmed = String(agentId || "").trim();
+  let safe = trimmed.replace(/[^a-zA-Z0-9_-]/g, "_");
+  if (safe.length > LOCK_KEY_MAX_CHARS) {
+    const digest = createHash("sha256").update(trimmed).digest("hex").slice(0, 12);
+    safe = `${safe.slice(0, LOCK_KEY_MAX_CHARS - 13)}_${digest}`;
+  }
+  if (!safe || isUnsafeBindKey(safe)) {
+    safe = `_${safe}`;
+  }
   return join(lockDir, `${safe}.lock`);
 }
 
@@ -231,21 +249,30 @@ function isUnsafeBindKey(key: string): boolean {
 export function parseSessionBinds(raw: unknown): Record<string, string> {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
   const out: Record<string, string> = {};
+  let count = 0;
   for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (count >= MAX_SESSION_BINDS_ENTRIES) break;
     const key = k.trim();
     if (!isValidBindToken(key) || isUnsafeBindKey(key)) continue;
     if (typeof v === "string") {
       const val = v.trim();
-      if (isValidBindToken(val)) out[key] = val;
+      if (isValidBindToken(val) && !isUnsafeBindKey(val)) {
+        out[key] = val;
+        count += 1;
+      }
     } else if (v && typeof v === "object" && typeof (v as any).profile === "string") {
       const val = (v as any).profile.trim();
-      if (isValidBindToken(val)) out[key] = val;
+      if (isValidBindToken(val) && !isUnsafeBindKey(val)) {
+        out[key] = val;
+        count += 1;
+      }
     }
   }
   return out;
 }
 
 export function loadSessionBinds(configDir: string): Record<string, string> {
+  if (!isSafeDirOrMissing(configDir)) return {};
   const merged: Record<string, string> = {};
   for (const filename of [LEGACY_AGY_BINDS_FILENAME, DEFAULT_SESSION_BINDS_FILENAME]) {
     const path = join(configDir, filename);
@@ -258,9 +285,15 @@ export function loadSessionBinds(configDir: string): Record<string, string> {
 }
 
 function resolveAgentIdForProfileName(configDir: string, name: string): string | null {
-  if (!name || name.includes("/") || name.includes("\\")) return null;
-  const base = name.replace(/\.json$/, "").replace(/[^a-zA-Z0-9_-]/g, "_");
-  for (const candidate of [join(configDir, "profiles", `${base}.json`), join(configDir, `${base}.json`)]) {
+  if (!name || name.includes("/") || name.includes("\\") || CONTROL_CHAR_RE.test(name)) return null;
+  if (!isSafeDirOrMissing(configDir)) return null;
+  const base = name.replace(/\.json$/i, "").replace(/[^a-zA-Z0-9_-]/g, "_");
+  if (!base || base.length > LOCK_KEY_MAX_CHARS || isUnsafeBindKey(base)) return null;
+  const profilesDir = join(configDir, "profiles");
+  const candidates = isSafeDirOrMissing(profilesDir)
+    ? [join(profilesDir, `${base}.json`), join(configDir, `${base}.json`)]
+    : [join(configDir, `${base}.json`)];
+  for (const candidate of candidates) {
     const parsed = readBoundedRegularJson(candidate, SESSION_BINDS_MAX_BYTES) as { agent_id?: unknown } | null;
     if (typeof parsed?.agent_id === "string" && parsed.agent_id.trim()) {
       return parsed.agent_id.trim();
@@ -272,7 +305,7 @@ function resolveAgentIdForProfileName(configDir: string, name: string): string |
 export function saveSessionBind(configDir: string, sessionId: string, profileName: string): void {
   const sid = sessionId.trim();
   const prof = profileName.trim();
-  if (!isValidBindToken(sid) || !isValidBindToken(prof) || isUnsafeBindKey(sid)) return;
+  if (!isValidBindToken(sid) || !isValidBindToken(prof) || isUnsafeBindKey(sid) || isUnsafeBindKey(prof)) return;
   if (!isSafeDirOrMissing(configDir)) return;
   const path = join(configDir, DEFAULT_SESSION_BINDS_FILENAME);
   if (!isSafeTargetFileOrMissing(path)) return;
@@ -796,7 +829,8 @@ export function detectAntigravityCallerSession(opts?: {
     opts?.brainDir?.trim() ||
     process.env.AGENTSCHAT_AGY_BRAIN_DIR?.trim() ||
     join(home, ".gemini", "antigravity", "brain");
-  if (!existsSync(brainDir)) return null;
+  const brainStat = safeLstat(brainDir);
+  if (!brainStat || brainStat.isSymbolicLink() || !brainStat.isDirectory()) return null;
 
   const nowMs = opts?.nowMs ?? Date.now();
   const maxAgeMs = opts?.maxAgeMs ?? 30_000;
@@ -832,14 +866,19 @@ export function detectAntigravityCallerSession(opts?: {
   const recentCids: { cid: string; mtimeMs: number }[] = [];
 
   for (const cid of candidateSet) {
-    const transcriptPath = join(brainDir, cid, ".system_generated", "logs", "transcript.jsonl");
-    let st: ReturnType<typeof statSync>;
-    try {
-      st = statSync(transcriptPath);
-    } catch {
+    const cidDir = join(brainDir, cid);
+    const sysDir = join(cidDir, ".system_generated");
+    const logsDir = join(sysDir, "logs");
+    if (
+      !isSafeDirOrMissing(cidDir) ||
+      !isSafeDirOrMissing(sysDir) ||
+      !isSafeDirOrMissing(logsDir)
+    ) {
       continue;
     }
-    if (st.size <= 0 || nowMs - st.mtimeMs > maxAgeMs) continue;
+    const transcriptPath = join(logsDir, "transcript.jsonl");
+    const st = safeLstat(transcriptPath);
+    if (!st || st.isSymbolicLink() || !st.isFile() || st.size <= 0 || nowMs - st.mtimeMs > maxAgeMs) continue;
     recentCids.push({ cid, mtimeMs: st.mtimeMs });
 
     let tail = "";
@@ -981,14 +1020,85 @@ export function isDshHostProcess(opts?: {
   return false;
 }
 
+const SAFE_DSH_SESSION_ID_RE = /^session-[a-zA-Z0-9_-]{1,128}$/;
+const DSH_HEALTH_MAX_BYTES = 256 * 1024;
+
+function isSafeDirEntryName(entry: string): boolean {
+  return (
+    entry.length > 0 &&
+    entry.length <= 255 &&
+    entry !== "." &&
+    entry !== ".." &&
+    !entry.includes("/") &&
+    !entry.includes("\\") &&
+    !CONTROL_CHAR_RE.test(entry)
+  );
+}
+
+function isLoopbackDshHealthUrl(rawUrl: string): boolean {
+  let u: URL;
+  try {
+    u = new URL(rawUrl);
+  } catch {
+    return false;
+  }
+  if (u.protocol !== "http:") return false;
+  if (u.username || u.password || u.hash) return false;
+  const host = u.hostname.toLowerCase();
+  if (host !== "127.0.0.1" && host !== "localhost" && host !== "[::1]" && host !== "::1") {
+    return false;
+  }
+  if (u.port) {
+    const port = Number(u.port);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return false;
+  }
+  return true;
+}
+
+async function readBoundedDshHealthJson(res: Response): Promise<unknown> {
+  const reader = (res as any)?.body?.getReader?.();
+  if (!reader) {
+    return await res.json();
+  }
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value instanceof Uint8Array) {
+        total += value.byteLength;
+        if (total > DSH_HEALTH_MAX_BYTES) {
+          await reader.cancel().catch(() => {});
+          throw new Error("DSH /health response exceeded byte cap");
+        }
+        chunks.push(value);
+      }
+    }
+  } finally {
+    try {
+      reader.releaseLock?.();
+    } catch {}
+  }
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    merged.set(c, offset);
+    offset += c.byteLength;
+  }
+  return JSON.parse(Buffer.from(merged).toString("utf8"));
+}
+
 /** mtime of a session directory's log, or 0 when it has none. */
 function sessionDirMtime(dir: string): number {
+  const dirStat = safeLstat(dir);
+  if (!dirStat || dirStat.isSymbolicLink() || !dirStat.isDirectory()) return 0;
   let newest = 0;
   for (const file of ["session.v4.jsonl.zstd", "session.v4.jsonl"]) {
-    try {
-      const mtime = statSync(join(dir, file)).mtimeMs;
-      if (mtime > newest) newest = mtime;
-    } catch {}
+    const st = safeLstat(join(dir, file));
+    if (st && !st.isSymbolicLink() && st.isFile() && st.mtimeMs > newest) {
+      newest = st.mtimeMs;
+    }
   }
   return newest;
 }
@@ -1001,15 +1111,23 @@ function sessionDirMtime(dir: string): number {
  * two sessions that are both `running` at the same time.
  */
 function sessionLogMtime(dshHome: string, sid: string): number {
+  if (!SAFE_DSH_SESSION_ID_RE.test(sid)) return 0;
+  const sessionsRoot = join(dshHome, "sessions");
+  const rootStat = safeLstat(sessionsRoot);
+  if (!rootStat || rootStat.isSymbolicLink() || !rootStat.isDirectory()) return 0;
   let projects: string[];
   try {
-    projects = readdirSync(join(dshHome, "sessions"));
+    projects = readdirSync(sessionsRoot);
   } catch {
     return 0;
   }
   let newest = 0;
   for (const project of projects) {
-    const mtime = sessionDirMtime(join(dshHome, "sessions", project, sid));
+    if (!isSafeDirEntryName(project)) continue;
+    const projDir = join(sessionsRoot, project);
+    const projStat = safeLstat(projDir);
+    if (!projStat || projStat.isSymbolicLink() || !projStat.isDirectory()) continue;
+    const mtime = sessionDirMtime(join(projDir, sid));
     if (mtime > newest) newest = mtime;
   }
   return newest;
@@ -1018,6 +1136,8 @@ function sessionLogMtime(dshHome: string, sid: string): number {
 /** Newest session log within `maxAgeMs`; the fallback when `/health` is unavailable. */
 function newestSessionLog(dshHome: string, nowMs: number, maxAgeMs: number): string | null {
   const root = join(dshHome, "sessions");
+  const rootStat = safeLstat(root);
+  if (!rootStat || rootStat.isSymbolicLink() || !rootStat.isDirectory()) return null;
   let projects: string[];
   try {
     projects = readdirSync(root);
@@ -1026,15 +1146,19 @@ function newestSessionLog(dshHome: string, nowMs: number, maxAgeMs: number): str
   }
   let best: { sid: string; mtime: number } | null = null;
   for (const project of projects) {
+    if (!isSafeDirEntryName(project)) continue;
+    const projDir = join(root, project);
+    const projStat = safeLstat(projDir);
+    if (!projStat || projStat.isSymbolicLink() || !projStat.isDirectory()) continue;
     let entries: string[];
     try {
-      entries = readdirSync(join(root, project));
+      entries = readdirSync(projDir);
     } catch {
       continue;
     }
     for (const entry of entries) {
-      if (!entry.startsWith("session-")) continue;
-      const mtime = sessionDirMtime(join(root, project, entry));
+      if (!SAFE_DSH_SESSION_ID_RE.test(entry)) continue;
+      const mtime = sessionDirMtime(join(projDir, entry));
       if (mtime === 0 || nowMs - mtime > maxAgeMs) continue;
       if (best === null || mtime > best.mtime) best = { sid: entry, mtime };
     }
@@ -1073,49 +1197,53 @@ export async function detectDshCallerSession(opts?: {
     "http://127.0.0.1:8799/health";
   const nowMs = opts?.nowMs ?? Date.now();
 
-  try {
-    const f = opts?.fetchImpl ?? fetch;
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 150);
-    timer.unref?.();
+  if (isLoopbackDshHealthUrl(healthUrl)) {
     try {
-      const res = await f(healthUrl, { signal: ctrl.signal });
-      if (res.ok) {
-        const data = (await res.json()) as {
-          roots?: Array<{ id?: string; status?: string }>;
-        };
-        const roots = Array.isArray(data?.roots) ? data.roots : [];
-        const running = roots
-          .filter((r) => typeof r?.id === "string" && r.id.startsWith("session-") && r.status === "running")
-          .map((r) => r.id!);
-        if (running.length === 1) return running[0]!;
-        if (running.length > 1) {
-          // More than one session is mid-turn; the caller is the one that just
-          // wrote a row (its session log mtime is the newest). `roots` is
-          // oldest-first, so the newest root is the fallback when logs are
-          // unavailable — never `running[0]`, which is the *oldest*.
-          const ranked = running
-            .map((sid) => ({ sid, mtime: sessionLogMtime(dshHome, sid) }))
-            .sort((a, b) => b.mtime - a.mtime);
-          if (ranked[0]!.mtime > 0 && ranked[0]!.mtime >= ranked[1]!.mtime) return ranked[0]!.sid;
-          return running[running.length - 1]!;
+      const f = opts?.fetchImpl ?? fetch;
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 150);
+      timer.unref?.();
+      try {
+        const res = await f(healthUrl, { signal: ctrl.signal, redirect: "error" });
+        if (res.ok) {
+          const data = (await readBoundedDshHealthJson(res)) as {
+            roots?: Array<{ id?: string; status?: string }>;
+          };
+          const roots = Array.isArray(data?.roots) ? data.roots : [];
+          const running = roots
+            .filter((r) => typeof r?.id === "string" && SAFE_DSH_SESSION_ID_RE.test(r.id) && r.status === "running")
+            .map((r) => r.id!);
+          if (running.length === 1) return running[0]!;
+          if (running.length > 1) {
+            // More than one session is mid-turn; the caller is the one that just
+            // wrote a row (its session log mtime is the newest). `roots` is
+            // oldest-first, so the newest root is the fallback when logs are
+            // unavailable — never `running[0]`, which is the *oldest*.
+            const ranked = running
+              .map((sid) => ({ sid, mtime: sessionLogMtime(dshHome, sid) }))
+              .sort((a, b) => b.mtime - a.mtime);
+            if (ranked[0]!.mtime > 0 && ranked[0]!.mtime >= ranked[1]!.mtime) return ranked[0]!.sid;
+            return running[running.length - 1]!;
+          }
+          const allValid = roots
+            .filter((r) => typeof r?.id === "string" && SAFE_DSH_SESSION_ID_RE.test(r.id))
+            .map((r) => r.id!);
+          if (allValid.length === 1) return allValid[0]!;
+        } else {
+          await res.body?.cancel().catch(() => {});
         }
-        const allValid = roots
-          .filter((r) => typeof r?.id === "string" && r.id.startsWith("session-"))
-          .map((r) => r.id!);
-        if (allValid.length === 1) return allValid[0]!;
-      } else {
-        await res.body?.cancel().catch(() => {});
+      } finally {
+        clearTimeout(timer);
       }
-    } finally {
-      clearTimeout(timer);
-    }
-  } catch {}
+    } catch {}
+  }
 
   // No health endpoint (older/newer DSH, or the inbound plugin is not
   // installed): the same log-mtime signal still identifies the session that
   // just ran a tool call. DSH writes one directory per session under
   // `<dshHome>/sessions/<project>/session-<uuid>/`.
+  const homeStat = safeLstat(dshHome);
+  if (!homeStat || homeStat.isSymbolicLink() || !homeStat.isDirectory()) return null;
   const newestByLog = newestSessionLog(dshHome, nowMs, 30_000);
   if (newestByLog) return newestByLog;
   return null;

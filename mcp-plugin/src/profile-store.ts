@@ -16,25 +16,28 @@
  *    it, and verify the result instead of assuming it took.
  */
 import {
-  existsSync,
   lstatSync,
   writeFileSync,
   renameSync,
   copyFileSync,
   chmodSync,
   unlinkSync,
-  statSync,
   readdirSync,
   readFileSync,
   type Stats,
 } from "fs";
-import { join, resolve } from "path";
+import { dirname, join, resolve } from "path";
 
 /** Where diagnostics go. Injectable so tests can assert on them. */
 export type Warn = (message: string) => void;
 
 const defaultWarn: Warn = (m) => process.stderr.write(m);
 const MAX_PROFILE_JSON_BYTES = 64 * 1024;
+const CONTROL_CHAR_GLOBAL_RE = /[\x00-\x1f\x7f]/g;
+
+function sanitizeWarnPart(value: unknown): string {
+  return String(value ?? "").replace(CONTROL_CHAR_GLOBAL_RE, "?");
+}
 
 function safeLstat(target: string): Stats | undefined {
   try {
@@ -46,9 +49,15 @@ function safeLstat(target: string): Stats | undefined {
 }
 
 export function safeWriteProfile(path: string, data: unknown, warn: Warn = defaultWarn): void {
+  const parentDir = dirname(path);
+  const parentStat = safeLstat(parentDir);
+  if (!parentStat || parentStat.isSymbolicLink() || !parentStat.isDirectory()) {
+    throw new Error(`Refusing to write profile into invalid or symlinked parent directory: ${sanitizeWarnPart(parentDir)}`);
+  }
+
   const pathStat = safeLstat(path);
   if (pathStat?.isSymbolicLink()) {
-    throw new Error(`Refusing to write profile through symlink: ${path}`);
+    throw new Error(`Refusing to write profile through symlink: ${sanitizeWarnPart(path)}`);
   }
 
   const tmp = path + ".tmp";
@@ -60,12 +69,24 @@ export function safeWriteProfile(path: string, data: unknown, warn: Warn = defau
     try {
       unlinkSync(tmp);
     } catch (e) {
-      warn(`[agentchat] WARNING: stale ${tmp} could not be removed: ${e}\n`);
+      warn(`[agentchat] WARNING: stale ${sanitizeWarnPart(tmp)} could not be removed: ${sanitizeWarnPart(e)}\n`);
     }
   }
 
   // Created fresh with exclusive `wx` → refuses symlinks/races and guarantees mode 0600 from instant of creation.
   writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600, flag: "wx" });
+
+  // Re-verify parent and target right before renameSync to narrow TOCTOU symlink swaps.
+  const currentParent = safeLstat(parentDir);
+  if (!currentParent || currentParent.isSymbolicLink() || !currentParent.isDirectory()) {
+    try { unlinkSync(tmp); } catch {}
+    throw new Error(`Refusing to write profile into symlinked parent directory: ${sanitizeWarnPart(parentDir)}`);
+  }
+  if (safeLstat(path)?.isSymbolicLink()) {
+    try { unlinkSync(tmp); } catch {}
+    throw new Error(`Refusing to overwrite symlinked profile: ${sanitizeWarnPart(path)}`);
+  }
+
   try {
     renameSync(tmp, path);
   } catch (err: any) {
@@ -73,9 +94,10 @@ export function safeWriteProfile(path: string, data: unknown, warn: Warn = defau
       // On Windows NTFS, antivirus or search indexers can momentarily hold `path` open,
       // causing atomic MoveFileEx to return EPERM/EACCES. Fall back to copy+unlink when
       // `path` is not a symlink or directory.
-      if (safeLstat(path)?.isSymbolicLink()) {
+      const winTarget = safeLstat(path);
+      if (winTarget?.isSymbolicLink() || winTarget?.isDirectory()) {
         try { unlinkSync(tmp); } catch {}
-        throw new Error(`Refusing to overwrite symlinked profile: ${path}`);
+        throw new Error(`Refusing to overwrite symlinked or directory profile: ${sanitizeWarnPart(path)}`);
       }
       copyFileSync(tmp, path);
       try {
@@ -89,21 +111,31 @@ export function safeWriteProfile(path: string, data: unknown, warn: Warn = defau
   // POSIX mode bits (0600) do not exist on Windows NTFS (`statSync().mode & 0o777` is always 0666);
   // Windows protects `%USERPROFILE%\.agentschat` via user-profile NTFS ACL inheritance instead.
   if (process.platform !== "win32") {
+    const postStat = safeLstat(path);
+    if (!postStat || postStat.isSymbolicLink() || !postStat.isFile()) {
+      warn(`[agentchat] WARNING: could not verify permissions of ${sanitizeWarnPart(path)}: non-regular target\n`);
+      return;
+    }
     try {
       chmodSync(path, 0o600);
     } catch (e) {
-      warn(`[agentchat] WARNING: could not chmod ${path} to 0600: ${e}\n`);
+      warn(`[agentchat] WARNING: could not chmod ${sanitizeWarnPart(path)} to 0600: ${sanitizeWarnPart(e)}\n`);
     }
 
     try {
-      const mode = statSync(path).mode & 0o777;
+      const verified = safeLstat(path);
+      if (!verified || verified.isSymbolicLink() || !verified.isFile()) {
+        warn(`[agentchat] WARNING: could not verify permissions of ${sanitizeWarnPart(path)}: non-regular target\n`);
+        return;
+      }
+      const mode = verified.mode & 0o777;
       if (mode !== 0o600) {
         warn(
-          `[agentchat] WARNING: ${path} is mode ${mode.toString(8)}, expected 600 — it holds your agent key. Fix: chmod 600 ${path}\n`,
+          `[agentchat] WARNING: ${sanitizeWarnPart(path)} is mode ${mode.toString(8)}, expected 600 — it holds your agent key. Fix: chmod 600 ${sanitizeWarnPart(path)}\n`,
         );
       }
     } catch (e) {
-      warn(`[agentchat] WARNING: could not verify permissions of ${path}: ${e}\n`);
+      warn(`[agentchat] WARNING: could not verify permissions of ${sanitizeWarnPart(path)}: ${sanitizeWarnPart(e)}\n`);
     }
   }
 }
@@ -152,21 +184,24 @@ export function findDefaultProfileCollision(
     typeof defParsed.display_name === "string" ? defParsed.display_name.trim().toLowerCase() : "";
   if (!defAgentId && !defDisplayName) return null;
 
+  const cfgStat = safeLstat(configDir);
+  if (!cfgStat || cfgStat.isSymbolicLink() || !cfgStat.isDirectory()) return null;
+
   const resolvedDefault = resolve(defaultProfilePath);
   for (const dir of [join(configDir, "profiles"), configDir]) {
     const dirStat = safeLstat(dir);
     if (!dirStat || dirStat.isSymbolicLink() || !dirStat.isDirectory()) continue;
     let files: string[] = [];
     try {
-      files = readdirSync(dir).filter((f) => f.endsWith(".json"));
+      files = readdirSync(dir).filter((f) => /\.json$/i.test(f));
     } catch {
       continue;
     }
     for (const file of files) {
-      if (NON_PROFILE_JSON_FILES.has(file)) continue;
+      if (NON_PROFILE_JSON_FILES.has(file.toLowerCase())) continue;
       const candidatePath = join(dir, file);
       if (resolve(candidatePath) === resolvedDefault) continue;
-      const baseName = file.replace(/\.json$/, "");
+      const baseName = file.replace(/\.json$/i, "");
       if (baseName.toLowerCase() === "profile") continue;
 
       const candStat = safeLstat(candidatePath);

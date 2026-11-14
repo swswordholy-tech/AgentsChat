@@ -11,6 +11,7 @@ import {
   detectRuntimeSession,
   findBoundSessionForProfile,
   loadSessionBinds,
+  lockFilePath,
   parseAntigravityLsofOutput,
   parseSessionBinds,
   parseWindowsAntigravityProbeJson,
@@ -1347,5 +1348,80 @@ describe("multi-window lock & connect_profile / disconnect_profile integration t
 
     saveSessionBind(cleanCfg, "good-sid", "GoodProfile");
     expect(loadSessionBinds(cleanCfg)).toEqual({ "good-sid": "GoodProfile" });
+  });
+
+  test("Campaign #114 KR3: bounds lockFilePath keys, blocks prototype profile values, guards symlinked transcript/dsh logs, and blocks non-loopback DSH SSRF", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ac-sb-c114-"));
+    const lockDir = join(root, "locks");
+    mkdirSync(lockDir, { recursive: true });
+
+    // 1. Overlong & prototype agentIds produce bounded, distinct, safe lock file paths
+    const longA = "a".repeat(220) + "_1";
+    const longB = "a".repeat(220) + "_2";
+    const lockA = lockFilePath(lockDir, longA);
+    const lockB = lockFilePath(lockDir, longB);
+    expect(lockA).not.toBe(lockB);
+    expect(lockA.split("/").pop()!.length).toBeLessThanOrEqual(135);
+    expect(lockFilePath(lockDir, "")).toBe(join(lockDir, "_.lock"));
+    expect(lockFilePath(lockDir, "__proto__")).toBe(join(lockDir, "___proto__.lock"));
+
+    // 2. Prototype-polluting profile values and uppercase .JSON aliases
+    expect(
+      parseSessionBinds({
+        "sess-1": "__proto__",
+        "sess-2": "constructor",
+        "sess-3": { profile: "prototype" },
+        "sess-ok": "ValidBot",
+      }),
+    ).toEqual({ "sess-ok": "ValidBot" });
+
+    const cfgDir = join(root, "cfg");
+    mkdirSync(join(cfgDir, "profiles"), { recursive: true });
+    writeFileSync(join(cfgDir, "profiles", "Alpha.json"), JSON.stringify({ agent_id: "same-agent" }));
+    saveSessionBind(cfgDir, "sid-1", "Alpha.JSON");
+    saveSessionBind(cfgDir, "sid-2", "Alpha");
+    expect(loadSessionBinds(cfgDir)).toEqual({ "sid-2": "Alpha" });
+
+    // 3. detectAntigravityCallerSession refuses symlinked transcript.jsonl
+    const brainDir = join(root, "brain");
+    const cid = "ba32c38a-052c-4291-86dd-373a68ea85a3";
+    const logsDir = join(brainDir, cid, ".system_generated", "logs");
+    mkdirSync(logsDir, { recursive: true });
+    const outsideTranscript = join(root, "outside-transcript.jsonl");
+    writeFileSync(
+      outsideTranscript,
+      JSON.stringify({ type: "PLANNER_RESPONSE", tool_calls: [{ name: "mcp_agentschat_whoami" }] }) + "\n",
+    );
+    symlinkSync(outsideTranscript, join(logsDir, "transcript.jsonl"));
+    expect(detectAntigravityCallerSession({ brainDir, toolName: "whoami" })).toBeNull();
+
+    // 4. detectDshCallerSession refuses non-loopback healthUrl (SSRF guard) & path-traversal session IDs
+    let externalFetched = false;
+    const externalSid = await detectDshCallerSession({
+      dshHome: join(root, "dsh-empty"),
+      healthUrl: "http://169.254.169.254/latest/meta-data/",
+      fetchImpl: (async () => {
+        externalFetched = true;
+        return new Response(JSON.stringify({ roots: [{ id: "session-ssrf", status: "running" }] }), { status: 200 });
+      }) as unknown as typeof fetch,
+    });
+    expect(externalFetched).toBe(false);
+    expect(externalSid).toBeNull();
+
+    const traversalSid = await detectDshCallerSession({
+      dshHome: join(root, "dsh-empty"),
+      healthUrl: "http://127.0.0.1:8799/health",
+      fetchImpl: (async () =>
+        new Response(
+          JSON.stringify({
+            roots: [
+              { id: "session-../../etc/passwd", status: "running" },
+              { id: "session-legit-42", status: "running" },
+            ],
+          }),
+          { status: 200 },
+        )) as unknown as typeof fetch,
+    });
+    expect(traversalSid).toBe("session-legit-42");
   });
 });

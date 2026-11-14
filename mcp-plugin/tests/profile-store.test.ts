@@ -108,4 +108,48 @@ describe("safeWriteProfile keeps the agent key 0600", () => {
     symlinkSync(defPath, symCand);
     expect(findDefaultProfileCollision(dir, defPath)).toBeNull();
   });
+
+  test("Campaign #114 KR3: rejects symlinked parent dirs, scrubs control chars in warnings, and handles uppercase .JSON metadata/profile collisions", () => {
+    const outsideDir = join(dir, "outside");
+    mkdirSync(outsideDir);
+    const symParent = join(dir, "sym-parent");
+    symlinkSync(outsideDir, symParent);
+
+    expect(() => safeWriteProfile(join(symParent, "profile.json"), { token: "ac_secret" })).toThrow(
+      /invalid or symlinked parent directory/i,
+    );
+    expect(existsSync(join(outsideDir, "profile.json"))).toBe(false);
+
+    // Control characters in warning paths/errors are scrubbed before hitting stderr/warn sink
+    const noisyPath = join(dir, "bad\x1b[31mname.json");
+    mkdirSync(noisyPath + ".tmp");
+    const warnings: string[] = [];
+    expect(() => safeWriteProfile(noisyPath, { token: "ac_secret" }, (m) => warnings.push(m))).toThrow();
+    expect(warnings.join("")).not.toContain("\x1b");
+    expect(warnings.join("")).toMatch(/could not be removed/);
+
+    // findDefaultProfileCollision skips uppercase metadata files (SESSION-BINDS.JSON) while detecting uppercase .JSON shadow profiles
+    const cfgDir = join(dir, "cfg");
+    mkdirSync(cfgDir);
+    const defPath = join(cfgDir, "profile.json");
+    writeFileSync(defPath, JSON.stringify({ agent_id: "bot_upper", display_name: "Upper Bot", token: "ac_def" }));
+    writeFileSync(
+      join(cfgDir, "SESSION-BINDS.JSON"),
+      JSON.stringify({ agent_id: "bot_upper", display_name: "Upper Bot", token: "ac_not_profile" }),
+    );
+    expect(findDefaultProfileCollision(cfgDir, defPath)).toBeNull();
+
+    writeFileSync(
+      join(cfgDir, "NamedUpper.JSON"),
+      JSON.stringify({ agent_id: "bot_upper", display_name: "Upper Bot", token: "ac_named" }),
+    );
+    const collision = findDefaultProfileCollision(cfgDir, defPath);
+    expect(collision?.collidingName).toBe("NamedUpper");
+    expect(collision?.reason).toBe("agent_id");
+
+    // Symlinked configDir is refused by findDefaultProfileCollision
+    const symCfg = join(dir, "sym-cfg");
+    symlinkSync(cfgDir, symCfg);
+    expect(findDefaultProfileCollision(symCfg, defPath)).toBeNull();
+  });
 });
