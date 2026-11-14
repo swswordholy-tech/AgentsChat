@@ -58,16 +58,28 @@ function normalizeProfileSlug(s: string): string {
   return base.replace(/[^a-zA-Z0-9_-]/g, "_");
 }
 
-/** uuid → profile name. Non-string (and empty / prototype / control-char) values are ignored. */
+const MAX_GROK_BIND_ENTRIES = 1024;
+const MAX_GROK_BINDS_PATH_LEN = 4096;
+
+function isSafeProfileBindName(name: string): boolean {
+  if (!name || name.length > 256 || hasControlChars(name)) return false;
+  if (isUnsafeObjectKey(name) || name === "." || name.includes("..") || /[\/\\]/.test(name)) return false;
+  return true;
+}
+
+/** uuid → profile name. Non-string (and empty / prototype / path-traversal / control-char) values are ignored. */
 export function parseGrokBinds(raw: unknown): Record<string, string> {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return {};
   const out: Record<string, string> = {};
+  let count = 0;
   for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (count >= MAX_GROK_BIND_ENTRIES) break;
     if (typeof v !== "string") continue;
     const name = v.trim();
-    if (!name || name.length > 256 || hasControlChars(name)) continue;
+    if (!isSafeProfileBindName(name)) continue;
     const key = k.trim();
     if (!key || key.length > 256 || isUnsafeObjectKey(key) || hasControlChars(key)) continue;
+    if (!Object.hasOwn(out, key)) count++;
     out[key] = name;
   }
   return out;
@@ -86,7 +98,9 @@ export function parseGrokBindsText(text: string): { binds: Record<string, string
 
 export function resolveGrokBindsPath(configDir: string, envOverride?: string): string {
   const trimmed = typeof envOverride === "string" ? envOverride.trim() : "";
-  if (trimmed.length > 0 && !hasControlChars(trimmed)) return trimmed;
+  if (trimmed.length > 0 && trimmed.length <= MAX_GROK_BINDS_PATH_LEN && !trimmed.startsWith("-") && !hasControlChars(trimmed)) {
+    return trimmed;
+  }
   return join(configDir, DEFAULT_GROK_BINDS_FILENAME);
 }
 
@@ -106,7 +120,7 @@ export function decideGrokBind(input: {
   if (!id || isUnsafeObjectKey(id) || hasControlChars(id)) return { kind: "skip" };
   const binds = input.binds && typeof input.binds === "object" ? input.binds : {};
   const profileName = Object.hasOwn(binds, id) ? binds[id] : undefined;
-  if (typeof profileName === "string" && profileName.trim().length > 0 && !hasControlChars(profileName)) {
+  if (typeof profileName === "string" && isSafeProfileBindName(profileName.trim())) {
     return { kind: "hit", conversationId: id, profileName: profileName.trim() };
   }
   return { kind: "miss", conversationId: id };
@@ -124,7 +138,7 @@ export function boundProfileForConversation(
   if (!id || isUnsafeObjectKey(id) || hasControlChars(id)) return null;
   if (!binds || typeof binds !== "object") return null;
   const name = Object.hasOwn(binds, id) ? binds[id] : undefined;
-  return typeof name === "string" && name.trim().length > 0 && !hasControlChars(name) ? name.trim() : null;
+  return typeof name === "string" && isSafeProfileBindName(name.trim()) ? name.trim() : null;
 }
 
 /** Basename without `.json` — compare `activeProfileFile` to a bind name. */

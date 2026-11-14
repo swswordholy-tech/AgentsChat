@@ -69,3 +69,18 @@ test("redactParticipantPii masks emails and phones and preserves full agent IDs"
   expect(redactParticipantPii("100-20")).toBe("100-20");
   expect(redactSecrets(undefined as any)).toBe("");
 });
+
+test("Campaign #116: redactSecrets masks MCP OAuth access/refresh/code tokens even when preserveAcKeys=true, and redactParticipantPii strips control chars", () => {
+  const at = "mcp_at_" + "A".repeat(43);
+  const rt = "mcp_rt_" + "B".repeat(43);
+  const code = "mcp_code_" + "C".repeat(43);
+  const ac = "ac_" + "D".repeat(24);
+  expect(redactSecrets(`${at} ${rt} ${code}`)).toBe(
+    "mcp_***REDACTED*** mcp_***REDACTED*** mcp_***REDACTED***",
+  );
+  expect(redactSecrets(`${ac} ${at}`, { preserveAcKeys: true })).toBe(
+    `${ac} mcp_***REDACTED***`,
+  );
+  expect(redactParticipantPii("agent\r\n\u0000name")).toBe("agentname");
+  expect(redactParticipantPii("\r\n\u0000")).toBe("unknown");
+});

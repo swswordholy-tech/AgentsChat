@@ -19,7 +19,9 @@ export function redactSecrets(text: string, opts?: RedactOptions): string {
   const step = opts?.preserveAcKeys
     ? text
     : text.replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***");
-  return step.replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
+  return step
+    .replace(/mcp_(?:at|rt|code)_[A-Za-z0-9_-]{16,}/g, "mcp_***REDACTED***")
+    .replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
 }
 
 const PHONE_PII_RE = /^\+?\d[\d\s()-]{5,}[\d)]$/;
@@ -46,7 +48,7 @@ export function isHumanPiiHandle(rawId: unknown): boolean {
  * in full (no 8/12-char truncation).
  */
 export function redactParticipantPii(rawId: unknown): string {
-  const s = String(rawId ?? "").trim();
+  const s = String(rawId ?? "").replace(/[\x00-\x1f\x7f]+/g, "").trim();
   if (!s) return "unknown";
   const atIdx = s.indexOf("@");
   if (atIdx >= 0) {
@@ -57,5 +59,5 @@ export function redactParticipantPii(rawId: unknown): string {
     const digits = s.replace(/\D/g, "");
     return `user:phone_***${digits.slice(-2) || "00"}`;
   }
-  return s;
+  return s.slice(0, 128);
 }

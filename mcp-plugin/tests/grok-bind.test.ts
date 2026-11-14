@@ -498,4 +498,40 @@ describe("nonGrokWakeReason / grokBindApplies — non-Grok wakes are exempt", ()
     ).toBe(false);
     expect(nonGrokWakeReason({ AGENTCHAT_WAKE_KIND: "url\r\nforged" })).toBe("AGENTCHAT_WAKE_KIND=urlforged");
   });
+
+  test("Campaign #116: parseGrokBinds filters unsafe profile names & caps 1024 entries; resolveGrokBindsPath rejects option-like/oversized overrides", () => {
+    const raw: Record<string, string> = {
+      "uuid-proto": "__proto__",
+      "uuid-ctor": "Constructor",
+      "uuid-trav": "../evil",
+      "uuid-slash": "sub/Bot",
+      "uuid-backslash": "sub\\Bot",
+      "uuid-good": "SafeBot",
+    };
+    for (let i = 0; i < 1100; i++) raw[`uuid-${i}`] = `Bot-${i}`;
+    const parsed = parseGrokBinds(raw);
+    expect(parsed["uuid-proto"]).toBeUndefined();
+    expect(parsed["uuid-ctor"]).toBeUndefined();
+    expect(parsed["uuid-trav"]).toBeUndefined();
+    expect(parsed["uuid-slash"]).toBeUndefined();
+    expect(parsed["uuid-backslash"]).toBeUndefined();
+    expect(parsed["uuid-good"]).toBe("SafeBot");
+    expect(Object.keys(parsed).length).toBe(1024);
+
+    expect(
+      decideGrokBind({
+        explicitIdentity: false,
+        hasToken: false,
+        conversationId: "u1",
+        binds: { u1: "../escape" },
+      }),
+    ).toEqual({ kind: "miss", conversationId: "u1" });
+    expect(boundProfileForConversation("u1", { u1: "__proto__" })).toBeNull();
+    expect(resolveGrokBindsPath("/home/u/.agentschat", "--malicious-flag")).toBe(
+      "/home/u/.agentschat/grok-binds.json",
+    );
+    expect(resolveGrokBindsPath("/home/u/.agentschat", "/" + "x".repeat(5000))).toBe(
+      "/home/u/.agentschat/grok-binds.json",
+    );
+  });
 });
