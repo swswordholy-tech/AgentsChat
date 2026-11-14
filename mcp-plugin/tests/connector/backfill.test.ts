@@ -89,3 +89,27 @@ describe("selectChannelContextMessages & safeCursorBotFile", () => {
     expect(escaped.includes("/etc/")).toBe(false);
   });
 });
+
+
+test("malformed content cannot seed a cursor, replay or enter channel context", () => {
+  const invalid: any[] = [null, undefined, false, 42, "message",
+    ...[undefined, null, 42, true, {}, [], ["__typing__"]].map(content => ({
+      id: "invalid", timestamp: "2026-09-01T11:00:00Z", sender_id: "human", content,
+    })),
+  ];
+  expect(planBackfill(undefined, invalid, A)).toEqual({ replay: [] });
+  expect(planBackfill("2026-09-01T09:00:00Z", invalid, A).replay).toEqual([]);
+  expect(selectChannelContextMessages(invalid)).toEqual([]);
+  expect(selectChannelContextMessages(invalid, "2026-09-01T09:00:00Z")).toEqual([]);
+  const mixed = [...invalid, ...msgs];
+  expect(planBackfill(undefined, mixed, A).seed).toBe("2026-09-01T10:00:03Z");
+  expect(planBackfill("2026-09-01T10:00:00Z", mixed, A).replay.map(m => m.id)).toEqual(["3", "5"]);
+  expect(selectChannelContextMessages(mixed).map(m => m.id)).toEqual(["1", "2", "3", "5"]);
+});
+
+test("empty string remains valid for backfill while context requires visible text", () => {
+  const empty = { id: "empty", timestamp: "2026-09-01T11:00:00Z", sender_id: "human", content: "" };
+  expect(planBackfill(undefined, [empty], A).seed).toBe(empty.timestamp);
+  expect(planBackfill("2026-09-01T10:00:00Z", [empty], A).replay).toEqual([empty]);
+  expect(selectChannelContextMessages([empty])).toEqual([]);
+});

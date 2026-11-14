@@ -32,7 +32,9 @@
  */
 
 import WS from "ws";
-import { readFileSync } from "node:fs";
+import { lstatSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { startConnector, PlatformHttpError, PlatformNetworkError } from "./server.ts";
 import { requireIdentity, type Identity } from "./identities.ts";
 import { redactSecrets } from "../src/redact.ts";
@@ -93,11 +95,17 @@ function parseIdentitiesJson(raw: string, source: string): Identity[] {
 }
 
 /** Load identities; throws on bad JSON/shape (SIGHUP keeps prior set). */
-function loadIdentities(): Identity[] {
+export function loadIdentities(): Identity[] {
   const file = (process.env.RELAY_IDENTITIES_FILE || "").trim();
   if (file) {
     let raw: string;
-    try { raw = readFileSync(file, "utf8"); }
+    try {
+      const stat = lstatSync(file);
+      if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 1_048_576) {
+        throw new Error("Unsafe identities file");
+      }
+      raw = readFileSync(file, "utf8");
+    }
     catch { throw new Error("RELAY_IDENTITIES_FILE could not be read"); }
     return parseIdentitiesJson(raw, "RELAY_IDENTITIES_FILE");
   }
@@ -122,6 +130,18 @@ function resolveIdentitiesAtStartup(): Identity[] {
   }
 }
 
+/** Bound timers to Node's signed 32-bit range after applying the caller's minimum. */
+export function clampTimerMs(raw: unknown, fallback: number, minMs: number): number {
+  const value = Number(raw);
+  return Math.min(2_147_483_647, Math.max(minMs, Math.floor(Number.isFinite(value) && value > 0 ? value : fallback)));
+}
+
+/** Both the source CLI and the bundled dist/connector.js run directly. */
+export function isConnectorEntrypoint(entry: string | undefined, moduleUrl: string, isMain = false): boolean {
+  return isMain || Boolean(entry && resolve(entry) === fileURLToPath(moduleUrl));
+}
+
+async function main() {
 /** Mutable identity list — hooks and reload close over this binding. */
 let identities = resolveIdentitiesAtStartup();
 
@@ -161,10 +181,10 @@ const heartbeatsByBot = new Map<string, HeartbeatMonitor>();
 const dedup = new MessageDedup();
 
 // Same defaults as stdio MCP (src/server.ts): 15s ping / 45s pong / 30s connect.
-const HB_PING_MS = Math.max(5_000, Number(process.env.AGENTSCHAT_CONNECTOR_PING_MS || 15_000));
-const HB_PONG_MS = Math.max(HB_PING_MS + 5_000, Number(process.env.AGENTSCHAT_CONNECTOR_PONG_TIMEOUT_MS || 45_000));
-const HB_CONNECT_MS = Math.max(5_000, Number(process.env.AGENTSCHAT_CONNECTOR_CONNECT_TIMEOUT_MS || 30_000));
-const HTTP_TIMEOUT_MS = Math.max(2_000, Number(process.env.AGENTSCHAT_CONNECTOR_HTTP_TIMEOUT_MS || 10_000));
+const HB_PING_MS = clampTimerMs(process.env.AGENTSCHAT_CONNECTOR_PING_MS, 15_000, 5_000);
+const HB_PONG_MS = clampTimerMs(process.env.AGENTSCHAT_CONNECTOR_PONG_TIMEOUT_MS, 45_000, Math.min(2_147_483_647, HB_PING_MS + 5_000));
+const HB_CONNECT_MS = clampTimerMs(process.env.AGENTSCHAT_CONNECTOR_CONNECT_TIMEOUT_MS, 30_000, 5_000);
+const HTTP_TIMEOUT_MS = clampTimerMs(process.env.AGENTSCHAT_CONNECTOR_HTTP_TIMEOUT_MS, 10_000, 2_000);
 
 function stopHeartbeat(botId: string) {
   const hb = heartbeatsByBot.get(botId);
@@ -177,7 +197,7 @@ function stopHeartbeat(botId: string) {
 // stdio MCP (`last-seen-msg-ts-<agent>.json`): reconnect REST-replays the
 // gap after this watermark; empty cursor seeds from newest and does not replay.
 const CURSOR_DIR = process.env.AGENTCHAT_CURSOR_DIR || process.cwd();
-const cursorFlushMs = Math.max(500, Number(process.env.AGENTSCHAT_MCP_CURSOR_FLUSH_MS || 5000));
+const cursorFlushMs = clampTimerMs(process.env.AGENTSCHAT_MCP_CURSOR_FLUSH_MS, 5_000, 500);
 
 type CursorStore = {
   file: string;
@@ -187,7 +207,7 @@ type CursorStore = {
 };
 const cursors = new Map<string, CursorStore>();
 
-function cursorFor(id: Identity): CursorStore {
+function cursorFor(id: Pick<Identity, "botId">): CursorStore {
   let s = cursors.get(id.botId);
   if (s) return s;
   const file = safeCursorBotFile(CURSOR_DIR, id.botId);
@@ -208,7 +228,7 @@ function scheduleSave(s: CursorStore) {
   (s.timer as any).unref?.();
 }
 
-function advanceCursor(id: Identity, channelId: string | undefined, timestamp: string | undefined) {
+function advanceCursor(id: Pick<Identity, "botId">, channelId: string | undefined, timestamp: string | undefined) {
   if (typeof channelId !== "string" || typeof timestamp !== "string" || !timestamp) return;
   const s = cursorFor(id);
   const prev = s.map.get(channelId) || "";
@@ -239,6 +259,7 @@ async function joinMemberships(ws: WS, id: Identity) {
       signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
     });
     if (!r.ok) {
+      await r.body?.cancel().catch(() => {});
       log(`list mine failed: ${r.status}`);
       return;
     }
@@ -279,7 +300,10 @@ async function backfillIdentity(id: Identity, channelIds: string[]) {
         headers: { Authorization: `Bearer ${id.token}` },
         signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
       });
-      if (!r.ok) continue;
+      if (!r.ok) {
+        await r.body?.cancel().catch(() => {});
+        continue;
+      }
       const msgs = (((await r.json()) as any)?.messages ?? []) as any[];
       if (!currentIdentity(id)) return;
       const plan = planBackfill(after, msgs, id.agentId);
@@ -438,7 +462,10 @@ const connector = startConnector({
         body: JSON.stringify({ sender_id: id.agentId, content_type: "text", content, ...(replyTo ? { parent_id: replyTo } : {}) }),
         signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
       }).catch(() => { throw new PlatformNetworkError(); });
-      if (!res.ok) throw new PlatformHttpError(res.status);
+      if (!res.ok) {
+        await res.body?.cancel().catch(() => {});
+        throw new PlatformHttpError(res.status);
+      }
       const data = (await res.json()) as any;
       return { id: data?.id };
     },
@@ -447,7 +474,10 @@ const connector = startConnector({
       const res = await fetch(`${API}/api/loops/mine`, {
         headers: { Authorization: `Bearer ${id.token}` }, signal: AbortSignal.timeout(5000),
       });
-      if (!res.ok) throw new PlatformHttpError(res.status);
+      if (!res.ok) {
+        await res.body?.cancel().catch(() => {});
+        throw new PlatformHttpError(res.status);
+      }
       return await res.json();
     },
     async getChatInfo(botId, chatId) {
@@ -456,9 +486,12 @@ const connector = startConnector({
         headers: { Authorization: `Bearer ${id.token}` },
         signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
       });
-      if (!res.ok) return { name: chatId, type: chatId.startsWith("dm-") ? "dm" : "group" };
+      if (!res.ok) {
+        await res.body?.cancel().catch(() => {});
+        return { name: chatId, type: /^dm[-:]/i.test(chatId) ? "dm" : "group" };
+      }
       const data = (await res.json()) as any;
-      return { name: data?.name ?? chatId, type: chatId.startsWith("dm-") ? "dm" : "group" };
+      return { name: data?.name ?? chatId, type: /^dm[-:]/i.test(chatId) ? "dm" : "group" };
     },
     async sendTyping(botId, chatId) {
       const id = requireIdentity(identities, botId);
@@ -480,7 +513,10 @@ const connector = startConnector({
           signal: boundedSignal,
           headers: { Authorization: `Bearer ${id.token}` },
         });
-        if (!res.ok) return null;
+        if (!res.ok) {
+          await res.body?.cancel().catch(() => {});
+          return null;
+        }
         const rawMsgs = (((await res.json()) as any)?.messages ?? []) as any[];
         const tail = selectChannelContextMessages(rawMsgs, sinceTs, excludeId);
         if (!tail.length) return null;
@@ -585,4 +621,10 @@ for (const sig of ["SIGINT", "SIGTERM"] as const) {
     connector.stop();
     process.exit(0);
   });
+}
+
+}
+
+if (isConnectorEntrypoint(process.argv[1], import.meta.url, import.meta.main) || process.argv.includes("--connector")) {
+  await main();
 }

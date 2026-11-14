@@ -61,13 +61,14 @@ export interface WireEvent {
  * not become an agent turn (typing placeholder, or no channel to key a session on).
  */
 export function toWireEvent(msg: AgentsChatMessage, platform = "agentschat"): WireEvent | null {
-  const content = msg.content ?? "";
+  if (!msg || typeof msg !== "object") return null;
+  const content = typeof msg.content === "string" ? msg.content : "";
   if (content === "__typing__") return null;
 
   const chatId = msg.channel_id ?? "";
   if (!chatId) return null;
 
-  const isDm = chatId.startsWith("dm-");
+  const isDm = /^dm[-:]/i.test(chatId);
 
   return {
     text: content,
