@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -12,6 +12,7 @@ import {
   findBoundSessionForProfile,
   loadSessionBinds,
   parseAntigravityLsofOutput,
+  parseSessionBinds,
   parseWindowsAntigravityProbeJson,
   parseWindowsNetstatOutput,
   readAgentLock,
@@ -1281,5 +1282,70 @@ describe("multi-window lock & connect_profile / disconnect_profile integration t
     });
     expect(sid).toBeNull();
     expect(bodyCancelled).toBe(true);
+  });
+
+  test("Campaign #105 KR3: session-bind and agent-lock refuse symlinks, oversized files, control chars, and >256-char tokens", () => {
+    const root = mkdtempSync(join(tmpdir(), "ac-sb-c105-"));
+    const cfgDir = join(root, "cfg");
+    const outsideDir = join(root, "outside");
+    mkdirSync(cfgDir, { recursive: true });
+    mkdirSync(outsideDir, { recursive: true });
+
+    const outsideSecret = join(outsideDir, "secret.json");
+    writeFileSync(outsideSecret, JSON.stringify({ "stolen-sess": "AdminProfile" }));
+
+    // 1. Symlinked session-binds.json must be ignored on load, save, and remove (never read or clobbered)
+    const symlinkBinds = join(cfgDir, "session-binds.json");
+    symlinkSync(outsideSecret, symlinkBinds);
+    expect(loadSessionBinds(cfgDir)).toEqual({});
+    saveSessionBind(cfgDir, "legit-sess", "MainProfile");
+    expect(removeSessionBind(cfgDir, "stolen-sess")).toBe(false);
+    expect(lstatSync(symlinkBinds).isSymbolicLink()).toBe(true);
+    expect(JSON.parse(readFileSync(outsideSecret, "utf8"))).toEqual({ "stolen-sess": "AdminProfile" });
+
+    // 2. Symlinked lock file and symlinked lockDir must be rejected without unlinking or overwriting target
+    const lockDir = join(root, "locks");
+    mkdirSync(lockDir, { recursive: true });
+    const outsideLockTarget = join(outsideDir, "victim.lock");
+    writeFileSync(outsideLockTarget, JSON.stringify({ pid: process.pid, agentId: "agent-sym", updatedAt: new Date().toISOString() }));
+    const past = new Date(Date.now() - 10_000);
+    utimesSync(outsideLockTarget, past, past);
+
+    const symLock = join(lockDir, "agent-sym.lock");
+    symlinkSync(outsideLockTarget, symLock);
+    expect(readAgentLock(lockDir, "agent-sym")).toBeNull();
+    expect(checkAgentLock({ lockDir, agentId: "agent-sym", currentPid: process.pid })).toEqual({ locked: false });
+    expect(releaseAgentLock({ lockDir, agentId: "agent-sym", currentPid: process.pid })).toBe(false);
+    expect(acquireAgentLock({ lockDir, agentId: "agent-sym", currentPid: process.pid })).toBeNull();
+    expect(lstatSync(symLock).isSymbolicLink()).toBe(true);
+    expect(existsSync(outsideLockTarget)).toBe(true);
+
+    const symlinkedLockDir = join(root, "locks-link");
+    symlinkSync(outsideDir, symlinkedLockDir);
+    expect(acquireAgentLock({ lockDir: symlinkedLockDir, agentId: "agent-new", currentPid: process.pid })).toBeNull();
+
+    // 3. Control characters, prototype keys, and >256-char tokens are rejected
+    const cleanCfg = join(root, "clean-cfg");
+    mkdirSync(cleanCfg, { recursive: true });
+    expect(
+      parseSessionBinds({
+        "ok-session": "ValidProfile",
+        "bad\nsession": "ValidProfile",
+        "ok-2": "Bad\x00Profile",
+        __proto__: "Evil",
+        constructor: "Evil",
+        ["x".repeat(257)]: "ValidProfile",
+        "ok-3": "y".repeat(257),
+      }),
+    ).toEqual({ "ok-session": "ValidProfile" });
+
+    saveSessionBind(cleanCfg, "bad\rsid", "ValidProfile");
+    saveSessionBind(cleanCfg, "valid-sid", "bad\tprof");
+    saveSessionBind(cleanCfg, "z".repeat(257), "ValidProfile");
+    saveSessionBind(cleanCfg, "__proto__", "ValidProfile");
+    expect(loadSessionBinds(cleanCfg)).toEqual({});
+
+    saveSessionBind(cleanCfg, "good-sid", "GoodProfile");
+    expect(loadSessionBinds(cleanCfg)).toEqual({ "good-sid": "GoodProfile" });
   });
 });

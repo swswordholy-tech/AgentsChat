@@ -14,7 +14,7 @@
  *    crashed/closed processes automatically release their lock (never deadlocks).
  */
 import { createHash } from "node:crypto";
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -67,6 +67,42 @@ export function resolveLockDir(homeDir: string, env: Record<string, string | und
   return join(baseTmp, `agentschat-locks-${hash}`);
 }
 
+const LOCK_FILE_MAX_BYTES = 64 * 1024;
+const SESSION_BINDS_MAX_BYTES = 1024 * 1024;
+const CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
+
+function readBoundedRegularJson(path: string, maxBytes: number): unknown | null {
+  try {
+    const st = lstatSync(path);
+    if (st.isSymbolicLink() || !st.isFile() || st.size > maxBytes) return null;
+    return JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function isSafeTargetFileOrMissing(path: string): boolean {
+  try {
+    const st = lstatSync(path);
+    return !st.isSymbolicLink() && st.isFile();
+  } catch (e: any) {
+    return Boolean(e && typeof e === "object" && e.code === "ENOENT");
+  }
+}
+
+function isSafeDirOrMissing(dirPath: string): boolean {
+  try {
+    const st = lstatSync(dirPath);
+    return !st.isSymbolicLink() && st.isDirectory();
+  } catch (e: any) {
+    return Boolean(e && typeof e === "object" && e.code === "ENOENT");
+  }
+}
+
+function isValidBindToken(value: string): boolean {
+  return value.length > 0 && value.length <= 256 && !CONTROL_CHAR_RE.test(value);
+}
+
 export function lockFilePath(lockDir: string, agentId: string): string {
   const safe = String(agentId || "").trim().replace(/[^a-zA-Z0-9_-]/g, "_");
   return join(lockDir, `${safe}.lock`);
@@ -75,16 +111,11 @@ export function lockFilePath(lockDir: string, agentId: string): string {
 export function readAgentLock(lockDir: string, agentId: string): AgentLockRecord | null {
   if (!agentId) return null;
   const file = lockFilePath(lockDir, agentId);
-  if (!existsSync(file)) return null;
-  try {
-    const raw = JSON.parse(readFileSync(file, "utf8"));
-    if (!raw || typeof raw !== "object" || typeof raw.pid !== "number" || typeof raw.agentId !== "string") {
-      return null;
-    }
-    return raw as AgentLockRecord;
-  } catch {
+  const raw = readBoundedRegularJson(file, LOCK_FILE_MAX_BYTES) as Record<string, unknown> | null;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw) || typeof raw.pid !== "number" || typeof raw.agentId !== "string") {
     return null;
   }
+  return raw as unknown as AgentLockRecord;
 }
 
 /**
@@ -106,16 +137,14 @@ export function checkAgentLock(opts: {
   const file = lockFilePath(lockDir, agentId);
   const record = readAgentLock(lockDir, agentId);
   if (!record) {
-    if (existsSync(file)) {
-      try {
-        const st = statSync(file);
-        if (Date.now() - st.mtimeMs > 1_000) unlinkSync(file);
-      } catch {}
-    }
+    try {
+      const st = lstatSync(file);
+      if (!st.isSymbolicLink() && st.isFile() && Date.now() - st.mtimeMs > 1_000) unlinkSync(file);
+    } catch {}
     return { locked: false };
   }
   if (!isPidAlive(record.pid)) {
-    try { unlinkSync(lockFilePath(lockDir, agentId)); } catch {}
+    try { unlinkSync(file); } catch {}
     return { locked: false, stale: true };
   }
   if (record.pid === currentPid) {
@@ -141,6 +170,8 @@ export function acquireAgentLock(opts: {
   currentPid?: number;
 }): AgentLockRecord | null {
   if (!opts.agentId) return null;
+  const file = lockFilePath(opts.lockDir, opts.agentId);
+  if (!isSafeDirOrMissing(opts.lockDir) || !isSafeTargetFileOrMissing(file)) return null;
   const record: AgentLockRecord = {
     pid: opts.currentPid ?? process.pid,
     agentId: opts.agentId,
@@ -151,7 +182,7 @@ export function acquireAgentLock(opts: {
   };
   try {
     mkdirSync(opts.lockDir, { recursive: true, mode: 0o700 });
-    safeWriteProfile(lockFilePath(opts.lockDir, opts.agentId), record);
+    safeWriteProfile(file, record);
     return record;
   } catch {
     return null;
@@ -170,15 +201,13 @@ export function releaseAgentLock(opts: {
   const file = lockFilePath(opts.lockDir, opts.agentId);
   const existing = readAgentLock(opts.lockDir, opts.agentId);
   if (!existing) {
-    if (existsSync(file)) {
-      try {
-        const st = statSync(file);
-        if (Date.now() - st.mtimeMs > 1_000) {
-          unlinkSync(file);
-          return true;
-        }
-      } catch {}
-    }
+    try {
+      const st = lstatSync(file);
+      if (!st.isSymbolicLink() && st.isFile() && Date.now() - st.mtimeMs > 1_000) {
+        unlinkSync(file);
+        return true;
+      }
+    } catch {}
     return false;
   }
   const samePid = existing.pid === currentPid;
@@ -186,7 +215,7 @@ export function releaseAgentLock(opts: {
   const dead = !isPidAlive(existing.pid);
   if (!samePid && !sameSession && !dead) return false;
   try {
-    unlinkSync(lockFilePath(opts.lockDir, opts.agentId));
+    unlinkSync(file);
     return true;
   } catch {
     return false;
@@ -204,11 +233,13 @@ export function parseSessionBinds(raw: unknown): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
     const key = k.trim();
-    if (!key || isUnsafeBindKey(key)) continue;
-    if (typeof v === "string" && v.trim()) {
-      out[key] = v.trim();
-    } else if (v && typeof v === "object" && typeof (v as any).profile === "string" && (v as any).profile.trim()) {
-      out[key] = (v as any).profile.trim();
+    if (!isValidBindToken(key) || isUnsafeBindKey(key)) continue;
+    if (typeof v === "string") {
+      const val = v.trim();
+      if (isValidBindToken(val)) out[key] = val;
+    } else if (v && typeof v === "object" && typeof (v as any).profile === "string") {
+      const val = (v as any).profile.trim();
+      if (isValidBindToken(val)) out[key] = val;
     }
   }
   return out;
@@ -218,10 +249,10 @@ export function loadSessionBinds(configDir: string): Record<string, string> {
   const merged: Record<string, string> = {};
   for (const filename of [LEGACY_AGY_BINDS_FILENAME, DEFAULT_SESSION_BINDS_FILENAME]) {
     const path = join(configDir, filename);
-    if (!existsSync(path)) continue;
-    try {
-      Object.assign(merged, parseSessionBinds(JSON.parse(readFileSync(path, "utf8"))));
-    } catch {}
+    const parsed = readBoundedRegularJson(path, SESSION_BINDS_MAX_BYTES);
+    if (parsed !== null) {
+      Object.assign(merged, parseSessionBinds(parsed));
+    }
   }
   return merged;
 }
@@ -230,13 +261,10 @@ function resolveAgentIdForProfileName(configDir: string, name: string): string |
   if (!name || name.includes("/") || name.includes("\\")) return null;
   const base = name.replace(/\.json$/, "").replace(/[^a-zA-Z0-9_-]/g, "_");
   for (const candidate of [join(configDir, "profiles", `${base}.json`), join(configDir, `${base}.json`)]) {
-    if (!existsSync(candidate)) continue;
-    try {
-      const parsed = JSON.parse(readFileSync(candidate, "utf8")) as { agent_id?: unknown };
-      if (typeof parsed?.agent_id === "string" && parsed.agent_id.trim()) {
-        return parsed.agent_id.trim();
-      }
-    } catch {}
+    const parsed = readBoundedRegularJson(candidate, SESSION_BINDS_MAX_BYTES) as { agent_id?: unknown } | null;
+    if (typeof parsed?.agent_id === "string" && parsed.agent_id.trim()) {
+      return parsed.agent_id.trim();
+    }
   }
   return null;
 }
@@ -244,17 +272,20 @@ function resolveAgentIdForProfileName(configDir: string, name: string): string |
 export function saveSessionBind(configDir: string, sessionId: string, profileName: string): void {
   const sid = sessionId.trim();
   const prof = profileName.trim();
-  if (!sid || !prof) return;
+  if (!isValidBindToken(sid) || !isValidBindToken(prof) || isUnsafeBindKey(sid)) return;
+  if (!isSafeDirOrMissing(configDir)) return;
+  const path = join(configDir, DEFAULT_SESSION_BINDS_FILENAME);
+  if (!isSafeTargetFileOrMissing(path)) return;
   const targetAgentId = resolveAgentIdForProfileName(configDir, prof);
   const isSameProfileOrAgent = (existingProf: string): boolean => {
     if (existingProf === prof) return true;
     if (!targetAgentId) return false;
     return resolveAgentIdForProfileName(configDir, existingProf) === targetAgentId;
   };
-  const path = join(configDir, DEFAULT_SESSION_BINDS_FILENAME);
   let current: Record<string, string> = {};
-  if (existsSync(path)) {
-    try { current = parseSessionBinds(JSON.parse(readFileSync(path, "utf8"))); } catch {}
+  const existingParsed = readBoundedRegularJson(path, SESSION_BINDS_MAX_BYTES);
+  if (existingParsed !== null) {
+    current = parseSessionBinds(existingParsed);
   }
   // Enforce 1:1 (profileName & agent_id) <-> sessionId mapping so re-binding a
   // profile (or an alias file such as `profile.json` + `<Name>.json` sharing one
@@ -270,30 +301,35 @@ export function saveSessionBind(configDir: string, sessionId: string, profileNam
   safeWriteProfile(path, current);
 
   const legacyPath = join(configDir, LEGACY_AGY_BINDS_FILENAME);
-  if (existsSync(legacyPath)) {
-    try {
-      const legacy = parseSessionBinds(JSON.parse(readFileSync(legacyPath, "utf8")));
-      let changed = false;
-      for (const [existingSid, existingProf] of Object.entries(legacy)) {
-        if (existingSid !== sid && isSameProfileOrAgent(existingProf)) {
-          delete legacy[existingSid];
-          changed = true;
+  if (isSafeTargetFileOrMissing(legacyPath)) {
+    const legacyParsed = readBoundedRegularJson(legacyPath, SESSION_BINDS_MAX_BYTES);
+    if (legacyParsed !== null) {
+      try {
+        const legacy = parseSessionBinds(legacyParsed);
+        let changed = false;
+        for (const [existingSid, existingProf] of Object.entries(legacy)) {
+          if (existingSid !== sid && isSameProfileOrAgent(existingProf)) {
+            delete legacy[existingSid];
+            changed = true;
+          }
         }
-      }
-      if (changed) safeWriteProfile(legacyPath, legacy);
-    } catch {}
+        if (changed) safeWriteProfile(legacyPath, legacy);
+      } catch {}
+    }
   }
 }
 
 export function removeSessionBind(configDir: string, sessionId: string): boolean {
   const sid = sessionId.trim();
-  if (!sid || isUnsafeBindKey(sid)) return false;
+  if (!isValidBindToken(sid) || isUnsafeBindKey(sid)) return false;
   let removed = false;
   for (const filename of [DEFAULT_SESSION_BINDS_FILENAME, LEGACY_AGY_BINDS_FILENAME]) {
     const path = join(configDir, filename);
-    if (!existsSync(path)) continue;
+    if (!isSafeTargetFileOrMissing(path)) continue;
+    const raw = readBoundedRegularJson(path, SESSION_BINDS_MAX_BYTES);
+    if (raw === null) continue;
     try {
-      const current = parseSessionBinds(JSON.parse(readFileSync(path, "utf8")));
+      const current = parseSessionBinds(raw);
       if (Object.hasOwn(current, sid)) {
         delete current[sid];
         safeWriteProfile(path, current);
