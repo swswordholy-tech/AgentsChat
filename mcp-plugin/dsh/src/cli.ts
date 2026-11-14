@@ -24,7 +24,7 @@ import { appendWakeQueue, buildWakePayload, fireWake } from "../../muse/src/wake
 import { agentschatConfigDir, resolveSessionForAgent } from "../../src/session-route.ts";
 import { loadSessionBinds } from "../../src/session-bind.ts";
 import { resolveWindowsCliSpawn } from "../../src/wake.ts";
-import { applyDshCordisPatchFile } from "./patch.ts";
+import { applyDshCordisPatchFile, isBlockedDshHost } from "./patch.ts";
 
 export const DSH_PROFILE_PATH = join(homedir(), ".agentschat", "dsh.json");
 const DEFAULT_WS_URL = "wss://agents-chat.com/ws";
@@ -101,6 +101,20 @@ function isSafeAgentId(value: unknown): boolean {
     !FORBIDDEN_KEYS.has(value.toLowerCase()) && !/[\s\x00-\x1f\x7f/\\]/.test(value);
 }
 
+function validateChannelId(value: string | undefined): string {
+  if (!value || value.startsWith("--") || !isSafeAgentId(value) ||
+      Object.getOwnPropertyNames(Object.prototype).some((key) => key.toLowerCase() === value.toLowerCase())) throw new Error("Invalid channel id: --send requires a channel id and --channel requires a value");
+  return value;
+}
+
+function logText(value: string): string {
+  return redact(value.replace(/[\x00-\x1f\x7f]/g, ""));
+}
+
+function promptHeader(value: string): string {
+  return value.replace(/[\r\n\x00-\x1f\x7f]/g, "");
+}
+
 function isLoopbackHost(hostname: string): boolean {
   const h = hostname.toLowerCase().replace(/\.$/, "");
   return h === "localhost" || h === "127.0.0.1" || h === "[::1]" || h === "::1";
@@ -117,7 +131,7 @@ function validateHttpOrWsUrl(raw: string, allowedProtocols: string[], label: str
   } catch {
     throw new Error(`Invalid ${label} URL`);
   }
-  if (parsed.username || parsed.password || parsed.port === "0" ||
+  if (isBlockedDshHost(parsed.hostname) || parsed.username || parsed.password || parsed.port === "0" ||
       ((parsed.protocol === "http:" || parsed.protocol === "https:") && (parsed.search || parsed.hash))) throw new Error(`Invalid ${label} URL`);
   if (!allowedProtocols.includes(parsed.protocol)) {
     throw new Error(`Unsupported ${label} protocol: ${parsed.protocol}`);
@@ -207,6 +221,10 @@ export async function registerOnly(name: string, restUrl: string, profilePath = 
     throw new Error(`Registration failed: ${res.status} ${errText}`);
   }
   const data = JSON.parse(await readRegistrationText(res)) as Record<string, unknown>;
+  if (data === null || typeof data !== "object" || Array.isArray(data) ||
+      Object.getPrototypeOf(data) !== Object.prototype || Object.prototype.hasOwnProperty.call(data, "__proto__")) {
+    throw new Error("Invalid registration response object");
+  }
   const rawAgentId = (data.agentId ?? data.agent_id ?? data.id) as string | undefined;
   const rawToken = (data.agentKey ?? data.token ?? data.key) as string | undefined;
   const agentId = typeof rawAgentId === "string" ? rawAgentId.trim() : "";
@@ -245,7 +263,7 @@ export async function registerOnly(name: string, restUrl: string, profilePath = 
     if (created) { try { unlinkSync(tmp); } catch {} }
     throw err;
   }
-  console.log(`Registered DSH agent '${name}' as ${agentId}. Identity saved to ${profilePath} (token not printed).`);
+  console.log(`Registered DSH agent '${cleanName}' as ${agentId}. Identity saved to ${profilePath} (token not printed).`);
 }
 
 /**
@@ -355,6 +373,10 @@ DeepSeek Harness (dsh) integration for AgentsChat:
     return;
   }
 
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === "--channel" || argv[i] === "--send") validateChannelId(argv[i + 1]);
+  }
+
   if (has("--setup", argv)) {
     const dshHome = arg("--dsh-home", argv);
     const dshProfile = arg("--dsh-profile", argv);
@@ -390,13 +412,16 @@ DeepSeek Harness (dsh) integration for AgentsChat:
     } catch {
       console.log("[dsh-wake] No global dsh.json identity; watching session-binds.json for bound DSH sessions.");
     }
-    const defaultWsUrl = primaryConfig?.wsUrl ?? process.env.AGENTCHAT_WS_URL ?? DEFAULT_WS_URL;
+    const defaultWsUrl = validateHttpOrWsUrl(
+      primaryConfig?.wsUrl ?? process.env.AGENTCHAT_WS_URL ?? DEFAULT_WS_URL,
+      ["ws:", "wss:"], "AgentChat WebSocket",
+    );
 
     const rawWakeChannels: string[] = [];
     for (let i = 0; i < argv.length; i++) {
       if (argv[i] === "--channel" && argv[i + 1]) rawWakeChannels.push(argv[i + 1]);
     }
-    if (primaryConfig?.defaultChannelId) rawWakeChannels.push(primaryConfig.defaultChannelId);
+    if (primaryConfig?.defaultChannelId) rawWakeChannels.push(validateChannelId(primaryConfig.defaultChannelId));
     const wakeChannels = [...new Set(rawWakeChannels)];
     const queueFile =
       process.env.DSH_WAKE_QUEUE ?? join(homedir(), ".agentschat", "dsh-wake-queue.jsonl");
@@ -430,7 +455,7 @@ DeepSeek Harness (dsh) integration for AgentsChat:
           { url: wakeUrl, secret: wakeSecret, logger: console.error, targetSessionId: route?.sessionId },
         );
         console.log(
-          `[dsh-wake] ${m.channel_id} ${m.sender_id} ${m.id} agent=${botIdentity.agentId} queued=${queued} target=${route?.sessionId ?? "unbound"}`,
+          `[dsh-wake] ${logText(`${m.channel_id} ${m.sender_id} ${m.id} agent=${botIdentity.agentId} queued=${queued} target=${route?.sessionId ?? "unbound"}`)}`,
         );
       });
       botClient.onReconnect = () => {
@@ -516,13 +541,13 @@ DeepSeek Harness (dsh) integration for AgentsChat:
               displayName: typeof raw.display_name === "string" ? raw.display_name : undefined,
             });
             for (const c of wakeChannels) extraClient.joinChannel(c);
-            console.log(`[dsh-wake] Connected bound session ${sid} -> ${profName} (${botAgentId})`);
+            console.log(`[dsh-wake] ${logText(`Connected bound session ${sid} -> ${profName} (${botAgentId})`)}`);
           } catch (err) {
             try {
               extraClient?.disconnect();
             } catch {}
             const msg = err instanceof Error ? err.message : String(err);
-            console.error(`[dsh-wake] Failed to connect bound session ${sid} (${profName}): ${redact(msg)}`);
+            console.error(`[dsh-wake] ${logText(`Failed to connect bound session ${sid} (${profName}): ${msg}`)}`);
           }
         }
       } catch {} finally {
@@ -582,7 +607,7 @@ DeepSeek Harness (dsh) integration for AgentsChat:
     for (let i = 0; i < argv.length; i++) {
       if (argv[i] === "--channel" && argv[i + 1]) rawChannels.push(argv[i + 1]);
     }
-    if (config.defaultChannelId) rawChannels.push(config.defaultChannelId);
+    if (config.defaultChannelId) rawChannels.push(validateChannelId(config.defaultChannelId));
     const channels = [...new Set(rawChannels)];
     const autoReply = arg("--auto-reply", argv);
     const dshProfile = arg("--dsh-profile", argv) ?? "headless";
@@ -596,13 +621,13 @@ DeepSeek Harness (dsh) integration for AgentsChat:
       channels,
       channelKinds,
       responder: async (ctx) => {
-        console.log(`[inbound] ${ctx.message.channel_id} ${ctx.message.sender_id}: ${ctx.message.content}`);
+        console.log(`[inbound] ${logText(`${ctx.message.channel_id} ${ctx.message.sender_id}: ${ctx.message.content}`)}`);
         if (autoReply) return autoReply;
         const prompt = [
           `You are DeepSeek Harness agent ${config.agentId} on AgentsChat.`,
-          `Reply concisely to the latest message in channel ${ctx.message.channel_id}.`,
+          `Reply concisely to the latest message in channel ${promptHeader(ctx.message.channel_id)}.`,
           `Recent conversation context:\n${ctx.context}`,
-          `Latest message from ${ctx.message.sender_id}: ${ctx.message.content}`,
+          `Latest message from ${promptHeader(ctx.message.sender_id)}: ${ctx.message.content}`,
         ].join("\n\n");
         return runDshHeadlessResponder(prompt, { dshProfile });
       },

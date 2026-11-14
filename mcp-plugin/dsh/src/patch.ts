@@ -33,6 +33,15 @@ function checkParentDirectory(path: string): void {
   }
 }
 
+/** URL.hostname is canonicalized by WHATWG URL, including IPv4-in-IPv6. */
+export function isBlockedDshHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/\.$/, "").replace(/^\[|\]$/g, "");
+  if (host === "metadata.google.internal" || host === "metadata.goog" || /^169\.254\./.test(host)) return true;
+  if (/^::ffff:(?:0:)?a9fe:[0-9a-f]{1,4}$/.test(host)) return true;
+  const first = host.split(":")[0];
+  return host.includes(":") && /^[0-9a-f]{1,4}$/.test(first) && (parseInt(first, 16) & 0xffc0) === 0xfe80;
+}
+
 export function resolveDshPatchPath(opts: DshPatchOptions = {}): string {
   const home = opts.dshHome ?? process.env.DSH_HOME ?? join(homedir(), ".dsh");
   if (!home || home.length > 4096 || home.startsWith("-") || !isAbsolute(home) || /[\x00-\x1f\x7f]/.test(home)) {
@@ -91,6 +100,7 @@ export function buildMcpAgentsChatArgs(opts: DshPatchOptions = {}): string[] {
     const host = parsed.hostname.toLowerCase().replace(/\.$/, "");
     const isLoopback = host === "localhost" || host === "127.0.0.1" || host === "[::1]" || host === "::1";
     if (
+      isBlockedDshHost(parsed.hostname) ||
       parsed.username ||
       parsed.password ||
       parsed.port === "0" || parsed.search || parsed.hash ||

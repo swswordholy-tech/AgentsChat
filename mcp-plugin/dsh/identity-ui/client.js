@@ -107,8 +107,10 @@ window.__ModuleLoader__.load({
         }
       }, [refresh]);
 
-      const boundName = data && sessionId ? data.binds[sessionId] : undefined;
-      const profile = data && boundName ? data.profiles.find((p) => p.name === boundName) : undefined;
+      const boundName = data && data.binds && typeof data.binds === 'object' &&
+        Object.prototype.hasOwnProperty.call(data.binds, sessionId) ? data.binds[sessionId] : undefined;
+      const profiles = data && Array.isArray(data.profiles) ? data.profiles.filter((p) => p && typeof p === 'object') : [];
+      const profile = boundName ? profiles.find((p) => p.name === boundName) : undefined;
 
       async function call(path, payload) {
         setBusy(true);
@@ -174,7 +176,7 @@ window.__ModuleLoader__.load({
                 { style: { padding: '4px 8px 6px', fontSize: '11px', color: 'var(--dsw-alias-label-tertiary)' } },
                 '这个会话用哪个 AgentsChat 身份',
               ),
-              (data && data.profiles ? data.profiles : []).slice(0, 8).map((entry) =>
+              profiles.slice(0, 8).map((entry) =>
                 h(
                   'button',
                   {
@@ -191,7 +193,7 @@ window.__ModuleLoader__.load({
                     { style: { flex: '1', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
                     entry.displayName || entry.name,
                   ),
-                  h('span', { style: { color: 'var(--dsw-alias-label-tertiary)', fontSize: '11px' } }, entry.agentId.slice(0, 8)),
+                  h('span', { style: { color: 'var(--dsw-alias-label-tertiary)', fontSize: '11px' } }, typeof entry.agentId === 'string' ? entry.agentId.slice(0, 8) : ''),
                 ),
               ),
               sessionId
@@ -230,7 +232,7 @@ window.__ModuleLoader__.load({
                         style: { color: 'var(--dsw-alias-state-business-primary)', fontSize: '12px', textDecoration: 'none' },
                         href: CHAT + encodeURIComponent(profile.agentId),
                         target: '_blank',
-                        rel: 'noreferrer',
+                        rel: 'noopener noreferrer',
                       },
                       '打开私聊',
                     ),

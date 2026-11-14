@@ -1,4 +1,6 @@
 import { describe, expect, spyOn, test } from "bun:test";
+import { runInNewContext } from "node:vm";
+import { apply as applyIdentityHost } from "../identity-ui/index.js";
 import { createHmac } from "node:crypto";
 import * as fs from "node:fs";
 import * as crypto from "node:crypto";
@@ -12,6 +14,7 @@ import {
   resolveDshPatchPath,
 } from "../src/patch.ts";
 import { loadDshConfig, main, registerOnly, runDshHeadlessResponder, safeDshConfig } from "../src/cli.ts";
+import { TypingHeartbeat } from "../../muse/src/typing.ts";
 import { MuseBridge } from "../../muse/src/bridge.ts";
 import { MuseAgentChatClient } from "../../muse/src/client.ts";
 import {
@@ -852,4 +855,264 @@ test("bound DSH clients strip .JSON case-insensitively and skip reserved or own-
     for (const name of envNames) { if (previous[name] === undefined) delete process.env[name]; else process.env[name] = previous[name]; }
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// Render the shipped browser modules with a minimal React/slot host. No DOM or network.
+function renderIdentityChip(file: string, data: unknown, sessionId: string): any {
+  const react = {
+    createElement: (type: unknown, props: any, ...children: unknown[]) => ({ type, props, children }),
+    useState: (() => { let i = 0; return () => [[data, true, "", false][i++], () => {}]; })(),
+    useCallback: (fn: unknown) => fn,
+    useEffect: () => {},
+  };
+  let module: any;
+  const window = { __ModuleLoader__: { load(value: unknown) { module = value; } } };
+  runInNewContext(readFileSync(join(ROOT, "dsh", file), "utf8"), { window, fetch: () => Promise.resolve({}), });
+  const plugin = module.factory(() => react);
+  let chip: any;
+  plugin.apply({ slots: { inject(_name: string, fn: () => void) { fn(); }, register(_options: any, component: any) { chip = component; } } });
+  return chip({ sessionId });
+}
+
+function identityElements(tree: any): any[] {
+  if (!tree || typeof tree !== "object") return [];
+  if (Array.isArray(tree)) return tree.flatMap(identityElements);
+  return [tree, ...(tree.children ?? []).flatMap(identityElements)];
+}
+
+test("identity clients render null/non-object binds and malformed profiles without crashing", () => {
+  for (const file of ["client.js", "identity-ui/client.js"]) {
+    for (const binds of [null, undefined, false, 7, "oops", {}]) {
+      for (const profiles of [null, undefined, false, 7, "oops", {}]) {
+        expect(() => renderIdentityChip(file, { binds, profiles }, "session-ok")).not.toThrow();
+      }
+    }
+    const tree = renderIdentityChip(file, { binds: {}, profiles: [null, false, 7, { name: "missing" }, { name: "numeric", agentId: 42 }, { name: "null", agentId: null }] }, "session-ok");
+    expect(identityElements(tree).filter((el) => el.type === "button")).toHaveLength(5);
+  }
+});
+
+test("identity clients never resolve inherited session binds, but render own binds and protected links", () => {
+  for (const file of ["client.js", "identity-ui/client.js"]) {
+    for (const session of ["constructor", "toString", "__proto__"]) {
+      let reads = 0;
+      const inherited = Object.create(Object.defineProperty({}, session, { get() { reads++; return "stolen"; } }));
+      const profiles = [{ name: "stolen", agentId: "stolen-agent" }];
+      const tree = renderIdentityChip(file, { binds: inherited, profiles }, session);
+      expect(reads).toBe(0);
+      expect(identityElements(tree).some((el) => el.type === "a")).toBe(false);
+      const own = Object.fromEntries([[session, "stolen"]]);
+      const links = identityElements(renderIdentityChip(file, { binds: own, profiles }, session)).filter((el) => el.type === "a");
+      expect(links).toHaveLength(1);
+      expect(links[0].props).toMatchObject({ href: "https://agents-chat.com/chat/stolen-agent", target: "_blank", rel: "noopener noreferrer" });
+    }
+  }
+});
+
+test("identity host log creates a private file and stays within the 256KiB budget", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dsh122-log-"));
+  const path = join(dir, ".dsh", "agentschat-identity-host.log");
+  mkdirSync(join(dir, ".dsh"));
+  try {
+    applyIdentityHost({}, { homeDir: dir });
+    expect(readFileSync(path, "utf8")).toMatch(/^\d{4}-.* host half applied\n$/);
+    if (process.platform !== "win32") expect(fs.statSync(path).mode & 0o777).toBe(0o600);
+    for (const size of [256 * 1024 - 1, 256 * 1024, 256 * 1024 + 1]) {
+      writeFileSync(path, "x".repeat(size));
+      applyIdentityHost({}, { homeDir: dir });
+      expect(fs.statSync(path).size).toBe(size);
+    }
+    writeFileSync(path, "x".repeat(256 * 1024 - 100));
+    applyIdentityHost({}, { homeDir: dir });
+    expect(fs.statSync(path).size).toBeGreaterThan(256 * 1024 - 100);
+    expect(fs.statSync(path).size).toBeLessThanOrEqual(256 * 1024);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("identity host log refuses symlinked targets, parents, ancestors and non-regular targets", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dsh122-links-"));
+  const victim = join(dir, "victim");
+  writeFileSync(victim, "untouched");
+  const home = join(dir, "home");
+  mkdirSync(join(home, ".dsh"), { recursive: true });
+  const log = join(home, ".dsh", "agentschat-identity-host.log");
+  try {
+    symlinkSync(victim, log);
+    applyIdentityHost({}, { homeDir: home });
+    expect(readFileSync(victim, "utf8")).toBe("untouched");
+    fs.unlinkSync(log); mkdirSync(log);
+    applyIdentityHost({}, { homeDir: home });
+    expect(fs.statSync(log).isDirectory()).toBe(true);
+    rmSync(log, { recursive: true });
+    symlinkSync(home, join(dir, "alias"));
+    for (const root of [join(dir, "alias"), join(dir, "alias", "nested")]) applyIdentityHost({}, { homeDir: root });
+    expect(readdirSync(join(home, ".dsh"))).toEqual([]);
+    rmSync(join(home, ".dsh"), { recursive: true });
+    mkdirSync(join(dir, "outside")); symlinkSync(join(dir, "outside"), join(home, ".dsh"));
+    applyIdentityHost({}, { homeDir: home });
+    expect(readdirSync(join(dir, "outside"))).toEqual([]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("identity host log refuses a target swapped to a symlink between lstat and open", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dsh122-open-"));
+  mkdirSync(join(dir, ".dsh"));
+  const log = join(dir, ".dsh", "agentschat-identity-host.log"), victim = join(dir, "victim");
+  writeFileSync(log, "log"); writeFileSync(victim, "untouched");
+  const original = fs.openSync;
+  const open = spyOn(fs, "openSync").mockImplementation(((path: any, ...args: any[]) => {
+    if (path === log) { fs.unlinkSync(log); symlinkSync(victim, log); }
+    return (original as any)(path, ...args);
+  }) as typeof fs.openSync);
+  try {
+    applyIdentityHost({}, { homeDir: dir });
+    expect(open).toHaveBeenCalled();
+    expect(readFileSync(victim, "utf8")).toBe("untouched");
+  } finally { open.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("DSH config, registration and patch reject canonical cloud-metadata and link-local hosts", async () => {
+  const env = { AGENTCHAT_AGENT_ID: "bot", AGENTCHAT_TOKEN: "test-token" };
+  const request = spyOn(globalThis, "fetch").mockRejectedValue(new Error("unexpected fetch"));
+  const hosts = ["169.254.169.254", "169.254.0.0", "169.254.255.255", "metadata.google.internal", "METADATA.GOOG.", "[fe80::1]", "[febf:ffff::1]", "[FE90::1234]", "[::ffff:169.254.42.7]", "[::ffff:0:169.254.42.7]", "[0:0:0:0:0:ffff:a9fe:1]", "[::ffff:0:a9fe:ffff]", "0xa9fea9fe", "2852039166"];
+  try {
+    for (const host of hosts) {
+      expect(() => buildMcpAgentsChatArgs({ apiUrl: `https://${host}` })).toThrow(/Invalid/);
+      expect(() => loadDshConfig({ ...env, AGENTCHAT_REST_URL: `https://${host}` })).toThrow(/Invalid/);
+      expect(() => loadDshConfig({ ...env, AGENTCHAT_WS_URL: `wss://${host}/ws` })).toThrow(/Invalid/);
+      await expect(registerOnly("bot", `https://${host}`)).rejects.toThrow(/Invalid/);
+    }
+    expect(request).not.toHaveBeenCalled();
+    for (const host of ["example.com", "metadata.goog.example.com", "169.253.255.255", "169.255.0.0", "[fe7f::1]", "[fec0::1]", "[::ffff:169.253.1.1]"]) {
+      expect(buildMcpAgentsChatArgs({ apiUrl: `https://${host}` })).toContain(`https://${host}`);
+      expect(loadDshConfig({ ...env, AGENTCHAT_WS_URL: `wss://${host}/ws` }).wsUrl).toBe(`wss://${host}/ws`);
+    }
+    for (const url of ["http://localhost:8787", "http://127.0.0.1:8787", "http://[::1]:8787"]) expect(buildMcpAgentsChatArgs({ apiUrl: url })).toContain(url);
+  } finally { request.mockRestore(); }
+});
+
+test("registration rejects non-object and own-proto JSON before writing and logs the cleaned name", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "dsh122-register-"));
+  const path = join(dir, "identity.json");
+  let body = "";
+  const request = spyOn(globalThis, "fetch").mockImplementation((async () => new Response(body)) as unknown as typeof fetch);
+  const log = spyOn(console, "log").mockImplementation(() => {});
+  try {
+    for (body of ["null", "[]", "true", "3", '"text"', '{"__proto__":{},"agentId":"bot","token":"test-token"}']) {
+      await expect(registerOnly("bot", "https://example.com", path)).rejects.toThrow(/registration response object/);
+      expect(existsSync(path)).toBe(false);
+    }
+    body = '{"agentId":"bot","token":"test-token"}';
+    await registerOnly("\r\n  clean-bot  \n", "https://example.com", path);
+    expect(JSON.parse(String(request.mock.calls.at(-1)![1]!.body)).name).toBe("clean-bot");
+    const logs = log.mock.calls.map((args) => args.join(" ")).join(" ");
+    expect(logs).toContain("'clean-bot'");
+    expect(logs).not.toMatch(/[\r\n]/);
+  } finally { request.mockRestore(); log.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("all channel and send flags validate before connecting, including repeated and missing values", async () => {
+  const connect = spyOn(MuseAgentChatClient.prototype, "connect").mockRejectedValue(new Error("unexpected connect"));
+  try {
+    for (const value of [undefined, "", " ", " bad", "bad id", "--listen", ".", "..", "a/b", "a\\b", "constructor", "Prototype", "__PrOtO__", "toString", "valueOf", "hasOwnProperty", "bad\n", "bad\x00", "bad\x7f"]) {
+      const values = value === undefined ? [] : [value];
+      for (const args of [["--listen", "--channel", ...values], ["--wake", "--channel", "good", "--channel", ...values], ["--send", ...values, "--text", "hello"]]) {
+        await expect(main(args)).rejects.toThrow(/channel id/);
+      }
+    }
+    expect(connect).not.toHaveBeenCalled();
+  } finally { connect.mockRestore(); }
+});
+
+async function withDshIdentity(fn: () => Promise<void>) {
+  const names = ["AGENTCHAT_AGENT_ID", "AGENTCHAT_TOKEN", "AGENTCHAT_CHANNEL_ID", "AGENTSCHAT_CONFIG_DIR", "DSH_BIN", "DSH_WAKE_QUEUE"] as const;
+  const previous = names.map((name) => process.env[name]);
+  const dir = mkdtempSync(join(tmpdir(), "dsh122-env-"));
+  process.env.AGENTCHAT_AGENT_ID = "dsh-test-bot"; process.env.AGENTCHAT_TOKEN = "test-token";
+  delete process.env.AGENTCHAT_CHANNEL_ID;
+  process.env.AGENTSCHAT_CONFIG_DIR = dir; process.env.DSH_WAKE_QUEUE = join(dir, "queue");
+  const signals = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
+  const listeners = signals.map((signal) => new Set(process.listeners(signal)));
+  try { await fn(); } finally {
+    signals.forEach((signal, i) => { for (const listener of process.listeners(signal)) if (!listeners[i]!.has(listener)) process.removeListener(signal, listener); });
+    names.forEach((name, i) => { if (previous[i] === undefined) delete process.env[name]; else process.env[name] = previous[i]; });
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("listen logs redact controls/secrets while prompt headers strip controls and preserve message text", async () => {
+  if (process.platform === "win32") return;
+  await withDshIdentity(async () => {
+    const bin = join(process.env.AGENTSCHAT_CONFIG_DIR!, "responder");
+    writeFileSync(bin, '#!/bin/sh\nprintf "%s" "$3"\n', { mode: 0o700 });
+    process.env.DSH_BIN = bin;
+    let prompt: string | null = null;
+    const message = { channel_id: "room\r\nforged\x00\x7f", sender_id: "sender\r\nforged\x01\x7f", content: "hello\nworld ac_12345678901234567890\x1b[31m", id: "id" };
+    const start = spyOn(MuseBridge.prototype, "start").mockImplementation(async function (this: MuseBridge) {
+      prompt = await (this as any).opts.responder({ message, context: "recent\ncontext" });
+    });
+    const closed = spyOn(MuseAgentChatClient.prototype, "waitUntilClosed").mockResolvedValue();
+    const log = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await main(["--listen", "--channel", "room"]);
+      expect(String(prompt)).toContain("channel roomforged.");
+      expect(String(prompt)).toContain("Latest message from senderforged: hello\nworld");
+      expect(String(prompt)).toContain(message.content);
+      expect(String(prompt)).toContain("recent\ncontext");
+      const inbound = log.mock.calls.map((args) => args.join(" ")).find((line) => line.startsWith("[inbound]"))!;
+      expect(inbound).toContain("****");
+      expect(inbound).not.toContain("ac_12345678901234567890");
+      expect(inbound).not.toMatch(/[\x00-\x1f\x7f]/);
+    } finally { start.mockRestore(); closed.mockRestore(); log.mockRestore(); }
+  });
+});
+
+test("wake logs scrub controls and secrets from inbound routing metadata", async () => {
+  await withDshIdentity(async () => {
+    let client: any;
+    const connect = spyOn(MuseAgentChatClient.prototype, "connect").mockImplementation(async function (this: MuseAgentChatClient) { client = this; });
+    const closed = spyOn(MuseAgentChatClient.prototype, "waitUntilClosed").mockImplementation(async () => {
+      for (const handler of client.messageHandlers) handler({ channel_id: "dm:room\r\n\x1b", sender_id: "peer\r\nac_12345678901234567890\x7f", id: "msg\x00", content: "hello" });
+    });
+    const typing = spyOn(TypingHeartbeat.prototype, "start").mockImplementation(() => {});
+    const joinChannel = spyOn(MuseAgentChatClient.prototype, "joinChannel").mockImplementation(() => {});
+    const disconnect = spyOn(MuseAgentChatClient.prototype, "disconnect").mockImplementation(() => {});
+    const log = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await main(["--wake", "--channel", "room"]);
+      const lines = log.mock.calls.map((args) => args.join(" ")).filter((line) => line.startsWith("[dsh-wake]"));
+      expect(lines.length).toBeGreaterThan(0);
+      for (const line of lines) { expect(line).not.toMatch(/[\x00-\x1f\x7f]/); expect(line).not.toContain("ac_12345678901234567890"); }
+      expect(lines.some((line) => line.includes("****"))).toBe(true);
+    } finally { connect.mockRestore(); closed.mockRestore(); typing.mockRestore(); joinChannel.mockRestore(); disconnect.mockRestore(); log.mockRestore(); }
+  });
+});
+
+test("wake validates the fallback WebSocket URL when the primary identity config fails", async () => {
+  const previous = process.env.AGENTCHAT_WS_URL;
+  const connect = spyOn(MuseAgentChatClient.prototype, "connect").mockRejectedValue(new Error("unexpected connect"));
+  try {
+    await withDshIdentity(async () => {
+      process.env.AGENTCHAT_WS_URL = "wss://[::ffff:0:169.254.169.254]/ws";
+      await expect(main(["--wake"])).rejects.toThrow(/Invalid AgentChat WebSocket URL/);
+      expect(connect).not.toHaveBeenCalled();
+    });
+  } finally {
+    connect.mockRestore();
+    if (previous === undefined) delete process.env.AGENTCHAT_WS_URL; else process.env.AGENTCHAT_WS_URL = previous;
+  }
+});
+
+test("configured default channels reject prototype keys before listen or wake connects", async () => {
+  await withDshIdentity(async () => {
+    const connect = spyOn(MuseAgentChatClient.prototype, "connect").mockRejectedValue(new Error("unexpected connect"));
+    try {
+      for (const channel of ["constructor", "__proto__", "toString", "bad/id", "bad\\id", "bad\x7fid"]) {
+        process.env.AGENTCHAT_CHANNEL_ID = channel;
+        await expect(main(["--listen"])).rejects.toThrow(/channel id/);
+        await expect(main(["--wake"])).rejects.toThrow(/channel id/);
+      }
+      expect(connect).not.toHaveBeenCalled();
+    } finally { connect.mockRestore(); }
+  });
 });
