@@ -31,6 +31,7 @@ export interface MuseBridgeOptions {
  */
 export class MuseBridge {
   private readonly client: MuseAgentChatClient;
+  private readonly activeReplies = new Map<string, number>();
   private readonly history = new Map<string, ChatMessage[]>();
   private readonly opts: MuseBridgeOptions;
   private readonly typing = new TypingHeartbeat((channelId) => this.client.sendTyping(channelId));
@@ -53,6 +54,7 @@ export class MuseBridge {
 
   stop(): void {
     this.typing.stopAll();
+    this.activeReplies.clear();
     this.client.disconnect();
   }
 
@@ -62,7 +64,7 @@ export class MuseBridge {
 
   /** Test seam: feed an inbound message without a socket. */
   async handleMessage(message: ChatMessage): Promise<void> {
-    if (!message.channel_id) return;
+    if (!message.channel_id || message.content === "__typing__") return;
     if (!this.history.has(message.channel_id) && this.history.size >= 200) {
       const oldest = this.history.keys().next().value;
       if (oldest !== undefined) this.history.delete(oldest);
@@ -78,7 +80,9 @@ export class MuseBridge {
       return;
     }
     // Show "thinking" from the moment we decide to answer until the reply lands (even if responder throws).
-    this.typing.start(message.channel_id);
+    const active = this.activeReplies.get(message.channel_id) ?? 0;
+    this.activeReplies.set(message.channel_id, active + 1);
+    if (active === 0) this.typing.start(message.channel_id);
     try {
       const ctx: MuseResponderContext = {
         message,
@@ -95,7 +99,13 @@ export class MuseBridge {
         }
       }
     } finally {
-      this.typing.stop(message.channel_id);
+      const remaining = (this.activeReplies.get(message.channel_id) ?? 1) - 1;
+      if (remaining <= 0) {
+        this.activeReplies.delete(message.channel_id);
+        this.typing.stop(message.channel_id);
+      } else {
+        this.activeReplies.set(message.channel_id, remaining);
+      }
     }
   }
 }
