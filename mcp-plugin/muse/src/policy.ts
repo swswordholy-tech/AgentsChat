@@ -16,27 +16,41 @@ export const MAX_CONTEXT_BYTES = 15_000;
 export const MAX_MESSAGE_BYTES = 2_000;
 
 export function isMentioned(content: string, agentId: string, displayName?: string): boolean {
+  if (typeof content !== "string") return false;
   const haystack = content.toLowerCase();
-  const names = [`@${agentId.toLowerCase()}`];
-  if (displayName) names.push(`@${displayName.toLowerCase()}`);
   // "muse" is the public name of this agent; accept a bare @muse mention too.
-  names.push("@muse");
-  return names.some((name) => haystack.includes(name));
+  const names = [agentId, displayName, "muse"]
+    .filter((name): name is string => typeof name === "string" && name.trim().length > 0)
+    .map((name) => `@${name.trim().toLowerCase()}`);
+  return names.some((name) => {
+    let index = haystack.indexOf(name);
+    while (index !== -1) {
+      const before = haystack[index - 1];
+      const afterCodePoint = haystack.codePointAt(index + name.length);
+      const after = afterCodePoint === undefined ? "" : String.fromCodePoint(afterCodePoint);
+      if ((!before || !/[a-z0-9@]/i.test(before)) &&
+          (!after || !/[\p{L}\p{N}\p{M}_-]/u.test(after))) return true;
+      index = haystack.indexOf(name, index + 1);
+    }
+    return false;
+  });
 }
 
 export function shouldDispatch(
   message: ChatMessage,
   opts: { agentId: string; displayName?: string; channelKind?: ChannelKind },
 ): boolean {
+  if (!message || typeof message !== "object" || typeof message.content !== "string") return false;
   if (message.sender_id === opts.agentId) return false;
   if (opts.channelKind === "direct") return true;
   // Unknown kind: be conservative and require a mention, except when the
   // message looks like a DM (server may omit channel_type on DMs).
-  if (!opts.channelKind) return isMentioned(message.content, opts.agentId, opts.displayName);
+  if (!opts.channelKind && typeof message.channel_id === "string" && /^dm-/i.test(message.channel_id)) return true;
   return isMentioned(message.content, opts.agentId, opts.displayName);
 }
 
 function truncateToBytes(text: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
   const encoder = new TextEncoder();
   if (encoder.encode(text).length <= maxBytes) return text;
   let low = 0;
@@ -46,6 +60,9 @@ function truncateToBytes(text: string, maxBytes: number): string {
     if (encoder.encode(text.slice(0, mid)).length <= maxBytes) low = mid;
     else high = mid - 1;
   }
+  if (low > 0 && low < text.length &&
+      text.charCodeAt(low - 1) >= 0xd800 && text.charCodeAt(low - 1) <= 0xdbff &&
+      text.charCodeAt(low) >= 0xdc00 && text.charCodeAt(low) <= 0xdfff) low -= 1;
   return text.slice(0, low);
 }
 
@@ -57,12 +74,15 @@ export function buildContext(messages: ChatMessage[], agentId: string): string {
   const lines: string[] = [];
   let bytes = 0;
   for (const m of [...recent].reverse()) {
-    const line = `${m.sender_id}: ${truncateToBytes(m.content, MAX_MESSAGE_BYTES)}\n`;
+    const sender = typeof m.sender_id === "string"
+      ? m.sender_id.replace(/[\x00-\x1f\x7f]+/g, " ").slice(0, 128)
+      : "unknown";
+    const line = `${sender}: ${truncateToBytes(m.content, MAX_MESSAGE_BYTES)}\n`;
     const lineBytes = new TextEncoder().encode(line).length;
     if (bytes + lineBytes > MAX_CONTEXT_BYTES) break;
     bytes += lineBytes;
-    lines.unshift(line);
+    lines.push(line);
   }
   void agentId;
-  return lines.join("");
+  return lines.reverse().join("");
 }
