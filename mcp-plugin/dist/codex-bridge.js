@@ -1759,7 +1759,7 @@ class AppServer {
         const err = new Error(`App-server request timed out (${method})`);
         this.fatal(err);
         reject(err);
-      }, Math.max(50, timeoutMs));
+      }, Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.min(Math.max(50, Math.floor(timeoutMs)), 2147483647) : 30000);
       timer.unref?.();
       this.pending.set(id, { method, timer, resolve: resolve4, reject });
       try {
@@ -1772,6 +1772,10 @@ class AppServer {
     });
   }
   receive(message) {
+    if (!message || typeof message !== "object" || Array.isArray(message)) {
+      this.fatal(new Error("Invalid app-server response"));
+      return;
+    }
     if (message.id !== undefined && message.method) {
       try {
         this.write({ id: message.id, error: { code: -32601, message: "Interactive requests unsupported by bridge" } });
@@ -1806,8 +1810,8 @@ class AppServer {
       a.items.set(p.item.id, p.item.text);
     if (message.method === "turn/completed") {
       this.active = undefined;
-      if (p.turn.status !== "completed") {
-        a.reject(new Error(`Codex turn ${p.turn.status}`));
+      if (p.turn?.status !== "completed") {
+        a.reject(new Error(`Codex turn ${p.turn?.status ?? "unknown"}`));
         return;
       }
       for (const item of p.turn.items ?? [])
@@ -1912,14 +1916,14 @@ class AppServer {
     try {
       child.stdin.end();
     } catch {}
-    if (child.exitCode === null) {
+    if (child.exitCode === null && child.signalCode === null) {
       try {
         child.kill("SIGTERM");
       } catch {}
       if (!this.killTimer) {
         this.killTimer = setTimeout(() => {
           this.killTimer = undefined;
-          if (child.exitCode === null) {
+          if (child.exitCode === null && child.signalCode === null) {
             try {
               child.kill("SIGKILL");
             } catch {}

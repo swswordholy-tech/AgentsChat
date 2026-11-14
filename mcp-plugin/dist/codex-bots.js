@@ -1,10 +1,14 @@
 #!/usr/bin/env node
+import { createRequire } from "node:module";
+var __require = /* @__PURE__ */ createRequire(import.meta.url);
+
 // codex/manager.ts
 import { spawn } from "node:child_process";
-import { mkdirSync as mkdirSync2, openSync, closeSync, readFileSync as readFileSync3, writeFileSync, unlinkSync, existsSync as existsSync2, renameSync } from "node:fs";
+import { mkdirSync as mkdirSync2, openSync, closeSync, readFileSync as readFileSync3, writeFileSync, unlinkSync, lstatSync as lstatSync2, renameSync } from "node:fs";
 import { join as join3, resolve as resolve3 } from "node:path";
 import { homedir as homedir3 } from "node:os";
 import { createHash as createHash2 } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
 // codex/bots-config.ts
@@ -1180,9 +1184,9 @@ async function codexPresent(managerPid = process.pid) {
 }
 
 // codex/manager.ts
-var { values } = parseArgs({ options: { "codex-bots": { type: "boolean" }, config: { type: "string" }, "watch-codex": { type: "boolean" }, check: { type: "boolean" }, status: { type: "boolean" }, help: { type: "boolean" } } });
+var values = {};
 var root = join3(homedir3(), ".agentschat/codex-bots");
-var registry = resolve3(values.config ?? defaultRegistry());
+var registry = "";
 var statusFile = join3(root, "status.json");
 var lock = join3(root, "manager.lock");
 var workers = new Map;
@@ -1191,9 +1195,15 @@ var missing = 0;
 var saveSeq = 0;
 var timer;
 function removeDeadLock(file) {
-  if (!existsSync2(file))
+  let raw;
+  try {
+    const stat = lstatSync2(file);
+    if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 64 * 1024)
+      return;
+    raw = readFileSync3(file, "utf8").trim();
+  } catch {
     return;
-  const raw = readFileSync3(file, "utf8").trim();
+  }
   const pid = Number(raw);
   if (!raw || !Number.isInteger(pid) || pid <= 0) {
     try {
@@ -1210,15 +1220,29 @@ function removeDeadLock(file) {
       } catch {}
   }
 }
-function save() {
-  const tmp = `${statusFile}.${process.pid}.${++saveSeq}.tmp`;
+function save(rootDir = root) {
+  const statusFile2 = join3(rootDir, "status.json");
+  const tmp = `${statusFile2}.${process.pid}.${++saveSeq}.tmp`;
+  let created = false;
   try {
-    writeFileSync(tmp, JSON.stringify({ pid: process.pid, updated_at: new Date().toISOString(), bots: [...workers.values()].map((w) => ({ name: w.config.name, agent_id: w.config.agentId, workdir: w.config.cwd, effort: w.config.effort, model: w.config.model, pid: w.child?.pid, status: w.status })) }, null, 2), { mode: 384 });
-    renameSync(tmp, statusFile);
-  } catch {
+    const dir = lstatSync2(rootDir);
+    if (dir.isSymbolicLink() || !dir.isDirectory())
+      return;
     try {
-      unlinkSync(tmp);
-    } catch {}
+      if (lstatSync2(statusFile2).isSymbolicLink())
+        return;
+    } catch (e) {
+      if (e.code !== "ENOENT")
+        return;
+    }
+    writeFileSync(tmp, JSON.stringify({ pid: process.pid, updated_at: new Date().toISOString(), bots: [...workers.values()].map((w) => ({ name: w.config.name, agent_id: w.config.agentId, workdir: w.config.cwd, effort: w.config.effort, model: w.config.model, pid: w.child?.pid, status: w.status })) }, null, 2), { mode: 384, flag: "wx" });
+    created = true;
+    renameSync(tmp, statusFile2);
+  } catch {
+    if (created)
+      try {
+        unlinkSync(tmp);
+      } catch {}
   }
 }
 async function stop(w) {
@@ -1227,12 +1251,19 @@ async function stop(w) {
     await new Promise((done) => {
       const timeout = setTimeout(() => killGroup(child), 20000);
       timeout.unref?.();
-      child.once("exit", () => {
+      const exited = () => {
         clearTimeout(timeout);
         killGroup(child);
         done();
-      });
-      child.kill("SIGTERM");
+      };
+      child.once("exit", exited);
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        clearTimeout(timeout);
+        child.removeListener("exit", exited);
+        done();
+      }
     });
   w.child = undefined;
   w.status = "stopped";
@@ -1250,12 +1281,17 @@ function killGroup(child) {
     child.kill("SIGKILL");
   } catch {}
 }
-function start(w) {
+function start(w, spawnWorker = spawn) {
   removeDeadLock(join3(w.config.stateDir, "bridge.lock"));
   w.status = "starting";
-  const child = spawn(process.execPath, [resolve3(process.argv[1]), "--codex-bridge", "--managed-worker"], { cwd: w.config.cwd, detached: process.platform !== "win32", windowsHide: true, stdio: ["ignore", "pipe", "pipe", "ipc"] });
+  const child = spawnWorker(process.execPath, [resolve3(process.argv[1]), "--codex-bridge", "--managed-worker"], { cwd: w.config.cwd, detached: process.platform !== "win32", windowsHide: true, stdio: ["ignore", "pipe", "pipe", "ipc"] });
   w.child = child;
-  child.once("spawn", () => child.send(w.config, () => {}));
+  child.once("spawn", () => {
+    if (child.connected)
+      try {
+        child.send(w.config, () => {});
+      } catch {}
+  });
   let buffer = "";
   child.stderr?.on("data", (data) => {
     buffer = (buffer + String(data)).slice(-8192);
@@ -1319,6 +1355,13 @@ async function tick() {
   }
   save();
 }
+function removeOwnedLock(file) {
+  try {
+    const stat = lstatSync2(file);
+    if (!stat.isSymbolicLink() && stat.isFile() && stat.size <= 64 * 1024 && readFileSync3(file, "utf8").trim() === String(process.pid))
+      unlinkSync(file);
+  } catch {}
+}
 async function main() {
   if (values.help) {
     console.log(`agentschat-mcp --codex-bots [--config FILE] [--watch-codex] [--check|--status]
@@ -1327,7 +1370,15 @@ Watch polls external Codex processes every 5 seconds.`);
     return;
   }
   if (values.status) {
-    console.log(readFileSync3(statusFile, "utf8"));
+    try {
+      const stat = lstatSync2(statusFile);
+      if (stat.isSymbolicLink() || !stat.isFile())
+        throw new Error("Unsafe status file");
+      console.log(readFileSync3(statusFile, "utf8"));
+    } catch {
+      console.error("Bot manager status unavailable; status file is missing, unsafe, or unreadable");
+      process.exitCode = 1;
+    }
     return;
   }
   const configs = loadBots(registry);
@@ -1355,14 +1406,24 @@ Watch polls external Codex processes every 5 seconds.`);
     await running;
     await Promise.all([...workers.values()].map(stop));
     save();
-    if (readFileSync3(lock, "utf8") === String(process.pid))
-      unlinkSync(lock);
+    removeOwnedLock(lock);
   };
   process.once("SIGINT", () => void shutdown());
   process.once("SIGTERM", () => void shutdown());
   loop();
 }
-main().catch(() => {
-  console.error("Bot manager failed; check registry, profile permissions, and existing manager");
-  process.exitCode = 1;
-});
+if (__require.main == __require.module || process.argv.includes("--codex-bots") || process.argv[1] && resolve3(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  ({ values } = parseArgs({ options: { "codex-bots": { type: "boolean" }, config: { type: "string" }, "watch-codex": { type: "boolean" }, check: { type: "boolean" }, status: { type: "boolean" }, help: { type: "boolean" } } }));
+  registry = resolve3(values.config ?? defaultRegistry());
+  main().catch(() => {
+    console.error("Bot manager failed; check registry, profile permissions, and existing manager");
+    process.exitCode = 1;
+  });
+}
+export {
+  stop,
+  start,
+  save,
+  removeOwnedLock,
+  removeDeadLock
+};
