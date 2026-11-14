@@ -52,6 +52,11 @@ function validateIdentities(identities: readonly Identity[], allowEmptyCredentia
       typeof value !== "string" || (!value.trim() && !(allowEmptyCredentials && value === "")))) {
       throw new Error("missing identity credentials");
     }
+    if (!allowEmptyCredentials &&
+        (/[\x00-\x1f\x7f]/.test(id.gatewayId) ||
+         ["__proto__", "constructor", "prototype"].includes(id.gatewayId.toLowerCase()))) {
+      throw new Error("invalid identity gatewayId");
+    }
     if (bots.has(id.botId.trim()) || agents.has(id.agentId.trim())) {
       throw new Error("duplicate identity botId or agentId — ambiguous routing");
     }
@@ -150,7 +155,7 @@ function matchesExactMention(content: string, id: string): boolean {
 
 /** All exact addressed targets, once each, in identity-table order. */
 export function routeInboundTargets(table: IdentityTable, ctx: InboundContext): Identity[] {
-  if (ctx.channel_id?.startsWith("dm-")) {
+  if (/^dm[-:]/i.test(ctx.channel_id ?? "")) {
     const owner = ctx.dmOwnerBotId ? table.forBot(ctx.dmOwnerBotId) : null;
     return owner ? [owner] : [];
   }
@@ -161,7 +166,7 @@ export function routeInboundTargets(table: IdentityTable, ctx: InboundContext): 
 
 export function routeInbound(table: IdentityTable, ctx: InboundContext): Identity | null {
   // DM: route to the identity that owns the DM channel.
-  if (ctx.channel_id?.startsWith("dm-")) {
+  if (/^dm[-:]/i.test(ctx.channel_id ?? "")) {
     return ctx.dmOwnerBotId ? table.forBot(ctx.dmOwnerBotId) : null;
   }
   // Group/channel: an explicit mentioned_ids annotation wins when present.

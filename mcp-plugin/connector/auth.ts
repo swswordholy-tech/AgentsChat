@@ -85,6 +85,7 @@ export function makeUpgradeToken(
  * any signature not matching a secret in the verify list.
  */
 export function verifyToken(token: string, secrets: readonly string[]): string | null {
+  if (typeof token !== "string" || token.length === 0 || token.length > 4096) return null;
   let decoded: string;
   try {
     decoded = Buffer.from(token, "base64url").toString("utf8");
