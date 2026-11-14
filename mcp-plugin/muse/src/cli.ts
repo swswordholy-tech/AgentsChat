@@ -15,7 +15,7 @@
  * Tokens are never printed. Registration uses the public REST endpoint and
  * shows the nonblocking Terms notice at https://agents-chat.com/terms.
  */
-import { writeFileSync, mkdirSync, renameSync, unlinkSync } from "node:fs";
+import { writeFileSync, mkdirSync, renameSync, unlinkSync, existsSync, lstatSync } from "node:fs";
 import { dirname } from "node:path";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -24,7 +24,7 @@ import { MuseAgentChatClient } from "./client.ts";
 import { loadConfig, PROFILE_PATH, safeConfig } from "./config.ts";
 import { shouldDispatch } from "./policy.ts";
 import { TypingHeartbeat } from "./typing.ts";
-import { appendWakeQueue, buildWakePayload, fireWake } from "./wake.ts";
+import { appendWakeQueue, buildWakePayload, fireWake, redactSecrets } from "./wake.ts";
 
 function arg(name: string, argv: string[]): string | undefined {
   const i = argv.indexOf(name);
@@ -35,19 +35,45 @@ function has(name: string, argv: string[]): boolean {
 }
 
 async function registerOnly(name: string, restUrl: string): Promise<void> {
+  const cleanName = name.trim();
+  if (!cleanName || cleanName.length > 64 || /[\x00-\x1f\x7f]/.test(cleanName)) {
+    throw new Error("Invalid --name value");
+  }
+  const parsedRest = new URL(restUrl.trim());
+  if (parsedRest.username || parsedRest.password) {
+    throw new Error("Embedded credentials are not allowed in AGENTCHAT_REST_URL");
+  }
+  const isLocal = ["localhost", "127.0.0.1", "[::1]", "::1"].includes(parsedRest.hostname.toLowerCase());
+  if (parsedRest.protocol !== "https:" && !(parsedRest.protocol === "http:" && isLocal)) {
+    throw new Error("AGENTCHAT_REST_URL must use https:// (or http:// on loopback)");
+  }
+  const profileDir = dirname(PROFILE_PATH);
+  mkdirSync(profileDir, { recursive: true, mode: 0o700 });
+  if (lstatSync(profileDir).isSymbolicLink()) {
+    throw new Error("Refusing to write Muse profile inside symlinked directory");
+  }
+  if (existsSync(PROFILE_PATH)) {
+    const st = lstatSync(PROFILE_PATH);
+    if (st.isSymbolicLink() || !st.isFile()) {
+      throw new Error("Refusing to overwrite symlink or non-regular Muse profile");
+    }
+  }
   console.log("Terms notice: https://agents-chat.com/terms (notice only, no acceptance prompt)");
-  const res = await fetch(`${restUrl.replace(/\/$/, "")}/api/account/register`, {
+  const res = await fetch(`${restUrl.trim().replace(/\/$/, "")}/api/account/register`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ name, type: "agent", capabilities: ["chat"] }),
+    body: JSON.stringify({ name: cleanName, type: "agent", capabilities: ["chat"] }),
+    redirect: "error",
     signal: AbortSignal.timeout(15_000),
   });
-  if (!res.ok) throw new Error(`Registration failed: ${res.status} ${await res.text()}`);
+  if (!res.ok) {
+    const errBody = redactSecrets((await res.text()).slice(0, 512));
+    throw new Error(`Registration failed: ${res.status} ${errBody}`);
+  }
   const data = (await res.json()) as Record<string, unknown>;
-  const agentId = (data.agentId ?? data.agent_id ?? data.id) as string | undefined;
-  const token = (data.agentKey ?? data.token ?? data.key) as string | undefined;
+  const agentId = String(data.agentId ?? data.agent_id ?? data.id ?? "").trim();
+  const token = String(data.agentKey ?? data.token ?? data.key ?? "").trim();
   if (!agentId || !token) throw new Error("Registration response did not include an agent id/token");
-  mkdirSync(dirname(PROFILE_PATH), { recursive: true, mode: 0o700 });
   const tmp = `${PROFILE_PATH}.${process.pid}.${Date.now()}.tmp`;
   try {
     writeFileSync(tmp, JSON.stringify({ agentId, token }, null, 2), { mode: 0o600 });
@@ -56,7 +82,7 @@ async function registerOnly(name: string, restUrl: string): Promise<void> {
     try { unlinkSync(tmp); } catch {}
     throw err;
   }
-  console.log(`Registered agent '${name}' as ${agentId}. Identity saved to ${PROFILE_PATH} (token not printed).`);
+  console.log(`Registered agent '${cleanName}' as ${agentId}. Identity saved to ${PROFILE_PATH} (token not printed).`);
 }
 
 async function main(): Promise<void> {

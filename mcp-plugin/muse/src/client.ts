@@ -10,6 +10,21 @@ import type { ChatMessage, MessageHandler, MuseAgentChatOptions, WireMessage } f
  * resolves only on an explicit disconnect(), not on transient drops, so a
  * long-lived Muse bot survives network blips without manual restarts.
  */
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
+const MAX_JOINED_CHANNELS = 256;
+
+function safeDelayMs(value: number | undefined, fallback: number, min = 0): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < min) return fallback;
+  return Math.min(value, MAX_TIMER_DELAY_MS);
+}
+
+function normalizeChannelId(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 128 || /[\x00-\x20\x7f]/.test(trimmed)) return null;
+  return trimmed;
+}
+
 export class MuseAgentChatClient {
   private ws: WebSocket | null = null;
   private sessionId: string | null = null;
@@ -46,11 +61,11 @@ export class MuseAgentChatClient {
     this.agentId = options.agentId;
     this.token = options.token;
     this.capabilities = options.capabilities ?? ["chat"];
-    this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 30_000;
-    this.connectTimeoutMs = options.connectTimeoutMs ?? 15_000;
+    this.heartbeatIntervalMs = safeDelayMs(options.heartbeatIntervalMs, 30_000, 100);
+    this.connectTimeoutMs = safeDelayMs(options.connectTimeoutMs, 15_000, 0);
     this.reconnect = options.reconnect ?? true;
-    this.initialReconnectDelayMs = options.initialReconnectDelayMs ?? 1_000;
-    this.maxReconnectDelayMs = options.maxReconnectDelayMs ?? 60_000;
+    this.initialReconnectDelayMs = safeDelayMs(options.initialReconnectDelayMs, 1_000, 0);
+    this.maxReconnectDelayMs = safeDelayMs(options.maxReconnectDelayMs, 60_000, 0);
     this.onDebug = options.onDebug;
     this.onReconnect = options.onReconnect;
   }
@@ -151,17 +166,20 @@ export class MuseAgentChatClient {
   }
 
   joinChannel(channelId: string): void {
-    if (channelId) {
-      this.joinedChannels.add(channelId);
-      this.sessionJoined.add(channelId);
-    }
-    this.send({ type: "join_channel", channel_id: channelId, agent_id: this.agentId });
+    const clean = normalizeChannelId(channelId);
+    if (!clean) return;
+    if (!this.joinedChannels.has(clean) && this.joinedChannels.size >= MAX_JOINED_CHANNELS) return;
+    this.joinedChannels.add(clean);
+    this.sessionJoined.add(clean);
+    this.send({ type: "join_channel", channel_id: clean, agent_id: this.agentId });
   }
 
   leaveChannel(channelId: string): void {
-    this.joinedChannels.delete(channelId);
-    this.sessionJoined.delete(channelId);
-    this.send({ type: "leave_channel", channel_id: channelId, agent_id: this.agentId });
+    const clean = normalizeChannelId(channelId);
+    if (!clean) return;
+    this.joinedChannels.delete(clean);
+    this.sessionJoined.delete(clean);
+    this.send({ type: "leave_channel", channel_id: clean, agent_id: this.agentId });
   }
 
   sendMessage(
@@ -268,8 +286,9 @@ export class MuseAgentChatClient {
         delay = this.nextReconnectDelayOverrideMs;
         this.nextReconnectDelayOverrideMs = null;
       } else {
+        const exp = Math.min(Math.max(0, this.reconnectAttempt), 30);
         delay = Math.min(
-          this.initialReconnectDelayMs * 2 ** this.reconnectAttempt,
+          this.initialReconnectDelayMs * 2 ** exp,
           this.maxReconnectDelayMs,
         );
         this.reconnectAttempt += 1;
@@ -289,12 +308,16 @@ export class MuseAgentChatClient {
   }
 
   private handleMessage(raw: string): void {
-    let msg: WireMessage;
+    let parsed: unknown;
     try {
-      msg = JSON.parse(raw) as WireMessage;
+      parsed = JSON.parse(raw);
     } catch {
       return;
     }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return;
+    }
+    const msg = parsed as WireMessage;
     if (msg.type === "auth_ok") {
       this.clearConnectTimer();
       this.sessionId = typeof msg.session_id === "string" ? msg.session_id : null;

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -8,6 +8,7 @@ import {
   buildMuseWakePrompt,
   buildWakePayload,
   fireWake,
+  redactSecrets,
   signWakeBody,
   verifyWakeSignature,
 } from "../src/wake.ts";
@@ -118,4 +119,48 @@ test("muse wake prompt names channel, sender and message id", () => {
   assert.ok(prompt.includes("welcome"));
   assert.ok(prompt.includes("alice"));
   assert.ok(prompt.includes("m1"));
+});
+
+test("Campaign #97: appendWakeQueue rejects symlinks, fireWake blocks non-http schemes and sets redirect:error, and redactSecrets scrubs Bearer/sk-", async () => {
+  assert.equal(redactSecrets("Authorization: Bearer topsecret999 key=sk-abcdefghijkl123456"), "Authorization: [redacted] key=[redacted]");
+
+  const dir = mkdtempSync(join(tmpdir(), "muse-wake97-"));
+  const target = join(dir, "target.txt");
+  const symQueue = join(dir, "sym-queue.jsonl");
+  writeFileSync(target, "keep");
+  symlinkSync(target, symQueue);
+  assert.throws(
+    () => appendWakeQueue(symQueue, { type: "message", message_id: "m-sym" }),
+    /symlink/,
+  );
+  assert.equal(readFileSync(target, "utf8"), "keep");
+
+  let called = false;
+  const logs = [];
+  await fireWake(
+    { id: "m-file", channel_id: "dm-1", sender_id: "bob", content: "hi" },
+    {
+      url: "file:///etc/passwd",
+      logger: (m) => logs.push(m),
+      fetchImpl: async () => {
+        called = true;
+        return new Response("ok");
+      },
+    },
+  );
+  assert.equal(called, false);
+  assert.equal(logs.length, 1);
+
+  let seenRedirect = "";
+  await fireWake(
+    { id: "m-redir", channel_id: "dm-1", sender_id: "bob", content: "hi" },
+    {
+      url: "https://example.com/wake",
+      fetchImpl: async (_url, init) => {
+        seenRedirect = String(init?.redirect ?? "");
+        return new Response("ok");
+      },
+    },
+  );
+  assert.equal(seenRedirect, "error");
 });

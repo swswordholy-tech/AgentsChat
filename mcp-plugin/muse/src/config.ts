@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -14,6 +14,41 @@ export interface MuseAgentChatConfig {
 export const DEFAULT_WS_URL = "wss://agents-chat.com/ws";
 export const DEFAULT_REST_URL = "https://agents-chat.com";
 export const PROFILE_PATH = join(homedir(), ".agentschat", "muse.json");
+const MAX_PROFILE_BYTES = 64 * 1024;
+
+function isLoopbackHost(hostname: string): boolean {
+  const h = hostname.toLowerCase();
+  return h === "localhost" || h === "127.0.0.1" || h === "[::1]" || h === "::1";
+}
+
+function validateEndpointUrl(raw: string, kind: "ws" | "rest"): string {
+  const trimmed = raw.trim();
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    throw new Error(`Invalid Muse ${kind} URL`);
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error(`Embedded credentials are not allowed in Muse ${kind} URL`);
+  }
+  if (kind === "ws") {
+    if (parsed.protocol !== "wss:" && parsed.protocol !== "ws:") {
+      throw new Error(`Invalid Muse ws URL protocol: ${parsed.protocol}`);
+    }
+    if (parsed.protocol === "ws:" && !isLoopbackHost(parsed.hostname)) {
+      throw new Error("Remote Muse ws URL must use wss://");
+    }
+  } else {
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+      throw new Error(`Invalid Muse rest URL protocol: ${parsed.protocol}`);
+    }
+    if (parsed.protocol === "http:" && !isLoopbackHost(parsed.hostname)) {
+      throw new Error("Remote Muse rest URL must use https://");
+    }
+  }
+  return trimmed;
+}
 
 export function redact(value: string | undefined): string {
   if (!value) return "(missing)";
@@ -45,7 +80,12 @@ interface ProfileFile {
 function readProfile(path = PROFILE_PATH): ProfileFile {
   try {
     if (!existsSync(path)) return {};
-    return JSON.parse(readFileSync(path, "utf8")) as ProfileFile;
+    const st = lstatSync(path);
+    if (!st.isFile() || st.isSymbolicLink() || st.size > MAX_PROFILE_BYTES) return {};
+    const parsed = JSON.parse(readFileSync(path, "utf8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as ProfileFile)
+      : {};
   } catch {
     return {};
   }
@@ -59,21 +99,25 @@ function readProfile(path = PROFILE_PATH): ProfileFile {
  */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env, profilePath?: string): MuseAgentChatConfig {
   const profile = readProfile(profilePath);
-  const agentId = env.AGENTCHAT_AGENT_ID ?? profile.agentId;
-  const token = env.AGENTCHAT_TOKEN ?? profile.token;
-  if (!agentId || !token) {
+  const rawAgentId = (env.AGENTCHAT_AGENT_ID ?? profile.agentId ?? "").trim();
+  const rawToken = (env.AGENTCHAT_TOKEN ?? profile.token ?? "").trim();
+  if (!rawAgentId || !rawToken || /[\x00-\x1f\x7f]/.test(rawAgentId) || /[\x00-\x1f\x7f]/.test(rawToken)) {
     throw new Error(
       "Missing AgentsChat identity: set AGENTCHAT_AGENT_ID and AGENTCHAT_TOKEN, " +
         `or create ${profilePath ?? PROFILE_PATH} via 'muse-agentchat --register-only --name <name>'. ` +
         "Tokens are never printed; see README for registration.",
     );
   }
+  const wsUrl = validateEndpointUrl(env.AGENTCHAT_WS_URL ?? profile.wsUrl ?? DEFAULT_WS_URL, "ws");
+  const restUrl = validateEndpointUrl(env.AGENTCHAT_REST_URL ?? profile.restUrl ?? DEFAULT_REST_URL, "rest");
+  const rawDisplay = (env.AGENTCHAT_DISPLAY_NAME ?? profile.displayName)?.trim();
+  const rawChannel = (env.AGENTCHAT_CHANNEL_ID ?? profile.defaultChannelId)?.trim();
   return {
-    agentId,
-    token,
-    wsUrl: env.AGENTCHAT_WS_URL ?? profile.wsUrl ?? DEFAULT_WS_URL,
-    restUrl: env.AGENTCHAT_REST_URL ?? profile.restUrl ?? DEFAULT_REST_URL,
-    displayName: env.AGENTCHAT_DISPLAY_NAME ?? profile.displayName,
-    defaultChannelId: env.AGENTCHAT_CHANNEL_ID ?? profile.defaultChannelId,
+    agentId: rawAgentId,
+    token: rawToken,
+    wsUrl,
+    restUrl,
+    displayName: rawDisplay || undefined,
+    defaultChannelId: rawChannel || undefined,
   };
 }

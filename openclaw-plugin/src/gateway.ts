@@ -28,11 +28,12 @@ function trace(line: string) {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") return;
     }
-    // Verify the opened descriptor too; NOFOLLOW closes the lstat/open race.
-    fd = openSync(debugLogPath, constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o600);
+    // Verify the opened descriptor too; NOFOLLOW closes the lstat/open race on POSIX.
+    const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
+    fd = openSync(debugLogPath, flags, 0o600);
     const stat = fstatSync(fd);
     if (!stat.isFile()) return;
-    fchmodSync(fd, 0o600);
+    try { fchmodSync(fd, 0o600); } catch {}
     const data = Buffer.from(`${new Date().toISOString()} ${redact(line)}\n`).subarray(0, MAX_TRACE_BYTES);
     if (stat.size + data.length > MAX_TRACE_BYTES) ftruncateSync(fd, 0);
     writeSync(fd, data);

@@ -1,5 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 /**
@@ -59,7 +59,8 @@ export interface WakePayload {
 
 export function redactSecrets(text: string): string {
   return text
-    .replace(/ac_[A-Za-z0-9_-]+/g, "[redacted]")
+    .replace(/\bBearer\s+[^\s"'<>\\]+/gi, "[redacted]")
+    .replace(/(?:ac_|sk-)[A-Za-z0-9_-]+/g, "[redacted]")
     .replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[redacted]");
 }
 
@@ -144,16 +145,31 @@ export async function fireWake(msg: WakeMessage, cfg: WakeConfig): Promise<void>
   const url = (cfg.url ?? "").trim();
   if (!url) return;
   const safeLogUrl = sanitizeWakeLogUrl(url);
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(url);
+  } catch {
+    log(`[muse-agentchat] wake POST rejected invalid URL: ${safeLogUrl}`);
+    return;
+  }
+  if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+    log(`[muse-agentchat] wake POST rejected unsupported protocol: ${parsedUrl.protocol}`);
+    return;
+  }
+  const timeoutMs =
+    typeof cfg.timeoutMs === "number" && Number.isFinite(cfg.timeoutMs) && cfg.timeoutMs >= 1
+      ? Math.min(cfg.timeoutMs, 60_000)
+      : 5_000;
   const body = JSON.stringify(buildWakePayload(msg, { targetSessionId: cfg.targetSessionId }));
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (cfg.secret) headers[WAKE_SIG_HEADER] = signWakeBody(body, cfg.secret);
   const doPost = async (): Promise<void> => {
     const f = cfg.fetchImpl ?? fetch;
     const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), cfg.timeoutMs ?? 5000);
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
     t.unref?.();
     try {
-      const res = await f(url, { method: "POST", headers, body, signal: ctrl.signal });
+      const res = await f(url, { method: "POST", headers, body, redirect: "error", signal: ctrl.signal });
       try {
         await (res as Response)?.body?.cancel?.();
       } catch {}
@@ -183,10 +199,24 @@ let wakeTmpSeq = 0;
  * Returns true if appended, false if it was already queued.
  */
 export function appendWakeQueue(queueFile: string, payload: WakePayload, maxLines = MAX_WAKE_QUEUE_LINES): boolean {
-  mkdirSync(dirname(queueFile), { recursive: true, mode: 0o700 });
+  const dir = dirname(queueFile);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  if (lstatSync(dir).isSymbolicLink()) {
+    throw new Error("Refusing to write Muse wake queue inside symlinked directory");
+  }
   const line = JSON.stringify(payload);
   let existingLines: string[] = [];
-  if (existsSync(queueFile)) {
+  let existedBefore = false;
+  try {
+    const st = lstatSync(queueFile);
+    if (st.isSymbolicLink() || !st.isFile()) {
+      throw new Error("Refusing to use symlink or non-regular file for Muse wake queue");
+    }
+    existedBefore = true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err;
+  }
+  if (existedBefore) {
     const existing = readFileSync(queueFile, "utf8");
     existingLines = existing.split("\n").filter((l) => l.length > 0);
     if (
@@ -202,7 +232,7 @@ export function appendWakeQueue(queueFile: string, payload: WakePayload, maxLine
       return false;
     }
   }
-  const cap = Math.max(1, maxLines);
+  const cap = Number.isFinite(maxLines) ? Math.max(1, Math.floor(maxLines)) : MAX_WAKE_QUEUE_LINES;
   if (existingLines.length >= cap) {
     const kept = [...existingLines.slice(-(cap - 1)), line];
     const tmp = `${queueFile}.${process.pid}.${Date.now()}.${++wakeTmpSeq}.tmp`;
@@ -215,7 +245,6 @@ export function appendWakeQueue(queueFile: string, payload: WakePayload, maxLine
     }
     return true;
   }
-  const existedBefore = existsSync(queueFile);
   appendFileSync(queueFile, `${line}\n`, { mode: 0o600 });
   if (!existedBefore && process.platform !== "win32") {
     try { chmodSync(queueFile, 0o600); } catch {}

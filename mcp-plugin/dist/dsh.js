@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // dsh/src/cli.ts
-import { chmodSync as chmodSync3, lstatSync as lstatSync2, mkdirSync as mkdirSync4, readFileSync as readFileSync6, renameSync as renameSync3, unlinkSync as unlinkSync4, writeFileSync as writeFileSync3 } from "node:fs";
+import { chmodSync as chmodSync3, lstatSync as lstatSync3, mkdirSync as mkdirSync4, readFileSync as readFileSync6, renameSync as renameSync3, unlinkSync as unlinkSync4, writeFileSync as writeFileSync3 } from "node:fs";
 import { spawn } from "node:child_process";
 import { dirname as dirname3, join as join6 } from "node:path";
 import { homedir as homedir5 } from "node:os";
@@ -126,6 +126,8 @@ class MuseBridge {
     return this.client.isConnected;
   }
   async handleMessage(message) {
+    if (!message.channel_id)
+      return;
     if (!this.history.has(message.channel_id) && this.history.size >= 200) {
       const oldest = this.history.keys().next().value;
       if (oldest !== undefined)
@@ -134,7 +136,8 @@ class MuseBridge {
     const list = this.history.get(message.channel_id) ?? [];
     list.push(message);
     this.history.set(message.channel_id, list.slice(-50));
-    const kind = this.opts.channelKinds?.[message.channel_id];
+    const kinds = this.opts.channelKinds;
+    const kind = kinds && Object.prototype.hasOwnProperty.call(kinds, message.channel_id) ? kinds[message.channel_id] : undefined;
     if (!shouldDispatch(message, { agentId: this.opts.agentId, displayName: this.opts.displayName, channelKind: kind })) {
       return;
     }
@@ -170,6 +173,22 @@ function resolveDrainReconnectDelay(frame, rand = Math.random) {
 }
 
 // muse/src/client.ts
+var MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
+var MAX_JOINED_CHANNELS = 256;
+function safeDelayMs(value, fallback, min = 0) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < min)
+    return fallback;
+  return Math.min(value, MAX_TIMER_DELAY_MS);
+}
+function normalizeChannelId(raw) {
+  if (typeof raw !== "string")
+    return null;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 128 || /[\x00-\x20\x7f]/.test(trimmed))
+    return null;
+  return trimmed;
+}
+
 class MuseAgentChatClient {
   ws = null;
   sessionId = null;
@@ -204,11 +223,11 @@ class MuseAgentChatClient {
     this.agentId = options.agentId;
     this.token = options.token;
     this.capabilities = options.capabilities ?? ["chat"];
-    this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 30000;
-    this.connectTimeoutMs = options.connectTimeoutMs ?? 15000;
+    this.heartbeatIntervalMs = safeDelayMs(options.heartbeatIntervalMs, 30000, 100);
+    this.connectTimeoutMs = safeDelayMs(options.connectTimeoutMs, 15000, 0);
     this.reconnect = options.reconnect ?? true;
-    this.initialReconnectDelayMs = options.initialReconnectDelayMs ?? 1000;
-    this.maxReconnectDelayMs = options.maxReconnectDelayMs ?? 60000;
+    this.initialReconnectDelayMs = safeDelayMs(options.initialReconnectDelayMs, 1000, 0);
+    this.maxReconnectDelayMs = safeDelayMs(options.maxReconnectDelayMs, 60000, 0);
     this.onDebug = options.onDebug;
     this.onReconnect = options.onReconnect;
   }
@@ -301,16 +320,22 @@ class MuseAgentChatClient {
     this.errorHandlers.push(handler);
   }
   joinChannel(channelId) {
-    if (channelId) {
-      this.joinedChannels.add(channelId);
-      this.sessionJoined.add(channelId);
-    }
-    this.send({ type: "join_channel", channel_id: channelId, agent_id: this.agentId });
+    const clean = normalizeChannelId(channelId);
+    if (!clean)
+      return;
+    if (!this.joinedChannels.has(clean) && this.joinedChannels.size >= MAX_JOINED_CHANNELS)
+      return;
+    this.joinedChannels.add(clean);
+    this.sessionJoined.add(clean);
+    this.send({ type: "join_channel", channel_id: clean, agent_id: this.agentId });
   }
   leaveChannel(channelId) {
-    this.joinedChannels.delete(channelId);
-    this.sessionJoined.delete(channelId);
-    this.send({ type: "leave_channel", channel_id: channelId, agent_id: this.agentId });
+    const clean = normalizeChannelId(channelId);
+    if (!clean)
+      return;
+    this.joinedChannels.delete(clean);
+    this.sessionJoined.delete(clean);
+    this.send({ type: "leave_channel", channel_id: clean, agent_id: this.agentId });
   }
   sendMessage(channelId, content, contentType = "text", replyTo) {
     this.send({
@@ -413,7 +438,8 @@ class MuseAgentChatClient {
         delay = this.nextReconnectDelayOverrideMs;
         this.nextReconnectDelayOverrideMs = null;
       } else {
-        delay = Math.min(this.initialReconnectDelayMs * 2 ** this.reconnectAttempt, this.maxReconnectDelayMs);
+        const exp = Math.min(Math.max(0, this.reconnectAttempt), 30);
+        delay = Math.min(this.initialReconnectDelayMs * 2 ** exp, this.maxReconnectDelayMs);
         this.reconnectAttempt += 1;
       }
       this.isReconnecting = true;
@@ -429,12 +455,16 @@ class MuseAgentChatClient {
     this.ws.send(JSON.stringify(payload));
   }
   handleMessage(raw) {
-    let msg;
+    let parsed;
     try {
-      msg = JSON.parse(raw);
+      parsed = JSON.parse(raw);
     } catch {
       return;
     }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return;
+    }
+    const msg = parsed;
     if (msg.type === "auth_ok") {
       this.clearConnectTimer();
       this.sessionId = typeof msg.session_id === "string" ? msg.session_id : null;
@@ -517,6 +547,7 @@ class MuseAgentChatClient {
 import { homedir } from "node:os";
 import { join } from "node:path";
 var PROFILE_PATH = join(homedir(), ".agentschat", "muse.json");
+var MAX_PROFILE_BYTES = 64 * 1024;
 function redact(value) {
   if (!value)
     return "(missing)";
@@ -527,12 +558,12 @@ function redact(value) {
 
 // muse/src/wake.ts
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 var WAKE_SIG_HEADER = "x-agentschat-signature";
 var WAKE_CONTENT_MAX = 500;
 function redactSecrets(text) {
-  return text.replace(/ac_[A-Za-z0-9_-]+/g, "[redacted]").replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[redacted]");
+  return text.replace(/\bBearer\s+[^\s"'<>\\]+/gi, "[redacted]").replace(/(?:ac_|sk-)[A-Za-z0-9_-]+/g, "[redacted]").replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[redacted]");
 }
 function buildWakePayload(msg, opts = {}) {
   const content = typeof msg.content === "string" ? redactSecrets(msg.content.slice(0, WAKE_CONTENT_MAX)) : undefined;
@@ -569,6 +600,18 @@ async function fireWake(msg, cfg) {
   if (!url)
     return;
   const safeLogUrl = sanitizeWakeLogUrl(url);
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(url);
+  } catch {
+    log(`[muse-agentchat] wake POST rejected invalid URL: ${safeLogUrl}`);
+    return;
+  }
+  if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+    log(`[muse-agentchat] wake POST rejected unsupported protocol: ${parsedUrl.protocol}`);
+    return;
+  }
+  const timeoutMs = typeof cfg.timeoutMs === "number" && Number.isFinite(cfg.timeoutMs) && cfg.timeoutMs >= 1 ? Math.min(cfg.timeoutMs, 60000) : 5000;
   const body = JSON.stringify(buildWakePayload(msg, { targetSessionId: cfg.targetSessionId }));
   const headers = { "Content-Type": "application/json" };
   if (cfg.secret)
@@ -576,10 +619,10 @@ async function fireWake(msg, cfg) {
   const doPost = async () => {
     const f = cfg.fetchImpl ?? fetch;
     const ctrl = new AbortController;
-    const t = setTimeout(() => ctrl.abort(), cfg.timeoutMs ?? 5000);
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
     t.unref?.();
     try {
-      const res = await f(url, { method: "POST", headers, body, signal: ctrl.signal });
+      const res = await f(url, { method: "POST", headers, body, redirect: "error", signal: ctrl.signal });
       try {
         await res?.body?.cancel?.();
       } catch {}
@@ -602,10 +645,25 @@ async function fireWake(msg, cfg) {
 var MAX_WAKE_QUEUE_LINES = 500;
 var wakeTmpSeq = 0;
 function appendWakeQueue(queueFile, payload, maxLines = MAX_WAKE_QUEUE_LINES) {
-  mkdirSync(dirname(queueFile), { recursive: true, mode: 448 });
+  const dir = dirname(queueFile);
+  mkdirSync(dir, { recursive: true, mode: 448 });
+  if (lstatSync(dir).isSymbolicLink()) {
+    throw new Error("Refusing to write Muse wake queue inside symlinked directory");
+  }
   const line = JSON.stringify(payload);
   let existingLines = [];
-  if (existsSync(queueFile)) {
+  let existedBefore = false;
+  try {
+    const st = lstatSync(queueFile);
+    if (st.isSymbolicLink() || !st.isFile()) {
+      throw new Error("Refusing to use symlink or non-regular file for Muse wake queue");
+    }
+    existedBefore = true;
+  } catch (err) {
+    if (err?.code !== "ENOENT")
+      throw err;
+  }
+  if (existedBefore) {
     const existing = readFileSync(queueFile, "utf8");
     existingLines = existing.split(`
 `).filter((l) => l.length > 0);
@@ -619,7 +677,7 @@ function appendWakeQueue(queueFile, payload, maxLines = MAX_WAKE_QUEUE_LINES) {
       return false;
     }
   }
-  const cap = Math.max(1, maxLines);
+  const cap = Number.isFinite(maxLines) ? Math.max(1, Math.floor(maxLines)) : MAX_WAKE_QUEUE_LINES;
   if (existingLines.length >= cap) {
     const kept = [...existingLines.slice(-(cap - 1)), line];
     const tmp = `${queueFile}.${process.pid}.${Date.now()}.${++wakeTmpSeq}.tmp`;
@@ -636,7 +694,6 @@ function appendWakeQueue(queueFile, payload, maxLines = MAX_WAKE_QUEUE_LINES) {
     }
     return true;
   }
-  const existedBefore = existsSync(queueFile);
   appendFileSync(queueFile, `${line}
 `, { mode: 384 });
   if (!existedBefore && process.platform !== "win32") {
@@ -824,7 +881,7 @@ function resolveWindowsCliSpawn(cmd, args, opts) {
 }
 
 // dsh/src/patch.ts
-import { chmodSync as chmodSync2, lstatSync, mkdirSync as mkdirSync3, readFileSync as readFileSync5, renameSync as renameSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2 } from "node:fs";
+import { chmodSync as chmodSync2, lstatSync as lstatSync2, mkdirSync as mkdirSync3, readFileSync as readFileSync5, renameSync as renameSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2 } from "node:fs";
 import { dirname as dirname2, join as join5 } from "node:path";
 import { homedir as homedir4 } from "node:os";
 var FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
@@ -960,7 +1017,7 @@ function applyDshCordisPatchFile(opts = {}) {
   let existed = false;
   let mode = 384;
   try {
-    const lst = lstatSync(patchPath);
+    const lst = lstatSync2(patchPath);
     if (lst.isSymbolicLink() || !lst.isFile()) {
       throw new Error(`Refusing to modify non-regular or symlinked DSH patch file: ${patchPath}`);
     }
@@ -1024,7 +1081,7 @@ function validateHttpOrWsUrl(raw, allowedProtocols, label) {
 function loadDshConfig(env = process.env, profilePath = DSH_PROFILE_PATH) {
   let profile = {};
   try {
-    const lst = lstatSync2(profilePath);
+    const lst = lstatSync3(profilePath);
     if (!lst.isSymbolicLink() && lst.isFile() && lst.size <= 256 * 1024) {
       const parsed = JSON.parse(readFileSync6(profilePath, "utf8"));
       if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
@@ -1087,7 +1144,7 @@ async function registerOnly(name, restUrl, profilePath = DSH_PROFILE_PATH) {
     throw new Error("Registration response did not include a valid agent id/token");
   }
   try {
-    const lst = lstatSync2(profilePath);
+    const lst = lstatSync3(profilePath);
     if (lst.isSymbolicLink() || !lst.isFile()) {
       throw new Error(`Refusing to overwrite non-regular file ${profilePath}`);
     }
@@ -1305,7 +1362,7 @@ DeepSeek Harness (dsh) integration for AgentsChat:
             const candidates = [join6(cfgDir, "profiles", `${base}.json`), join6(cfgDir, `${base}.json`)];
             const profPath = candidates.find((p) => {
               try {
-                const lst = lstatSync2(p);
+                const lst = lstatSync3(p);
                 return !lst.isSymbolicLink() && lst.isFile() && lst.size <= 256 * 1024;
               } catch {
                 return false;

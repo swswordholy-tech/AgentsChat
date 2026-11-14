@@ -327,3 +327,46 @@ test("reconnect auth timeout recovers from stalled half-open socket and re-joins
     await server.close();
   }
 });
+
+test("Campaign #97: MuseAgentChatClient ignores non-object/array frames, caps joinedChannels, and avoids backoff NaN overflow", async () => {
+  const server = new MockServer();
+  const port = await server.listen();
+  server.onMessage = (msg, socket) => {
+    if (msg.type === "auth") {
+      server.send(socket, { type: "auth_ok", agent_id: msg.agent_id, session_id: `s-${server.connections}` });
+    }
+  };
+  const debugEvents = [];
+  const client = new MuseAgentChatClient({
+    url: `ws://127.0.0.1:${port}`,
+    agentId: "muse-bot",
+    token: "t",
+    initialReconnectDelayMs: 0,
+    maxReconnectDelayMs: 50,
+    onDebug: (event, meta) => debugEvents.push({ event, meta }),
+  });
+  try {
+    await client.connect();
+    // Non-object / array frames must be ignored cleanly without throwing
+    client.handleMessage("null");
+    client.handleMessage("123");
+    client.handleMessage('["array","frame"]');
+    // Control-char / oversize channel_created must be rejected, and valid channels capped at 256
+    client.handleMessage(JSON.stringify({ type: "channel_created", channel_id: "bad\nroom" }));
+    for (let i = 0; i < 270; i++) {
+      client.joinChannel(`room-${i}`);
+    }
+    assert.equal(client.joinedChannels.size, 256);
+
+    // Simulate extreme reconnectAttempt=2000 with initialReconnectDelayMs=0 (previously 0 * Infinity === NaN!)
+    client.reconnectAttempt = 2000;
+    server.sockets[0].destroy();
+    await waitFor(() => debugEvents.some((e) => e.event === "reconnect:scheduled"), "reconnect scheduled");
+    const sched = debugEvents.find((e) => e.event === "reconnect:scheduled");
+    assert.equal(Number.isFinite(sched.meta.delayMs), true);
+    assert.equal(sched.meta.delayMs, 0);
+  } finally {
+    client.disconnect();
+    await server.close();
+  }
+});

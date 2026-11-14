@@ -62,6 +62,7 @@ export class MuseBridge {
 
   /** Test seam: feed an inbound message without a socket. */
   async handleMessage(message: ChatMessage): Promise<void> {
+    if (!message.channel_id) return;
     if (!this.history.has(message.channel_id) && this.history.size >= 200) {
       const oldest = this.history.keys().next().value;
       if (oldest !== undefined) this.history.delete(oldest);
@@ -69,7 +70,10 @@ export class MuseBridge {
     const list = this.history.get(message.channel_id) ?? [];
     list.push(message);
     this.history.set(message.channel_id, list.slice(-50));
-    const kind = this.opts.channelKinds?.[message.channel_id];
+    const kinds = this.opts.channelKinds;
+    const kind = kinds && Object.prototype.hasOwnProperty.call(kinds, message.channel_id)
+      ? kinds[message.channel_id]
+      : undefined;
     if (!shouldDispatch(message, { agentId: this.opts.agentId, displayName: this.opts.displayName, channelKind: kind })) {
       return;
     }
