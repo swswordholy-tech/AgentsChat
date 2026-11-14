@@ -17,6 +17,7 @@
  */
 import {
   lstatSync,
+  realpathSync,
   writeFileSync,
   renameSync,
   copyFileSync,
@@ -27,6 +28,7 @@ import {
   type Stats,
 } from "fs";
 import { dirname, join, resolve } from "path";
+import { redactSecrets } from "./redact.ts";
 
 /** Where diagnostics go. Injectable so tests can assert on them. */
 export type Warn = (message: string) => void;
@@ -34,9 +36,13 @@ export type Warn = (message: string) => void;
 const defaultWarn: Warn = (m) => process.stderr.write(m);
 const MAX_PROFILE_JSON_BYTES = 64 * 1024;
 const CONTROL_CHAR_GLOBAL_RE = /[\x00-\x1f\x7f]/g;
+const DARWIN_SYSTEM_SYMLINKS = new Set(["/var", "/tmp", "/etc"]);
 
 function sanitizeWarnPart(value: unknown): string {
-  return String(value ?? "").replace(CONTROL_CHAR_GLOBAL_RE, "?");
+  return redactSecrets(String(value ?? ""))
+    .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED]")
+    .replace(/\b(?:agent_key_|sk-|whsec_|gh[pousr]_|github_pat_|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g, "[REDACTED]")
+    .replace(CONTROL_CHAR_GLOBAL_RE, "?");
 }
 
 function safeLstat(target: string): Stats | undefined {
@@ -48,10 +54,40 @@ function safeLstat(target: string): Stats | undefined {
   }
 }
 
+function isAllowedDarwinSystemSymlink(dirPath: string): boolean {
+  if (process.platform !== "darwin" || !DARWIN_SYSTEM_SYMLINKS.has(dirPath)) return false;
+  try {
+    const resolved = realpathSync(dirPath);
+    if (resolved !== `/private${dirPath}`) return false;
+    const realSt = lstatSync(resolved);
+    return realSt.isDirectory() && !realSt.isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+function hasSafeAncestorDirs(targetPath: string): boolean {
+  let cur = dirname(resolve(targetPath));
+  for (let depth = 0; depth < 64; depth += 1) {
+    const st = safeLstat(cur);
+    if (st) {
+      if (st.isSymbolicLink()) {
+        if (!isAllowedDarwinSystemSymlink(cur)) return false;
+      } else if (!st.isDirectory()) {
+        return false;
+      }
+    }
+    const parent = dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+  return true;
+}
+
 export function safeWriteProfile(path: string, data: unknown, warn: Warn = defaultWarn): void {
   const parentDir = dirname(path);
   const parentStat = safeLstat(parentDir);
-  if (!parentStat || parentStat.isSymbolicLink() || !parentStat.isDirectory()) {
+  if (!parentStat || parentStat.isSymbolicLink() || !parentStat.isDirectory() || !hasSafeAncestorDirs(path)) {
     throw new Error(`Refusing to write profile into invalid or symlinked parent directory: ${sanitizeWarnPart(parentDir)}`);
   }
 
@@ -78,7 +114,7 @@ export function safeWriteProfile(path: string, data: unknown, warn: Warn = defau
 
   // Re-verify parent and target right before renameSync to narrow TOCTOU symlink swaps.
   const currentParent = safeLstat(parentDir);
-  if (!currentParent || currentParent.isSymbolicLink() || !currentParent.isDirectory()) {
+  if (!currentParent || currentParent.isSymbolicLink() || !currentParent.isDirectory() || !hasSafeAncestorDirs(path)) {
     try { unlinkSync(tmp); } catch {}
     throw new Error(`Refusing to write profile into symlinked parent directory: ${sanitizeWarnPart(parentDir)}`);
   }
@@ -148,11 +184,16 @@ export interface DefaultProfileCollision {
 
 const NON_PROFILE_JSON_FILES = new Set([
   "session-binds.json",
+  "session-binds.meta.json",
   "agy-binds.json",
+  "agy-binds.meta.json",
   "grok-binds.json",
   "grok-binds-meta.json",
   "grok-binds.meta.json",
   "identity-guard.json",
+  "cursor.json",
+  "read-cursors.json",
+  "wake-pids.json",
   "dsh.json",
   "config.json",
 ]);
@@ -167,7 +208,7 @@ export function findDefaultProfileCollision(
   configDir: string,
   defaultProfilePath: string,
 ): DefaultProfileCollision | null {
-  if (!defaultProfilePath) return null;
+  if (!defaultProfilePath || !hasSafeAncestorDirs(defaultProfilePath)) return null;
   const defStat = safeLstat(defaultProfilePath);
   if (!defStat || defStat.isSymbolicLink() || !defStat.isFile() || defStat.size > MAX_PROFILE_JSON_BYTES) {
     return null;
@@ -178,14 +219,23 @@ export function findDefaultProfileCollision(
   } catch {
     return null;
   }
-  if (!defParsed || typeof defParsed !== "object" || Array.isArray(defParsed)) return null;
+  if (
+    !defParsed ||
+    typeof defParsed !== "object" ||
+    Array.isArray(defParsed) ||
+    Object.prototype.hasOwnProperty.call(defParsed, "__proto__")
+  ) {
+    return null;
+  }
   const defAgentId = typeof defParsed.agent_id === "string" ? defParsed.agent_id.trim() : "";
   const defDisplayName =
     typeof defParsed.display_name === "string" ? defParsed.display_name.trim().toLowerCase() : "";
   if (!defAgentId && !defDisplayName) return null;
 
   const cfgStat = safeLstat(configDir);
-  if (!cfgStat || cfgStat.isSymbolicLink() || !cfgStat.isDirectory()) return null;
+  if (!cfgStat || cfgStat.isSymbolicLink() || !cfgStat.isDirectory() || !hasSafeAncestorDirs(join(configDir, "probe"))) {
+    return null;
+  }
 
   const resolvedDefault = resolve(defaultProfilePath);
   for (const dir of [join(configDir, "profiles"), configDir]) {
@@ -214,7 +264,14 @@ export function findDefaultProfileCollision(
       } catch {
         continue;
       }
-      if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+      if (
+        !candidate ||
+        typeof candidate !== "object" ||
+        Array.isArray(candidate) ||
+        Object.prototype.hasOwnProperty.call(candidate, "__proto__")
+      ) {
+        continue;
+      }
       const candAgentId = typeof candidate.agent_id === "string" ? candidate.agent_id.trim() : "";
       const candToken = typeof candidate.token === "string" ? candidate.token.trim() : "";
       if (!candAgentId || !candToken) continue;

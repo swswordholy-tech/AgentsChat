@@ -215,11 +215,32 @@ async function getBotOwner(base, agentId, token, request = fetch) {
 }
 
 // src/onboarding-status.ts
+var DEFAULT_PUBLIC_BASE = "https://agents-chat.com";
+function isForbiddenMetadataOrLinkLocalHost(host) {
+  if (host === "metadata.google.internal" || host.endsWith(".metadata.google.internal") || host === "metadata.goog" || host.endsWith(".metadata.goog") || host === "169.254.169.254") {
+    return true;
+  }
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) {
+    const [a, b] = host.split(".").map(Number);
+    if (a === 0 || a === 169 && b === 254)
+      return true;
+  }
+  if (host.startsWith("[") && host.endsWith("]")) {
+    const inner = host.slice(1, -1).toLowerCase();
+    if (inner === "::" || /^fe[89ab][0-9a-f]*:/i.test(inner))
+      return true;
+    if (/^::ffff:(?:0:)?(?:169\.254\.|a9fe:)/i.test(inner))
+      return true;
+  }
+  return false;
+}
 function isSafeOnboardingBase(base) {
   try {
+    if (!base || base !== base.trim() || /[\x00-\x20\x7f"<>\\]/.test(base))
+      return false;
     const parsed = new URL(base);
     const host = parsed.hostname.toLowerCase().replace(/\.$/, "");
-    if (!host)
+    if (!host || isForbiddenMetadataOrLinkLocalHost(host))
       return false;
     if (parsed.port !== "") {
       const p = Number(parsed.port);
@@ -290,7 +311,9 @@ async function getOnboardingStatus(base, agentId, token, request = fetch) {
   const rawAgentId = typeof agentId === "string" ? agentId.trim() : "";
   const validAgent = isSafeOnboardingAgentId(rawAgentId);
   const safeAgentId = validAgent ? rawAgentId : "";
-  const chat = `${cleanBase}/chat/${encodeURIComponent(safeAgentId)}`;
+  const validBase = Boolean(cleanBase && !/[\x00-\x1f\x7f]/.test(cleanBase) && isSafeOnboardingBase(cleanBase));
+  const safeDisplayBase = validBase ? cleanBase : DEFAULT_PUBLIC_BASE;
+  const chat = `${safeDisplayBase}/chat/${encodeURIComponent(safeAgentId)}`;
   const result = {
     agent_id: safeAgentId,
     claimed: null,
@@ -299,7 +322,7 @@ async function getOnboardingStatus(base, agentId, token, request = fetch) {
     claim_url: `${chat}?claim=1`,
     next_step: "check_identity"
   };
-  if (!cleanBase || !validAgent || /[\x00-\x1f\x7f]/.test(cleanBase) || typeof token !== "string" || !token.trim() || /[\x00-\x1f\x7f]/.test(token) || !isSafeOnboardingBase(cleanBase)) {
+  if (!validBase || !validAgent || typeof token !== "string" || !token.trim() || /[\x00-\x1f\x7f]/.test(token)) {
     return result;
   }
   try {
@@ -323,7 +346,7 @@ async function getOnboardingStatus(base, agentId, token, request = fetch) {
       return result;
     }
     const data = await readBoundedJson(r);
-    if (!data || typeof data !== "object" || Array.isArray(data) || data.agent_id !== safeAgentId || typeof data.claimed !== "boolean")
+    if (!data || typeof data !== "object" || Array.isArray(data) || Object.prototype.hasOwnProperty.call(data, "__proto__") || data.agent_id !== safeAgentId || typeof data.claimed !== "boolean")
       return result;
     result.authentication = "ok";
     result.claimed = data.claimed;
@@ -532,13 +555,13 @@ function isValidProfileAgentId(raw) {
 function sanitizeDiagnosticField(raw, fallback = "(unknown)") {
   if (typeof raw !== "string")
     return fallback;
-  const cleaned = raw.replace(/[\x00-\x1f\x7f]+/g, " ").trim();
+  const cleaned = redactSecrets(raw).replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED]").replace(/\b(?:agent_key_|sk-|whsec_|gh[pousr]_|github_pat_|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g, "[REDACTED]").replace(/[\x00-\x1f\x7f]+/g, " ").trim();
   return cleaned.length > 0 ? cleaned.slice(0, 256) : fallback;
 }
 function validateIdentityProfile(profile, file, allowDevToken = false) {
   const cleanNonempty = (value) => typeof value === "string" && value.trim().length > 0 && value.length <= 4096 && !/[\x00-\x1f\x7f]/.test(value);
   const safeFile = sanitizeDiagnosticField(file, "(unknown-path)");
-  if (!profile || typeof profile !== "object" || Array.isArray(profile) || !isValidProfileAgentId(profile.agent_id) || !cleanNonempty(profile.token) || !allowDevToken && profile.token.trim() === "dev-token" || profile.capabilities !== undefined && (!Array.isArray(profile.capabilities) || profile.capabilities.length > MAX_CAPABILITIES_LEN || !profile.capabilities.every((c) => cleanNonempty(c) && c.length <= 64))) {
+  if (!profile || typeof profile !== "object" || Array.isArray(profile) || Object.prototype.hasOwnProperty.call(profile, "__proto__") || !isValidProfileAgentId(profile.agent_id) || !cleanNonempty(profile.token) || !allowDevToken && profile.token.trim() === "dev-token" || profile.capabilities !== undefined && (!Array.isArray(profile.capabilities) || profile.capabilities.length > MAX_CAPABILITIES_LEN || !profile.capabilities.every((c) => cleanNonempty(c) && c.length <= 64))) {
     throw new Error(`Invalid identity profile at ${safeFile}. Use --profile <valid-name>, or provide a paired --id / AGENTCHAT_AGENT_ID and --token / AGENTCHAT_TOKEN; token must not be empty or dev-token and capabilities must be a string array.`);
   }
 }
@@ -2307,6 +2330,7 @@ import { join as join9 } from "node:path";
 // src/profile-store.ts
 import {
   lstatSync as lstatSync8,
+  realpathSync as realpathSync4,
   writeFileSync as writeFileSync3,
   renameSync as renameSync3,
   copyFileSync,
@@ -2319,8 +2343,9 @@ import { dirname as dirname2, join as join8, resolve as resolve4 } from "path";
 var defaultWarn = (m) => process.stderr.write(m);
 var MAX_PROFILE_JSON_BYTES = 64 * 1024;
 var CONTROL_CHAR_GLOBAL_RE = /[\x00-\x1f\x7f]/g;
+var DARWIN_SYSTEM_SYMLINKS = new Set(["/var", "/tmp", "/etc"]);
 function sanitizeWarnPart(value) {
-  return String(value ?? "").replace(CONTROL_CHAR_GLOBAL_RE, "?");
+  return redactSecrets(String(value ?? "")).replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED]").replace(/\b(?:agent_key_|sk-|whsec_|gh[pousr]_|github_pat_|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g, "[REDACTED]").replace(CONTROL_CHAR_GLOBAL_RE, "?");
 }
 function safeLstat(target) {
   try {
@@ -2331,10 +2356,42 @@ function safeLstat(target) {
     throw err;
   }
 }
+function isAllowedDarwinSystemSymlink(dirPath) {
+  if (process.platform !== "darwin" || !DARWIN_SYSTEM_SYMLINKS.has(dirPath))
+    return false;
+  try {
+    const resolved = realpathSync4(dirPath);
+    if (resolved !== `/private${dirPath}`)
+      return false;
+    const realSt = lstatSync8(resolved);
+    return realSt.isDirectory() && !realSt.isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+function hasSafeAncestorDirs(targetPath) {
+  let cur = dirname2(resolve4(targetPath));
+  for (let depth = 0;depth < 64; depth += 1) {
+    const st = safeLstat(cur);
+    if (st) {
+      if (st.isSymbolicLink()) {
+        if (!isAllowedDarwinSystemSymlink(cur))
+          return false;
+      } else if (!st.isDirectory()) {
+        return false;
+      }
+    }
+    const parent = dirname2(cur);
+    if (parent === cur)
+      break;
+    cur = parent;
+  }
+  return true;
+}
 function safeWriteProfile(path, data, warn = defaultWarn) {
   const parentDir = dirname2(path);
   const parentStat = safeLstat(parentDir);
-  if (!parentStat || parentStat.isSymbolicLink() || !parentStat.isDirectory()) {
+  if (!parentStat || parentStat.isSymbolicLink() || !parentStat.isDirectory() || !hasSafeAncestorDirs(path)) {
     throw new Error(`Refusing to write profile into invalid or symlinked parent directory: ${sanitizeWarnPart(parentDir)}`);
   }
   const pathStat = safeLstat(path);
@@ -2353,7 +2410,7 @@ function safeWriteProfile(path, data, warn = defaultWarn) {
   }
   writeFileSync3(tmp, JSON.stringify(data, null, 2), { mode: 384, flag: "wx" });
   const currentParent = safeLstat(parentDir);
-  if (!currentParent || currentParent.isSymbolicLink() || !currentParent.isDirectory()) {
+  if (!currentParent || currentParent.isSymbolicLink() || !currentParent.isDirectory() || !hasSafeAncestorDirs(path)) {
     try {
       unlinkSync2(tmp);
     } catch {}
@@ -2417,11 +2474,16 @@ function safeWriteProfile(path, data, warn = defaultWarn) {
 }
 var NON_PROFILE_JSON_FILES = new Set([
   "session-binds.json",
+  "session-binds.meta.json",
   "agy-binds.json",
+  "agy-binds.meta.json",
   "grok-binds.json",
   "grok-binds-meta.json",
   "grok-binds.meta.json",
   "identity-guard.json",
+  "cursor.json",
+  "read-cursors.json",
+  "wake-pids.json",
   "dsh.json",
   "config.json"
 ]);

@@ -893,13 +893,19 @@ import { join as join2 } from "node:path";
 
 // src/profile-store.ts
 var MAX_PROFILE_JSON_BYTES = 64 * 1024;
+var DARWIN_SYSTEM_SYMLINKS = new Set(["/var", "/tmp", "/etc"]);
 var NON_PROFILE_JSON_FILES = new Set([
   "session-binds.json",
+  "session-binds.meta.json",
   "agy-binds.json",
+  "agy-binds.meta.json",
   "grok-binds.json",
   "grok-binds-meta.json",
   "grok-binds.meta.json",
   "identity-guard.json",
+  "cursor.json",
+  "read-cursors.json",
+  "wake-pids.json",
   "dsh.json",
   "config.json"
 ]);

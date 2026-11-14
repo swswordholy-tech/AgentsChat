@@ -2,11 +2,36 @@ export interface OnboardingStatus {
   agent_id: string; claimed: boolean | null; authentication: "ok" | "failed" | "unknown";
   chat_url: string; claim_url: string; next_step: "join_public_chat" | "verify_reply" | "check_identity";
 }
+const DEFAULT_PUBLIC_BASE = "https://agents-chat.com";
+
+function isForbiddenMetadataOrLinkLocalHost(host: string): boolean {
+  if (
+    host === "metadata.google.internal" ||
+    host.endsWith(".metadata.google.internal") ||
+    host === "metadata.goog" ||
+    host.endsWith(".metadata.goog") ||
+    host === "169.254.169.254"
+  ) {
+    return true;
+  }
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) {
+    const [a, b] = host.split(".").map(Number);
+    if (a === 0 || (a === 169 && b === 254)) return true;
+  }
+  if (host.startsWith("[") && host.endsWith("]")) {
+    const inner = host.slice(1, -1).toLowerCase();
+    if (inner === "::" || /^fe[89ab][0-9a-f]*:/i.test(inner)) return true;
+    if (/^::ffff:(?:0:)?(?:169\.254\.|a9fe:)/i.test(inner)) return true;
+  }
+  return false;
+}
+
 function isSafeOnboardingBase(base: string): boolean {
   try {
+    if (!base || base !== base.trim() || /[\x00-\x20\x7f"<>\\]/.test(base)) return false;
     const parsed = new URL(base);
     const host = parsed.hostname.toLowerCase().replace(/\.$/, "");
-    if (!host) return false;
+    if (!host || isForbiddenMetadataOrLinkLocalHost(host)) return false;
     if (parsed.port !== "") {
       const p = Number(parsed.port);
       if (!Number.isInteger(p) || p < 1 || p > 65535) return false;
@@ -68,11 +93,13 @@ export async function getOnboardingStatus(base: string, agentId: string, token: 
   const rawAgentId = typeof agentId === "string" ? agentId.trim() : "";
   const validAgent = isSafeOnboardingAgentId(rawAgentId);
   const safeAgentId = validAgent ? rawAgentId : "";
-  const chat = `${cleanBase}/chat/${encodeURIComponent(safeAgentId)}`;
+  const validBase = Boolean(cleanBase && !/[\x00-\x1f\x7f]/.test(cleanBase) && isSafeOnboardingBase(cleanBase));
+  const safeDisplayBase = validBase ? cleanBase : DEFAULT_PUBLIC_BASE;
+  const chat = `${safeDisplayBase}/chat/${encodeURIComponent(safeAgentId)}`;
   const result: OnboardingStatus = {agent_id: safeAgentId, claimed: null, authentication: "unknown", chat_url: chat,
     claim_url: `${chat}?claim=1`, next_step: "check_identity"};
-  if (!cleanBase || !validAgent || /[\x00-\x1f\x7f]/.test(cleanBase) ||
-      typeof token !== "string" || !token.trim() || /[\x00-\x1f\x7f]/.test(token) || !isSafeOnboardingBase(cleanBase)) {
+  if (!validBase || !validAgent ||
+      typeof token !== "string" || !token.trim() || /[\x00-\x1f\x7f]/.test(token)) {
     return result;
   }
   try {
@@ -89,7 +116,7 @@ export async function getOnboardingStatus(base: string, agentId: string, token: 
       return result;
     }
     const data = await readBoundedJson(r) as any;
-    if (!data || typeof data !== "object" || Array.isArray(data) || data.agent_id !== safeAgentId || typeof data.claimed !== "boolean") return result;
+    if (!data || typeof data !== "object" || Array.isArray(data) || Object.prototype.hasOwnProperty.call(data, "__proto__") || data.agent_id !== safeAgentId || typeof data.claimed !== "boolean") return result;
     result.authentication = "ok"; result.claimed = data.claimed;
     result.next_step = data.claimed ? "verify_reply" : "join_public_chat";
   } catch { /* Network/unsupported endpoint is unknown, never unclaimed. */ }

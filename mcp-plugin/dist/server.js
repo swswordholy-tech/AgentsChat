@@ -4,11 +4,32 @@ import { createRequire } from "node:module";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/onboarding-status.ts
+var DEFAULT_PUBLIC_BASE = "https://agents-chat.com";
+function isForbiddenMetadataOrLinkLocalHost(host) {
+  if (host === "metadata.google.internal" || host.endsWith(".metadata.google.internal") || host === "metadata.goog" || host.endsWith(".metadata.goog") || host === "169.254.169.254") {
+    return true;
+  }
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) {
+    const [a, b] = host.split(".").map(Number);
+    if (a === 0 || a === 169 && b === 254)
+      return true;
+  }
+  if (host.startsWith("[") && host.endsWith("]")) {
+    const inner = host.slice(1, -1).toLowerCase();
+    if (inner === "::" || /^fe[89ab][0-9a-f]*:/i.test(inner))
+      return true;
+    if (/^::ffff:(?:0:)?(?:169\.254\.|a9fe:)/i.test(inner))
+      return true;
+  }
+  return false;
+}
 function isSafeOnboardingBase(base) {
   try {
+    if (!base || base !== base.trim() || /[\x00-\x20\x7f"<>\\]/.test(base))
+      return false;
     const parsed = new URL(base);
     const host = parsed.hostname.toLowerCase().replace(/\.$/, "");
-    if (!host)
+    if (!host || isForbiddenMetadataOrLinkLocalHost(host))
       return false;
     if (parsed.port !== "") {
       const p = Number(parsed.port);
@@ -79,7 +100,9 @@ async function getOnboardingStatus(base, agentId, token, request = fetch) {
   const rawAgentId = typeof agentId === "string" ? agentId.trim() : "";
   const validAgent = isSafeOnboardingAgentId(rawAgentId);
   const safeAgentId = validAgent ? rawAgentId : "";
-  const chat = `${cleanBase}/chat/${encodeURIComponent(safeAgentId)}`;
+  const validBase = Boolean(cleanBase && !/[\x00-\x1f\x7f]/.test(cleanBase) && isSafeOnboardingBase(cleanBase));
+  const safeDisplayBase = validBase ? cleanBase : DEFAULT_PUBLIC_BASE;
+  const chat = `${safeDisplayBase}/chat/${encodeURIComponent(safeAgentId)}`;
   const result = {
     agent_id: safeAgentId,
     claimed: null,
@@ -88,7 +111,7 @@ async function getOnboardingStatus(base, agentId, token, request = fetch) {
     claim_url: `${chat}?claim=1`,
     next_step: "check_identity"
   };
-  if (!cleanBase || !validAgent || /[\x00-\x1f\x7f]/.test(cleanBase) || typeof token !== "string" || !token.trim() || /[\x00-\x1f\x7f]/.test(token) || !isSafeOnboardingBase(cleanBase)) {
+  if (!validBase || !validAgent || typeof token !== "string" || !token.trim() || /[\x00-\x1f\x7f]/.test(token)) {
     return result;
   }
   try {
@@ -112,7 +135,7 @@ async function getOnboardingStatus(base, agentId, token, request = fetch) {
       return result;
     }
     const data = await readBoundedJson(r);
-    if (!data || typeof data !== "object" || Array.isArray(data) || data.agent_id !== safeAgentId || typeof data.claimed !== "boolean")
+    if (!data || typeof data !== "object" || Array.isArray(data) || Object.prototype.hasOwnProperty.call(data, "__proto__") || data.agent_id !== safeAgentId || typeof data.claimed !== "boolean")
       return result;
     result.authentication = "ok";
     result.claimed = data.claimed;
@@ -1863,6 +1886,33 @@ ${rawBody}`;
   };
 }
 
+// src/redact.ts
+function redactSecrets2(text, opts) {
+  if (typeof text !== "string" || !text)
+    return "";
+  const step = opts?.preserveAcKeys ? text : text.replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***");
+  return step.replace(/mcp_(?:at|rt|code)_[A-Za-z0-9_-]{16,}/g, "mcp_***REDACTED***").replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
+}
+var PHONE_PII_RE2 = /^\+?\d[\d\s()-]{5,}[\d)]$/;
+function isPhoneShapedPii2(s) {
+  return PHONE_PII_RE2.test(s) && s.replace(/\D/g, "").length >= 7;
+}
+function redactParticipantPii2(rawId) {
+  const s = String(rawId ?? "").replace(/[\x00-\x1f\x7f]+/g, "").trim();
+  if (!s)
+    return "unknown";
+  const atIdx = s.indexOf("@");
+  if (atIdx >= 0) {
+    const local = s.slice(0, atIdx).replace(/[^a-zA-Z0-9]/g, "");
+    return `user:${(local.slice(0, 2) || "u").toLowerCase()}***`;
+  }
+  if (isPhoneShapedPii2(s)) {
+    const digits = s.replace(/\D/g, "");
+    return `user:phone_***${digits.slice(-2) || "00"}`;
+  }
+  return s.slice(0, 128);
+}
+
 // src/identity.ts
 var RESERVED_IDENTITY_IDS = new Set(["__proto__", "constructor", "prototype"]);
 var MAX_DISPLAY_NAME_LEN = 128;
@@ -1883,7 +1933,7 @@ function isValidProfileAgentId(raw) {
 function sanitizeDiagnosticField(raw, fallback = "(unknown)") {
   if (typeof raw !== "string")
     return fallback;
-  const cleaned = raw.replace(/[\x00-\x1f\x7f]+/g, " ").trim();
+  const cleaned = redactSecrets2(raw).replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED]").replace(/\b(?:agent_key_|sk-|whsec_|gh[pousr]_|github_pat_|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g, "[REDACTED]").replace(/[\x00-\x1f\x7f]+/g, " ").trim();
   return cleaned.length > 0 ? cleaned.slice(0, 256) : fallback;
 }
 function decideIdentity(i) {
@@ -1933,7 +1983,7 @@ function decideIdentity(i) {
 function validateIdentityProfile(profile, file, allowDevToken = false) {
   const cleanNonempty = (value) => typeof value === "string" && value.trim().length > 0 && value.length <= 4096 && !/[\x00-\x1f\x7f]/.test(value);
   const safeFile = sanitizeDiagnosticField(file, "(unknown-path)");
-  if (!profile || typeof profile !== "object" || Array.isArray(profile) || !isValidProfileAgentId(profile.agent_id) || !cleanNonempty(profile.token) || !allowDevToken && profile.token.trim() === "dev-token" || profile.capabilities !== undefined && (!Array.isArray(profile.capabilities) || profile.capabilities.length > MAX_CAPABILITIES_LEN || !profile.capabilities.every((c) => cleanNonempty(c) && c.length <= 64))) {
+  if (!profile || typeof profile !== "object" || Array.isArray(profile) || Object.prototype.hasOwnProperty.call(profile, "__proto__") || !isValidProfileAgentId(profile.agent_id) || !cleanNonempty(profile.token) || !allowDevToken && profile.token.trim() === "dev-token" || profile.capabilities !== undefined && (!Array.isArray(profile.capabilities) || profile.capabilities.length > MAX_CAPABILITIES_LEN || !profile.capabilities.every((c) => cleanNonempty(c) && c.length <= 64))) {
     throw new Error(`Invalid identity profile at ${safeFile}. Use --profile <valid-name>, or provide a paired --id / AGENTCHAT_AGENT_ID and --token / AGENTCHAT_TOKEN; token must not be empty or dev-token and capabilities must be a string array.`);
   }
 }
@@ -2400,35 +2450,6 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import { existsSync, lstatSync as lstatSync2, readFileSync as readFileSync3 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
 import { join as join3, win32 as pathWin32 } from "node:path";
-
-// src/redact.ts
-function redactSecrets2(text, opts) {
-  if (typeof text !== "string" || !text)
-    return "";
-  const step = opts?.preserveAcKeys ? text : text.replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***");
-  return step.replace(/mcp_(?:at|rt|code)_[A-Za-z0-9_-]{16,}/g, "mcp_***REDACTED***").replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
-}
-var PHONE_PII_RE2 = /^\+?\d[\d\s()-]{5,}[\d)]$/;
-function isPhoneShapedPii2(s) {
-  return PHONE_PII_RE2.test(s) && s.replace(/\D/g, "").length >= 7;
-}
-function redactParticipantPii2(rawId) {
-  const s = String(rawId ?? "").replace(/[\x00-\x1f\x7f]+/g, "").trim();
-  if (!s)
-    return "unknown";
-  const atIdx = s.indexOf("@");
-  if (atIdx >= 0) {
-    const local = s.slice(0, atIdx).replace(/[^a-zA-Z0-9]/g, "");
-    return `user:${(local.slice(0, 2) || "u").toLowerCase()}***`;
-  }
-  if (isPhoneShapedPii2(s)) {
-    const digits = s.replace(/\D/g, "");
-    return `user:phone_***${digits.slice(-2) || "00"}`;
-  }
-  return s.slice(0, 128);
-}
-
-// src/wake.ts
 var WAKE_SIG_HEADER = "x-agentschat-signature";
 var WAKE_ID_HEADER = "X-AgentsChat-Wake-Id";
 var SAFE_WAKE_ID_RE = /^[a-zA-Z0-9_-]{1,128}$/;
@@ -3002,6 +3023,7 @@ import { spawnSync } from "node:child_process";
 // src/profile-store.ts
 import {
   lstatSync as lstatSync3,
+  realpathSync,
   writeFileSync,
   renameSync,
   copyFileSync,
@@ -3014,8 +3036,9 @@ import { dirname, join as join4, resolve as resolve2 } from "path";
 var defaultWarn = (m) => process.stderr.write(m);
 var MAX_PROFILE_JSON_BYTES = 64 * 1024;
 var CONTROL_CHAR_GLOBAL_RE = /[\x00-\x1f\x7f]/g;
+var DARWIN_SYSTEM_SYMLINKS = new Set(["/var", "/tmp", "/etc"]);
 function sanitizeWarnPart(value) {
-  return String(value ?? "").replace(CONTROL_CHAR_GLOBAL_RE, "?");
+  return redactSecrets2(String(value ?? "")).replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED]").replace(/\b(?:agent_key_|sk-|whsec_|gh[pousr]_|github_pat_|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g, "[REDACTED]").replace(CONTROL_CHAR_GLOBAL_RE, "?");
 }
 function safeLstat2(target) {
   try {
@@ -3026,10 +3049,42 @@ function safeLstat2(target) {
     throw err;
   }
 }
+function isAllowedDarwinSystemSymlink(dirPath) {
+  if (process.platform !== "darwin" || !DARWIN_SYSTEM_SYMLINKS.has(dirPath))
+    return false;
+  try {
+    const resolved = realpathSync(dirPath);
+    if (resolved !== `/private${dirPath}`)
+      return false;
+    const realSt = lstatSync3(resolved);
+    return realSt.isDirectory() && !realSt.isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+function hasSafeAncestorDirs(targetPath) {
+  let cur = dirname(resolve2(targetPath));
+  for (let depth = 0;depth < 64; depth += 1) {
+    const st = safeLstat2(cur);
+    if (st) {
+      if (st.isSymbolicLink()) {
+        if (!isAllowedDarwinSystemSymlink(cur))
+          return false;
+      } else if (!st.isDirectory()) {
+        return false;
+      }
+    }
+    const parent = dirname(cur);
+    if (parent === cur)
+      break;
+    cur = parent;
+  }
+  return true;
+}
 function safeWriteProfile(path, data, warn = defaultWarn) {
   const parentDir = dirname(path);
   const parentStat = safeLstat2(parentDir);
-  if (!parentStat || parentStat.isSymbolicLink() || !parentStat.isDirectory()) {
+  if (!parentStat || parentStat.isSymbolicLink() || !parentStat.isDirectory() || !hasSafeAncestorDirs(path)) {
     throw new Error(`Refusing to write profile into invalid or symlinked parent directory: ${sanitizeWarnPart(parentDir)}`);
   }
   const pathStat = safeLstat2(path);
@@ -3048,7 +3103,7 @@ function safeWriteProfile(path, data, warn = defaultWarn) {
   }
   writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 384, flag: "wx" });
   const currentParent = safeLstat2(parentDir);
-  if (!currentParent || currentParent.isSymbolicLink() || !currentParent.isDirectory()) {
+  if (!currentParent || currentParent.isSymbolicLink() || !currentParent.isDirectory() || !hasSafeAncestorDirs(path)) {
     try {
       unlinkSync(tmp);
     } catch {}
@@ -3112,11 +3167,16 @@ function safeWriteProfile(path, data, warn = defaultWarn) {
 }
 var NON_PROFILE_JSON_FILES = new Set([
   "session-binds.json",
+  "session-binds.meta.json",
   "agy-binds.json",
+  "agy-binds.meta.json",
   "grok-binds.json",
   "grok-binds-meta.json",
   "grok-binds.meta.json",
   "identity-guard.json",
+  "cursor.json",
+  "read-cursors.json",
+  "wake-pids.json",
   "dsh.json",
   "config.json"
 ]);
@@ -4507,6 +4567,7 @@ import { fileURLToPath } from "url";
 // src/profile-store.ts
 import {
   lstatSync as lstatSync7,
+  realpathSync as realpathSync2,
   writeFileSync as writeFileSync2,
   renameSync as renameSync2,
   copyFileSync as copyFileSync2,
@@ -4519,8 +4580,9 @@ import { dirname as dirname2, join as join8, resolve as resolve3 } from "path";
 var defaultWarn2 = (m) => process.stderr.write(m);
 var MAX_PROFILE_JSON_BYTES2 = 64 * 1024;
 var CONTROL_CHAR_GLOBAL_RE2 = /[\x00-\x1f\x7f]/g;
+var DARWIN_SYSTEM_SYMLINKS2 = new Set(["/var", "/tmp", "/etc"]);
 function sanitizeWarnPart2(value) {
-  return String(value ?? "").replace(CONTROL_CHAR_GLOBAL_RE2, "?");
+  return redactSecrets2(String(value ?? "")).replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED]").replace(/\b(?:agent_key_|sk-|whsec_|gh[pousr]_|github_pat_|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g, "[REDACTED]").replace(CONTROL_CHAR_GLOBAL_RE2, "?");
 }
 function safeLstat4(target) {
   try {
@@ -4531,10 +4593,42 @@ function safeLstat4(target) {
     throw err;
   }
 }
+function isAllowedDarwinSystemSymlink2(dirPath) {
+  if (process.platform !== "darwin" || !DARWIN_SYSTEM_SYMLINKS2.has(dirPath))
+    return false;
+  try {
+    const resolved = realpathSync2(dirPath);
+    if (resolved !== `/private${dirPath}`)
+      return false;
+    const realSt = lstatSync7(resolved);
+    return realSt.isDirectory() && !realSt.isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+function hasSafeAncestorDirs2(targetPath) {
+  let cur = dirname2(resolve3(targetPath));
+  for (let depth = 0;depth < 64; depth += 1) {
+    const st = safeLstat4(cur);
+    if (st) {
+      if (st.isSymbolicLink()) {
+        if (!isAllowedDarwinSystemSymlink2(cur))
+          return false;
+      } else if (!st.isDirectory()) {
+        return false;
+      }
+    }
+    const parent = dirname2(cur);
+    if (parent === cur)
+      break;
+    cur = parent;
+  }
+  return true;
+}
 function safeWriteProfile2(path, data, warn = defaultWarn2) {
   const parentDir = dirname2(path);
   const parentStat = safeLstat4(parentDir);
-  if (!parentStat || parentStat.isSymbolicLink() || !parentStat.isDirectory()) {
+  if (!parentStat || parentStat.isSymbolicLink() || !parentStat.isDirectory() || !hasSafeAncestorDirs2(path)) {
     throw new Error(`Refusing to write profile into invalid or symlinked parent directory: ${sanitizeWarnPart2(parentDir)}`);
   }
   const pathStat = safeLstat4(path);
@@ -4553,7 +4647,7 @@ function safeWriteProfile2(path, data, warn = defaultWarn2) {
   }
   writeFileSync2(tmp, JSON.stringify(data, null, 2), { mode: 384, flag: "wx" });
   const currentParent = safeLstat4(parentDir);
-  if (!currentParent || currentParent.isSymbolicLink() || !currentParent.isDirectory()) {
+  if (!currentParent || currentParent.isSymbolicLink() || !currentParent.isDirectory() || !hasSafeAncestorDirs2(path)) {
     try {
       unlinkSync4(tmp);
     } catch {}
@@ -4617,16 +4711,21 @@ function safeWriteProfile2(path, data, warn = defaultWarn2) {
 }
 var NON_PROFILE_JSON_FILES2 = new Set([
   "session-binds.json",
+  "session-binds.meta.json",
   "agy-binds.json",
+  "agy-binds.meta.json",
   "grok-binds.json",
   "grok-binds-meta.json",
   "grok-binds.meta.json",
   "identity-guard.json",
+  "cursor.json",
+  "read-cursors.json",
+  "wake-pids.json",
   "dsh.json",
   "config.json"
 ]);
 function findDefaultProfileCollision(configDir, defaultProfilePath) {
-  if (!defaultProfilePath)
+  if (!defaultProfilePath || !hasSafeAncestorDirs2(defaultProfilePath))
     return null;
   const defStat = safeLstat4(defaultProfilePath);
   if (!defStat || defStat.isSymbolicLink() || !defStat.isFile() || defStat.size > MAX_PROFILE_JSON_BYTES2) {
@@ -4638,15 +4737,17 @@ function findDefaultProfileCollision(configDir, defaultProfilePath) {
   } catch {
     return null;
   }
-  if (!defParsed || typeof defParsed !== "object" || Array.isArray(defParsed))
+  if (!defParsed || typeof defParsed !== "object" || Array.isArray(defParsed) || Object.prototype.hasOwnProperty.call(defParsed, "__proto__")) {
     return null;
+  }
   const defAgentId = typeof defParsed.agent_id === "string" ? defParsed.agent_id.trim() : "";
   const defDisplayName = typeof defParsed.display_name === "string" ? defParsed.display_name.trim().toLowerCase() : "";
   if (!defAgentId && !defDisplayName)
     return null;
   const cfgStat = safeLstat4(configDir);
-  if (!cfgStat || cfgStat.isSymbolicLink() || !cfgStat.isDirectory())
+  if (!cfgStat || cfgStat.isSymbolicLink() || !cfgStat.isDirectory() || !hasSafeAncestorDirs2(join8(configDir, "probe"))) {
     return null;
+  }
   const resolvedDefault = resolve3(defaultProfilePath);
   for (const dir of [join8(configDir, "profiles"), configDir]) {
     const dirStat = safeLstat4(dir);
@@ -4677,8 +4778,9 @@ function findDefaultProfileCollision(configDir, defaultProfilePath) {
       } catch {
         continue;
       }
-      if (!candidate || typeof candidate !== "object" || Array.isArray(candidate))
+      if (!candidate || typeof candidate !== "object" || Array.isArray(candidate) || Object.prototype.hasOwnProperty.call(candidate, "__proto__")) {
         continue;
+      }
       const candAgentId = typeof candidate.agent_id === "string" ? candidate.agent_id.trim() : "";
       const candToken = typeof candidate.token === "string" ? candidate.token.trim() : "";
       if (!candAgentId || !candToken)
@@ -4697,6 +4799,7 @@ function findDefaultProfileCollision(configDir, defaultProfilePath) {
 
 // src/identity-guard.ts
 var IDENTITY_GUARD_FILENAME = "identity-guard.json";
+var MAX_GUARD_SELECTORS = 256;
 function emptyGuardRecord() {
   return { bySelector: {}, lastEffective: null };
 }
@@ -4707,18 +4810,21 @@ function isUnsafeSelectorKey(key) {
 function cleanDisplayToken(raw, maxLen = 128) {
   if (typeof raw !== "string")
     return "";
-  return raw.replace(/[\x00-\x1f\x7f]+/g, "").trim().slice(0, maxLen);
+  return redactSecrets2(raw).replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED]").replace(/\b(?:agent_key_|sk-|whsec_|gh[pousr]_|github_pat_|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g, "[REDACTED]").replace(/[\x00-\x1f\x7f]+/g, "").trim().slice(0, maxLen);
 }
 function parseGuardRecord(text) {
   if (!text || typeof text !== "string" || text.length > 262144)
     return emptyGuardRecord();
   try {
     const raw = JSON.parse(text);
-    if (!raw || typeof raw !== "object" || Array.isArray(raw))
+    if (!raw || typeof raw !== "object" || Array.isArray(raw) || Object.prototype.hasOwnProperty.call(raw, "__proto__")) {
       return emptyGuardRecord();
+    }
     const bySelector = {};
     if (raw.bySelector && typeof raw.bySelector === "object" && !Array.isArray(raw.bySelector)) {
       for (const [k, v] of Object.entries(raw.bySelector)) {
+        if (Object.keys(bySelector).length >= MAX_GUARD_SELECTORS)
+          break;
         if (/[\x00-\x1f\x7f]/.test(k) || typeof v !== "string" || /[\x00-\x1f\x7f]/.test(v))
           continue;
         const key = k.trim();
@@ -4729,8 +4835,9 @@ function parseGuardRecord(text) {
       }
     }
     const rawLast = raw.lastEffective;
-    const cleanAgentId = rawLast && typeof rawLast === "object" && !Array.isArray(rawLast) && typeof rawLast.agentId === "string" ? cleanDisplayToken(rawLast.agentId, 128) : "";
-    const cleanDecl = rawLast && typeof rawLast === "object" && !Array.isArray(rawLast) && rawLast.declaredName ? cleanDisplayToken(String(rawLast.declaredName), 128) : "";
+    const validRawLast = rawLast && typeof rawLast === "object" && !Array.isArray(rawLast) && !Object.prototype.hasOwnProperty.call(rawLast, "__proto__");
+    const cleanAgentId = validRawLast && typeof rawLast.agentId === "string" ? cleanDisplayToken(rawLast.agentId, 128) : "";
+    const cleanDecl = validRawLast && rawLast.declaredName ? cleanDisplayToken(String(rawLast.declaredName), 128) : "";
     return {
       bySelector,
       lastEffective: cleanAgentId.length > 0 && !isUnsafeSelectorKey(cleanAgentId) ? {
@@ -4778,6 +4885,11 @@ function advanceGuardRecord(prev, current, ts, trusted) {
   if (!current.agentId)
     return next;
   if (current.declaredName && !isUnsafeSelectorKey(current.declaredName)) {
+    if (!Object.hasOwn(next.bySelector, current.declaredName) && Object.keys(next.bySelector).length >= MAX_GUARD_SELECTORS) {
+      const oldestKey = Object.keys(next.bySelector)[0];
+      if (oldestKey !== undefined)
+        delete next.bySelector[oldestKey];
+    }
     next.bySelector[current.declaredName] = current.agentId;
   }
   if (trusted) {
@@ -4812,7 +4924,7 @@ function expectedAgentIdViolation(expected, liveAgentId) {
 
 // src/read-cursor.ts
 import { randomBytes } from "crypto";
-import { chmodSync as chmodSync3, lstatSync as lstatSync8, readFileSync as readFileSync9, realpathSync, renameSync as renameSync3, unlinkSync as unlinkSync5, writeFileSync as writeFileSync3 } from "fs";
+import { chmodSync as chmodSync3, lstatSync as lstatSync8, readFileSync as readFileSync9, realpathSync as realpathSync3, renameSync as renameSync3, unlinkSync as unlinkSync5, writeFileSync as writeFileSync3 } from "fs";
 import { dirname as dirname3, isAbsolute as isAbsolute3, join as join9, sep } from "path";
 var MAX_CURSOR_BYTES = 4 * 1024 * 1024;
 var MAX_CURSOR_ENTRIES = 50000;
@@ -4821,7 +4933,7 @@ var tmpCounter = 0;
 function scrubDiag(value) {
   return redactSecrets2(String(value ?? "")).replace(/\b(?:Bearer|Basic)\s+[^\s"'<>\\]+/gi, "[REDACTED]").replace(/(?:agent_key_|sk-|whsec_|gh[pousr]_|github_pat_|AIza|AKIA|ASIA)[A-Za-z0-9+/=_-]{12,}/g, "[REDACTED]").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
 }
-function hasSafeAncestorDirs(targetFile) {
+function hasSafeAncestorDirs3(targetFile) {
   let dir = dirname3(isAbsolute3(targetFile) ? targetFile : `${process.cwd()}${sep}${targetFile}`);
   while (true) {
     let st;
@@ -4832,7 +4944,7 @@ function hasSafeAncestorDirs(targetFile) {
     }
     const isDarwinRootLink = process.platform === "darwin" && (dir === "/var" || dir === "/tmp" || dir === "/etc") && st.isSymbolicLink() && (() => {
       try {
-        return realpathSync(dir) === `/private${dir}` && !lstatSync8("/private").isSymbolicLink() && lstatSync8("/private").isDirectory() && !lstatSync8(`/private${dir}`).isSymbolicLink() && lstatSync8(`/private${dir}`).isDirectory();
+        return realpathSync3(dir) === `/private${dir}` && !lstatSync8("/private").isSymbolicLink() && lstatSync8("/private").isDirectory() && !lstatSync8(`/private${dir}`).isSymbolicLink() && lstatSync8(`/private${dir}`).isDirectory();
       } catch {
         return false;
       }
@@ -4858,7 +4970,7 @@ function cursorFileForAgent(configDir, agentId) {
 }
 function loadCursor(file, warn) {
   try {
-    if (!hasSafeAncestorDirs(file)) {
+    if (!hasSafeAncestorDirs3(file)) {
       let exists = false;
       try {
         lstatSync8(file);
@@ -4909,7 +5021,7 @@ function loadCursor(file, warn) {
 function persistCursor(file, cursor, warn) {
   try {
     const parentStat = lstatSync8(dirname3(file));
-    if (parentStat.isSymbolicLink() || !parentStat.isDirectory() || !hasSafeAncestorDirs(file)) {
+    if (parentStat.isSymbolicLink() || !parentStat.isDirectory() || !hasSafeAncestorDirs3(file)) {
       warn(`[agentchat] WARNING: failed to persist read cursor to ${scrubDiag(file)}: parent is not a real directory
 `);
       return false;
@@ -5001,7 +5113,7 @@ function matchesMention2(content, agentId) {
 
 // src/read-cursor.ts
 import { randomBytes as randomBytes2 } from "crypto";
-import { chmodSync as chmodSync4, lstatSync as lstatSync9, readFileSync as readFileSync10, realpathSync as realpathSync2, renameSync as renameSync4, unlinkSync as unlinkSync6, writeFileSync as writeFileSync4 } from "fs";
+import { chmodSync as chmodSync4, lstatSync as lstatSync9, readFileSync as readFileSync10, realpathSync as realpathSync4, renameSync as renameSync4, unlinkSync as unlinkSync6, writeFileSync as writeFileSync4 } from "fs";
 import { dirname as dirname4, isAbsolute as isAbsolute4, join as join10, sep as sep2 } from "path";
 var MAX_CURSOR_BYTES2 = 4 * 1024 * 1024;
 var MAX_CURSOR_ENTRIES2 = 50000;
@@ -5010,7 +5122,7 @@ var tmpCounter2 = 0;
 function scrubDiag2(value) {
   return redactSecrets2(String(value ?? "")).replace(/\b(?:Bearer|Basic)\s+[^\s"'<>\\]+/gi, "[REDACTED]").replace(/(?:agent_key_|sk-|whsec_|gh[pousr]_|github_pat_|AIza|AKIA|ASIA)[A-Za-z0-9+/=_-]{12,}/g, "[REDACTED]").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
 }
-function hasSafeAncestorDirs2(targetFile) {
+function hasSafeAncestorDirs4(targetFile) {
   let dir = dirname4(isAbsolute4(targetFile) ? targetFile : `${process.cwd()}${sep2}${targetFile}`);
   while (true) {
     let st;
@@ -5021,7 +5133,7 @@ function hasSafeAncestorDirs2(targetFile) {
     }
     const isDarwinRootLink = process.platform === "darwin" && (dir === "/var" || dir === "/tmp" || dir === "/etc") && st.isSymbolicLink() && (() => {
       try {
-        return realpathSync2(dir) === `/private${dir}` && !lstatSync9("/private").isSymbolicLink() && lstatSync9("/private").isDirectory() && !lstatSync9(`/private${dir}`).isSymbolicLink() && lstatSync9(`/private${dir}`).isDirectory();
+        return realpathSync4(dir) === `/private${dir}` && !lstatSync9("/private").isSymbolicLink() && lstatSync9("/private").isDirectory() && !lstatSync9(`/private${dir}`).isSymbolicLink() && lstatSync9(`/private${dir}`).isDirectory();
       } catch {
         return false;
       }
@@ -5047,7 +5159,7 @@ function cursorFileForAgent2(configDir, agentId) {
 }
 function loadCursor2(file, warn) {
   try {
-    if (!hasSafeAncestorDirs2(file)) {
+    if (!hasSafeAncestorDirs4(file)) {
       let exists = false;
       try {
         lstatSync9(file);
@@ -5098,7 +5210,7 @@ function loadCursor2(file, warn) {
 function persistCursor2(file, cursor, warn) {
   try {
     const parentStat = lstatSync9(dirname4(file));
-    if (parentStat.isSymbolicLink() || !parentStat.isDirectory() || !hasSafeAncestorDirs2(file)) {
+    if (parentStat.isSymbolicLink() || !parentStat.isDirectory() || !hasSafeAncestorDirs4(file)) {
       warn(`[agentchat] WARNING: failed to persist read cursor to ${scrubDiag2(file)}: parent is not a real directory
 `);
       return false;

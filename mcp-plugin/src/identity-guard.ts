@@ -53,7 +53,10 @@ export type GuardVerdict =
   | { kind: "warn"; message: string }
   | { kind: "gate"; message: string };
 
+import { redactSecrets } from "./redact.ts";
+
 export const IDENTITY_GUARD_FILENAME = "identity-guard.json";
+const MAX_GUARD_SELECTORS = 256;
 
 export function emptyGuardRecord(): IdentityGuardRecord {
   return { bySelector: {}, lastEffective: null };
@@ -66,7 +69,12 @@ function isUnsafeSelectorKey(key: string): boolean {
 
 function cleanDisplayToken(raw: unknown, maxLen = 128): string {
   if (typeof raw !== "string") return "";
-  return raw.replace(/[\x00-\x1f\x7f]+/g, "").trim().slice(0, maxLen);
+  return redactSecrets(raw)
+    .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED]")
+    .replace(/\b(?:agent_key_|sk-|whsec_|gh[pousr]_|github_pat_|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g, "[REDACTED]")
+    .replace(/[\x00-\x1f\x7f]+/g, "")
+    .trim()
+    .slice(0, maxLen);
 }
 
 /** Parse a persisted record; anything unreadable/malformed is an empty record (never blocks boot). */
@@ -74,10 +82,17 @@ export function parseGuardRecord(text: string | null): IdentityGuardRecord {
   if (!text || typeof text !== "string" || text.length > 262_144) return emptyGuardRecord();
   try {
     const raw = JSON.parse(text);
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return emptyGuardRecord();
+    if (!raw || typeof raw !== "object" || Array.isArray(raw) || Object.prototype.hasOwnProperty.call(raw, "__proto__")) {
+      return emptyGuardRecord();
+    }
     const bySelector: Record<string, string> = {};
-    if (raw.bySelector && typeof raw.bySelector === "object" && !Array.isArray(raw.bySelector)) {
+    if (
+      raw.bySelector &&
+      typeof raw.bySelector === "object" &&
+      !Array.isArray(raw.bySelector)
+    ) {
       for (const [k, v] of Object.entries(raw.bySelector as Record<string, unknown>)) {
+        if (Object.keys(bySelector).length >= MAX_GUARD_SELECTORS) break;
         if (/[\x00-\x1f\x7f]/.test(k) || typeof v !== "string" || /[\x00-\x1f\x7f]/.test(v)) continue;
         const key = k.trim();
         const val = v.trim();
@@ -86,12 +101,17 @@ export function parseGuardRecord(text: string | null): IdentityGuardRecord {
       }
     }
     const rawLast = raw.lastEffective;
+    const validRawLast =
+      rawLast &&
+      typeof rawLast === "object" &&
+      !Array.isArray(rawLast) &&
+      !Object.prototype.hasOwnProperty.call(rawLast, "__proto__");
     const cleanAgentId =
-      rawLast && typeof rawLast === "object" && !Array.isArray(rawLast) && typeof rawLast.agentId === "string"
+      validRawLast && typeof rawLast.agentId === "string"
         ? cleanDisplayToken(rawLast.agentId, 128)
         : "";
     const cleanDecl =
-      rawLast && typeof rawLast === "object" && !Array.isArray(rawLast) && rawLast.declaredName
+      validRawLast && rawLast.declaredName
         ? cleanDisplayToken(String(rawLast.declaredName), 128)
         : "";
     return {
@@ -178,6 +198,10 @@ export function advanceGuardRecord(
   const next: IdentityGuardRecord = { bySelector: { ...prev.bySelector }, lastEffective: prev.lastEffective };
   if (!current.agentId) return next;
   if (current.declaredName && !isUnsafeSelectorKey(current.declaredName)) {
+    if (!Object.hasOwn(next.bySelector, current.declaredName) && Object.keys(next.bySelector).length >= MAX_GUARD_SELECTORS) {
+      const oldestKey = Object.keys(next.bySelector)[0];
+      if (oldestKey !== undefined) delete next.bySelector[oldestKey];
+    }
     next.bySelector[current.declaredName] = current.agentId;
   }
   if (trusted) {

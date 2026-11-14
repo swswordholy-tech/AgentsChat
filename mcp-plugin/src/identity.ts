@@ -59,6 +59,8 @@ export interface IdentityInputs {
   fallbackName: string;
 }
 
+import { redactSecrets } from "./redact.ts";
+
 const RESERVED_IDENTITY_IDS = new Set(["__proto__", "constructor", "prototype"]);
 const MAX_DISPLAY_NAME_LEN = 128;
 const MAX_AGENT_ID_LEN = 128;
@@ -85,7 +87,11 @@ function isValidProfileAgentId(raw: unknown): raw is string {
 
 function sanitizeDiagnosticField(raw: string | undefined, fallback = "(unknown)"): string {
   if (typeof raw !== "string") return fallback;
-  const cleaned = raw.replace(/[\x00-\x1f\x7f]+/g, " ").trim();
+  const cleaned = redactSecrets(raw)
+    .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED]")
+    .replace(/\b(?:agent_key_|sk-|whsec_|gh[pousr]_|github_pat_|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g, "[REDACTED]")
+    .replace(/[\x00-\x1f\x7f]+/g, " ")
+    .trim();
   return cleaned.length > 0 ? cleaned.slice(0, 256) : fallback;
 }
 
@@ -155,6 +161,7 @@ export function validateIdentityProfile(profile: any, file: string, allowDevToke
     typeof value === "string" && value.trim().length > 0 && value.length <= 4096 && !/[\x00-\x1f\x7f]/.test(value);
   const safeFile = sanitizeDiagnosticField(file, "(unknown-path)");
   if (!profile || typeof profile !== "object" || Array.isArray(profile) ||
+      Object.prototype.hasOwnProperty.call(profile, "__proto__") ||
       !isValidProfileAgentId(profile.agent_id) ||
       !cleanNonempty(profile.token) ||
       (!allowDevToken && profile.token.trim() === "dev-token") ||
