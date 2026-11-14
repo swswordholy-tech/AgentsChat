@@ -4,7 +4,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // codex/manager.ts
 import { spawn } from "node:child_process";
-import { mkdirSync as mkdirSync2, openSync, closeSync, readFileSync as readFileSync3, writeFileSync, unlinkSync, lstatSync as lstatSync2, renameSync } from "node:fs";
+import { mkdirSync as mkdirSync2, openSync, closeSync, readFileSync as readFileSync3, writeFileSync, unlinkSync, lstatSync as lstatSync3, renameSync } from "node:fs";
 import { join as join3, resolve as resolve3 } from "node:path";
 import { homedir as homedir3 } from "node:os";
 import { createHash as createHash2 } from "node:crypto";
@@ -12,12 +12,12 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
 // codex/bots-config.ts
-import { readFileSync as readFileSync2, realpathSync as realpathSync2, mkdirSync, lstatSync } from "node:fs";
+import { readFileSync as readFileSync2, realpathSync as realpathSync2, mkdirSync, lstatSync as lstatSync2 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
 import { dirname, isAbsolute as isAbsolute2, join as join2, resolve as resolve2 } from "node:path";
 
 // codex/config.ts
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
@@ -944,6 +944,22 @@ function codexHomeMode(value) {
     throw new Error("codex_home_mode must be linked, isolated or auth-only");
   return value;
 }
+var MAX_CONFIG_BYTES = 1048576;
+function checkedPath(path, directory = false) {
+  let stat;
+  try {
+    stat = lstatSync(path);
+  } catch (error) {
+    if (error.code === "ENOENT")
+      return;
+    throw error;
+  }
+  if (stat.isSymbolicLink() || (directory ? !stat.isDirectory() : !stat.isFile()))
+    throw new Error(directory ? `Config directory must be a non-symlink directory: ${path}` : `Selected profile is not a regular file: ${path}`);
+  if (!directory && stat.size > MAX_CONFIG_BYTES)
+    throw new Error(`Config file exceeds 1 MiB: ${path}`);
+  return stat;
+}
 function readJson(file) {
   try {
     return JSON.parse(readFileSync(file, "utf8"));
@@ -961,9 +977,13 @@ function strings(value, name) {
 function resolveConfig(opts, env = process.env, home = homedir()) {
   const cwd = realpathSync(opts.cwd ?? process.cwd());
   const configFile = join(cwd, ".agentschat/config.json");
-  const project = opts.settings ?? (existsSync(configFile) ? readJson(configFile) : {});
+  if (opts.settings === undefined)
+    checkedPath(join(cwd, ".agentschat"), true);
+  const project = opts.settings ?? (checkedPath(configFile) ? readJson(configFile) : {});
   if (!project || typeof project !== "object" || Array.isArray(project))
     throw new Error("Invalid project config");
+  if (["__proto__", "constructor", "prototype"].some((key2) => Object.hasOwn(project, key2)))
+    throw new Error("Invalid project config prototype key");
   const allowed = new Set(["profile", "agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort", "model", "state_root", "codex_home_mode"]);
   if (Object.keys(project).some((k) => !allowed.has(k)))
     throw new Error("Unknown project config field (credentials belong in a private profile)");
@@ -973,7 +993,9 @@ function resolveConfig(opts, env = process.env, home = homedir()) {
   const localProfile = join(cwd, ".agentschat/profile.json");
   let codexProfile;
   const codexFile = join(cwd, ".codex/config.toml");
-  if (opts.settings === undefined && existsSync(codexFile)) {
+  if (opts.settings === undefined)
+    checkedPath(join(cwd, ".codex"), true);
+  if (opts.settings === undefined && checkedPath(codexFile)) {
     let doc;
     try {
       doc = parse(readFileSync(codexFile, "utf8"));
@@ -993,7 +1015,7 @@ function resolveConfig(opts, env = process.env, home = homedir()) {
   const choices = [
     [opts.profile, "flag"],
     [project.profile, "project-config"],
-    [opts.settings === undefined && existsSync(localProfile) ? localProfile : undefined, "project-profile"],
+    [opts.settings === undefined && checkedPath(localProfile) ? localProfile : undefined, "project-profile"],
     [codexProfile, "project-codex"],
     [env.AGENTSCHAT_PROFILE, "env"],
     [env.AGENTCHAT_PROFILE, "legacy-env"],
@@ -1003,7 +1025,7 @@ function resolveConfig(opts, env = process.env, home = homedir()) {
   if (typeof selector !== "string" || /[\x00-\x1f\x7f]/.test(selector))
     throw new Error("Invalid profile selector");
   let profileFile;
-  if (selector.startsWith("~/"))
+  if (/^~[\\/]/.test(selector))
     profileFile = join(home, selector.slice(2));
   else if (isAbsolute(selector) || selector.includes("/") || selector.includes("\\"))
     profileFile = resolve(cwd, selector);
@@ -1014,14 +1036,14 @@ function resolveConfig(opts, env = process.env, home = homedir()) {
     }
     const name = selector.endsWith(".json") ? selector : `${selector}.json`;
     profileFile = join(home, ".agentschat/profiles", name);
-    if (!existsSync(profileFile))
+    if (!checkedPath(profileFile))
       profileFile = join(home, ".agentschat", name);
-    if (!existsSync(profileFile))
+    if (!checkedPath(profileFile))
       profileFile = join(home, ".agentchat", name);
   }
-  if (!existsSync(profileFile))
+  if (!checkedPath(profileFile))
     throw new Error(`Selected profile missing: ${profileFile}; no identity fallback or registration`);
-  const profileStat = statSync(profileFile);
+  const profileStat = checkedPath(profileFile);
   if (!profileStat.isFile())
     throw new Error(`Selected profile is not a regular file: ${profileFile}`);
   if (process.platform !== "win32" && profileStat.mode & 63)
@@ -1034,7 +1056,7 @@ function resolveConfig(opts, env = process.env, home = homedir()) {
   const wsUrl = project.ws_url ?? `${apiUrl.replace(/^http/, "ws").replace(/\/$/, "")}/ws`;
   for (const [raw, protocols] of [[apiUrl, ["https:", "http:"]], [wsUrl, ["wss:", "ws:"]]]) {
     const url = new URL(raw);
-    if (!protocols.includes(url.protocol) || url.username || url.password || url.search || url.hash || !url.protocol.endsWith("s:") && !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname))
+    if (!protocols.includes(url.protocol) || url.username || url.password || url.search || url.hash || url.port === "0" || !url.protocol.endsWith("s:") && !["127.0.0.1", "localhost", "[::1]", "::1"].includes(url.hostname.toLowerCase().replace(/\.$/, "")))
       throw new Error("Server URLs must use TLS (except loopback) and contain no credentials/query");
   }
   const canonicalApi = new URL(apiUrl).href.replace(/\/$/, "");
@@ -1045,7 +1067,7 @@ function resolveConfig(opts, env = process.env, home = homedir()) {
   const codexBin = opts.codexBin ?? "codex";
   if (typeof codexBin !== "string" || !codexBin.trim() || /[\x00-\x1f\x7f]/.test(codexBin))
     throw new Error("Invalid codex_bin");
-  const stateRoot = root === undefined ? join(home, ".agentschat/codex-bridge") : root.startsWith("~/") ? join(home, root.slice(2)) : resolve(cwd, root);
+  const stateRoot = root === undefined ? join(home, ".agentschat/codex-bridge") : /^~[\\/]/.test(root) ? join(home, root.slice(2)) : resolve(cwd, root);
   return {
     cwd,
     profileFile,
@@ -1072,7 +1094,7 @@ function defaultRegistry(home = homedir2()) {
 function loadBots(file = defaultRegistry(), home = homedir2()) {
   let doc;
   try {
-    const info = lstatSync(file);
+    const info = lstatSync2(file);
     if (info.isSymbolicLink() || !info.isFile() || info.size > 1048576)
       throw new Error("Invalid registry file");
     doc = JSON.parse(readFileSync2(file, "utf8"));
@@ -1197,7 +1219,7 @@ var timer;
 function removeDeadLock(file) {
   let raw;
   try {
-    const stat = lstatSync2(file);
+    const stat = lstatSync3(file);
     if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 64 * 1024)
       return;
     raw = readFileSync3(file, "utf8").trim();
@@ -1225,11 +1247,11 @@ function save(rootDir = root) {
   const tmp = `${statusFile2}.${process.pid}.${++saveSeq}.tmp`;
   let created = false;
   try {
-    const dir = lstatSync2(rootDir);
+    const dir = lstatSync3(rootDir);
     if (dir.isSymbolicLink() || !dir.isDirectory())
       return;
     try {
-      if (lstatSync2(statusFile2).isSymbolicLink())
+      if (lstatSync3(statusFile2).isSymbolicLink())
         return;
     } catch (e) {
       if (e.code !== "ENOENT")
@@ -1357,7 +1379,7 @@ async function tick() {
 }
 function removeOwnedLock(file) {
   try {
-    const stat = lstatSync2(file);
+    const stat = lstatSync3(file);
     if (!stat.isSymbolicLink() && stat.isFile() && stat.size <= 64 * 1024 && readFileSync3(file, "utf8").trim() === String(process.pid))
       unlinkSync(file);
   } catch {}
@@ -1371,7 +1393,7 @@ Watch polls external Codex processes every 5 seconds.`);
   }
   if (values.status) {
     try {
-      const stat = lstatSync2(statusFile);
+      const stat = lstatSync3(statusFile);
       if (stat.isSymbolicLink() || !stat.isFile())
         throw new Error("Unsafe status file");
       console.log(readFileSync3(statusFile, "utf8"));

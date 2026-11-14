@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { loadBots } from "../codex/bots-config.ts";
 import { modelName, reasoningEffort, resolveConfig, type BridgeConfig } from "../codex/config.ts";
 import { authorizedLoopTick } from "../codex/loop-grants.ts";
@@ -258,7 +258,7 @@ test("config expands Windows tilde paths and accepts canonical loopback aliases 
   const { home, cwd } = configFixture();
   const config = resolveConfig({ cwd, profile: "~\\valid.json", stateRoot: "~\\state", settings: { api_url: "http://LOCALHOST.:1234", ws_url: "ws://[::1]:1234/ws" } }, {}, home);
   expect(config.profileFile).toBe(join(home, "valid.json"));
-  expect(config.stateDir.startsWith(join(home, "state") + "/")).toBe(true);
+  expect(config.stateDir.startsWith(join(home, "state") + sep)).toBe(true);
   for (const field of ["api_url", "ws_url"]) {
     for (const url of ["http://localhost:0", "https://localhost:0", "ws://[::1]:0/ws", "wss://localhost:0/ws"]) {
       expect(() => resolveConfig({ cwd, profile: "~\\valid.json", settings: { [field]: url } }, {}, home)).toThrow("Server URLs");

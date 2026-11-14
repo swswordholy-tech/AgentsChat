@@ -2,7 +2,7 @@
 import { test, expect, afterEach } from "bun:test";
 import { mkdtempSync, readFileSync, readdirSync, statSync, rmSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { preserveChannelHistory, priorChannelThreads } from "../codex/thread-history.ts";
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, {recursive:true,force:true}); });
@@ -83,7 +83,7 @@ test("history rechecks archive symlinks introduced during serialization and remo
     rmSync(archive); symlinkSync(outside, archive); return s;
   })).toThrow("symlink");
   expect(readFileSync(outside, "utf8")).toBe("unchanged");
-  expect(readdirSync(hist)).toEqual([archive.split("/").pop()!]);
+  expect(readdirSync(hist)).toEqual([basename(archive)]);
 });
 
 test("embedded message prototype keys are stripped from imported records without losing ordinary fields", () => {

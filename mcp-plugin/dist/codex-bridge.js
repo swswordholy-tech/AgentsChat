@@ -176,7 +176,14 @@ async function getBotOwner(base, agentId, token, request = fetch) {
 function isSafeOnboardingBase(base) {
   try {
     const parsed = new URL(base);
-    const host = parsed.hostname.toLowerCase();
+    const host = parsed.hostname.toLowerCase().replace(/\.$/, "");
+    if (!host)
+      return false;
+    if (parsed.port !== "") {
+      const p = Number(parsed.port);
+      if (!Number.isInteger(p) || p < 1 || p > 65535)
+        return false;
+    }
     const isLoopback = host === "127.0.0.1" || host === "localhost" || host === "[::1]" || host === "::1";
     if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && isLoopback))
       return false;
@@ -187,8 +194,25 @@ function isSafeOnboardingBase(base) {
     return false;
   }
 }
+function isSafeOnboardingAgentId(id) {
+  if (!id || id.length > 128 || /[\x00-\x1f\x7f\s/\\]/.test(id))
+    return false;
+  if (id === "." || id.includes(".."))
+    return false;
+  const lower = id.toLowerCase();
+  if (lower === "__proto__" || lower === "constructor" || lower === "prototype")
+    return false;
+  return true;
+}
 var MAX_ONBOARDING_JSON_BYTES = 64 * 1024;
 async function readBoundedJson(r, maxBytes = MAX_ONBOARDING_JSON_BYTES) {
+  const declaredLen = Number(r.headers?.get?.("content-length"));
+  if (Number.isFinite(declaredLen) && declaredLen > maxBytes) {
+    try {
+      await r.body?.cancel?.();
+    } catch {}
+    throw new Error("onboarding response too large");
+  }
   if (!r.body) {
     const txt = await r.text();
     if (Buffer.byteLength(txt, "utf8") > maxBytes)
@@ -221,7 +245,9 @@ async function readBoundedJson(r, maxBytes = MAX_ONBOARDING_JSON_BYTES) {
 }
 async function getOnboardingStatus(base, agentId, token, request = fetch) {
   const cleanBase = typeof base === "string" ? base.trim().replace(/\/+$/, "") : "";
-  const safeAgentId = typeof agentId === "string" ? agentId.trim() : "";
+  const rawAgentId = typeof agentId === "string" ? agentId.trim() : "";
+  const validAgent = isSafeOnboardingAgentId(rawAgentId);
+  const safeAgentId = validAgent ? rawAgentId : "";
   const chat = `${cleanBase}/chat/${encodeURIComponent(safeAgentId)}`;
   const result = {
     agent_id: safeAgentId,
@@ -231,7 +257,7 @@ async function getOnboardingStatus(base, agentId, token, request = fetch) {
     claim_url: `${chat}?claim=1`,
     next_step: "check_identity"
   };
-  if (!cleanBase || !safeAgentId || /[\x00-\x1f\x7f]/.test(cleanBase) || /[\x00-\x1f\x7f]/.test(safeAgentId) || typeof token !== "string" || !token.trim() || /[\x00-\x1f\x7f]/.test(token) || !isSafeOnboardingBase(cleanBase)) {
+  if (!cleanBase || !validAgent || /[\x00-\x1f\x7f]/.test(cleanBase) || typeof token !== "string" || !token.trim() || /[\x00-\x1f\x7f]/.test(token) || !isSafeOnboardingBase(cleanBase)) {
     return result;
   }
   try {
@@ -255,7 +281,7 @@ async function getOnboardingStatus(base, agentId, token, request = fetch) {
       return result;
     }
     const data = await readBoundedJson(r);
-    if (!data || typeof data !== "object" || data.agent_id !== safeAgentId || typeof data.claimed !== "boolean")
+    if (!data || typeof data !== "object" || Array.isArray(data) || data.agent_id !== safeAgentId || typeof data.claimed !== "boolean")
       return result;
     result.authentication = "ok";
     result.claimed = data.claimed;
@@ -421,17 +447,17 @@ ${text}`,
 }
 
 // codex/run.ts
-import { readFileSync as readFileSync11, lstatSync as lstatSync11 } from "node:fs";
+import { readFileSync as readFileSync11, lstatSync as lstatSync12 } from "node:fs";
 import { homedir as homedir6 } from "node:os";
 import { join as join11 } from "node:path";
 
 // codex/bots-config.ts
-import { readFileSync as readFileSync3, realpathSync as realpathSync3, mkdirSync as mkdirSync3, lstatSync as lstatSync3 } from "node:fs";
+import { readFileSync as readFileSync3, realpathSync as realpathSync3, mkdirSync as mkdirSync3, lstatSync as lstatSync4 } from "node:fs";
 import { homedir as homedir3 } from "node:os";
 import { dirname, isAbsolute as isAbsolute3, join as join4, resolve as resolve3 } from "node:path";
 
 // codex/config.ts
-import { existsSync as existsSync2, readFileSync as readFileSync2, realpathSync as realpathSync2, statSync } from "node:fs";
+import { lstatSync as lstatSync3, readFileSync as readFileSync2, realpathSync as realpathSync2 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
 import { isAbsolute as isAbsolute2, join as join3, resolve as resolve2 } from "node:path";
 import { createHash } from "node:crypto";
@@ -1358,6 +1384,22 @@ function codexHomeMode(value) {
     throw new Error("codex_home_mode must be linked, isolated or auth-only");
   return value;
 }
+var MAX_CONFIG_BYTES = 1048576;
+function checkedPath(path, directory = false) {
+  let stat;
+  try {
+    stat = lstatSync3(path);
+  } catch (error) {
+    if (error.code === "ENOENT")
+      return;
+    throw error;
+  }
+  if (stat.isSymbolicLink() || (directory ? !stat.isDirectory() : !stat.isFile()))
+    throw new Error(directory ? `Config directory must be a non-symlink directory: ${path}` : `Selected profile is not a regular file: ${path}`);
+  if (!directory && stat.size > MAX_CONFIG_BYTES)
+    throw new Error(`Config file exceeds 1 MiB: ${path}`);
+  return stat;
+}
 function readJson(file) {
   try {
     return JSON.parse(readFileSync2(file, "utf8"));
@@ -1375,9 +1417,13 @@ function strings(value, name) {
 function resolveConfig(opts, env = process.env, home = homedir2()) {
   const cwd = realpathSync2(opts.cwd ?? process.cwd());
   const configFile = join3(cwd, ".agentschat/config.json");
-  const project = opts.settings ?? (existsSync2(configFile) ? readJson(configFile) : {});
+  if (opts.settings === undefined)
+    checkedPath(join3(cwd, ".agentschat"), true);
+  const project = opts.settings ?? (checkedPath(configFile) ? readJson(configFile) : {});
   if (!project || typeof project !== "object" || Array.isArray(project))
     throw new Error("Invalid project config");
+  if (["__proto__", "constructor", "prototype"].some((key2) => Object.hasOwn(project, key2)))
+    throw new Error("Invalid project config prototype key");
   const allowed = new Set(["profile", "agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort", "model", "state_root", "codex_home_mode"]);
   if (Object.keys(project).some((k) => !allowed.has(k)))
     throw new Error("Unknown project config field (credentials belong in a private profile)");
@@ -1387,7 +1433,9 @@ function resolveConfig(opts, env = process.env, home = homedir2()) {
   const localProfile = join3(cwd, ".agentschat/profile.json");
   let codexProfile;
   const codexFile = join3(cwd, ".codex/config.toml");
-  if (opts.settings === undefined && existsSync2(codexFile)) {
+  if (opts.settings === undefined)
+    checkedPath(join3(cwd, ".codex"), true);
+  if (opts.settings === undefined && checkedPath(codexFile)) {
     let doc;
     try {
       doc = parse(readFileSync2(codexFile, "utf8"));
@@ -1407,7 +1455,7 @@ function resolveConfig(opts, env = process.env, home = homedir2()) {
   const choices = [
     [opts.profile, "flag"],
     [project.profile, "project-config"],
-    [opts.settings === undefined && existsSync2(localProfile) ? localProfile : undefined, "project-profile"],
+    [opts.settings === undefined && checkedPath(localProfile) ? localProfile : undefined, "project-profile"],
     [codexProfile, "project-codex"],
     [env.AGENTSCHAT_PROFILE, "env"],
     [env.AGENTCHAT_PROFILE, "legacy-env"],
@@ -1417,7 +1465,7 @@ function resolveConfig(opts, env = process.env, home = homedir2()) {
   if (typeof selector !== "string" || /[\x00-\x1f\x7f]/.test(selector))
     throw new Error("Invalid profile selector");
   let profileFile;
-  if (selector.startsWith("~/"))
+  if (/^~[\\/]/.test(selector))
     profileFile = join3(home, selector.slice(2));
   else if (isAbsolute2(selector) || selector.includes("/") || selector.includes("\\"))
     profileFile = resolve2(cwd, selector);
@@ -1428,14 +1476,14 @@ function resolveConfig(opts, env = process.env, home = homedir2()) {
     }
     const name = selector.endsWith(".json") ? selector : `${selector}.json`;
     profileFile = join3(home, ".agentschat/profiles", name);
-    if (!existsSync2(profileFile))
+    if (!checkedPath(profileFile))
       profileFile = join3(home, ".agentschat", name);
-    if (!existsSync2(profileFile))
+    if (!checkedPath(profileFile))
       profileFile = join3(home, ".agentchat", name);
   }
-  if (!existsSync2(profileFile))
+  if (!checkedPath(profileFile))
     throw new Error(`Selected profile missing: ${profileFile}; no identity fallback or registration`);
-  const profileStat = statSync(profileFile);
+  const profileStat = checkedPath(profileFile);
   if (!profileStat.isFile())
     throw new Error(`Selected profile is not a regular file: ${profileFile}`);
   if (process.platform !== "win32" && profileStat.mode & 63)
@@ -1448,7 +1496,7 @@ function resolveConfig(opts, env = process.env, home = homedir2()) {
   const wsUrl = project.ws_url ?? `${apiUrl.replace(/^http/, "ws").replace(/\/$/, "")}/ws`;
   for (const [raw, protocols] of [[apiUrl, ["https:", "http:"]], [wsUrl, ["wss:", "ws:"]]]) {
     const url = new URL(raw);
-    if (!protocols.includes(url.protocol) || url.username || url.password || url.search || url.hash || !url.protocol.endsWith("s:") && !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname))
+    if (!protocols.includes(url.protocol) || url.username || url.password || url.search || url.hash || url.port === "0" || !url.protocol.endsWith("s:") && !["127.0.0.1", "localhost", "[::1]", "::1"].includes(url.hostname.toLowerCase().replace(/\.$/, "")))
       throw new Error("Server URLs must use TLS (except loopback) and contain no credentials/query");
   }
   const canonicalApi = new URL(apiUrl).href.replace(/\/$/, "");
@@ -1459,7 +1507,7 @@ function resolveConfig(opts, env = process.env, home = homedir2()) {
   const codexBin = opts.codexBin ?? "codex";
   if (typeof codexBin !== "string" || !codexBin.trim() || /[\x00-\x1f\x7f]/.test(codexBin))
     throw new Error("Invalid codex_bin");
-  const stateRoot = root === undefined ? join3(home, ".agentschat/codex-bridge") : root.startsWith("~/") ? join3(home, root.slice(2)) : resolve2(cwd, root);
+  const stateRoot = root === undefined ? join3(home, ".agentschat/codex-bridge") : /^~[\\/]/.test(root) ? join3(home, root.slice(2)) : resolve2(cwd, root);
   return {
     cwd,
     profileFile,
@@ -1486,7 +1534,7 @@ function defaultRegistry(home = homedir3()) {
 function loadBots(file = defaultRegistry(), home = homedir3()) {
   let doc;
   try {
-    const info = lstatSync3(file);
+    const info = lstatSync4(file);
     if (info.isSymbolicLink() || !info.isFile() || info.size > 1048576)
       throw new Error("Invalid registry file");
     doc = JSON.parse(readFileSync3(file, "utf8"));
@@ -1555,7 +1603,7 @@ import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 
 // src/wake.ts
-import { existsSync as existsSync3, lstatSync as lstatSync4, readFileSync as readFileSync4 } from "node:fs";
+import { existsSync as existsSync2, lstatSync as lstatSync5, readFileSync as readFileSync4 } from "node:fs";
 import { homedir as homedir4 } from "node:os";
 import { join as join5, win32 as pathWin32 } from "node:path";
 var GROK_GATEWAY_PATH_CANDIDATES = [
@@ -1576,7 +1624,7 @@ function resolveWindowsCliSpawn(cmd, args, opts) {
     return { cmd: trimmed, args };
   }
   const env = opts?.env ?? process.env;
-  const exists = opts?.existsImpl ?? existsSync3;
+  const exists = opts?.existsImpl ?? existsSync2;
   const readText = opts?.readTextImpl ?? ((p) => readFileSync4(p, "utf8"));
   const hasSep = /[\\/]/.test(trimmed) || /^[A-Za-z]:/.test(trimmed);
   const hasWinExt = /\.(?:exe|cmd|bat)$/i.test(trimmed);
@@ -1958,13 +2006,13 @@ function isTeamLeadSkillInvocation(prompt) {
 }
 
 // codex/bridge.ts
-import { lstatSync as lstatSync9, mkdirSync as mkdirSync6, readFileSync as readFileSync9, renameSync as renameSync4, writeFileSync as writeFileSync4, openSync as openSync2, closeSync as closeSync2, unlinkSync as unlinkSync4 } from "node:fs";
+import { lstatSync as lstatSync10, mkdirSync as mkdirSync6, readFileSync as readFileSync9, renameSync as renameSync4, writeFileSync as writeFileSync4, openSync as openSync2, closeSync as closeSync2, unlinkSync as unlinkSync4 } from "node:fs";
 import { join as join9 } from "node:path";
 import { randomBytes as randomBytes2 } from "node:crypto";
 
 // codex/thread-history.ts
 import { createHash as createHash2, randomBytes } from "node:crypto";
-import { chmodSync, lstatSync as lstatSync5, mkdirSync as mkdirSync4, renameSync as renameSync2, unlinkSync, writeFileSync as writeFileSync2 } from "node:fs";
+import { chmodSync, lstatSync as lstatSync6, mkdirSync as mkdirSync4, renameSync as renameSync2, unlinkSync, writeFileSync as writeFileSync2 } from "node:fs";
 import { join as join6 } from "node:path";
 function priorChannelThreads(threads, channel) {
   if (!threads || typeof threads !== "object" || typeof channel !== "string" || !channel)
@@ -1985,15 +2033,26 @@ function priorChannelThreads(threads, channel) {
   }).map(([, id]) => id))];
 }
 function preserveChannelHistory(directory, channel, histories, redact) {
+  const checkDirectory = (path) => {
+    try {
+      const stat = lstatSync6(path);
+      if (stat.isSymbolicLink() || !stat.isDirectory())
+        throw new Error("History directory must be a non-symlink directory");
+    } catch (error) {
+      if (error.code !== "ENOENT")
+        throw error;
+    }
+  };
   const root = join6(directory, "history");
+  checkDirectory(directory);
+  checkDirectory(root);
   mkdirSync4(root, { recursive: true, mode: 448 });
-  if (lstatSync5(root).isSymbolicLink())
-    throw new Error("History directory must not be a symlink");
+  checkDirectory(root);
   if (process.platform !== "win32")
     chmodSync(root, 448);
   const file = join6(root, createHash2("sha256").update(channel).digest("hex").slice(0, 24) + ".json");
   try {
-    if (lstatSync5(file).isSymbolicLink())
+    if (lstatSync6(file).isSymbolicLink())
       throw new Error("History archive must not be a symlink");
   } catch (e) {
     if (e.code !== "ENOENT")
@@ -2004,6 +2063,13 @@ function preserveChannelHistory(directory, channel, histories, redact) {
     writeFileSync2(tmp, redact(JSON.stringify({ channel_id: channel, threads: histories })), { flag: "wx", mode: 384 });
     if (process.platform !== "win32")
       chmodSync(tmp, 384);
+    try {
+      if (lstatSync6(file).isSymbolicLink())
+        throw new Error("History archive must not be a symlink");
+    } catch (error) {
+      if (error.code !== "ENOENT")
+        throw error;
+    }
     renameSync2(tmp, file);
   } catch (err) {
     try {
@@ -2033,6 +2099,8 @@ function preserveChannelHistory(directory, channel, histories, redact) {
             try {
               const message = JSON.parse(text.slice(text.lastIndexOf(marker) + marker.length));
               if (message && typeof message === "object" && !Array.isArray(message)) {
+                for (const key of ["__proto__", "constructor", "prototype"])
+                  delete message[key];
                 if (message.channel_id === channel)
                   records.push({ order, sequence: sequence++, value: { ...message, role: "user" } });
                 continue;
@@ -2085,16 +2153,16 @@ End of historical context.
 }
 
 // codex/loop-grants.ts
-import { lstatSync as lstatSync6, readFileSync as readFileSync6 } from "node:fs";
+import { lstatSync as lstatSync7, readFileSync as readFileSync6 } from "node:fs";
 import { join as join7 } from "node:path";
 function grants(config, opts) {
   try {
     const platform = opts?.platform ?? process.platform;
     const getuid = opts && "getuid" in opts ? opts.getuid : process.getuid;
-    const directory = lstatSync6(config.stateDir);
+    const directory = lstatSync7(config.stateDir);
     if (directory.isSymbolicLink() || !directory.isDirectory())
       return [];
-    const file = join7(config.stateDir, "loop-grants.json"), stat = lstatSync6(file);
+    const file = join7(config.stateDir, "loop-grants.json"), stat = lstatSync7(file);
     if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 1048576)
       return [];
     if (platform !== "win32") {
@@ -2143,19 +2211,19 @@ async function verifyLoopTick(raw, config, owner, list, opts) {
 
 // src/session-bind.ts
 import { createHash as createHash3 } from "node:crypto";
-import { closeSync, existsSync as existsSync5, lstatSync as lstatSync8, mkdirSync as mkdirSync5, openSync, readFileSync as readFileSync8, readSync, readdirSync as readdirSync4, statSync as statSync3, unlinkSync as unlinkSync3 } from "node:fs";
+import { closeSync, existsSync as existsSync4, lstatSync as lstatSync9, mkdirSync as mkdirSync5, openSync, readFileSync as readFileSync8, readSync, readdirSync as readdirSync4, statSync as statSync2, unlinkSync as unlinkSync3 } from "node:fs";
 import { homedir as homedir5, tmpdir } from "node:os";
 import { join as join8 } from "node:path";
 
 // src/profile-store.ts
 import {
-  lstatSync as lstatSync7,
+  lstatSync as lstatSync8,
   writeFileSync as writeFileSync3,
   renameSync as renameSync3,
   copyFileSync,
   chmodSync as chmodSync2,
   unlinkSync as unlinkSync2,
-  statSync as statSync2,
+  statSync,
   readdirSync as readdirSync3,
   readFileSync as readFileSync7
 } from "fs";
@@ -2163,7 +2231,7 @@ var defaultWarn = (m) => process.stderr.write(m);
 var MAX_PROFILE_JSON_BYTES = 64 * 1024;
 function safeLstat(target) {
   try {
-    return lstatSync7(target);
+    return lstatSync8(target);
   } catch (err) {
     if (err && err.code === "ENOENT")
       return;
@@ -2212,7 +2280,7 @@ function safeWriteProfile(path, data, warn = defaultWarn) {
 `);
     }
     try {
-      const mode = statSync2(path).mode & 511;
+      const mode = statSync(path).mode & 511;
       if (mode !== 384) {
         warn(`[agentchat] WARNING: ${path} is mode ${mode.toString(8)}, expected 600 — it holds your agent key. Fix: chmod 600 ${path}
 `);
@@ -2259,7 +2327,7 @@ var LOCK_FILE_MAX_BYTES = 64 * 1024;
 var SESSION_BINDS_MAX_BYTES = 1024 * 1024;
 function readBoundedRegularJson(path, maxBytes) {
   try {
-    const st = lstatSync8(path);
+    const st = lstatSync9(path);
     if (st.isSymbolicLink() || !st.isFile() || st.size > maxBytes)
       return null;
     return JSON.parse(readFileSync8(path, "utf8"));
@@ -2269,7 +2337,7 @@ function readBoundedRegularJson(path, maxBytes) {
 }
 function isSafeTargetFileOrMissing(path) {
   try {
-    const st = lstatSync8(path);
+    const st = lstatSync9(path);
     return !st.isSymbolicLink() && st.isFile();
   } catch (e) {
     return Boolean(e && typeof e === "object" && e.code === "ENOENT");
@@ -2277,7 +2345,7 @@ function isSafeTargetFileOrMissing(path) {
 }
 function isSafeDirOrMissing(dirPath) {
   try {
-    const st = lstatSync8(dirPath);
+    const st = lstatSync9(dirPath);
     return !st.isSymbolicLink() && st.isDirectory();
   } catch (e) {
     return Boolean(e && typeof e === "object" && e.code === "ENOENT");
@@ -2327,7 +2395,7 @@ function releaseAgentLock(opts) {
   const existing = readAgentLock(opts.lockDir, opts.agentId);
   if (!existing) {
     try {
-      const st = lstatSync8(file);
+      const st = lstatSync9(file);
       if (!st.isSymbolicLink() && st.isFile() && Date.now() - st.mtimeMs > 1000) {
         unlinkSync3(file);
         return true;
@@ -2405,7 +2473,7 @@ class Bridge {
     this.file = join9(config.stateDir, "state.json");
     this.lock = join9(config.stateDir, "bridge.lock");
     try {
-      const stat = lstatSync9(this.lock);
+      const stat = lstatSync10(this.lock);
       if (!stat.isSymbolicLink() && stat.isFile() && stat.size <= 64 * 1024) {
         const content = readFileSync9(this.lock, "utf8");
         const holderPid = /^\d+$/.test(content) && content.trim() === content ? Number(content) : NaN;
@@ -2425,7 +2493,7 @@ class Bridge {
     try {
       let hasState = false;
       try {
-        const stat = lstatSync9(this.file);
+        const stat = lstatSync10(this.file);
         if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 16 * 1024 * 1024)
           throw new Error("Unsafe bridge state");
         hasState = true;
@@ -2476,7 +2544,7 @@ class Bridge {
     try {
       writeFileSync4(tmp, JSON.stringify(this.state), { mode: 384, flag: "wx" });
       try {
-        if (lstatSync9(this.file).isSymbolicLink())
+        if (lstatSync10(this.file).isSymbolicLink())
           throw new Error("Bridge state must not be a symlink");
       } catch (error) {
         if (error.code !== "ENOENT")
@@ -2672,7 +2740,7 @@ AgentsChat message:
     this.pause();
     await this.draining;
     try {
-      const stat = lstatSync9(this.lock);
+      const stat = lstatSync10(this.lock);
       if (!stat.isSymbolicLink() && stat.isFile() && stat.size <= 64 * 1024 && readFileSync9(this.lock, "utf8") === String(process.pid))
         unlinkSync4(this.lock);
     } catch (error) {
@@ -2781,7 +2849,7 @@ function resolveDrainReconnectDelay(frame, rand = Math.random) {
 }
 
 // codex/inbox-sync.ts
-import { chmodSync as chmodSync3, lstatSync as lstatSync10, mkdirSync as mkdirSync7, readFileSync as readFileSync10, renameSync as renameSync5, unlinkSync as unlinkSync5, writeFileSync as writeFileSync5 } from "node:fs";
+import { chmodSync as chmodSync3, lstatSync as lstatSync11, mkdirSync as mkdirSync7, readFileSync as readFileSync10, renameSync as renameSync5, unlinkSync as unlinkSync5, writeFileSync as writeFileSync5 } from "node:fs";
 import { randomBytes as randomBytes3 } from "node:crypto";
 import { join as join10 } from "node:path";
 
@@ -2839,7 +2907,7 @@ class InboxSync {
     this.active = active;
     this.log = log;
     mkdirSync7(stateDir, { recursive: true, mode: 448 });
-    const dirStat = lstatSync10(stateDir);
+    const dirStat = lstatSync11(stateDir);
     if (dirStat.isSymbolicLink() || !dirStat.isDirectory())
       throw new Error("Invalid inbound state directory");
     if (process.platform !== "win32")
@@ -2847,7 +2915,7 @@ class InboxSync {
     this.file = join10(stateDir, "inbound-cursors.json");
     let fileStat;
     try {
-      fileStat = lstatSync10(this.file);
+      fileStat = lstatSync11(this.file);
     } catch (err) {
       if (err.code !== "ENOENT")
         throw err;
@@ -3294,7 +3362,7 @@ async function main() {
     }
     if (!values["gui-thread"] || !values["gui-message-file"])
       throw new Error("GUI submission requires --gui-thread and --gui-message-file");
-    const stat = lstatSync11(values["gui-message-file"]);
+    const stat = lstatSync12(values["gui-message-file"]);
     if (stat.isSymbolicLink() || !stat.isFile())
       throw new Error("GUI message must be a regular file, not a symlink");
     if (stat.size > 256 * 1024)
