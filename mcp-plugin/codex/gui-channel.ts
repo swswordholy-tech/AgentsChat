@@ -20,6 +20,10 @@ function payload(result: any): any {
   }
   return result;
 }
+function validTarget(value: unknown): value is string {
+  return typeof value === "string" && value.trim() === value && value.length >= 1 && value.length <= 256 &&
+    !/[\x00-\x1f\x7f]/.test(value) && !["__proto__", "prototype", "constructor"].includes(value);
+}
 /** Private durable outbox. An authorized GUI host calls dispatch; enqueue is NOT delivery. */
 export class GuiChannel {
   constructor(private directory: string, private allowedThreads: readonly string[]) {
@@ -53,11 +57,11 @@ export class GuiChannel {
     if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("GUI receipt must be a regular file, not a symlink");
     if (stat.size > 1_048_576) throw new Error("GUI receipt exceeds size limit");
     const entry = JSON.parse(readFileSync(path, "utf8"));
-    if (!entry || typeof entry !== "object" || Array.isArray(entry) || entry.id !== id ||
-      typeof entry.threadId !== "string" || !entry.threadId.trim() || typeof entry.prompt !== "string" ||
+    if (!entry || typeof entry !== "object" || Array.isArray(entry) || Object.prototype.hasOwnProperty.call(entry, "__proto__") || entry.id !== id ||
+      !validTarget(entry.threadId) || typeof entry.prompt !== "string" ||
       typeof entry.createdAt !== "string" ||
       !["pending", "sending", "submitted", "delivered", "uncertain"].includes(entry.status) ||
-      (entry.hostId !== undefined && typeof entry.hostId !== "string") ||
+      (entry.hostId !== undefined && !validTarget(entry.hostId)) ||
       (entry.turnId !== undefined && typeof entry.turnId !== "string") ||
       (entry.deliveredAt !== undefined && typeof entry.deliveredAt !== "string")) throw new Error("Invalid GUI receipt");
     return entry;
@@ -71,6 +75,7 @@ export class GuiChannel {
     return entries;
   }
   enqueue(threadId: string, text: string, hostId?: string): GuiDelivery {
+    if (!validTarget(threadId) || (hostId !== undefined && !validTarget(hostId))) throw new Error("Invalid GUI target");
     if (!this.allowedThreads.includes(threadId)) throw new Error("GUI target is not allowed");
     if (!text.trim() || text.length > 24000) throw new Error("GUI message must contain 1–24000 characters");
     const id = randomUUID();

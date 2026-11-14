@@ -162,3 +162,35 @@ test("GUI rechecks destination after serialization and preserves planted links",
   expect(()=>new GuiChannel(regular,[])).toThrow("real directory");
  } finally {rmSync(dir,{recursive:true,force:true});}
 });
+
+
+test("GUI validates thread and optional host identifiers on enqueue and persisted reads", () => {
+ const dir=mkdtempSync(join(tmpdir(),"gui-targets-"));
+ try {
+  const invalid: any[]=[undefined,null,0,{},[],""," target","target ","x".repeat(257),"__proto__","prototype","constructor"];
+  for(let code=0;code<32;code++)invalid.push(`a${String.fromCharCode(code)}b`);
+  invalid.push("a\x7fb");
+  const q=new GuiChannel(dir,["target",...invalid]);
+  const good=q.enqueue("target","hello","host");
+  const path=join(dir,`${good.id}.json`);
+  for(const value of invalid) {
+   expect(()=>q.enqueue(value,"hello")).toThrow("Invalid GUI target");
+   if(value!==undefined)expect(()=>q.enqueue("target","hello",value)).toThrow("Invalid GUI target");
+   writeFileSync(path,JSON.stringify({...good,threadId:value}));
+   expect(()=>q.get(good.id)).toThrow("Invalid GUI receipt");
+   if(value!==undefined) {
+    writeFileSync(path,JSON.stringify({...good,hostId:value}));
+    expect(()=>q.get(good.id)).toThrow("Invalid GUI receipt");
+   }
+  }
+  for(const target of ["a","x".repeat(256),"线程-α","thread.id:1"]) {
+   const allowed=new GuiChannel(dir,[target]);
+   const entry=allowed.enqueue(target,"hello",target);
+   expect(allowed.get(entry.id)).toEqual(entry);
+  }
+  const absent=q.enqueue("target","hello");expect(q.get(absent.id).hostId).toBeUndefined();
+  writeFileSync(path,JSON.stringify(good).replace(/}$/, ',"__proto__":{"threadId":"other"}}'));
+  expect(()=>q.get(good.id)).toThrow("Invalid GUI receipt");
+  expect(q.list().some(e=>e.id===good.id)).toBe(false);
+ } finally {rmSync(dir,{recursive:true,force:true});}
+});
