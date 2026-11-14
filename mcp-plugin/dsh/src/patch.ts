@@ -88,7 +88,13 @@ export function buildMcpAgentsChatArgs(opts: DshPatchOptions = {}): string[] {
     } catch {
       throw new Error("Invalid AgentsChat API URL");
     }
-    if (parsed.username || parsed.password || (parsed.protocol !== "http:" && parsed.protocol !== "https:")) {
+    const host = parsed.hostname.toLowerCase().replace(/\.$/, "");
+    const isLoopback = host === "localhost" || host === "127.0.0.1" || host === "[::1]" || host === "::1";
+    if (
+      parsed.username ||
+      parsed.password ||
+      (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && isLoopback))
+    ) {
       throw new Error("Invalid AgentsChat API URL");
     }
     args.push("--url", rawUrl);
@@ -199,6 +205,9 @@ export function applyDshCordisPatchFile(opts: DshPatchOptions = {}): {
     if (lst.isSymbolicLink() || !lst.isFile()) {
       throw new Error(`Refusing to modify non-regular or symlinked DSH patch file: ${patchPath}`);
     }
+    if (lst.size > 1_048_576) {
+      throw new Error(`Refusing to modify oversized DSH patch file (>1MiB): ${patchPath}`);
+    }
     existed = true;
     mode = lst.mode & 0o777;
   } catch (err: any) {
@@ -214,6 +223,13 @@ export function applyDshCordisPatchFile(opts: DshPatchOptions = {}): {
     try {
       writeFileSync(tmp, content, { encoding: "utf8", mode, flag: "wx" });
       created = true;
+      try {
+        if (lstatSync(patchPath).isSymbolicLink()) {
+          throw new Error(`Refusing to overwrite symlinked DSH patch file: ${patchPath}`);
+        }
+      } catch (err: any) {
+        if (err?.code !== "ENOENT") throw err;
+      }
       renameSync(tmp, patchPath);
       if (process.platform !== "win32") {
         try {

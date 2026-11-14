@@ -462,4 +462,48 @@ describe("DeepSeek Harness (dsh) integration", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  test("Campaign #109 KR3: enforces TLS on remote ws/http URLs while allowing loopback, classifies dm: as direct, validates --name, and rejects >1MiB patch files", async () => {
+    const env = { AGENTCHAT_AGENT_ID: "bot-109", AGENTCHAT_TOKEN: "ac_token_109" };
+    expect(() => loadDshConfig({ ...env, AGENTCHAT_WS_URL: "ws://remote.example/ws" })).toThrow(/TLS/);
+    expect(() => loadDshConfig({ ...env, AGENTCHAT_REST_URL: "http://remote.example" })).toThrow(/TLS/);
+    expect(() => buildMcpAgentsChatArgs({ apiUrl: "http://remote.example" })).toThrow(/Invalid AgentsChat API URL/);
+
+    expect(loadDshConfig({ ...env, AGENTCHAT_WS_URL: "ws://127.0.0.1:8787/ws", AGENTCHAT_REST_URL: "http://localhost:8787" }).wsUrl).toBe(
+      "ws://127.0.0.1:8787/ws",
+    );
+    expect(buildMcpAgentsChatArgs({ apiUrl: "http://127.0.0.1:8787" })).toContain("http://127.0.0.1:8787");
+
+    await expect(registerOnly("   ", "https://agents-chat.com")).rejects.toThrow(/Invalid --name/);
+    await expect(registerOnly("bad\nname", "https://agents-chat.com")).rejects.toThrow(/Invalid --name/);
+    await expect(registerOnly("good-bot", "http://remote.example")).rejects.toThrow(/TLS/);
+
+    const priorId = process.env.AGENTCHAT_AGENT_ID;
+    const priorToken = process.env.AGENTCHAT_TOKEN;
+    process.env.AGENTCHAT_AGENT_ID = "dsh-test-bot";
+    process.env.AGENTCHAT_TOKEN = "test-token";
+    let kinds: unknown;
+    const start = spyOn(MuseBridge.prototype, "start").mockImplementation(async function (this: MuseBridge) {
+      kinds = (this as unknown as { opts: { channelKinds: unknown } }).opts.channelKinds;
+    });
+    const closed = spyOn(MuseAgentChatClient.prototype, "waitUntilClosed").mockResolvedValue();
+    try {
+      await main(["--listen", "--channel", "dm:colon-direct", "--channel", "DM:upper-colon"]);
+      expect(kinds).toEqual({ "dm:colon-direct": "direct", "DM:upper-colon": "direct" });
+    } finally {
+      start.mockRestore();
+      closed.mockRestore();
+      if (priorId === undefined) delete process.env.AGENTCHAT_AGENT_ID; else process.env.AGENTCHAT_AGENT_ID = priorId;
+      if (priorToken === undefined) delete process.env.AGENTCHAT_TOKEN; else process.env.AGENTCHAT_TOKEN = priorToken;
+    }
+
+    const dir = mkdtempSync(join(tmpdir(), "dsh-c109-oversize-"));
+    try {
+      const patchFile = join(dir, "cordis.patch.yml");
+      writeFileSync(patchFile, "# comment\n" + "x".repeat(1_050_000), "utf8");
+      expect(() => applyDshCordisPatchFile({ dshHome: dir })).toThrow(/oversized/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

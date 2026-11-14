@@ -72,6 +72,11 @@ function checkParentDirectory(path: string): void {
   }
 }
 
+function isLoopbackHost(hostname: string): boolean {
+  const h = hostname.toLowerCase().replace(/\.$/, "");
+  return h === "localhost" || h === "127.0.0.1" || h === "[::1]" || h === "::1";
+}
+
 function validateHttpOrWsUrl(raw: string, allowedProtocols: string[], label: string): string {
   const trimmed = raw.trim();
   if (!trimmed || /[\x00-\x20\x7f]/.test(trimmed)) {
@@ -86,6 +91,9 @@ function validateHttpOrWsUrl(raw: string, allowedProtocols: string[], label: str
   if (parsed.username || parsed.password) throw new Error(`Invalid ${label} URL`);
   if (!allowedProtocols.includes(parsed.protocol)) {
     throw new Error(`Unsupported ${label} protocol: ${parsed.protocol}`);
+  }
+  if ((parsed.protocol === "ws:" || parsed.protocol === "http:") && !isLoopbackHost(parsed.hostname)) {
+    throw new Error(`Remote ${label} URL must use TLS (${parsed.protocol === "ws:" ? "wss://" : "https://"})`);
   }
   return trimmed;
 }
@@ -150,13 +158,17 @@ export function safeDshConfig(config: DshBridgeConfig): Record<string, unknown> 
 }
 
 export async function registerOnly(name: string, restUrl: string, profilePath = DSH_PROFILE_PATH): Promise<void> {
+  const cleanName = typeof name === "string" ? name.trim() : "";
+  if (!cleanName || cleanName.length > 64 || /[\x00-\x1f\x7f]/.test(cleanName)) {
+    throw new Error("Invalid --name value");
+  }
   checkParentDirectory(profilePath);
   const safeRestUrl = validateHttpOrWsUrl(restUrl, ["http:", "https:"], "AgentChat REST");
   console.log("Terms notice: https://agents-chat.com/terms (notice only, no acceptance prompt)");
   const res = await fetch(`${safeRestUrl.replace(/\/+$/, "")}/api/account/register`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ name, type: "agent", capabilities: ["chat"] }),
+    body: JSON.stringify({ name: cleanName, type: "agent", capabilities: ["chat"] }),
     redirect: "error",
     signal: AbortSignal.timeout(15_000),
   });
@@ -258,10 +270,16 @@ export async function runDshHeadlessResponder(
     timer.unref?.();
 
     child.stdout.on("data", (chunk: Buffer) => {
-      if (stdout.length < 2_000_000) stdout += chunk.toString("utf8");
+      if (stdout.length < 2_000_000) {
+        const text = chunk.toString("utf8");
+        stdout += text.slice(0, 2_000_000 - stdout.length);
+      }
     });
     child.stderr.on("data", (chunk: Buffer) => {
-      if (stderr.length < 65_536) stderr += chunk.toString("utf8");
+      if (stderr.length < 65_536) {
+        const text = chunk.toString("utf8");
+        stderr += text.slice(0, 65_536 - stderr.length);
+      }
     });
     child.on("error", (err) => {
       clearTimers();
@@ -364,7 +382,7 @@ DeepSeek Harness (dsh) integration for AgentsChat:
           typing.stop(m.channel_id);
           return;
         }
-        const kind = /^dm-/i.test(m.channel_id) ? "direct" : "group";
+        const kind = /^dm[-:]/i.test(m.channel_id) ? "direct" : "group";
         if (!shouldDispatch(m, { agentId: botIdentity.agentId, displayName: botIdentity.displayName, channelKind: kind })) return;
         typing.start(m.channel_id);
         const route = resolveSessionForAgent(botIdentity.agentId);
@@ -430,10 +448,14 @@ DeepSeek Harness (dsh) integration for AgentsChat:
             const rawToken = typeof raw.token === "string" ? raw.token : "";
             const botAgentId = rawAgentId.trim();
             const botToken = rawToken.trim();
-            const botWsUrl =
-              typeof raw.server === "string" && /^wss?:\/\//i.test(raw.server.trim()) && !/[\x00-\x20\x7f]/.test(raw.server.trim())
-                ? raw.server.trim()
-                : defaultWsUrl;
+            let botWsUrl = defaultWsUrl;
+            if (typeof raw.server === "string" && raw.server.trim()) {
+              try {
+                botWsUrl = validateHttpOrWsUrl(raw.server.trim(), ["ws:", "wss:"], "AgentChat WebSocket");
+              } catch {
+                botWsUrl = defaultWsUrl;
+              }
+            }
             if (
               !botAgentId ||
               !botToken ||
@@ -487,6 +509,7 @@ DeepSeek Harness (dsh) integration for AgentsChat:
       };
       process.once("SIGINT", shutdown);
       process.once("SIGTERM", shutdown);
+      process.once("SIGHUP", shutdown);
       if (primaryClient) {
         void primaryClient.waitUntilClosed().then(resolve);
       }
@@ -528,7 +551,7 @@ DeepSeek Harness (dsh) integration for AgentsChat:
     const dshProfile = arg("--dsh-profile", argv) ?? "headless";
     const channelKinds: Record<string, "direct" | "group"> = {};
     for (const c of channels) {
-      channelKinds[c] = /^dm-/i.test(c) ? "direct" : "group";
+      channelKinds[c] = /^dm[-:]/i.test(c) ? "direct" : "group";
     }
     const bridge = new MuseBridge(client, {
       agentId: config.agentId,
@@ -548,9 +571,23 @@ DeepSeek Harness (dsh) integration for AgentsChat:
       },
     });
     client.onReconnect = () => bridge.rejoin();
-    await bridge.start();
-    console.log(`DSH bridge listening on ${channels.join(", ") || "(no channels — pass --channel <id>)"} (profile=${dshProfile}).`);
-    await client.waitUntilClosed();
+    const shutdownListen = () => {
+      try {
+        client.disconnect();
+      } catch {}
+    };
+    process.once("SIGINT", shutdownListen);
+    process.once("SIGTERM", shutdownListen);
+    process.once("SIGHUP", shutdownListen);
+    try {
+      await bridge.start();
+      console.log(`DSH bridge listening on ${channels.join(", ") || "(no channels — pass --channel <id>)"} (profile=${dshProfile}).`);
+      await client.waitUntilClosed();
+    } finally {
+      process.removeListener("SIGINT", shutdownListen);
+      process.removeListener("SIGTERM", shutdownListen);
+      process.removeListener("SIGHUP", shutdownListen);
+    }
     return;
   }
 
