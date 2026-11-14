@@ -16,8 +16,17 @@ export function priorChannelThreads(threads: Record<string, string>, channel: st
 
 /** Keep complete source turns privately; seed the new task with past chat, not old instructions. */
 export function preserveChannelHistory(directory: string, channel: string, histories: ThreadHistory[], redact: (s: string) => string): string {
-  const root = join(directory, "history"); mkdirSync(root, {recursive:true, mode:0o700});
-  if (lstatSync(root).isSymbolicLink()) throw new Error("History directory must not be a symlink");
+  const checkDirectory = (path: string) => {
+    try {
+      const stat = lstatSync(path);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("History directory must be a non-symlink directory");
+    } catch (error: any) { if (error.code !== "ENOENT") throw error; }
+  };
+  const root = join(directory, "history");
+  checkDirectory(directory);
+  checkDirectory(root);
+  mkdirSync(root, {recursive:true, mode:0o700});
+  checkDirectory(root);
   if (process.platform !== "win32") chmodSync(root, 0o700);
   const file = join(root, createHash("sha256").update(channel).digest("hex").slice(0,24) + ".json");
   try {
@@ -29,6 +38,9 @@ export function preserveChannelHistory(directory: string, channel: string, histo
   try {
     writeFileSync(tmp, redact(JSON.stringify({channel_id:channel, threads:histories})), {flag:"wx", mode:0o600});
     if (process.platform !== "win32") chmodSync(tmp, 0o600);
+    try {
+      if (lstatSync(file).isSymbolicLink()) throw new Error("History archive must not be a symlink");
+    } catch (error: any) { if (error.code !== "ENOENT") throw error; }
     renameSync(tmp, file);
   } catch (err) {
     try { unlinkSync(tmp); } catch { /* Best-effort temp cleanup. */ }
@@ -52,6 +64,7 @@ export function preserveChannelHistory(directory: string, channel: string, histo
             try {
               const message = JSON.parse(text.slice(text.lastIndexOf(marker) + marker.length));
               if (message && typeof message === "object" && !Array.isArray(message)) {
+                for (const key of ["__proto__", "constructor", "prototype"]) delete message[key];
                 if (message.channel_id === channel) records.push({order,sequence:sequence++,value:{...message,role:"user"}});
                 continue;
               }

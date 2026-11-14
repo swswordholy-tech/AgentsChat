@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { lstatSync, readFileSync, realpathSync, type Stats } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
@@ -37,6 +37,16 @@ export interface BridgeConfig {
   codexBin: string; stateDir: string; codexHomeMode?: CodexHomeMode; permissions: PermissionMode; effort?: ReasoningEffort; model?: string;
 }
 export interface IdentitySettings { state_root?: string; codex_home_mode?: CodexHomeMode; permissions?: PermissionMode; effort?: ReasoningEffort; model?: string; profile?: string; agent_id?: string; channels?: string[]; senders?: string[]; api_url?: string; ws_url?: string }
+const MAX_CONFIG_BYTES = 1_048_576;
+function checkedPath(path: string, directory = false): Stats | undefined {
+  let stat: Stats;
+  try { stat = lstatSync(path); }
+  catch (error: any) { if (error.code === "ENOENT") return undefined; throw error; }
+  if (stat.isSymbolicLink() || (directory ? !stat.isDirectory() : !stat.isFile()))
+    throw new Error(directory ? `Config directory must be a non-symlink directory: ${path}` : `Selected profile is not a regular file: ${path}`);
+  if (!directory && stat.size > MAX_CONFIG_BYTES) throw new Error(`Config file exceeds 1 MiB: ${path}`);
+  return stat;
+}
 function readJson(file: string): any {
   try { return JSON.parse(readFileSync(file, "utf8")); }
   catch { throw new Error(`Cannot read valid JSON: ${file}`); }
@@ -51,8 +61,10 @@ export function resolveConfig(opts: { cwd?: string; profile?: string; codexBin?:
   env: NodeJS.ProcessEnv = process.env, home = homedir()): BridgeConfig {
   const cwd = realpathSync(opts.cwd ?? process.cwd());
   const configFile = join(cwd, ".agentschat/config.json");
-  const project = opts.settings ?? (existsSync(configFile) ? readJson(configFile) : {});
+  if (opts.settings === undefined) checkedPath(join(cwd, ".agentschat"), true);
+  const project = opts.settings ?? (checkedPath(configFile) ? readJson(configFile) : {});
   if (!project || typeof project !== "object" || Array.isArray(project)) throw new Error("Invalid project config");
+  if (["__proto__", "constructor", "prototype"].some(key => Object.hasOwn(project, key))) throw new Error("Invalid project config prototype key");
   const allowed = new Set(["profile", "agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort", "model", "state_root", "codex_home_mode"]);
   if (Object.keys(project).some(k => !allowed.has(k))) throw new Error("Unknown project config field (credentials belong in a private profile)");
   for (const k of ["profile", "agent_id", "api_url", "ws_url", "state_root"])
@@ -62,7 +74,8 @@ export function resolveConfig(opts: { cwd?: string; profile?: string; codexBin?:
   // must not execute the configured MCP command or inherit its token overrides.
   let codexProfile: string | undefined;
   const codexFile = join(cwd, ".codex/config.toml");
-  if (opts.settings === undefined && existsSync(codexFile)) {
+  if (opts.settings === undefined) checkedPath(join(cwd, ".codex"), true);
+  if (opts.settings === undefined && checkedPath(codexFile)) {
     let doc: any;
     try { doc = parseToml(readFileSync(codexFile, "utf8")); }
     catch { throw new Error("Invalid project .codex/config.toml"); }
@@ -77,14 +90,14 @@ export function resolveConfig(opts: { cwd?: string; profile?: string; codexBin?:
   }
   const choices = [
     [opts.profile, "flag"], [project.profile, "project-config"],
-    [opts.settings === undefined && existsSync(localProfile) ? localProfile : undefined, "project-profile"],
+    [opts.settings === undefined && checkedPath(localProfile) ? localProfile : undefined, "project-profile"],
     [codexProfile, "project-codex"],
     [env.AGENTSCHAT_PROFILE, "env"], [env.AGENTCHAT_PROFILE, "legacy-env"], ["profile", "default"],
   ];
   const [selector, source] = choices.find(([v]) => v !== undefined && v !== "") as [string, string];
   if (typeof selector !== "string" || /[\x00-\x1f\x7f]/.test(selector)) throw new Error("Invalid profile selector");
   let profileFile: string;
-  if (selector.startsWith("~/")) profileFile = join(home, selector.slice(2));
+  if (/^~[\\/]/.test(selector)) profileFile = join(home, selector.slice(2));
   else if (isAbsolute(selector) || selector.includes("/") || selector.includes("\\")) profileFile = resolve(cwd, selector);
   else {
     const stem = selector.replace(/\.json$/i, "");
@@ -93,11 +106,11 @@ export function resolveConfig(opts: { cwd?: string; profile?: string; codexBin?:
     }
     const name = selector.endsWith(".json") ? selector : `${selector}.json`;
     profileFile = join(home, ".agentschat/profiles", name);
-    if (!existsSync(profileFile)) profileFile = join(home, ".agentschat", name);
-    if (!existsSync(profileFile)) profileFile = join(home, ".agentchat", name);
+    if (!checkedPath(profileFile)) profileFile = join(home, ".agentschat", name);
+    if (!checkedPath(profileFile)) profileFile = join(home, ".agentchat", name);
   }
-  if (!existsSync(profileFile)) throw new Error(`Selected profile missing: ${profileFile}; no identity fallback or registration`);
-  const profileStat = statSync(profileFile);
+  if (!checkedPath(profileFile)) throw new Error(`Selected profile missing: ${profileFile}; no identity fallback or registration`);
+  const profileStat = checkedPath(profileFile)!;
   if (!profileStat.isFile()) throw new Error(`Selected profile is not a regular file: ${profileFile}`);
   if (process.platform !== "win32" && (profileStat.mode & 0o077)) throw new Error(`Profile must be private (chmod 600): ${profileFile}`);
   const profile = readJson(profileFile);
@@ -107,8 +120,8 @@ export function resolveConfig(opts: { cwd?: string; profile?: string; codexBin?:
   const wsUrl = project.ws_url ?? `${apiUrl.replace(/^http/, "ws").replace(/\/$/, "")}/ws`;
   for (const [raw, protocols] of [[apiUrl, ["https:", "http:"]], [wsUrl, ["wss:", "ws:"]]] as const) {
     const url = new URL(raw);
-    if (!(protocols as readonly string[]).includes(url.protocol) || url.username || url.password || url.search || url.hash ||
-      (!url.protocol.endsWith("s:") && !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname))) throw new Error("Server URLs must use TLS (except loopback) and contain no credentials/query");
+    if (!(protocols as readonly string[]).includes(url.protocol) || url.username || url.password || url.search || url.hash || url.port === "0" ||
+      (!url.protocol.endsWith("s:") && !["127.0.0.1", "localhost", "[::1]", "::1"].includes(url.hostname.toLowerCase().replace(/\.$/, "")))) throw new Error("Server URLs must use TLS (except loopback) and contain no credentials/query");
   }
   const canonicalApi = new URL(apiUrl).href.replace(/\/$/, "");
   const key = createHash("sha256").update(JSON.stringify([cwd, canonicalApi, profile.agent_id])).digest("hex").slice(0, 24);
@@ -116,7 +129,7 @@ export function resolveConfig(opts: { cwd?: string; profile?: string; codexBin?:
   if (root !== undefined && (typeof root !== "string" || !root.trim() || /[\x00-\x1f\x7f]/.test(root))) throw new Error("Invalid state_root");
   const codexBin = opts.codexBin ?? "codex";
   if (typeof codexBin !== "string" || !codexBin.trim() || /[\x00-\x1f\x7f]/.test(codexBin)) throw new Error("Invalid codex_bin");
-  const stateRoot = root === undefined ? join(home, ".agentschat/codex-bridge") : root.startsWith("~/") ? join(home, root.slice(2)) : resolve(cwd, root);
+  const stateRoot = root === undefined ? join(home, ".agentschat/codex-bridge") : /^~[\\/]/.test(root) ? join(home, root.slice(2)) : resolve(cwd, root);
   return { cwd, profileFile, source, codexHomeMode: codexHomeMode(opts.codexHomeMode ?? project.codex_home_mode), permissions: permissionMode(project.permissions), effort: reasoningEffort(project.effort), model: modelName(project.model), agentId: profile.agent_id, token: profile.token,
     apiUrl: canonicalApi, wsUrl, channels: strings(project.channels, "channels"),
     senders: strings(project.senders, "senders"), codexBin,

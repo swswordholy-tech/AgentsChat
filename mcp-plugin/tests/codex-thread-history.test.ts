@@ -1,6 +1,6 @@
 /** Migration must retain original evidence, chronological chat and private file permissions. */
 import { test, expect, afterEach } from "bun:test";
-import { mkdtempSync, readFileSync, readdirSync, statSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, statSync, rmSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { preserveChannelHistory, priorChannelThreads } from "../codex/thread-history.ts";
@@ -55,4 +55,42 @@ test("repeated migration does not let nested bootstrap or a huge message erase r
  const prompt=preserveChannelHistory(root,"group",[old,current],s=>s);
  expect(prompt).toContain("remember this agreement");expect(prompt).toContain("migration completed");expect(prompt).not.toContain("old preview");expect(prompt).toContain('"truncated":true');expect(prompt.length).toBeLessThan(20000);
  const file=join(root,"history",readdirSync(join(root,"history"))[0]!);expect(readFileSync(file,"utf8")).toContain("old preview");
+});
+
+
+test("history rejects directory symlinks before recursive mkdir can create outside history", () => {
+  for (const linkRoot of [false, true]) {
+    const base = directory();
+    const outside = join(base, "outside"); mkdirSync(outside);
+    const state = join(base, "state");
+    if (linkRoot) { mkdirSync(state); symlinkSync(outside, join(state, "history"), "dir"); }
+    else symlinkSync(outside, state, "dir");
+    expect(() => preserveChannelHistory(state, "group", [], s => s)).toThrow("non-symlink directory");
+    expect(readdirSync(outside)).toEqual([]);
+  }
+  const base = directory();
+  const state = join(base, "state"); writeFileSync(state, "ordinary file");
+  expect(() => preserveChannelHistory(state, "group", [], s => s)).toThrow("non-symlink directory");
+});
+
+test("history rechecks archive symlinks introduced during serialization and removes the temporary file", () => {
+  const root = directory();
+  preserveChannelHistory(root, "group", [], s => s);
+  const hist = join(root, "history");
+  const archive = join(hist, readdirSync(hist)[0]!);
+  const outside = join(root, "outside"); writeFileSync(outside, "unchanged");
+  expect(() => preserveChannelHistory(root, "group", [], s => {
+    rmSync(archive); symlinkSync(outside, archive); return s;
+  })).toThrow("symlink");
+  expect(readFileSync(outside, "utf8")).toBe("unchanged");
+  expect(readdirSync(hist)).toEqual([archive.split("/").pop()!]);
+});
+
+test("embedded message prototype keys are stripped from imported records without losing ordinary fields", () => {
+  const root = directory();
+  const text = 'AgentsChat message:\n{"id":"safe","channel_id":"group","content":"kept","__proto__":{"polluted":true},"constructor":"bad","prototype":"bad"}';
+  const prompt = preserveChannelHistory(root, "group", [{id:"thread", turns:[{id:"001",items:[{type:"userMessage",content:[{type:"text",text}]}]}]}], s => s);
+  const line = prompt.split("\n").find(line => line.startsWith('{"id":"safe"'))!;
+  expect(JSON.parse(line)).toEqual({id:"safe",channel_id:"group",content:"kept",role:"user"});
+  expect(({} as any).polluted).toBeUndefined();
 });
