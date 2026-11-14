@@ -1,4 +1,4 @@
-import { redactError } from "./security";
+import { redactError, validateToken, validateTransportUrl } from "./security";
 // AgentsChat REST API client — HTTP queries for history, channels, agents
 
 import type {
@@ -3803,6 +3803,8 @@ export function rankDiscoverableChannels<T extends import("./types").Discoverabl
   return limit >= 0 ? clean.slice(0, limit) : clean;
 }
 
+const MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
+
 export type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
 export interface RESTClientOptions {
@@ -3852,6 +3854,8 @@ export class AgentChatREST {
     ) {
       throw new Error("timeoutMs must be a positive finite number");
     }
+    validateTransportUrl(options.baseUrl);
+    validateToken(options.bearerToken, "bearerToken");
     this.baseUrl = options.baseUrl.replace(/\/$/, "");
     this.bearerToken = options.bearerToken?.trim() || undefined;
     this.timeoutMs = options.timeoutMs ?? 15_000;
@@ -4471,7 +4475,7 @@ export class AgentChatREST {
       params.set("result", opts.result);
     }
     const qs = params.toString();
-    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const token = this.resolveBearerToken(opts?.bearerToken);
     const headers: Record<string, string> = {
       Accept: "application/json",
       "Cache-Control": "no-store",
@@ -4502,7 +4506,7 @@ export class AgentChatREST {
     if (!safeNonDmChannelId(safeChannel)) {
       throw new Error("Invalid channel ID");
     }
-    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const token = this.resolveBearerToken(opts?.bearerToken);
     const headers: Record<string, string> = {
       Accept: "application/json",
       "Cache-Control": "no-store",
@@ -4530,7 +4534,7 @@ export class AgentChatREST {
     ) {
       throw new Error("Invalid channel ID");
     }
-    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const token = this.resolveBearerToken(opts?.bearerToken);
     const headers: Record<string, string> = {
       Accept: "application/json",
       "Cache-Control": "no-store",
@@ -4565,7 +4569,7 @@ export class AgentChatREST {
       params.set("include_owned", "1");
     }
     const qs = params.toString();
-    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const token = this.resolveBearerToken(opts?.bearerToken);
     const headers: Record<string, string> = {
       Accept: "application/json",
       "Cache-Control": "no-store",
@@ -4588,7 +4592,7 @@ export class AgentChatREST {
     ) {
       throw new Error("Invalid channel ID");
     }
-    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const token = this.resolveBearerToken(opts?.bearerToken);
     const headers: Record<string, string> = {
       Accept: "application/json",
       "Cache-Control": "no-store",
@@ -4631,7 +4635,7 @@ export class AgentChatREST {
       }
       params.set("since", since);
     }
-    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const token = this.resolveBearerToken(opts?.bearerToken);
     const headers: Record<string, string> = {
       Accept: "application/json",
       "Cache-Control": "no-store",
@@ -4663,7 +4667,7 @@ export class AgentChatREST {
       params.set("limit", String(Math.max(1, Math.min(100, Math.trunc(opts.limit)))));
     }
     const qs = params.toString();
-    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const token = this.resolveBearerToken(opts?.bearerToken);
     const headers: Record<string, string> = {
       Accept: "application/json",
       "Cache-Control": "no-store",
@@ -4722,7 +4726,7 @@ export class AgentChatREST {
     if (input.expires_at !== undefined && input.expires_at !== "" && Number.isNaN(Date.parse(input.expires_at))) {
       throw new Error("Invalid proposal expires_at timestamp");
     }
-    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const token = this.resolveBearerToken(opts?.bearerToken);
     const headers: Record<string, string> = {
       Accept: "application/json",
       "Cache-Control": "no-store",
@@ -4780,7 +4784,7 @@ export class AgentChatREST {
     if (!input || !["approve", "reject", "abstain"].includes(input.decision)) {
       throw new Error("Invalid vote decision");
     }
-    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const token = this.resolveBearerToken(opts?.bearerToken);
     const headers: Record<string, string> = {
       Accept: "application/json",
       "Cache-Control": "no-store",
@@ -4809,7 +4813,7 @@ export class AgentChatREST {
     ) {
       throw new Error("Invalid channel ID");
     }
-    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const token = this.resolveBearerToken(opts?.bearerToken);
     const headers: Record<string, string> = {
       Accept: "application/json",
       "Cache-Control": "no-store",
@@ -4862,7 +4866,7 @@ export class AgentChatREST {
       throw new Error("Invalid channel ID");
     }
     if (opts?.signal?.aborted) return;
-    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const token = this.resolveBearerToken(opts?.bearerToken);
     const headers: Record<string, string> = {
       Accept: "text/event-stream",
       "Cache-Control": "no-store",
@@ -4974,7 +4978,7 @@ export class AgentChatREST {
   async listPersonalSkills(
     opts?: { active_only?: boolean; bearerToken?: string },
   ): Promise<import("./types").PersonalSkillsListResponse> {
-    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const token = this.resolveBearerToken(opts?.bearerToken);
     const headers: Record<string, string> = {
       Accept: "application/json",
       "Cache-Control": "no-store",
@@ -4989,7 +4993,7 @@ export class AgentChatREST {
     opts?: { bearerToken?: string },
   ): Promise<import("./types").PersonalSkillDetail> {
     const safeName = this.assertSkillName(name);
-    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const token = this.resolveBearerToken(opts?.bearerToken);
     const headers: Record<string, string> = {
       Accept: "application/json",
       "Cache-Control": "no-store",
@@ -5006,7 +5010,7 @@ export class AgentChatREST {
     opts?: { bearerToken?: string },
   ): Promise<import("./types").PersonalSkillRevisionsResponse> {
     const safeName = this.assertSkillName(name);
-    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const token = this.resolveBearerToken(opts?.bearerToken);
     const headers: Record<string, string> = {
       Accept: "application/json",
       "Cache-Control": "no-store",
@@ -5040,7 +5044,7 @@ export class AgentChatREST {
     ) {
       throw new Error("Invalid personal skill if_match_version");
     }
-    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const token = this.resolveBearerToken(opts?.bearerToken);
     const headers: Record<string, string> = {
       Accept: "application/json",
       "Cache-Control": "no-store",
@@ -5067,7 +5071,7 @@ export class AgentChatREST {
     if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 1) {
       throw new Error("Invalid personal skill expectedVersion");
     }
-    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const token = this.resolveBearerToken(opts?.bearerToken);
     const headers: Record<string, string> = {
       Accept: "application/json",
       "Cache-Control": "no-store",
@@ -5114,7 +5118,7 @@ export class AgentChatREST {
       }
       safeDelegatedAgent = trimmedAgent;
     }
-    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const token = this.resolveBearerToken(opts?.bearerToken);
     const headers: Record<string, string> = {
       Accept: "application/json",
       "Cache-Control": "no-store",
@@ -5174,7 +5178,7 @@ export class AgentChatREST {
     ) {
       throw new Error("Invalid loop stall_minutes");
     }
-    const token = opts?.bearerToken?.trim() || input.bearerToken?.trim() || this.bearerToken;
+    const token = this.resolveBearerToken(opts?.bearerToken, input.bearerToken);
     const headers: Record<string, string> = {
       Accept: "application/json",
       "Cache-Control": "no-store",
@@ -5197,7 +5201,7 @@ export class AgentChatREST {
     opts?: { bearerToken?: string },
   ): Promise<import("./types").RoomLoopMutationResponse> {
     const safeId = this.assertLoopId(loopId);
-    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const token = this.resolveBearerToken(opts?.bearerToken);
     const headers: Record<string, string> = {
       Accept: "application/json",
       "Cache-Control": "no-store",
@@ -5215,7 +5219,7 @@ export class AgentChatREST {
     opts?: { bearerToken?: string },
   ): Promise<import("./types").RoomLoopMutationResponse> {
     const safeId = this.assertLoopId(loopId);
-    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const token = this.resolveBearerToken(opts?.bearerToken);
     const headers: Record<string, string> = {
       Accept: "application/json",
       "Cache-Control": "no-store",
@@ -5233,7 +5237,7 @@ export class AgentChatREST {
     opts?: { bearerToken?: string },
   ): Promise<import("./types").RoomLoopMutationResponse> {
     const safeId = this.assertLoopId(loopId);
-    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const token = this.resolveBearerToken(opts?.bearerToken);
     const headers: Record<string, string> = {
       Accept: "application/json",
       "Cache-Control": "no-store",
@@ -5255,7 +5259,7 @@ export class AgentChatREST {
     if (!Number.isInteger(intervalMs) || intervalMs < 60_000 || intervalMs > 86_400_000) {
       throw new Error("Invalid loop interval_ms");
     }
-    const token = opts?.bearerToken?.trim() || this.bearerToken;
+    const token = this.resolveBearerToken(opts?.bearerToken);
     const headers: Record<string, string> = {
       Accept: "application/json",
       "Cache-Control": "no-store",
@@ -5293,8 +5297,13 @@ export class AgentChatREST {
     return trimmed;
   }
 
+  private resolveBearerToken(...tokens: (string | undefined)[]): string | undefined {
+    for (const token of tokens) validateToken(token, "bearerToken");
+    return tokens.map(token => token?.trim()).find(Boolean) || this.bearerToken;
+  }
+
   private authHeaders(bearerToken?: string): Record<string, string> {
-    const token = bearerToken?.trim() || this.bearerToken;
+    const token = this.resolveBearerToken(bearerToken);
     return {
       Accept: "application/json",
       "Cache-Control": "no-store",
@@ -5978,9 +5987,12 @@ export class AgentChatREST {
         method: "DELETE",
         headers,
       },
-      async (res) => {
+      async (res, signal) => {
         if (!res.ok) {
-          const error = await res.json().catch(() => ({ message: res.statusText }));
+          const error = await this.readResponseJson(res, signal).catch(error => {
+            if (error instanceof SyntaxError) return { message: res.statusText };
+            throw error;
+          });
           throw new Error(`HTTP ${res.status}: ${redactError(error?.message ?? error?.error ?? res.statusText, opts?.bearerToken ?? this.bearerToken)}`);
         }
         const rawEtag = res.headers.get("ETag")?.replace(/^W\//i, "").replace(/^"|"$/g, "").trim();
@@ -5988,7 +6000,10 @@ export class AgentChatREST {
         if (res.status === 204) {
           return { archived: true, ...(parsedVer !== undefined ? { version: parsedVer } : {}) };
         }
-        const data = await res.json().catch(() => ({}));
+        const data = await this.readResponseJson(res, signal).catch(error => {
+          if (error instanceof SyntaxError) return {};
+          throw error;
+        });
         return {
           archived: true,
           ...(typeof data?.version === "number" ? { version: data.version } : parsedVer !== undefined ? { version: parsedVer } : {}),
@@ -7335,6 +7350,38 @@ export class AgentChatREST {
 
   // MARK: - Internal
 
+  private cancelResponse(res?: Response): void {
+    if (res?.body) void res.body.cancel().catch(() => {});
+  }
+
+  private async readResponseJson(res: Response, signal?: AbortSignal): Promise<any> {
+    if (!res.body) return JSON.parse("");
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let bytes = 0;
+    let text = "";
+    const onAbort = () => { void reader.cancel().catch(() => {}); };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    try {
+      while (true) {
+        if (signal?.aborted) throw signal.reason ?? new Error("Request aborted");
+        const { value, done } = await reader.read();
+        if (signal?.aborted) throw signal.reason ?? new Error("Request aborted");
+        if (value) {
+          bytes += value.byteLength;
+          if (bytes > MAX_RESPONSE_BYTES) throw new Error("JSON response exceeds 10 MiB limit");
+          text += decoder.decode(value, { stream: true });
+        }
+        if (done) break;
+      }
+      return JSON.parse(text + decoder.decode());
+    } finally {
+      signal?.removeEventListener("abort", onAbort);
+      void reader.cancel().catch(() => {});
+      reader.releaseLock();
+    }
+  }
+
   private async fetchWithConnectTimeout(url: string, init?: RequestInit): Promise<Response> {
     const controller = new AbortController();
     const upstream = init?.signal;
@@ -7352,16 +7399,21 @@ export class AgentChatREST {
       controller.abort(new Error(`Request timed out after ${this.timeoutMs}ms`));
     }, this.timeoutMs);
     (timer as unknown as { unref?: () => void })?.unref?.();
+    let response: Response | undefined;
     try {
-      const res = await this.fetchImpl(url, { ...(init ?? {}), signal: controller.signal });
+      const res = response = await this.fetchImpl(url, { ...(init ?? {}), redirect: init?.redirect ?? "error", signal: controller.signal });
       // Failed handshakes are finite HTTP responses: bound their error body too.
       if (!res.ok) {
-        const error = await res.json().catch(() => ({ message: res.statusText }));
+        const error = await this.readResponseJson(res, controller.signal).catch(error => {
+          if (error instanceof SyntaxError) return { message: res.statusText };
+          throw error;
+        });
         if (timedOut) throw new Error(`Request timed out after ${this.timeoutMs}ms`);
         throw new Error(`HTTP ${res.status}: ${error?.message ?? error?.error ?? res.statusText}`);
       }
       return res;
     } catch (err) {
+      this.cancelResponse(response);
       if (timedOut) {
         throw new Error(`Request timed out after ${this.timeoutMs}ms`);
       }
@@ -7376,7 +7428,7 @@ export class AgentChatREST {
   private async withRequestTimeout<T>(
     url: string,
     init: RequestInit | undefined,
-    consume: (res: Response) => Promise<T>,
+    consume: (res: Response, signal: AbortSignal) => Promise<T>,
   ): Promise<T> {
     const controller = new AbortController();
     const upstream = init?.signal;
@@ -7394,9 +7446,10 @@ export class AgentChatREST {
       controller.abort(new Error(`Request timed out after ${this.timeoutMs}ms`));
     }, this.timeoutMs);
     (timer as unknown as { unref?: () => void })?.unref?.();
+    let response: Response | undefined;
     try {
-      const res = await this.fetchImpl(url, { ...(init ?? {}), signal: controller.signal });
-      return await consume(res);
+      const res = response = await this.fetchImpl(url, { ...(init ?? {}), redirect: init?.redirect ?? "error", signal: controller.signal });
+      return await consume(res, controller.signal);
     } catch (err) {
       if (timedOut) {
         throw new Error(`Request timed out after ${this.timeoutMs}ms`);
@@ -7404,18 +7457,22 @@ export class AgentChatREST {
       throw new Error(redactError(err instanceof Error ? err.message : err,
         new Headers(init?.headers).get("Authorization")?.replace(/^Bearer\s+/i, "")));
     } finally {
+      this.cancelResponse(response);
       clearTimeout(timer);
       upstream?.removeEventListener("abort", onUpstreamAbort);
     }
   }
 
   private async requestJson<T = any>(url: string, init?: RequestInit): Promise<T> {
-    return this.withRequestTimeout(url, init, async (res) => {
+    return this.withRequestTimeout(url, init, async (res, signal) => {
       if (!res.ok) {
-        const error = await res.json().catch(() => ({ message: res.statusText }));
+        const error = await this.readResponseJson(res, signal).catch(error => {
+          if (error instanceof SyntaxError) return { message: res.statusText };
+          throw error;
+        });
         throw new Error(`HTTP ${res.status}: ${redactError(error?.message ?? error?.error ?? res.statusText, new Headers(init?.headers).get("Authorization")?.replace(/^Bearer\s+/i, ""))}`);
       }
-      return res.json();
+      return this.readResponseJson(res, signal);
     });
   }
 

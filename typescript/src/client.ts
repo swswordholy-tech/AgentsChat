@@ -1,6 +1,6 @@
 // AgentsChat TypeScript SDK — WebSocket client
 
-import { redactError } from "./security";
+import { redactError, validateToken, validateTransportUrl } from "./security";
 
 import type {
   AgentPresence,
@@ -83,6 +83,11 @@ export class AgentChatClient {
   readonly heartbeatTimeoutMs: number;
 
   constructor(options: ClientOptions) {
+    validateTransportUrl(options.url, true);
+    if (typeof options.agentId !== "string" || !options.agentId.trim() || /[\x00-\x1f\x7f]/.test(options.agentId)) {
+      throw new Error("Invalid agentId");
+    }
+    validateToken(options.token);
     this.url = options.url;
     this.agentId = options.agentId;
     this.token = options.token ?? "dev-token";
