@@ -1,5 +1,6 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import { createHmac } from "node:crypto";
+import * as fs from "node:fs";
 import * as crypto from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -33,7 +34,7 @@ test("DSH rejects embedded URL credentials in configuration and patch arguments"
 
 test("patch and registration reject symlinked parents and ancestors without changing victims", async () => {
   const dir = mkdtempSync(join(tmpdir(), "dsh-parent-"));
-  const request = spyOn(globalThis, "fetch").mockImplementation(async () => Response.json({ agentId: "bot", token: "test-token" }));
+  const request = spyOn(globalThis, "fetch").mockImplementation((async () => Response.json({ agentId: "bot", token: "test-token" })) as unknown as typeof fetch);
   try {
     const real = join(dir, "real");
     mkdirSync(real);
@@ -62,7 +63,7 @@ test("CLI missing values reject a following flag without network IO", async () =
 test("exclusive temporary writes preserve colliding symlinks and their targets", async () => {
   const dir = mkdtempSync(join(tmpdir(), "dsh-exclusive-"));
   const random = spyOn(crypto, "randomBytes").mockImplementation((() => Buffer.from("12345678", "hex")) as typeof crypto.randomBytes);
-  const request = spyOn(globalThis, "fetch").mockImplementation(async () => Response.json({ agentId: "bot", token: "test-token" }));
+  const request = spyOn(globalThis, "fetch").mockImplementation((async () => Response.json({ agentId: "bot", token: "test-token" })) as unknown as typeof fetch);
   try {
     const victim = join(dir, "victim");
     writeFileSync(victim, "untouched");
@@ -415,7 +416,7 @@ describe("DeepSeek Harness (dsh) integration", () => {
       expect(localGet.headers.get("vary")).toContain("Origin");
       const idBody = (await localGet.json()) as { binds: Record<string, string> };
       expect(Object.prototype.hasOwnProperty.call(idBody.binds, "__proto__")).toBe(false);
-      expect(idBody.binds["session-good"]).toBe("DshTest");
+      expect(idBody.binds).toEqual({});
 
       // 3. Prototype-key bind attempt rejected with 400
       const protoBind = await fetch(`${base}/identity/bind`, {
@@ -506,4 +507,349 @@ describe("DeepSeek Harness (dsh) integration", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+});
+
+async function startTestInbound(
+  dir: string,
+  options: Record<string, unknown> = {},
+  delivered: unknown[] = [],
+): Promise<{ base: string; stop: () => void }> {
+  let stop = () => {};
+  const base = await new Promise<string>((ready) => {
+    applyInboundBridge({
+      get(service: string) {
+        if (service === "agents") return { roots: () => [{
+          id: "session-test", status: "idle", session: "test",
+          followup(message: unknown) { delivered.push(message); },
+        }] };
+        return undefined;
+      },
+      effect(fn: () => () => void) { stop = fn(); },
+    }, {
+      port: 0, mcpBin: "", agentschatDir: dir, logPath: join(dir, "bridge.log"),
+      ...options,
+      onListening({ port }: { port: number }) { ready(`http://127.0.0.1:${port}`); },
+    });
+  });
+  return { base, stop };
+}
+
+function postJson(base: string, path: string, body: unknown): Promise<Response> {
+  return fetch(`${base}${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+}
+
+test("DSH REST URL, profile and home guards reject ambiguous inputs and keep loopback working", () => {
+  const env = { AGENTCHAT_AGENT_ID: "bot", AGENTCHAT_TOKEN: "test-token" };
+  for (const url of ["https://example.com:0", "http://localhost:0", "https://example.com?x=1", "https://example.com#x", 'https://example.com/"', "https://example.com/<x>", "https://example.com/\\x", "https://example.com/a b", " https://example.com", "https://example.com\n"]) {
+    expect(() => loadDshConfig({ ...env, AGENTCHAT_REST_URL: url })).toThrow();
+  }
+  for (const url of ["https://example.com:0", "http://localhost:0", "https://example.com?x=1", "https://example.com#x"]) {
+    expect(() => buildMcpAgentsChatArgs({ apiUrl: url })).toThrow();
+  }
+  for (const url of ["wss://example.com:0/ws", "ws://127.0.0.1:0/ws", 'wss://example.com/"', "wss://example.com/\\x"]) {
+    expect(() => loadDshConfig({ ...env, AGENTCHAT_WS_URL: url })).toThrow();
+  }
+  for (const profile of ["CONSTRUCTOR", "Prototype", "__PrOtO__"]) {
+    expect(() => resolveDshPatchPath({ dshProfile: profile })).toThrow();
+    expect(() => buildMcpAgentsChatArgs({ agentsChatProfile: profile })).toThrow();
+    expect(() => loadDshConfig({ ...env, AGENTCHAT_AGENT_ID: profile })).toThrow();
+  }
+  for (const home of ["relative", "./relative", "../relative", "-option", "/tmp/bad\npath", "/" + "x".repeat(4096)]) {
+    expect(() => resolveDshPatchPath({ dshHome: home })).toThrow(/Invalid DSH home/);
+  }
+  expect(resolveDshPatchPath({ dshHome: "/" + "x".repeat(4095) }).length).toBeGreaterThan(4096);
+  expect(loadDshConfig({ ...env, AGENTCHAT_WS_URL: "ws://127.0.0.1:8787/ws", AGENTCHAT_REST_URL: "http://localhost:8787" }).restUrl).toBe("http://localhost:8787");
+});
+
+test("DSH rejects own __proto__ in config JSON", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dsh118-config-"));
+  try {
+    const path = join(dir, "dsh.json");
+    writeFileSync(path, '{"__proto__":{},"agentId":"bot","token":"test-token"}');
+    expect(() => loadDshConfig({}, path)).toThrow(/Missing/);
+    writeFileSync(path, '{"agentId":"bot","token":"test-token"}');
+    expect(loadDshConfig({}, path).agentId).toBe("bot");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("registration rejects unsafe returned IDs before writing", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "dsh118-ids-"));
+  let agentId = "";
+  const request = spyOn(globalThis, "fetch").mockImplementation((async () => Response.json({ agentId, token: "test-token" })) as unknown as typeof fetch);
+  try {
+    for (agentId of [".", "..", "CONSTRUCTOR", "Prototype", "__PrOtO__", "bad/id", "bad\\id", "bad id", "bad\nid", " bad", "bad\u007f"]) {
+      await expect(registerOnly("bot", "https://example.com", join(dir, "dsh.json"))).rejects.toThrow(/valid agent/);
+      expect(existsSync(join(dir, "dsh.json"))).toBe(false);
+    }
+    agentId = "valid-bot.1";
+    await registerOnly("bot", "https://example.com", join(dir, "dsh.json"));
+    expect(JSON.parse(readFileSync(join(dir, "dsh.json"), "utf8")).agentId).toBe(agentId);
+  } finally { request.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("registration bounds actual streamed bytes at 1MiB and cancels oversized responses", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "dsh118-size-"));
+  const valid = JSON.stringify({ agentId: "bot", token: "test-token" });
+  let cancelled = false;
+  let oversized = true;
+  const request = spyOn(globalThis, "fetch").mockImplementation((async () => {
+    if (!oversized) return new Response(valid + " ".repeat(1024 * 1024 - valid.length));
+    let index = 0;
+    return new Response(new ReadableStream<Uint8Array>({
+      pull(controller) { controller.enqueue(new Uint8Array(++index <= 16 ? 65536 : 1).fill(32)); },
+      cancel() { cancelled = true; },
+    }), { headers: { "content-length": "1" } });
+  }) as unknown as typeof fetch);
+  try {
+    await expect(registerOnly("bot", "https://example.com", join(dir, "dsh.json"))).rejects.toThrow(/exceeds 1MiB/);
+    expect(cancelled).toBe(true);
+    expect(existsSync(join(dir, "dsh.json"))).toBe(false);
+    oversized = false;
+    await registerOnly("bot", "https://example.com", join(dir, "dsh.json"));
+    expect(JSON.parse(readFileSync(join(dir, "dsh.json"), "utf8")).agentId).toBe("bot");
+  } finally { request.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("registration rechecks a target swapped to a symlink after temp creation", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "dsh118-race-"));
+  const target = join(dir, "dsh.json"), victim = join(dir, "victim");
+  writeFileSync(victim, "untouched");
+  const request = spyOn(globalThis, "fetch").mockImplementation((async () => Response.json({ agentId: "bot", token: "test-token" })) as unknown as typeof fetch);
+  const originalWrite = fs.writeFileSync;
+  const write = spyOn(fs, "writeFileSync").mockImplementation(((path: any, ...args: any[]) => {
+    (originalWrite as any)(path, ...args);
+    if (String(path).startsWith(`${target}.`) && String(path).endsWith(".tmp")) symlinkSync(victim, target);
+  }) as typeof fs.writeFileSync);
+  try {
+    await expect(registerOnly("bot", "https://example.com", target)).rejects.toThrow(/non-regular/);
+    expect(fs.lstatSync(target).isSymbolicLink()).toBe(true);
+    expect(readFileSync(victim, "utf8")).toBe("untouched");
+    expect(readdirSync(dir).some((name) => name.endsWith(".tmp"))).toBe(false);
+  } finally { write.mockRestore(); request.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("inbound prompts classify dm: and DM- and bound sanitized header fields", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "dsh118-prompt-"));
+  const delivered: any[] = [];
+  const bridge = await startTestInbound(dir, {}, delivered);
+  try {
+    const secret = readFileSync(join(dir, "dsh-inbound.secret"), "utf8").trim();
+    for (const channel of ["dm:legacy", "DM-legacy", "group"]) {
+      const payload = JSON.stringify({ channel_id: channel + "\n" + "x".repeat(200), message_id: "msg-" + channel + "\r\n" + "m".repeat(200), sender_id: "peer\u0000\u007f\n" + "s".repeat(200), content: "hello\nworld", target_session_id: "session-test" });
+      const response = await fetch(`${bridge.base}/agentschat/wake`, { method: "POST", headers: { "x-agentschat-signature": createHmac("sha256", secret).update(payload).digest("hex") }, body: payload });
+      expect(response.status).toBe(200);
+      const rendered = JSON.stringify(delivered.at(-1));
+      const message = delivered.at(-1);
+      const text = typeof message.content === "string" ? message.content : message.content[0].text;
+      expect(text).toContain(`kind: ${channel === "group" ? "channel message" : "direct message"}`);
+      expect(text).toContain("hello\nworld");
+      const lines = text.split("\n");
+      for (const label of ["channel_id: ", "message_id: ", "from: "]) {
+        const line = lines.find((line: string) => line.startsWith(label))!;
+        expect(line.slice(label.length)).toHaveLength(128);
+        expect(line).not.toMatch(/[\x00-\x1f\x7f]/);
+      }
+      expect(rendered).not.toContain("\\u0000");
+    }
+    expect(delivered).toHaveLength(3);
+  } finally { bridge.stop(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("inbound identity filters case-insensitive keys, own proto documents, and reads .JSON", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "dsh118-profiles-"));
+  mkdirSync(join(dir, "profiles"));
+  for (const name of ["Good.JSON", "CONSTRUCTOR.json", "Prototype.JSON"]) writeFileSync(join(dir, "profiles", name), JSON.stringify({ agent_id: "bot" }));
+  writeFileSync(join(dir, "profiles", "Dirty.json"), '{"__proto__":{},"agent_id":"dirty"}');
+  writeFileSync(join(dir, "session-binds.json"), '{"__proto__":{},"session-ok":"Good"}');
+  const bridge = await startTestInbound(dir);
+  try {
+    let data = await (await fetch(`${bridge.base}/identity`)).json() as any;
+    expect(data.profiles.map((p: any) => p.name)).toEqual(["Good"]);
+    expect(data.binds).toEqual({});
+    for (const sessionId of [".", "..", "CONSTRUCTOR", "Prototype", "a/b", "a\\b"]) {
+      expect((await postJson(bridge.base, "/identity/bind", { sessionId, profileName: "Good" })).status).toBe(400);
+    }
+    expect((await postJson(bridge.base, "/identity/bind", { sessionId: "session-test", profileName: "Good" })).status).toBe(200);
+    data = await (await fetch(`${bridge.base}/identity`)).json();
+    expect(data.binds).toEqual({ "session-test": "Good" });
+  } finally { bridge.stop(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("identity/create rejects remote HTTP, credentials, port zero, queries and fragments before fetch", async () => {
+  const realFetch = globalThis.fetch;
+  let registrations = 0;
+  const request = spyOn(globalThis, "fetch").mockImplementation(((input: any, init: any) => {
+    if (String(input).endsWith("/api/account/register")) { registrations++; return Promise.resolve(Response.json({ agentId: "bot", token: "test-token" })); }
+    return realFetch(input, init);
+  }) as typeof fetch);
+  try {
+    for (const apiUrl of ["http://remote.example", "https://example.com:0", "http://localhost:0", "https://user:pass@example.com", "https://example.com?x=1", "https://example.com#x"]) {
+      const dir = mkdtempSync(join(tmpdir(), "dsh118-url-"));
+      const bridge = await startTestInbound(dir, { apiUrl });
+      try {
+        expect((await postJson(bridge.base, "/identity/create", { name: "test" })).status).toBe(400);
+        expect(readdirSync(join(dir, "profiles"))).toEqual([]);
+      } finally { bridge.stop(); rmSync(dir, { recursive: true, force: true }); }
+    }
+    expect(registrations).toBe(0);
+    for (const apiUrl of ["https://example.com", "http://localhost:8787", "http://127.0.0.1:8787", "http://[::1]:8787"]) {
+      const dir = mkdtempSync(join(tmpdir(), "dsh118-local-"));
+      const bridge = await startTestInbound(dir, { apiUrl });
+      try { expect((await postJson(bridge.base, "/identity/create", { name: "test" })).status).toBe(200); }
+      finally { bridge.stop(); rmSync(dir, { recursive: true, force: true }); }
+    }
+    expect(registrations).toBe(4);
+  } finally { request.mockRestore(); }
+});
+
+test("identity/create rejects oversized responses and unsafe agent IDs, scrubs OAuth, webhook and JWT errors", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "dsh118-response-"));
+  const bridge = await startTestInbound(dir, { apiUrl: "https://example.com" });
+  const realFetch = globalThis.fetch;
+  let response = () => Response.json({});
+  const request = spyOn(globalThis, "fetch").mockImplementation(((input: any, init: any) => String(input).endsWith("/api/account/register") ? Promise.resolve(response()) : realFetch(input, init)) as typeof fetch);
+  try {
+    response = () => new Response(" ".repeat(1024 * 1024 + 1), { headers: { "content-length": "1" } });
+    let result = await postJson(bridge.base, "/identity/create", { name: "test" });
+    expect(result.status).toBe(500);
+    expect((await result.json() as any).error).toContain("1MiB");
+    for (const agentId of ["CONSTRUCTOR", "Prototype", "bad id", "bad/id", "bad\\id", ".", "..", " bad", "bad\n"]) {
+      response = () => Response.json({ agentId, token: "test-token" });
+      expect((await postJson(bridge.base, "/identity/create", { name: "test" })).status).toBe(502);
+    }
+    const secrets = ["mcp_at_abcdefgh", "mcp_rt_abcdefgh", "mcp_code_abcdefgh", "whsec_abcdefgh", "eyJabcdefghij.abc.sig"];
+    response = () => new Response(secrets.join(" "), { status: 400 });
+    result = await postJson(bridge.base, "/identity/create", { name: "test" });
+    expect(result.status).toBe(502);
+    const text = await result.text();
+    for (const secret of secrets) expect(text).not.toContain(secret);
+    expect(text.match(/REDACTED/g)).toHaveLength(5);
+    response = () => new Response("x".repeat(190) + " " + secrets[0], { status: 400 });
+    result = await postJson(bridge.base, "/identity/create", { name: "test" });
+    expect(await result.text()).not.toContain("mcp_at_");
+    expect(readdirSync(join(dir, "profiles"))).toEqual([]);
+  } finally { request.mockRestore(); bridge.stop(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("inbound secret, bind, profile and log writes refuse symlinked parents", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "dsh118-parents-"));
+  mkdirSync(join(dir, "real"));
+  symlinkSync(join(dir, "real"), join(dir, "link"));
+  try {
+    let effects = 0;
+    applyInboundBridge({ get() {}, effect() { effects++; } }, { port: 0, mcpBin: "", agentschatDir: join(dir, "link"), logPath: join(dir, "link", "log") });
+    expect(effects).toBe(0);
+    expect(readdirSync(join(dir, "real"))).toEqual([]);
+    const bridge = await startTestInbound(dir, { logPath: join(dir, "link", "log") });
+    try {
+      symlinkSync(join(dir, "real"), join(dir, "profiles"));
+      expect((await postJson(bridge.base, "/identity/create", { name: "test" })).status).toBe(500);
+      expect(readdirSync(join(dir, "real"))).toEqual([]);
+    } finally { bridge.stop(); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("inbound exclusive temp writes preserve collisions for secrets, binds and profiles", async () => {
+  for (const kind of ["secret", "bind", "profile"]) {
+    const dir = mkdtempSync(join(tmpdir(), `dsh118-exclusive-${kind}-`));
+    const victim = join(dir, "victim");
+    writeFileSync(victim, "untouched");
+    let collided = "";
+    let stop = () => {};
+    const originalWrite = fs.writeFileSync;
+    const writes = spyOn(fs, "writeFileSync").mockImplementation(((path: any, ...args: any[]) => {
+      const name = String(path);
+      const matches = name.endsWith(".tmp") && (kind === "secret" ? name.includes("dsh-inbound.secret.") : kind === "bind" ? name.includes("session-binds.json.") : name.includes("test.json."));
+      if (matches) { collided = name; symlinkSync(victim, name); }
+      return (originalWrite as any)(path, ...args);
+    }) as typeof fs.writeFileSync);
+    const realFetch = globalThis.fetch;
+    const request = spyOn(globalThis, "fetch").mockImplementation(((input: any, init: any) => String(input).endsWith("/api/account/register") ? Promise.resolve(Response.json({ agentId: "bot", token: "test-token" })) : realFetch(input, init)) as typeof fetch);
+    try {
+      if (kind === "secret") {
+        let effects = 0;
+        applyInboundBridge({ get() {}, effect() { effects++; } }, { port: 0, mcpBin: "", agentschatDir: dir, logPath: join(dir, "log") });
+        expect(effects).toBe(0);
+      } else {
+        const bridge = await startTestInbound(dir, { apiUrl: "https://example.com" });
+        stop = bridge.stop;
+        const result = await postJson(bridge.base, kind === "bind" ? "/identity/unbind" : "/identity/create", { sessionId: "session-test", name: "test" });
+        expect(result.status).toBe(500);
+      }
+      expect(collided).not.toBe("");
+      expect(fs.lstatSync(collided).isSymbolicLink()).toBe(true);
+      expect(readFileSync(victim, "utf8")).toBe("untouched");
+    } finally { request.mockRestore(); writes.mockRestore(); stop(); rmSync(dir, { recursive: true, force: true }); }
+  }
+});
+
+test("inbound rechecks secret, bind and profile targets immediately before rename", async () => {
+  for (const kind of ["secret", "bind", "profile"]) {
+    const dir = mkdtempSync(join(tmpdir(), `dsh118-recheck-${kind}-`));
+    const victim = join(dir, "victim");
+    writeFileSync(victim, "untouched");
+    let swapped = "";
+    let stop = () => {};
+    const originalWrite = fs.writeFileSync;
+    const writes = spyOn(fs, "writeFileSync").mockImplementation(((path: any, ...args: any[]) => {
+      const result = (originalWrite as any)(path, ...args);
+      const name = String(path);
+      const matches = name.endsWith(".tmp") && (kind === "secret" ? name.includes("dsh-inbound.secret.") : kind === "bind" ? name.includes("session-binds.json.") : name.includes("test.json."));
+      if (matches) {
+        swapped = kind === "secret" ? join(dir, "dsh-inbound.secret") : kind === "bind" ? join(dir, "session-binds.json") : join(dir, "profiles", "test.json");
+        symlinkSync(victim, swapped);
+      }
+      return result;
+    }) as typeof fs.writeFileSync);
+    const realFetch = globalThis.fetch;
+    const request = spyOn(globalThis, "fetch").mockImplementation(((input: any, init: any) => String(input).endsWith("/api/account/register") ? Promise.resolve(Response.json({ agentId: "bot", token: "test-token" })) : realFetch(input, init)) as typeof fetch);
+    try {
+      if (kind === "secret") {
+        let effects = 0;
+        applyInboundBridge({ get() {}, effect() { effects++; } }, { port: 0, mcpBin: "", agentschatDir: dir, logPath: join(dir, "log") });
+        expect(effects).toBe(0);
+      } else {
+        const bridge = await startTestInbound(dir, { apiUrl: "https://example.com" });
+        stop = bridge.stop;
+        const result = await postJson(bridge.base, kind === "bind" ? "/identity/unbind" : "/identity/create", { sessionId: "session-test", name: "test" });
+        expect(result.status).toBe(500);
+      }
+      expect(swapped).not.toBe("");
+      expect(fs.lstatSync(swapped).isSymbolicLink()).toBe(true);
+      expect(readFileSync(victim, "utf8")).toBe("untouched");
+      expect(readdirSync(dir).some((name) => name.endsWith(".tmp"))).toBe(false);
+      if (existsSync(join(dir, "profiles"))) expect(readdirSync(join(dir, "profiles")).some((name) => name.endsWith(".tmp"))).toBe(false);
+    } finally { request.mockRestore(); writes.mockRestore(); stop(); rmSync(dir, { recursive: true, force: true }); }
+  }
+});
+
+test("bound DSH clients strip .JSON case-insensitively and skip reserved or own-proto profiles", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "dsh118-bound-"));
+  const envNames = ["AGENTSCHAT_CONFIG_DIR", "AGENTCHAT_AGENT_ID", "AGENTCHAT_TOKEN"] as const;
+  const previous = Object.fromEntries(envNames.map((name) => [name, process.env[name]]));
+  const signals = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
+  const listeners = signals.map((signal) => new Set(process.listeners(signal)));
+  process.env.AGENTSCHAT_CONFIG_DIR = dir;
+  process.env.AGENTCHAT_AGENT_ID = "primary-test";
+  process.env.AGENTCHAT_TOKEN = "test-token";
+  mkdirSync(join(dir, "profiles"));
+  writeFileSync(join(dir, "session-binds.json"), JSON.stringify({ "session-ok": "Good.JSON", "session-bad": "CONSTRUCTOR.JSON", "session-dirty": "Dirty.JSON" }));
+  for (const name of ["Good", "CONSTRUCTOR"]) writeFileSync(join(dir, "profiles", `${name}.json`), JSON.stringify({ agent_id: name, token: "test-token" }));
+  writeFileSync(join(dir, "profiles", "Dirty.json"), '{"__proto__":{},"agent_id":"dirty","token":"test-token"}');
+  let connections = 0;
+  const connect = spyOn(MuseAgentChatClient.prototype, "connect").mockImplementation(async () => { connections++; });
+  const joinChannel = spyOn(MuseAgentChatClient.prototype, "joinChannel").mockImplementation(() => {});
+  const disconnect = spyOn(MuseAgentChatClient.prototype, "disconnect").mockImplementation(() => {});
+  const closed = spyOn(MuseAgentChatClient.prototype, "waitUntilClosed").mockResolvedValue();
+  try {
+    await main(["--wake"]);
+    expect(connections).toBe(2); // Primary + Good; neither reserved nor dirty.
+  } finally {
+    connect.mockRestore(); joinChannel.mockRestore(); disconnect.mockRestore(); closed.mockRestore();
+    signals.forEach((signal, index) => {
+      for (const listener of process.listeners(signal)) if (!listeners[index]!.has(listener)) process.removeListener(signal, listener);
+    });
+    for (const name of envNames) { if (previous[name] === undefined) delete process.env[name]; else process.env[name] = previous[name]; }
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
