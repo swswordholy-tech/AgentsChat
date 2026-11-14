@@ -15,6 +15,7 @@ function payload(result: any): any {
   if (Array.isArray(result?.content)) {
     const text = result.content.find((c: any) => c.type === "text")?.text;
     if (!text) throw new Error("GUI tool returned no receipt");
+    if (typeof text !== "string" || text.length > 1_048_576) throw new Error("GUI receipt exceeds size limit");
     return JSON.parse(text);
   }
   return result;
@@ -22,6 +23,8 @@ function payload(result: any): any {
 /** Private durable outbox. An authorized GUI host calls dispatch; enqueue is NOT delivery. */
 export class GuiChannel {
   constructor(private directory: string, private allowedThreads: readonly string[]) {
+    const existing = lstatSync(directory, { throwIfNoEntry: false });
+    if (existing && (existing.isSymbolicLink() || !existing.isDirectory())) throw new Error("GUI outbox must be a real directory, not a symlink");
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     const stat = lstatSync(directory);
     if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("GUI outbox must be a real directory, not a symlink");
@@ -36,6 +39,8 @@ export class GuiChannel {
     if (stat?.isSymbolicLink() || (stat && !stat.isFile())) throw new Error("GUI receipt must be a regular file, not a symlink");
     try {
       writeFileSync(temp, JSON.stringify(entry), { mode: 0o600, flag: "wx" });
+      const current = lstatSync(path, { throwIfNoEntry: false });
+      if (current && (current.isSymbolicLink() || !current.isFile())) throw new Error("GUI receipt must be a regular file, not a symlink");
       renameSync(temp, path);
     } catch (error) {
       // An exclusive-create collision belongs to another writer; leave it alone.
@@ -46,6 +51,7 @@ export class GuiChannel {
   get(id: string): GuiDelivery {
     const path = this.path(id), stat = lstatSync(path);
     if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("GUI receipt must be a regular file, not a symlink");
+    if (stat.size > 1_048_576) throw new Error("GUI receipt exceeds size limit");
     const entry = JSON.parse(readFileSync(path, "utf8"));
     if (!entry || typeof entry !== "object" || Array.isArray(entry) || entry.id !== id ||
       typeof entry.threadId !== "string" || !entry.threadId.trim() || typeof entry.prompt !== "string" ||

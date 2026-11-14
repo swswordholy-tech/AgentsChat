@@ -141,3 +141,41 @@ test("each lookup observes ownership changes and a failure never retains the old
   expect(await getBotOwner(BASE, BOT, TOKEN, request)).toBeNull();
   expect(calls).toBe(6);
 });
+
+test("owner lookup accepts dotted uppercase loopback and rejects port zero or unsafe bot IDs before IO", async () => {
+  expect(await getBotOwner('http://LOCALHOST.:1234',BOT,TOKEN,respond())).toBe('real-owner');
+  let calls=0;
+  const request=(async(_url:RequestInfo|URL)=>{calls++;return Response.json(STATUS);}) as typeof fetch;
+  for(const base of ['http://localhost:0','https://test.invalid:0','https://test.invalid:000'])
+    expect(await getBotOwner(base,BOT,TOKEN,request)).toBeNull();
+  for(const id of ['.','..','a/b','a\\b','a b','__PROTO__','Constructor','PROTOTYPE'])
+    expect(await getBotOwner(BASE,id,TOKEN,request)).toBeNull();
+  expect(calls).toBe(0);
+});
+
+test("owner response byte limit allows exact size and cancels either oversized stream immediately", async () => {
+  for(const failStatus of [true,false]) {
+    const value=failStatus?STATUS:ENTITLEMENT, raw=JSON.stringify(value);
+    const exact=(async(url:RequestInfo|URL)=>isStatus(url)===failStatus
+      ? new Response(raw+' '.repeat(65_536-raw.length)) : Response.json(isStatus(url)?STATUS:ENTITLEMENT)) as typeof fetch;
+    expect(await getBotOwner(BASE,BOT,TOKEN,exact)).toBe('real-owner');
+    let cancelled=false;
+    const oversized=(async(url:RequestInfo|URL)=>isStatus(url)===failStatus
+      ? new Response(new ReadableStream({start(c){c.enqueue(new TextEncoder().encode(raw+' '.repeat(65_537-raw.length)));},cancel(){cancelled=true;return new Promise(()=>{});}}))
+      : Response.json(isStatus(url)?STATUS:ENTITLEMENT)) as typeof fetch;
+    expect(await getBotOwner(BASE,BOT,TOKEN,oversized)).toBeNull();
+    expect(cancelled).toBe(true);
+    const utf8=(async(url:RequestInfo|URL)=>isStatus(url)===failStatus
+      ? new Response(raw+' '.repeat(65_535-raw.length)+'é') : Response.json(isStatus(url)?STATUS:ENTITLEMENT)) as typeof fetch;
+    expect(await getBotOwner(BASE,BOT,TOKEN,utf8)).toBeNull();
+  }
+},1_000);
+
+test("oversized owner JSON returns null even while the other response body is stalled", async () => {
+  let cancelled=false;
+  const request=(async(url:RequestInfo|URL)=>new Response(isStatus(url)
+    ? new ReadableStream({start(c){c.enqueue(new Uint8Array(65_537));},cancel(){cancelled=true;}})
+    : new ReadableStream({start(){}}))) as typeof fetch;
+  expect(await getBotOwner(BASE,BOT,TOKEN,request)).toBeNull();
+  expect(cancelled).toBe(true);
+},1_000);

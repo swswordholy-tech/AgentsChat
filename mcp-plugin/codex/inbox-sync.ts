@@ -11,13 +11,14 @@ interface Snapshot {
   last_error?: string;
 }
 function timestamp(value: unknown): string {
-  if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) throw new Error("Invalid history timestamp");
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|z|[+-]\d{2}:\d{2})$/.test(value) || !Number.isFinite(Date.parse(value))) throw new Error("Invalid history timestamp");
   return normalizeTimestampForCursor(value, "after")!;
 }
 function validChannel(channel: unknown): channel is string {
-  return typeof channel === "string" && channel.trim().length > 0
+  return typeof channel === "string" && channel.trim().length > 0 && channel.trim().length <= 128
+    && !channel.includes("..") && !/[\/\\]/.test(channel)
     && !/[\x00-\x1f\x7f-\x9f]/.test(channel)
-    && !["__proto__", "constructor", "prototype"].includes(channel.trim());
+    && !["__proto__", "constructor", "prototype"].includes(channel.trim().toLowerCase());
 }
 function validateChannel(channel: unknown): asserts channel is string {
   if (!validChannel(channel)) throw new Error("Invalid inbound channel");
@@ -33,6 +34,8 @@ export class InboxSync {
   constructor(stateDir: string, private api: (path: string) => Promise<any>,
     private receive: (message: unknown) => boolean, private active: () => boolean,
     private log: (message: string) => void = console.error) {
+    const existing = lstatSync(stateDir, { throwIfNoEntry: false });
+    if (existing && (existing.isSymbolicLink() || !existing.isDirectory())) throw new Error("Invalid inbound state directory");
     mkdirSync(stateDir, {recursive:true, mode:0o700});
     const dirStat = lstatSync(stateDir);
     if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) throw new Error("Invalid inbound state directory");
@@ -42,6 +45,7 @@ export class InboxSync {
     try { fileStat = lstatSync(this.file); }
     catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
     if (fileStat && (fileStat.isSymbolicLink() || !fileStat.isFile())) throw new Error("Invalid inbound cursors file");
+    if (fileStat && fileStat.size > 1_048_576) throw new Error("Inbound cursors exceed size limit");
     this.state = fileStat ? JSON.parse(readFileSync(this.file, "utf8")) : {version:1, channels:{}};
     if (!this.state || this.state.version !== 1 || !this.state.channels || typeof this.state.channels !== "object" || Array.isArray(this.state.channels))
       throw new Error("Invalid inbound cursors; refusing to discard checkpoint");
@@ -59,6 +63,8 @@ export class InboxSync {
     try {
       writeFileSync(tmp, JSON.stringify(this.state), {mode:0o600, flag:"wx"});
       created = true;
+      const current = lstatSync(this.file, { throwIfNoEntry: false });
+      if (current && (current.isSymbolicLink() || !current.isFile())) throw new Error("Invalid inbound cursors file");
       renameSync(tmp, this.file);
     } catch (err) {
       if (created) { try { unlinkSync(tmp); } catch {} }
