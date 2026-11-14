@@ -1,6 +1,6 @@
-import { existsSync, lstatSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, isAbsolute, join, sep } from "node:path";
 
 export interface MuseAgentChatConfig {
   agentId: string;
@@ -21,13 +21,48 @@ function isLoopbackHost(hostname: string): boolean {
   return h === "localhost" || h === "127.0.0.1" || h === "[::1]" || h === "::1";
 }
 
-function validateEndpointUrl(raw: string, kind: "ws" | "rest"): string {
-  const trimmed = raw.trim();
+export function isSafeAgentId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 &&
+    ![".", "..", "__proto__", "constructor", "prototype"].includes(value.toLowerCase()) &&
+    !/[\/\\\s\x00-\x1f\x7f]/.test(value);
+}
+
+/** Inspect existing ancestors before recursive mkdir can follow a symlink. */
+export function assertSafeParentDirectories(file: string): void {
+  // Preserve lexical .. components so a symlink before /../ is still inspected.
+  let dir = dirname(isAbsolute(file) ? file : `${process.cwd()}${sep}${file}`);
+  while (true) {
+    try {
+      const st = lstatSync(dir);
+      const systemLink = process.platform === "darwin" &&
+        ["/var", "/tmp", "/etc"].includes(dir) && st.isSymbolicLink() &&
+        realpathSync(dir) === `/private${dir}` && !lstatSync(`/private${dir}`).isSymbolicLink() &&
+        lstatSync(`/private${dir}`).isDirectory();
+      if ((!systemLink && st.isSymbolicLink()) || (!st.isDirectory() && !systemLink)) {
+        throw new Error("Refusing to write Muse file inside symlinked or non-directory parent");
+      }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+}
+
+export function validateEndpointUrl(raw: string, kind: "ws" | "rest"): string {
+  if (raw !== raw.trim() || /["<>\\\x00-\x20\x7f]/.test(raw)) {
+    throw new Error(`Invalid Muse ${kind} URL`);
+  }
+  const trimmed = raw;
   let parsed: URL;
   try {
     parsed = new URL(trimmed);
   } catch {
     throw new Error(`Invalid Muse ${kind} URL`);
+  }
+  if (parsed.port === "0" || parsed.search || parsed.hash || raw.includes("?") || raw.includes("#")) {
+    throw new Error(`Invalid Muse ${kind} URL port/query/hash`);
   }
   if (parsed.username || parsed.password) {
     throw new Error(`Embedded credentials are not allowed in Muse ${kind} URL`);
@@ -83,7 +118,7 @@ function readProfile(path = PROFILE_PATH): ProfileFile {
     const st = lstatSync(path);
     if (!st.isFile() || st.isSymbolicLink() || st.size > MAX_PROFILE_BYTES) return {};
     const parsed = JSON.parse(readFileSync(path, "utf8"));
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) && !Object.hasOwn(parsed, "__proto__")
       ? (parsed as ProfileFile)
       : {};
   } catch {
@@ -101,7 +136,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, profilePath?: s
   const profile = readProfile(profilePath);
   const rawAgentId = (env.AGENTCHAT_AGENT_ID ?? profile.agentId ?? "").trim();
   const rawToken = (env.AGENTCHAT_TOKEN ?? profile.token ?? "").trim();
-  if (!rawAgentId || !rawToken || /[\x00-\x1f\x7f]/.test(rawAgentId) || /[\x00-\x1f\x7f]/.test(rawToken)) {
+  if (!isSafeAgentId(rawAgentId) || !rawToken || /[\x00-\x1f\x7f]/.test(rawAgentId) || /[\x00-\x1f\x7f]/.test(rawToken)) {
     throw new Error(
       "Missing AgentsChat identity: set AGENTCHAT_AGENT_ID and AGENTCHAT_TOKEN, " +
         `or create ${profilePath ?? PROFILE_PATH} via 'muse-agentchat --register-only --name <name>'. ` +

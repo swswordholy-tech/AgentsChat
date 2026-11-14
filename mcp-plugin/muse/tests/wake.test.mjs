@@ -41,7 +41,7 @@ test("Campaign #93: fireWake drains response body and sanitizes URL query/secret
   await fireWake(
     { id: "m-drain", channel_id: "dm-1", sender_id: "bob", content: "hi" },
     {
-      url: "https://user:pass@example.com/wake?token=ac_secret_999",
+      url: "https://example.com/wake?token=ac_secret_999",
       logger: (m) => logs.push(m),
       fetchImpl: async () =>
         new Response(

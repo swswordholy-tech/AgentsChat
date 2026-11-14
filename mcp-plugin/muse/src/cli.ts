@@ -22,12 +22,36 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { MuseBridge } from "./bridge.ts";
 import { MuseAgentChatClient } from "./client.ts";
-import { loadConfig, PROFILE_PATH, safeConfig } from "./config.ts";
+import { assertSafeParentDirectories, isSafeAgentId, loadConfig, PROFILE_PATH, safeConfig, validateEndpointUrl } from "./config.ts";
 import { shouldDispatch } from "./policy.ts";
 import { TypingHeartbeat } from "./typing.ts";
 import { appendWakeQueue, buildWakePayload, fireWake, redactSecrets } from "./wake.ts";
 
-const RESERVED_AGENT_IDS = new Set(["__proto__", "constructor", "prototype"]);
+const MAX_REGISTRATION_BYTES = 1024 * 1024;
+
+async function readRegistrationBody(res: Response): Promise<string> {
+  if (!res.body) throw new Error("Registration response body is missing");
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let bytes = 0;
+  let body = "";
+  let complete = false;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > MAX_REGISTRATION_BYTES) throw new Error("Registration response exceeds 1MiB limit");
+      body += decoder.decode(value, { stream: true });
+    }
+    body += decoder.decode();
+    complete = true;
+    return body;
+  } finally {
+    if (!complete) void reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+}
 
 export function arg(name: string, argv: string[]): string | undefined {
   const i = argv.indexOf(name);
@@ -49,19 +73,11 @@ export async function registerOnly(
   if (!cleanName || cleanName.length > 64 || /[\x00-\x1f\x7f]/.test(cleanName)) {
     throw new Error("Invalid --name value");
   }
-  const parsedRest = new URL(restUrl.trim());
-  if (parsedRest.username || parsedRest.password) {
-    throw new Error("Embedded credentials are not allowed in AGENTCHAT_REST_URL");
-  }
-  const isLocal = ["localhost", "127.0.0.1", "[::1]", "::1"].includes(parsedRest.hostname.toLowerCase());
-  if (parsedRest.protocol !== "https:" && !(parsedRest.protocol === "http:" && isLocal)) {
-    throw new Error("AGENTCHAT_REST_URL must use https:// (or http:// on loopback)");
-  }
+  const endpoint = validateEndpointUrl(restUrl, "rest");
   const profileDir = dirname(profilePath);
+  assertSafeParentDirectories(profilePath);
   mkdirSync(profileDir, { recursive: true, mode: 0o700 });
-  if (lstatSync(profileDir).isSymbolicLink()) {
-    throw new Error("Refusing to write Muse profile inside symlinked directory");
-  }
+  assertSafeParentDirectories(profilePath);
   try {
     const st = lstatSync(profilePath);
     if (st.isSymbolicLink() || !st.isFile()) {
@@ -71,33 +87,38 @@ export async function registerOnly(
     if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err;
   }
   console.log("Terms notice: https://agents-chat.com/terms (notice only, no acceptance prompt)");
-  const res = await fetchImpl(`${restUrl.trim().replace(/\/$/, "")}/api/account/register`, {
+  const res = await fetchImpl(`${endpoint.replace(/\/$/, "")}/api/account/register`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ name: cleanName, type: "agent", capabilities: ["chat"] }),
     redirect: "error",
     signal: AbortSignal.timeout(15_000),
   });
+  const responseBody = await readRegistrationBody(res);
   if (!res.ok) {
-    const errBody = redactSecrets((await res.text()).slice(0, 512));
+    const errBody = redactSecrets(responseBody).slice(0, 512);
     throw new Error(`Registration failed: ${res.status} ${errBody}`);
   }
-  const data = (await res.json()) as Record<string, unknown>;
+  const data = JSON.parse(responseBody) as Record<string, unknown>;
+  if (!data || typeof data !== "object" || Array.isArray(data) || Object.hasOwn(data, "__proto__")) {
+    throw new Error("Invalid registration response");
+  }
   const agentId = String(data.agentId ?? data.agent_id ?? data.id ?? "").trim();
   const token = String(data.agentKey ?? data.token ?? data.key ?? "").trim();
   if (!agentId || !token) throw new Error("Registration response did not include an agent id/token");
   if (
-    /[\x00-\x1f\x7f]/.test(agentId) ||
-    /[\x00-\x1f\x7f]/.test(token) ||
-    RESERVED_AGENT_IDS.has(agentId.toLowerCase())
+    !isSafeAgentId(agentId) ||
+    /[\x00-\x1f\x7f]/.test(token)
   ) {
     throw new Error("Registration response contained unsafe agent id or token");
   }
   const tmp = `${profilePath}.${process.pid}.${Date.now()}.${randomBytes(6).toString("hex")}.tmp`;
   try {
+    assertSafeParentDirectories(profilePath);
     writeFileSync(tmp, JSON.stringify({ agentId, token }, null, 2), { mode: 0o600, flag: "wx" });
     try {
-      if (lstatSync(profilePath).isSymbolicLink()) {
+      const st = lstatSync(profilePath);
+      if (st.isSymbolicLink() || !st.isFile()) {
         throw new Error("Refusing to overwrite symlink or non-regular Muse profile");
       }
     } catch (err) {

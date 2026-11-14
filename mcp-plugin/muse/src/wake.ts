@@ -1,6 +1,7 @@
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { appendFileSync, chmodSync, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { assertSafeParentDirectories } from "./config.ts";
 
 /**
  * Muse wake — the Grok Bot pattern, adapted for Muse.
@@ -125,11 +126,15 @@ export function verifyWakeSignature(body: string, sigHex: string, secrets: reado
 
 /** Prompt text a Muse host can inject into a turn, mirroring buildGrokPrompt. */
 export function buildMuseWakePrompt(payload: WakePayload): string {
-  const where = /^dm[-:]/i.test(payload.channel_id ?? "") ? "私聊 (DM)" : `频道 ${payload.channel_id ?? "?"}`;
+  const clean = (value: string) => value.replace(/[\x00-\x1f\x7f]/g, " ").slice(0, 128);
+  const sender = clean(payload.sender_id ?? "someone");
+  const channel = clean(payload.channel_id ?? "?");
+  const message = clean(payload.message_id ?? "");
+  const where = /^dm[-:]/i.test(channel) ? "私聊 (DM)" : `频道 ${channel}`;
   const content = payload.content ? `：“${payload.content}”` : "。";
   return (
-    `[AgentsChat] ${payload.sender_id ?? "someone"} 在${where}提到了你${content}` +
-    (payload.message_id ? ` (channel_id=${payload.channel_id}, message_id=${payload.message_id}，请用 bridge 回复；仅需更早历史时调 history)` : "")
+    `[AgentsChat] ${sender} 在${where}提到了你${content}` +
+    (payload.message_id ? ` (channel_id=${channel}, message_id=${message}，请用 bridge 回复；仅需更早历史时调 history)` : "")
   );
 }
 
@@ -141,6 +146,34 @@ export interface WakeConfig {
   logger?: (msg: string) => void;
   /** Harness session the wake belongs to (see buildWakePayload). */
   targetSessionId?: string;
+}
+
+// Loopback receivers are intentional; remote non-public address literals are not.
+function isUnsafeWakeHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/\.$/, "");
+  if (["metadata.google.internal", "metadata.goog"].includes(host)) return true;
+  const unsafeV4 = (ip: string) => {
+    const [a, b] = ip.split(".").map(Number);
+    return a === 0 || a === 10 || a === 169 && b === 254 ||
+      a === 172 && b >= 16 && b <= 31 || a === 192 && b === 168 || a >= 224;
+  };
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) return unsafeV4(host);
+  if (host.startsWith("[")) {
+    const address = host.slice(1, -1);
+    const [left, right = ""] = address.split("::");
+    const head = left ? left.split(":") : [];
+    const tail = right ? right.split(":") : [];
+    const words = address.includes("::")
+      ? [...head, ...Array(8 - head.length - tail.length).fill("0"), ...tail].map(x => parseInt(x, 16))
+      : head.map(x => parseInt(x, 16));
+    if (words.length !== 8) return true;
+    const mapped = (words.slice(0, 5).every(x => x === 0) && words[5] === 0xffff) ||
+      (words.slice(0, 4).every(x => x === 0) && words[4] === 0xffff && words[5] === 0);
+    if (mapped) return unsafeV4(`${words[6]! >> 8}.${words[6]! & 255}.${words[7]! >> 8}.${words[7]! & 255}`);
+    return words.every(x => x === 0) || (words[0]! & 0xffc0) === 0xfe80 ||
+      (words[0]! & 0xfe00) === 0xfc00 || (words[0]! & 0xff00) === 0xff00;
+  }
+  return false;
 }
 
 /** POST a wake event. Best-effort: resolves void whether it succeeded or not. */
@@ -158,6 +191,10 @@ export async function fireWake(msg: WakeMessage, cfg: WakeConfig): Promise<void>
   }
   if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
     log(`[muse-agentchat] wake POST rejected unsupported protocol: ${parsedUrl.protocol}`);
+    return;
+  }
+  if (parsedUrl.port === "0" || parsedUrl.username || parsedUrl.password || isUnsafeWakeHost(parsedUrl.hostname)) {
+    log(`[muse-agentchat] wake POST rejected unsafe URL: ${safeLogUrl}`);
     return;
   }
   const timeoutMs =
@@ -207,10 +244,9 @@ let wakeTmpSeq = 0;
  */
 export function appendWakeQueue(queueFile: string, payload: WakePayload, maxLines = MAX_WAKE_QUEUE_LINES): boolean {
   const dir = dirname(queueFile);
+  assertSafeParentDirectories(queueFile);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  if (lstatSync(dir).isSymbolicLink()) {
-    throw new Error("Refusing to write Muse wake queue inside symlinked directory");
-  }
+  assertSafeParentDirectories(queueFile);
   const line = JSON.stringify(payload);
   let existingLines: string[] = [];
   let existedBefore = false;
@@ -244,12 +280,14 @@ export function appendWakeQueue(queueFile: string, payload: WakePayload, maxLine
   }
   const cap = Number.isFinite(maxLines) ? Math.max(1, Math.floor(maxLines)) : MAX_WAKE_QUEUE_LINES;
   if (existingLines.length >= cap) {
-    const kept = [...existingLines.slice(-(cap - 1)), line];
+    const kept = [...(cap === 1 ? [] : existingLines.slice(-(cap - 1))), line];
     const tmp = `${queueFile}.${process.pid}.${Date.now()}.${++wakeTmpSeq}.${randomBytes(6).toString("hex")}.tmp`;
     try {
+      assertSafeParentDirectories(queueFile);
       writeFileSync(tmp, `${kept.join("\n")}\n`, { mode: 0o600, flag: "wx" });
       try {
-        if (lstatSync(queueFile).isSymbolicLink()) {
+        const st = lstatSync(queueFile);
+        if (st.isSymbolicLink() || !st.isFile()) {
           throw new Error("Refusing to use symlink or non-regular file for Muse wake queue");
         }
       } catch (err) {
@@ -279,6 +317,11 @@ export function appendWakeQueue(queueFile: string, payload: WakePayload, maxLine
         throw new Error("Muse wake queue exceeds maximum size limit");
       }
     }
+  }
+  assertSafeParentDirectories(queueFile);
+  const finalTarget = lstatSync(queueFile);
+  if (finalTarget.isSymbolicLink() || !finalTarget.isFile()) {
+    throw new Error("Refusing to use symlink or non-regular file for Muse wake queue");
   }
   appendFileSync(queueFile, `${line}\n`, { mode: 0o600 });
   return true;
