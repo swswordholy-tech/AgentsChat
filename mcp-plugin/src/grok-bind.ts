@@ -49,22 +49,34 @@ function isUnsafeObjectKey(key: string): boolean {
   return lower === "__proto__" || lower === "constructor" || lower === "prototype";
 }
 
-/** uuid → profile name. Non-string (and empty / prototype) values are ignored. */
+function hasControlChars(s: string): boolean {
+  return /[\x00-\x1f\x7f]/.test(s);
+}
+
+function normalizeProfileSlug(s: string): string {
+  const base = profileNameFromPath(s) ?? s;
+  return base.replace(/[^a-zA-Z0-9_-]/g, "_");
+}
+
+/** uuid → profile name. Non-string (and empty / prototype / control-char) values are ignored. */
 export function parseGrokBinds(raw: unknown): Record<string, string> {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return {};
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
     if (typeof v !== "string") continue;
     const name = v.trim();
-    if (!name) continue;
+    if (!name || name.length > 256 || hasControlChars(name)) continue;
     const key = k.trim();
-    if (!key || isUnsafeObjectKey(key)) continue;
+    if (!key || key.length > 256 || isUnsafeObjectKey(key) || hasControlChars(key)) continue;
     out[key] = name;
   }
   return out;
 }
 
 export function parseGrokBindsText(text: string): { binds: Record<string, string>; malformed: boolean } {
+  if (typeof text !== "string" || Buffer.byteLength(text, "utf8") > 1_048_576) {
+    return { binds: {}, malformed: true };
+  }
   try {
     return { binds: parseGrokBinds(JSON.parse(text)), malformed: false };
   } catch {
@@ -73,7 +85,8 @@ export function parseGrokBindsText(text: string): { binds: Record<string, string
 }
 
 export function resolveGrokBindsPath(configDir: string, envOverride?: string): string {
-  if (envOverride && envOverride.length > 0) return envOverride;
+  const trimmed = typeof envOverride === "string" ? envOverride.trim() : "";
+  if (trimmed.length > 0 && !hasControlChars(trimmed)) return trimmed;
   return join(configDir, DEFAULT_GROK_BINDS_FILENAME);
 }
 
@@ -89,11 +102,12 @@ export function decideGrokBind(input: {
   binds: Record<string, string>;
 }): GrokBindDecision {
   if (input.explicitIdentity || input.hasToken) return { kind: "skip" };
-  const id = input.conversationId?.trim();
-  if (!id || isUnsafeObjectKey(id)) return { kind: "skip" };
-  const profileName = Object.hasOwn(input.binds, id) ? input.binds[id] : undefined;
-  if (typeof profileName === "string" && profileName.length > 0) {
-    return { kind: "hit", conversationId: id, profileName };
+  const id = typeof input.conversationId === "string" ? input.conversationId.trim() : "";
+  if (!id || isUnsafeObjectKey(id) || hasControlChars(id)) return { kind: "skip" };
+  const binds = input.binds && typeof input.binds === "object" ? input.binds : {};
+  const profileName = Object.hasOwn(binds, id) ? binds[id] : undefined;
+  if (typeof profileName === "string" && profileName.trim().length > 0 && !hasControlChars(profileName)) {
+    return { kind: "hit", conversationId: id, profileName: profileName.trim() };
   }
   return { kind: "miss", conversationId: id };
 }
@@ -106,17 +120,18 @@ export function boundProfileForConversation(
   conversationId: string | undefined,
   binds: Record<string, string>,
 ): string | null {
-  const id = conversationId?.trim();
-  if (!id || isUnsafeObjectKey(id)) return null;
+  const id = typeof conversationId === "string" ? conversationId.trim() : "";
+  if (!id || isUnsafeObjectKey(id) || hasControlChars(id)) return null;
+  if (!binds || typeof binds !== "object") return null;
   const name = Object.hasOwn(binds, id) ? binds[id] : undefined;
-  return typeof name === "string" && name.length > 0 ? name : null;
+  return typeof name === "string" && name.trim().length > 0 && !hasControlChars(name) ? name.trim() : null;
 }
 
 /** Basename without `.json` — compare `activeProfileFile` to a bind name. */
 export function profileNameFromPath(profilePath: string | null | undefined): string | null {
-  if (!profilePath) return null;
+  if (!profilePath || typeof profilePath !== "string") return null;
   const base = profilePath.replace(/\\/g, "/").split("/").pop() || "";
-  const name = base.replace(/\.json$/i, "");
+  const name = base.replace(/\.json$/i, "").trim();
   return name || null;
 }
 
@@ -150,36 +165,40 @@ export function gateSwitchProfile(input: {
   const reqRaw =
     typeof input.requestedProfileName === "string" ? input.requestedProfileName.trim() : "";
   if (!reqRaw) return { kind: "allow" };
-  const reqNorm = profileNameFromPath(reqRaw) ?? reqRaw;
+  const reqSlug = normalizeProfileSlug(reqRaw);
 
-  const bindValues = Object.values(input.binds).filter((v) => typeof v === "string" && v.length > 0);
+  const binds = input.binds && typeof input.binds === "object" ? input.binds : {};
+  const bindValues = Object.values(binds).filter((v) => typeof v === "string" && v.trim().length > 0 && !hasControlChars(v));
   if (bindValues.length === 0) return { kind: "allow" };
 
-  const lockedMessage = (lockedName: string) =>
-    `Outbound identity is locked to grok-bind profile "${lockedName}" on this shared MCP; ` +
-    `use a separate MCP process / wake daemon, do not switch_profile.`;
+  const lockedMessage = (lockedName: string) => {
+    const clean = lockedName.replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 128);
+    return (
+      `Outbound identity is locked to grok-bind profile "${clean}" on this shared MCP; ` +
+      `use a separate MCP process / wake daemon, do not switch_profile.`
+    );
+  };
 
-  const bound = boundProfileForConversation(input.conversationId, input.binds);
+  const bound = boundProfileForConversation(input.conversationId, binds);
   if (bound) {
-    const boundNorm = profileNameFromPath(bound) ?? bound;
-    if (reqNorm === boundNorm) return { kind: "allow" };
+    if (reqSlug === normalizeProfileSlug(bound)) return { kind: "allow" };
     return {
       kind: "locked",
       boundProfileName: bound,
-      requestedProfileName: reqRaw,
+      requestedProfileName: reqRaw.replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 128),
       message: lockedMessage(bound),
     };
   }
 
   const current =
     typeof input.currentProfileName === "string" ? input.currentProfileName.trim() : "";
-  const currentNorm = current ? (profileNameFromPath(current) ?? current) : "";
-  if (current && bindValues.some((v) => (profileNameFromPath(v) ?? v) === currentNorm)) {
-    if (reqNorm === currentNorm) return { kind: "allow" };
+  const currentSlug = current ? normalizeProfileSlug(current) : "";
+  if (current && bindValues.some((v) => normalizeProfileSlug(v) === currentSlug)) {
+    if (reqSlug === currentSlug) return { kind: "allow" };
     return {
       kind: "locked",
-      boundProfileName: current,
-      requestedProfileName: reqRaw,
+      boundProfileName: current.replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 128),
+      requestedProfileName: reqRaw.replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 128),
       message: lockedMessage(current),
     };
   }
@@ -197,8 +216,10 @@ export function shouldHealBoundIdentity(input: {
   liveAgentId: string | null | undefined;
   boundAgentId: string | null | undefined;
 }): boolean {
-  if (!input.boundProfileName) return false;
-  if (input.liveProfileName !== input.boundProfileName) return true;
+  const boundNorm = typeof input.boundProfileName === "string" ? input.boundProfileName.trim() : "";
+  if (!boundNorm) return false;
+  const liveNorm = typeof input.liveProfileName === "string" ? input.liveProfileName.trim() : "";
+  if (!liveNorm || normalizeProfileSlug(liveNorm) !== normalizeProfileSlug(boundNorm)) return true;
   if (
     typeof input.boundAgentId === "string" &&
     input.boundAgentId.length > 0 &&
@@ -225,11 +246,13 @@ export const WAKE_MODE_ENV = "AGENTCHAT_WAKE_MODE";
  * - AGENTCHAT_WAKE_MODE set to something other than "grok" → that mode
  */
 export function nonGrokWakeReason(env: Record<string, string | undefined>): string | null {
-  const anti = (env[ANTIGRAVITY_WAKE_ENV] ?? "").trim();
+  if (!env || typeof env !== "object") return null;
+  const clean = (v: string) => v.replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 64);
+  const anti = clean((env[ANTIGRAVITY_WAKE_ENV] ?? "").trim());
   if (anti) return `${ANTIGRAVITY_WAKE_ENV}=${anti}`;
-  const kind = (env[WAKE_KIND_ENV] ?? "").trim();
+  const kind = clean((env[WAKE_KIND_ENV] ?? "").trim());
   if (kind && kind.toLowerCase() !== "grok") return `${WAKE_KIND_ENV}=${kind}`;
-  const mode = (env[WAKE_MODE_ENV] ?? "").trim();
+  const mode = clean((env[WAKE_MODE_ENV] ?? "").trim());
   if (mode && mode.toLowerCase() !== "grok") return `${WAKE_MODE_ENV}=${mode}`;
   return null;
 }

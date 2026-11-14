@@ -469,4 +469,33 @@ describe("nonGrokWakeReason / grokBindApplies — non-Grok wakes are exempt", ()
       }).kind,
     ).toBe("locked");
   });
+
+  test("Campaign #104: rejects control-char keys/values, trims whitespace envOverride, and aligns slug matching across gate & heal", () => {
+    const binds = parseGrokBinds({
+      "good-uuid": "Grok_Builder",
+      "bad\nuuid": "Jack",
+      "uuid-ctrl-val": "Evil\x1b[31mName",
+    });
+    expect(binds).toEqual({ "good-uuid": "Grok_Builder" });
+    expect(resolveGrokBindsPath("/home/u/.agentschat", "   ")).toBe("/home/u/.agentschat/grok-binds.json");
+    expect(resolveGrokBindsPath("/home/u/.agentschat", "/tmp/bad\x00path.json")).toBe("/home/u/.agentschat/grok-binds.json");
+
+    // "Grok Builder" slug-normalizes identically to "Grok_Builder" in both gateSwitchProfile and shouldHealBoundIdentity
+    expect(
+      gateSwitchProfile({
+        conversationId: "good-uuid",
+        binds,
+        requestedProfileName: "Grok Builder",
+      }),
+    ).toEqual({ kind: "allow" });
+    expect(
+      shouldHealBoundIdentity({
+        boundProfileName: "Grok_Builder",
+        liveProfileName: "Grok_Builder.json",
+        liveAgentId: "gb-1",
+        boundAgentId: "gb-1",
+      }),
+    ).toBe(false);
+    expect(nonGrokWakeReason({ AGENTCHAT_WAKE_KIND: "url\r\nforged" })).toBe("AGENTCHAT_WAKE_KIND=urlforged");
+  });
 });
