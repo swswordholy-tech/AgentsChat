@@ -226,7 +226,7 @@ async function getOnboardingStatus(base, agentId, token, request = fetch) {
 
 // codex/gui-channel.ts
 import { randomUUID } from "node:crypto";
-import { mkdirSync as mkdirSync2, writeFileSync, readFileSync, renameSync, readdirSync as readdirSync2, rmSync } from "node:fs";
+import { mkdirSync as mkdirSync2, writeFileSync, readFileSync, renameSync, readdirSync as readdirSync2, rmSync, lstatSync as lstatSync2 } from "node:fs";
 import { join as join2 } from "node:path";
 function payload(result) {
   if (result?.isError || result?.success === false || result?.error)
@@ -247,6 +247,9 @@ class GuiChannel {
     this.directory = directory;
     this.allowedThreads = allowedThreads;
     mkdirSync2(directory, { recursive: true, mode: 448 });
+    const stat = lstatSync2(directory);
+    if (stat.isSymbolicLink() || !stat.isDirectory())
+      throw new Error("GUI outbox must be a real directory, not a symlink");
   }
   path(id) {
     if (!/^[0-9a-f-]{36}$/.test(id))
@@ -255,14 +258,37 @@ class GuiChannel {
   }
   save(entry) {
     const path = this.path(entry.id), temp = `${path}.${randomUUID()}.tmp`;
-    writeFileSync(temp, JSON.stringify(entry), { mode: 384 });
-    renameSync(temp, path);
+    const stat = lstatSync2(path, { throwIfNoEntry: false });
+    if (stat?.isSymbolicLink() || stat && !stat.isFile())
+      throw new Error("GUI receipt must be a regular file, not a symlink");
+    try {
+      writeFileSync(temp, JSON.stringify(entry), { mode: 384, flag: "wx" });
+      renameSync(temp, path);
+    } catch (error) {
+      if (error.code !== "EEXIST")
+        rmSync(temp, { force: true });
+      throw error;
+    }
   }
   get(id) {
-    return JSON.parse(readFileSync(this.path(id), "utf8"));
+    const path = this.path(id), stat = lstatSync2(path);
+    if (stat.isSymbolicLink() || !stat.isFile())
+      throw new Error("GUI receipt must be a regular file, not a symlink");
+    const entry = JSON.parse(readFileSync(path, "utf8"));
+    if (!entry || typeof entry !== "object" || Array.isArray(entry) || entry.id !== id || typeof entry.threadId !== "string" || !entry.threadId.trim() || typeof entry.prompt !== "string" || typeof entry.createdAt !== "string" || !["pending", "sending", "submitted", "delivered", "uncertain"].includes(entry.status) || entry.hostId !== undefined && typeof entry.hostId !== "string" || entry.turnId !== undefined && typeof entry.turnId !== "string" || entry.deliveredAt !== undefined && typeof entry.deliveredAt !== "string")
+      throw new Error("Invalid GUI receipt");
+    return entry;
   }
   list() {
-    return readdirSync2(this.directory).filter((f) => /^[0-9a-f-]{36}\.json$/.test(f)).map((f) => this.get(f.slice(0, -5)));
+    const entries = [];
+    for (const file of readdirSync2(this.directory)) {
+      if (!/^[0-9a-f-]{36}\.json$/.test(file))
+        continue;
+      try {
+        entries.push(this.get(file.slice(0, -5)));
+      } catch {}
+    }
+    return entries;
   }
   enqueue(threadId, text, hostId) {
     if (!this.allowedThreads.includes(threadId))
@@ -284,7 +310,19 @@ ${text}`,
   }
   async dispatch(id, call) {
     const lock = `${this.path(id)}.lock`;
-    mkdirSync2(lock, { mode: 448 });
+    try {
+      mkdirSync2(lock, { mode: 448 });
+    } catch (error) {
+      if (error.code !== "EEXIST")
+        throw error;
+      const stat = lstatSync2(lock);
+      if (stat.isSymbolicLink())
+        throw new Error("GUI delivery lock must not be a symlink");
+      if (!stat.isDirectory() || Date.now() - stat.mtimeMs <= 5 * 60000)
+        throw error;
+      rmSync(lock, { recursive: true, force: true });
+      mkdirSync2(lock, { mode: 448 });
+    }
     try {
       const entry = this.get(id);
       if (!this.allowedThreads.includes(entry.threadId))
@@ -310,6 +348,7 @@ ${text}`,
       }
       try {
         let cursor;
+        const seenCursors = new Set;
         for (let page = 0;page < 5; page++) {
           const history = payload(await call("read_thread", {
             ...target,
@@ -327,20 +366,22 @@ ${text}`,
             this.save(entry);
             break;
           }
-          cursor = history.page?.nextCursor;
-          if (!cursor)
+          const nextCursor = history.page?.nextCursor;
+          if (typeof nextCursor !== "string" || !nextCursor.length || seenCursors.has(nextCursor))
             break;
+          seenCursors.add(nextCursor);
+          cursor = nextCursor;
         }
       } catch {}
       return entry;
     } finally {
-      rmSync(lock, { recursive: true });
+      rmSync(lock, { recursive: true, force: true });
     }
   }
 }
 
 // codex/run.ts
-import { readFileSync as readFileSync11 } from "node:fs";
+import { readFileSync as readFileSync11, lstatSync as lstatSync6 } from "node:fs";
 import { homedir as homedir6 } from "node:os";
 import { join as join11 } from "node:path";
 
@@ -356,10 +397,18 @@ import { isAbsolute as isAbsolute2, join as join3, resolve as resolve2 } from "n
 import { createHash } from "node:crypto";
 
 // src/identity.ts
+var RESERVED_IDENTITY_IDS = new Set(["__proto__", "constructor", "prototype"]);
+function sanitizeDiagnosticField(raw, fallback = "(unknown)") {
+  if (typeof raw !== "string")
+    return fallback;
+  const cleaned = raw.replace(/[\x00-\x1f\x7f]+/g, " ").trim();
+  return cleaned.length > 0 ? cleaned.slice(0, 256) : fallback;
+}
 function validateIdentityProfile(profile, file, allowDevToken = false) {
-  const nonempty = (value) => typeof value === "string" && value.trim().length > 0;
-  if (!profile || typeof profile !== "object" || Array.isArray(profile) || !nonempty(profile.agent_id) || !nonempty(profile.token) || !allowDevToken && profile.token === "dev-token" || profile.capabilities !== undefined && (!Array.isArray(profile.capabilities) || !profile.capabilities.every(nonempty))) {
-    throw new Error(`Invalid identity profile at ${file}. Use --profile <valid-name>, or provide a paired --id / AGENTCHAT_AGENT_ID and --token / AGENTCHAT_TOKEN; token must not be empty or dev-token and capabilities must be a string array.`);
+  const cleanNonempty = (value) => typeof value === "string" && value.trim().length > 0 && !/[\x00-\x1f\x7f]/.test(value);
+  const safeFile = sanitizeDiagnosticField(file, "(unknown-path)");
+  if (!profile || typeof profile !== "object" || Array.isArray(profile) || !cleanNonempty(profile.agent_id) || RESERVED_IDENTITY_IDS.has(profile.agent_id.trim()) || !cleanNonempty(profile.token) || !allowDevToken && profile.token.trim() === "dev-token" || profile.capabilities !== undefined && (!Array.isArray(profile.capabilities) || !profile.capabilities.every(cleanNonempty))) {
+    throw new Error(`Invalid identity profile at ${safeFile}. Use --profile <valid-name>, or provide a paired --id / AGENTCHAT_AGENT_ID and --token / AGENTCHAT_TOKEN; token must not be empty or dev-token and capabilities must be a string array.`);
   }
 }
 
@@ -1867,7 +1916,7 @@ import { join as join9 } from "node:path";
 
 // codex/thread-history.ts
 import { createHash as createHash2, randomBytes } from "node:crypto";
-import { chmodSync, lstatSync as lstatSync2, mkdirSync as mkdirSync4, renameSync as renameSync2, unlinkSync, writeFileSync as writeFileSync2 } from "node:fs";
+import { chmodSync, lstatSync as lstatSync3, mkdirSync as mkdirSync4, renameSync as renameSync2, unlinkSync, writeFileSync as writeFileSync2 } from "node:fs";
 import { join as join6 } from "node:path";
 function priorChannelThreads(threads, channel) {
   if (!threads || typeof threads !== "object" || typeof channel !== "string" || !channel)
@@ -1890,13 +1939,13 @@ function priorChannelThreads(threads, channel) {
 function preserveChannelHistory(directory, channel, histories, redact) {
   const root = join6(directory, "history");
   mkdirSync4(root, { recursive: true, mode: 448 });
-  if (lstatSync2(root).isSymbolicLink())
+  if (lstatSync3(root).isSymbolicLink())
     throw new Error("History directory must not be a symlink");
   if (process.platform !== "win32")
     chmodSync(root, 448);
   const file = join6(root, createHash2("sha256").update(channel).digest("hex").slice(0, 24) + ".json");
   try {
-    if (lstatSync2(file).isSymbolicLink())
+    if (lstatSync3(file).isSymbolicLink())
       throw new Error("History archive must not be a symlink");
   } catch (e) {
     if (e.code !== "ENOENT")
@@ -1988,13 +2037,13 @@ End of historical context.
 }
 
 // codex/loop-grants.ts
-import { lstatSync as lstatSync3, readFileSync as readFileSync6 } from "node:fs";
+import { lstatSync as lstatSync4, readFileSync as readFileSync6 } from "node:fs";
 import { join as join7 } from "node:path";
 function grants(config, opts) {
   try {
     const platform = opts?.platform ?? process.platform;
     const getuid = opts && "getuid" in opts ? opts.getuid : process.getuid;
-    const file = join7(config.stateDir, "loop-grants.json"), stat = lstatSync3(file);
+    const file = join7(config.stateDir, "loop-grants.json"), stat = lstatSync4(file);
     if (!stat.isFile())
       return [];
     if (platform !== "win32") {
@@ -2049,7 +2098,7 @@ import { join as join8 } from "node:path";
 
 // src/profile-store.ts
 import {
-  lstatSync as lstatSync4,
+  lstatSync as lstatSync5,
   writeFileSync as writeFileSync3,
   renameSync as renameSync3,
   copyFileSync,
@@ -2063,7 +2112,7 @@ var defaultWarn = (m) => process.stderr.write(m);
 var MAX_PROFILE_JSON_BYTES = 64 * 1024;
 function safeLstat(target) {
   try {
-    return lstatSync4(target);
+    return lstatSync5(target);
   } catch (err) {
     if (err && err.code === "ENOENT")
       return;
@@ -3001,6 +3050,9 @@ See codex/README.md for setup, verification, limitations and recovery.
 var codex;
 var bridge;
 var transport;
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value) && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
+}
 async function main() {
   const { values } = parseArgs({ options: {
     "codex-bridge": { type: "boolean" },
@@ -3033,6 +3085,11 @@ async function main() {
     }
     if (!values["gui-thread"] || !values["gui-message-file"])
       throw new Error("GUI submission requires --gui-thread and --gui-message-file");
+    const stat = lstatSync6(values["gui-message-file"]);
+    if (stat.isSymbolicLink() || !stat.isFile())
+      throw new Error("GUI message must be a regular file, not a symlink");
+    if (stat.size > 256 * 1024)
+      throw new Error("GUI message file exceeds 256 KiB");
     const { prompt, ...receipt } = channel.enqueue(values["gui-thread"], readFileSync11(values["gui-message-file"], "utf8"));
     console.log(JSON.stringify(receipt));
     return;
@@ -3045,8 +3102,13 @@ async function main() {
       return;
     }
     const timer = setTimeout(() => reject(new Error("Parent configuration missing")), 1e4);
+    timer.unref?.();
     process.once("message", (config) => {
       clearTimeout(timer);
+      if (!isPlainObject(config) || !Object.keys(config).length) {
+        reject(new Error("Invalid parent configuration"));
+        return;
+      }
       resolve4(config);
     });
   }) : undefined;
@@ -3070,20 +3132,32 @@ async function main() {
   codex = new AppServer(c.codexBin, undefined, undefined, c.permissions, runtime, c.effort, c.model, { profileFile: c.profileFile, agentId: c.agentId, apiUrl: c.apiUrl, wsUrl: c.wsUrl });
   if (values.conversations || values["read-conversation"]) {
     const state = JSON.parse(readFileSync11(join11(c.stateDir, "state.json"), "utf8"));
-    const channels = state.channels ?? {};
+    const channels = state?.channels === undefined ? {} : state.channels;
+    if (!isPlainObject(channels))
+      throw new Error("Invalid conversation channels");
+    const safeOutput = (value) => {
+      const text = JSON.stringify(value);
+      return redactSecrets(typeof c.token === "string" && c.token.length > 0 ? text.split(c.token).join("[REDACTED]") : text);
+    };
     if (values.conversations) {
-      console.log(JSON.stringify(Object.entries(channels).map(([channel2, data]) => ({ channel: channel2, thread: data.thread, isolated: data.namespace === runtime.home }))));
+      console.log(safeOutput(Object.entries(channels).map(([channel2, data]) => ({ channel: channel2, thread: data.thread, isolated: data.namespace === runtime.home }))));
       return;
     }
-    const channel = channels[values["read-conversation"]];
-    if (!channel)
+    const key = values["read-conversation"];
+    if (!Object.prototype.hasOwnProperty.call(channels, key))
       throw new Error("Unknown conversation channel");
+    const channel = channels[key];
+    if (!isPlainObject(channel) || typeof channel.thread !== "string" || !channel.thread)
+      throw new Error("Invalid conversation channel");
     if (channel.namespace && channel.namespace !== runtime.home)
       throw new Error("Conversation belongs to a different runtime home");
     await codex.start();
-    const history = channel.namespace ? await codex.readThread(channel.thread) : await codex.readLegacyThread(channel.thread);
-    console.log(redactSecrets(JSON.stringify(history).split(c.token).join("[REDACTED]")));
-    codex.close();
+    try {
+      const history = channel.namespace ? await codex.readThread(channel.thread) : await codex.readLegacyThread(channel.thread);
+      console.log(safeOutput(history));
+    } finally {
+      codex.close();
+    }
     return;
   }
   if (c.permissions === "full-access") {
@@ -3094,9 +3168,12 @@ async function main() {
   }
   if (values.check) {
     await codex.start();
-    console.log("Official app-server initialization: OK (no chat connection or generation)");
-    console.log(JSON.stringify({ authentication: await codex.authenticationStatus(), generation_verified: false, reply_verified: false, codex_home_mode: c.codexHomeMode ?? "linked" }));
-    codex.close();
+    try {
+      console.log("Official app-server initialization: OK (no chat connection or generation)");
+      console.log(JSON.stringify({ authentication: await codex.authenticationStatus(), generation_verified: false, reply_verified: false, codex_home_mode: c.codexHomeMode ?? "linked" }));
+    } finally {
+      codex.close();
+    }
     return;
   }
   transport = new AgentsChatTransport(c, (m) => {
@@ -3140,7 +3217,8 @@ async function main() {
   transport.start();
 }
 main().catch(async (e) => {
-  console.error(`Bridge startup failed: ${e instanceof Error && !/token|secret/i.test(e.message) ? e.message : "invalid configuration"}`);
+  const diagnostic = e instanceof Error ? redactSecrets(e.message) : "invalid configuration";
+  console.error(`Bridge startup failed: ${/token|secret|bearer|password|key/i.test(diagnostic) ? "invalid configuration" : diagnostic}`);
   transport?.stop();
   codex?.close();
   await bridge?.stop();

@@ -19,10 +19,18 @@ import { isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 
 // src/identity.ts
+var RESERVED_IDENTITY_IDS = new Set(["__proto__", "constructor", "prototype"]);
+function sanitizeDiagnosticField(raw, fallback = "(unknown)") {
+  if (typeof raw !== "string")
+    return fallback;
+  const cleaned = raw.replace(/[\x00-\x1f\x7f]+/g, " ").trim();
+  return cleaned.length > 0 ? cleaned.slice(0, 256) : fallback;
+}
 function validateIdentityProfile(profile, file, allowDevToken = false) {
-  const nonempty = (value) => typeof value === "string" && value.trim().length > 0;
-  if (!profile || typeof profile !== "object" || Array.isArray(profile) || !nonempty(profile.agent_id) || !nonempty(profile.token) || !allowDevToken && profile.token === "dev-token" || profile.capabilities !== undefined && (!Array.isArray(profile.capabilities) || !profile.capabilities.every(nonempty))) {
-    throw new Error(`Invalid identity profile at ${file}. Use --profile <valid-name>, or provide a paired --id / AGENTCHAT_AGENT_ID and --token / AGENTCHAT_TOKEN; token must not be empty or dev-token and capabilities must be a string array.`);
+  const cleanNonempty = (value) => typeof value === "string" && value.trim().length > 0 && !/[\x00-\x1f\x7f]/.test(value);
+  const safeFile = sanitizeDiagnosticField(file, "(unknown-path)");
+  if (!profile || typeof profile !== "object" || Array.isArray(profile) || !cleanNonempty(profile.agent_id) || RESERVED_IDENTITY_IDS.has(profile.agent_id.trim()) || !cleanNonempty(profile.token) || !allowDevToken && profile.token.trim() === "dev-token" || profile.capabilities !== undefined && (!Array.isArray(profile.capabilities) || !profile.capabilities.every(cleanNonempty))) {
+    throw new Error(`Invalid identity profile at ${safeFile}. Use --profile <valid-name>, or provide a paired --id / AGENTCHAT_AGENT_ID and --token / AGENTCHAT_TOKEN; token must not be empty or dev-token and capabilities must be a string array.`);
   }
 }
 
