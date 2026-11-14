@@ -1005,7 +1005,7 @@ describe("AgentChatClient realtime collaboration WS events", () => {
           include_archived: true,
         });
       }
-      if (url.includes("/api/channels?agent_id=bot%2Fslash")) {
+      if (url.includes("/api/channels?agent_id=bot%23tag")) {
         return Response.json({ channels: [] });
       }
       return Response.json({ ok: true });
@@ -1031,8 +1031,8 @@ describe("AgentChatClient realtime collaboration WS events", () => {
       const snap = await rest.getChannelOkrSnapshot("room-dev", { include_archived: true });
       expect(snap.objectives[0]?.id).toBe("obj_1");
 
-      await rest.getChannels("bot/slash");
-      expect(calls.some((c) => c.url.endsWith("/api/channels?agent_id=bot%2Fslash"))).toBe(true);
+      await rest.getChannels("bot#tag");
+      expect(calls.some((c) => c.url.endsWith("/api/channels?agent_id=bot%23tag"))).toBe(true);
 
       await expect(rest.registerWebhook("room-dev", "http://169.254.169.254/latest/meta-data")).rejects.toThrow(
         "Webhook host not allowed",

@@ -1,6 +1,6 @@
 // AgentsChat TypeScript SDK — WebSocket client
 
-import { redactError, validateToken, validateTransportUrl } from "./security";
+import { redactError, validateToken, validateTransportUrl, validatePathSegment } from "./security";
 
 import type {
   AgentPresence,
@@ -87,6 +87,7 @@ export class AgentChatClient {
     if (typeof options.agentId !== "string" || !options.agentId.trim() || /[\x00-\x1f\x7f]/.test(options.agentId)) {
       throw new Error("Invalid agentId");
     }
+    validatePathSegment(options.agentId, "agentId");
     validateToken(options.token);
     this.url = options.url;
     this.agentId = options.agentId;
@@ -452,7 +453,7 @@ export class AgentChatClient {
     } catch {
       return;
     }
-    if (!data || typeof data !== "object" || Array.isArray(data)) return;
+    if (!data || typeof data !== "object" || Array.isArray(data) || Object.prototype.hasOwnProperty.call(data, "__proto__")) return;
 
     switch (data.type) {
       case "auth_ok":
@@ -750,6 +751,9 @@ export class AgentChatClient {
   }
 
   private send(data: Record<string, unknown>) {
+    for (const [key, value] of Object.entries(data)) {
+      if (key === "id" || key.endsWith("_id")) validatePathSegment(value, key);
+    }
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(data));
     }

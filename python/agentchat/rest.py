@@ -7,7 +7,7 @@ from typing import Any, Optional
 
 import json
 import math
-from ._security import redact_error, validate_server_url, validate_token
+from ._security import redact_error, validate_server_url, validate_token, validate_path_segment
 import socket
 import urllib.error
 import urllib.parse
@@ -19,7 +19,8 @@ MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 
 
 def _quote_segment(value: str) -> str:
-    return urllib.parse.quote(str(value), safe="")
+    validate_path_segment(value)
+    return urllib.parse.quote(value, safe="")
 
 
 class AgentChatRESTError(Exception):
@@ -108,6 +109,7 @@ class AgentChatREST:
 
     def get_agent(self, agent_id: str) -> dict[str, Any]:
         """Get details for a specific agent."""
+        validate_path_segment(agent_id, "agent_id")
         return self._get(f"/api/agents/{_quote_segment(agent_id)}")
 
     def discover(self, capabilities: list[str] | None = None, limit: int = 20) -> list[dict[str, Any]]:
@@ -122,6 +124,7 @@ class AgentChatREST:
 
     def get_channels(self, agent_id: str) -> list[dict[str, Any]]:
         """Get channels that an agent belongs to."""
+        validate_path_segment(agent_id, "agent_id")
         query = urllib.parse.urlencode({"agent_id": agent_id})
         data = self._get(f"/api/channels?{query}")
         return _collection(data, "channels")
@@ -130,6 +133,11 @@ class AgentChatREST:
 
     def get_messages(self, channel_id: str, limit: int = 50, before: str | None = None, after: str | None = None) -> list[dict[str, Any]]:
         """Get messages from a channel with pagination."""
+        validate_path_segment(channel_id, "channel_id")
+        if before is not None:
+            validate_path_segment(before, "before")
+        if after is not None:
+            validate_path_segment(after, "after")
         query: dict[str, Any] = {"limit": limit}
         if before:
             query["before"] = before
@@ -140,6 +148,8 @@ class AgentChatREST:
 
     def send_message(self, channel_id: str, sender_id: str, content: str, sender_type: str = "agent", content_type: str = "text") -> dict[str, Any]:
         """Send a message via REST API (no WebSocket needed)."""
+        validate_path_segment(channel_id, "channel_id")
+        validate_path_segment(sender_id, "sender_id")
         return self._post(f"/api/channels/{_quote_segment(channel_id)}/messages", {
             "sender_id": sender_id,
             "content": content,
@@ -151,6 +161,8 @@ class AgentChatREST:
 
     def search(self, query: str, channel_id: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         """Search messages by keyword."""
+        if channel_id is not None:
+            validate_path_segment(channel_id, "channel_id")
         params: dict[str, Any] = {"q": query, "limit": limit}
         if channel_id:
             params["channel_id"] = channel_id
@@ -167,10 +179,12 @@ class AgentChatREST:
 
     def register_webhook(self, channel_id: str, url: str) -> dict[str, Any]:
         """Register a webhook callback URL for a channel."""
+        validate_path_segment(channel_id, "channel_id")
         return self._post("/api/webhooks", {"channel_id": channel_id, "url": url})
 
     def remove_webhook(self, channel_id: str, url: str) -> dict[str, Any]:
         """Remove a webhook callback URL."""
+        validate_path_segment(channel_id, "channel_id")
         return self._delete("/api/webhooks", {"channel_id": channel_id, "url": url})
 
     # MARK: - Agent Registration
@@ -206,6 +220,8 @@ class AgentChatREST:
         For agents: id is optional (auto-generated adj-adj-noun).
         For users: id (email) and password are required.
         """
+        if account_id is not None:
+            validate_path_segment(account_id, "account_id")
         body: dict[str, Any] = {"name": name, "type": account_type}
         if account_id:
             body["id"] = account_id
@@ -217,22 +233,29 @@ class AgentChatREST:
 
     def login(self, account_id: str, key: str) -> dict[str, Any]:
         """Login with id + key/password. Returns account info + JWT token."""
+        validate_path_segment(account_id, "account_id")
         return self._post("/api/account/login", {"id": account_id, "key": key})
 
     def get_account(self, account_id: str) -> dict[str, Any]:
         """Get public account info."""
+        validate_path_segment(account_id, "account_id")
         return self._get(f"/api/account/{_quote_segment(account_id)}")
 
     def claim_agent(self, owner_id: str, agent_key: str) -> dict[str, Any]:
         """Claim an agent by its key."""
+        validate_path_segment(owner_id, "owner_id")
         return self._post("/api/account/claim", {"owner_id": owner_id, "agent_key": agent_key})
 
     def release_agent(self, owner_id: str, agent_id: str) -> dict[str, Any]:
         """Release an owned agent."""
+        validate_path_segment(owner_id, "owner_id")
+        validate_path_segment(agent_id, "agent_id")
         return self._post("/api/account/release", {"owner_id": owner_id, "agent_id": agent_id})
 
     def set_agent_status(self, owner_id: str, agent_id: str, status: str) -> dict[str, Any]:
         """Enable/disable an owned agent."""
+        validate_path_segment(owner_id, "owner_id")
+        validate_path_segment(agent_id, "agent_id")
         return self._post("/api/account/status", {"owner_id": owner_id, "agent_id": agent_id, "status": status})
 
     def discover_channels(self, query: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
@@ -245,6 +268,7 @@ class AgentChatREST:
 
     def my_channels(self, agent_id: str) -> list[dict[str, Any]]:
         """Get channels the agent has joined."""
+        validate_path_segment(agent_id, "agent_id")
         data = self._get(f"/api/channels/mine?{urllib.parse.urlencode({'agent_id': agent_id})}")
         return _collection(data, "channels", default_empty=True)
 

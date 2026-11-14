@@ -118,18 +118,18 @@ class TestAgentChatREST(unittest.TestCase):
 
     def test_bearer_header_and_path_query_encoding(self) -> None:
         rest = AgentChatREST(f"http://127.0.0.1:{self.port}/", token="ac_secret_123", timeout=3.0)
-        rest.get_agent("team/agent#1")
-        rest.get_account("user/with/slash")
-        rest.get_messages("ch/alpha", limit=10, before="msg&1")
-        rest.search("hello&world=1#frag", channel_id="ch/1", limit=5)
+        rest.get_agent("team-agent#1")
+        rest.get_account("user+tag@example.com")
+        rest.get_messages("ch:alpha", limit=10, before="msg&1")
+        rest.search("hello&world=1#frag", channel_id="ch:1", limit=5)
         rest.discover_channels("中文 & Rust#1", limit=7)
 
         paths = [r["path"] for r in _RecordingHTTPHandler.recorded]
-        self.assertEqual(paths[0], "/api/agents/team%2Fagent%231")
-        self.assertEqual(paths[1], "/api/account/user%2Fwith%2Fslash")
-        self.assertEqual(paths[2], "/api/channels/ch%2Falpha/messages?limit=10&before=msg%261")
+        self.assertEqual(paths[0], "/api/agents/team-agent%231")
+        self.assertEqual(paths[1], "/api/account/user%2Btag%40example.com")
+        self.assertEqual(paths[2], "/api/channels/ch%3Aalpha/messages?limit=10&before=msg%261")
         self.assertIn("q=hello%26world%3D1%23frag", paths[3])
-        self.assertIn("channel_id=ch%2F1", paths[3])
+        self.assertIn("channel_id=ch%3A1", paths[3])
         self.assertIn("q=%E4%B8%AD%E6%96%87+%26+Rust%231", paths[4])
         for rec in _RecordingHTTPHandler.recorded:
             self.assertEqual(rec["auth"], "Bearer ac_secret_123")

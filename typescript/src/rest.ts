@@ -1,4 +1,4 @@
-import { redactError, validateToken, validateTransportUrl } from "./security";
+import { redactError, validateToken, validateTransportUrl, validatePathSegment } from "./security";
 // AgentsChat REST API client — HTTP queries for history, channels, agents
 
 import type {
@@ -34,7 +34,7 @@ export function parseSseFrames(buffer: string, maxBufferChars = 262_144): Parsed
     if (!payload) continue;
     try {
       const parsed = JSON.parse(payload);
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && !Object.prototype.hasOwnProperty.call(parsed, "__proto__")) {
         events.push(parsed as Record<string, unknown>);
       }
     } catch {
@@ -3803,7 +3803,7 @@ export function rankDiscoverableChannels<T extends import("./types").Discoverabl
   return limit >= 0 ? clean.slice(0, limit) : clean;
 }
 
-const MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
+const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 
 export type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
@@ -3899,6 +3899,7 @@ export class AgentChatREST {
   }
 
   async getAgent(agentId: string, opts?: { bearerToken?: string }): Promise<AgentCard> {
+    validatePathSegment(agentId, "agent ID");
     const safeId = this.assertSafeDiscoveryAgentId(agentId);
     const raw = await this.get<unknown>(`/api/agents/${encodeURIComponent(safeId)}`, {
       "Cache-Control": "no-store",
@@ -3959,6 +3960,7 @@ export class AgentChatREST {
   // MARK: - Channels
 
   async getChannels(agentId: string): Promise<StoredChannel[]> {
+    validatePathSegment(agentId, "agent ID");
     const data = await this.get<{ channels: StoredChannel[] }>(
       `/api/channels?agent_id=${encodeURIComponent(agentId)}`,
     );
@@ -3974,6 +3976,9 @@ export class AgentChatREST {
     after?: string,
     opts?: import("./types").GetMessagesOptions,
   ): Promise<StoredMessage[]> {
+    validatePathSegment(channelId, "channel ID");
+    if (before !== undefined) validatePathSegment(before, "before");
+    if (after !== undefined) validatePathSegment(after, "after");
     const safeChannel = this.assertSafeChannelRef(channelId);
     if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
       throw new Error("Invalid limit");
@@ -3999,6 +4004,8 @@ export class AgentChatREST {
     senderType = "agent",
     opts?: import("./types").SendMessageOptions,
   ): Promise<{ ok: boolean; id: string }> {
+    validatePathSegment(channelId, "channel ID");
+    validatePathSegment(senderId, "sender ID");
     const safeChannel = this.assertSafeChannelRef(channelId);
     const safeSender = typeof senderId === "string" ? senderId.trim() : "";
     if (!safeSender || safeSender.length > 160 || /[\u0000-\u001F]/.test(safeSender) || this.containsMemorySecretShape(safeSender)) {
@@ -4032,6 +4039,7 @@ export class AgentChatREST {
     limit = 50,
     opts?: import("./types").SearchMessagesOptions,
   ): Promise<StoredMessage[]> {
+    if (channelId !== undefined) validatePathSegment(channelId, "channel ID");
     const q = typeof query === "string" ? query.trim() : "";
     if (!q || q.length > 200 || /[\u0000-\u001F]/.test(q)) {
       throw new Error("Invalid search query");
@@ -4073,6 +4081,7 @@ export class AgentChatREST {
   }
 
   async getArena(channelId: string, opts?: { bearerToken?: string }): Promise<import("./types").GetArenaResponse> {
+    validatePathSegment(channelId, "channel ID");
     const safeChannel = this.assertSafeChannelRef(channelId);
     return this.get<import("./types").GetArenaResponse>(`/api/arenas/${encodeURIComponent(safeChannel)}`, {
       "Cache-Control": "no-store",
@@ -4121,6 +4130,7 @@ export class AgentChatREST {
     action: import("./types").ArenaAdvanceAction,
     opts?: import("./types").AdvanceArenaOptions,
   ): Promise<import("./types").AdvanceArenaResponse> {
+    validatePathSegment(channelId, "channel ID");
     const safeChannel = this.assertSafeChannelRef(channelId);
     if (action !== "tick" && action !== "finish") {
       throw new Error("Invalid arena action");
@@ -4208,6 +4218,7 @@ export class AgentChatREST {
     url: string,
     opts?: { bearerToken?: string },
   ): Promise<{ ok: boolean }> {
+    validatePathSegment(channelId, "channel ID");
     const target = this.assertWebhookTarget(channelId, url);
     return this.post(
       "/api/webhooks",
@@ -4221,6 +4232,7 @@ export class AgentChatREST {
     url: string,
     opts?: { bearerToken?: string },
   ): Promise<{ ok: boolean }> {
+    validatePathSegment(channelId, "channel ID");
     const target = this.assertWebhookTarget(channelId, url);
     return this.del(
       "/api/webhooks",
@@ -4247,26 +4259,34 @@ export class AgentChatREST {
   }
 
   async login(id: string, key: string): Promise<any> {
+    validatePathSegment(id, "account ID");
     return this.post("/api/account/login", { id, key });
   }
 
   async getAccount(id: string): Promise<any> {
+    validatePathSegment(id, "account ID");
     return this.get(`/api/account/${encodeURIComponent(id)}`);
   }
 
   async claimAgent(ownerId: string, agentKey: string): Promise<any> {
+    validatePathSegment(ownerId, "owner ID");
     return this.post("/api/account/claim", { owner_id: ownerId, agent_key: agentKey });
   }
 
   async releaseAgent(ownerId: string, agentId: string): Promise<any> {
+    validatePathSegment(ownerId, "owner ID");
+    validatePathSegment(agentId, "agent ID");
     return this.post("/api/account/release", { owner_id: ownerId, agent_id: agentId });
   }
 
   async setAgentStatus(ownerId: string, agentId: string, status: "active" | "disabled"): Promise<any> {
+    validatePathSegment(ownerId, "owner ID");
+    validatePathSegment(agentId, "agent ID");
     return this.post("/api/account/status", { owner_id: ownerId, agent_id: agentId, status });
   }
 
   private assertSafeDiscoveryAgentId(rawAgentId: string): string {
+    validatePathSegment(rawAgentId, "agent ID");
     const trimmed = typeof rawAgentId === "string" ? rawAgentId.trim() : "";
     if (
       !trimmed ||
@@ -4392,6 +4412,7 @@ export class AgentChatREST {
 
     const params = new URLSearchParams();
     if (rawAgentId !== undefined) {
+      validatePathSegment(rawAgentId, "agent ID");
       const trimmed = rawAgentId.trim();
       if (
         !trimmed ||
@@ -4436,6 +4457,7 @@ export class AgentChatREST {
     ownerId: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").OwnedAgentsListResponse> {
+    validatePathSegment(ownerId, "owner ID");
     const trimmed = typeof ownerId === "string" ? ownerId.trim() : "";
     if (
       !trimmed ||
@@ -4462,6 +4484,7 @@ export class AgentChatREST {
     agentId: string,
     opts?: { limit?: number; result?: CloudAgentAuditResult; bearerToken?: string },
   ): Promise<CloudAgentAuditFeed> {
+    validatePathSegment(agentId, "cloud agent ID");
     if (!isSafeCloudAuditAgentId(agentId) || this.containsMemorySecretShape(agentId)) {
       throw new Error("Invalid cloud agent ID");
     }
@@ -4502,6 +4525,7 @@ export class AgentChatREST {
     channelId: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").ChannelWakeHealth> {
+    validatePathSegment(channelId, "channel ID");
     const safeChannel = typeof channelId === "string" ? channelId.trim() : "";
     if (!safeNonDmChannelId(safeChannel)) {
       throw new Error("Invalid channel ID");
@@ -4524,6 +4548,7 @@ export class AgentChatREST {
     channelId: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").RoomLoopsFeed> {
+    validatePathSegment(channelId, "channel ID");
     const safeChannel = typeof channelId === "string" ? channelId.trim() : "";
     if (
       !safeChannel ||
@@ -4584,6 +4609,7 @@ export class AgentChatREST {
     channelId: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").ChannelBrief> {
+    validatePathSegment(channelId, "channel ID");
     const safeChannel = typeof channelId === "string" ? channelId.trim() : "";
     if (
       !safeNonDmChannelId(safeChannel) ||
@@ -4611,6 +4637,7 @@ export class AgentChatREST {
     id: string,
     opts?: { since?: string; bearerToken?: string },
   ): Promise<import("./types").WorkspaceGraph> {
+    validatePathSegment(id, "workspace graph ID");
     if (!["channel", "objective", "agent"].includes(scope)) {
       throw new Error("Invalid workspace graph scope");
     }
@@ -4653,6 +4680,7 @@ export class AgentChatREST {
     channelId: string,
     opts?: { limit?: number; bearerToken?: string },
   ): Promise<import("./types").ChannelProposalsFeed> {
+    validatePathSegment(channelId, "channel ID");
     const safeChannel = typeof channelId === "string" ? channelId.trim() : "";
     if (
       !safeNonDmChannelId(safeChannel) ||
@@ -4688,6 +4716,7 @@ export class AgentChatREST {
     input: import("./types").CreateChannelProposalInput,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").CreateChannelProposalResponse> {
+    validatePathSegment(channelId, "channel ID");
     const safeChannel = typeof channelId === "string" ? channelId.trim() : "";
     if (
       !safeNonDmChannelId(safeChannel) ||
@@ -4754,6 +4783,8 @@ export class AgentChatREST {
     input: import("./types").VoteChannelProposalInput,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").VoteChannelProposalResponse> {
+    validatePathSegment(channelId, "channel ID");
+    validatePathSegment(proposalId, "proposal ID");
     const safeChannel = typeof channelId === "string" ? channelId.trim() : "";
     if (
       !safeNonDmChannelId(safeChannel) ||
@@ -4806,6 +4837,7 @@ export class AgentChatREST {
     channelId: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").ChannelPinsResponse> {
+    validatePathSegment(channelId, "channel ID");
     const safeChannel = typeof channelId === "string" ? channelId.trim() : "";
     if (
       !safeNonDmChannelId(safeChannel) ||
@@ -4857,6 +4889,7 @@ export class AgentChatREST {
     channelId: string,
     opts?: import("./types").IterateChannelEventsOptions,
   ): AsyncGenerator<Record<string, unknown>, void, unknown> {
+    validatePathSegment(channelId, "channel ID");
     const safeChannel = channelId?.trim() ?? "";
     if (
       !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) ||
@@ -4949,6 +4982,7 @@ export class AgentChatREST {
     channelId: string,
     opts: import("./types").StreamChannelEventsOptions,
   ): Promise<void> {
+    validatePathSegment(channelId, "channel ID");
     if (!opts || typeof opts.onEvent !== "function") {
       throw new Error("Invalid SSE onEvent callback");
     }
@@ -4992,6 +5026,7 @@ export class AgentChatREST {
     name: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").PersonalSkillDetail> {
+    validatePathSegment(name, "skill name");
     const safeName = this.assertSkillName(name);
     const token = this.resolveBearerToken(opts?.bearerToken);
     const headers: Record<string, string> = {
@@ -5009,6 +5044,7 @@ export class AgentChatREST {
     name: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").PersonalSkillRevisionsResponse> {
+    validatePathSegment(name, "skill name");
     const safeName = this.assertSkillName(name);
     const token = this.resolveBearerToken(opts?.bearerToken);
     const headers: Record<string, string> = {
@@ -5027,6 +5063,7 @@ export class AgentChatREST {
     input: import("./types").SavePersonalSkillInput,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").SavePersonalSkillResponse> {
+    validatePathSegment(name, "skill name");
     const safeName = this.assertSkillName(name);
     if (!input?.body_markdown || typeof input.body_markdown !== "string" || !input.body_markdown.trim()) {
       throw new Error("Invalid personal skill body_markdown");
@@ -5067,6 +5104,7 @@ export class AgentChatREST {
     expectedVersion: number,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").ArchivePersonalSkillResponse> {
+    validatePathSegment(name, "skill name");
     const safeName = this.assertSkillName(name);
     if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 1) {
       throw new Error("Invalid personal skill expectedVersion");
@@ -5200,6 +5238,7 @@ export class AgentChatREST {
     loopId: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").RoomLoopMutationResponse> {
+    validatePathSegment(loopId, "loop ID");
     const safeId = this.assertLoopId(loopId);
     const token = this.resolveBearerToken(opts?.bearerToken);
     const headers: Record<string, string> = {
@@ -5218,6 +5257,7 @@ export class AgentChatREST {
     loopId: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").RoomLoopMutationResponse> {
+    validatePathSegment(loopId, "loop ID");
     const safeId = this.assertLoopId(loopId);
     const token = this.resolveBearerToken(opts?.bearerToken);
     const headers: Record<string, string> = {
@@ -5236,6 +5276,7 @@ export class AgentChatREST {
     loopId: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").RoomLoopMutationResponse> {
+    validatePathSegment(loopId, "loop ID");
     const safeId = this.assertLoopId(loopId);
     const token = this.resolveBearerToken(opts?.bearerToken);
     const headers: Record<string, string> = {
@@ -5255,6 +5296,7 @@ export class AgentChatREST {
     intervalMs: number,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").RoomLoopMutationResponse> {
+    validatePathSegment(loopId, "loop ID");
     const safeId = this.assertLoopId(loopId);
     if (!Number.isInteger(intervalMs) || intervalMs < 60_000 || intervalMs > 86_400_000) {
       throw new Error("Invalid loop interval_ms");
@@ -5275,6 +5317,7 @@ export class AgentChatREST {
   // MARK: - OKR Structured Working Memory Governance (/api/okr)
 
   private assertOkrEntityId(rawId: string, label: string): string {
+    validatePathSegment(rawId, label);
     const trimmed = rawId?.trim() ?? "";
     if (
       !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(trimmed) ||
@@ -5388,6 +5431,7 @@ export class AgentChatREST {
     input: import("./types").UpdateOkrObjectiveInput,
     opts?: { bearerToken?: string },
   ): Promise<{ ok: boolean; objective: import("./types").OkrObjectiveItem }> {
+    validatePathSegment(objectiveId, "objective ID");
     const safeId = this.assertOkrEntityId(objectiveId, "objective ID");
     const cas = this.assertOkrVersion(input?.if_match_updated_at);
     if (input?.title !== undefined) {
@@ -5416,6 +5460,7 @@ export class AgentChatREST {
     input: import("./types").ReparentOkrObjectiveInput,
     opts?: { bearerToken?: string },
   ): Promise<{ ok: boolean; objective: import("./types").OkrObjectiveItem; unchanged?: boolean }> {
+    validatePathSegment(objectiveId, "objective ID");
     const safeId = this.assertOkrEntityId(objectiveId, "objective ID");
     const cas = this.assertOkrVersion(input?.if_match_updated_at);
     let parentId: string | null = null;
@@ -5439,6 +5484,7 @@ export class AgentChatREST {
     input?: import("./types").ArchiveOkrObjectiveInput,
     opts?: { bearerToken?: string },
   ): Promise<{ ok: boolean; objective: import("./types").OkrObjectiveItem; retired_loop_ids?: string[] }> {
+    validatePathSegment(objectiveId, "objective ID");
     const safeId = this.assertOkrEntityId(objectiveId, "objective ID");
     const body: Record<string, unknown> = {};
     if (input?.completion_summary !== undefined) {
@@ -5457,6 +5503,7 @@ export class AgentChatREST {
     objectiveId: string,
     opts?: { bearerToken?: string },
   ): Promise<{ ok: boolean; objective: import("./types").OkrObjectiveItem }> {
+    validatePathSegment(objectiveId, "objective ID");
     const safeId = this.assertOkrEntityId(objectiveId, "objective ID");
     return this.post(
       `/api/okr/objectives/${encodeURIComponent(safeId)}/unarchive`,
@@ -5470,6 +5517,7 @@ export class AgentChatREST {
     input: import("./types").CreateOkrKrInput,
     opts?: { bearerToken?: string },
   ): Promise<{ ok: boolean; kr: import("./types").OkrKeyResultItem }> {
+    validatePathSegment(objectiveId, "objective ID");
     const safeOid = this.assertOkrEntityId(objectiveId, "objective ID");
     const title = input?.title?.trim() ?? "";
     if (!title || title.length > 200) throw new Error("Invalid KR title");
@@ -5500,6 +5548,7 @@ export class AgentChatREST {
     input: import("./types").UpdateOkrKrInput,
     opts?: { bearerToken?: string },
   ): Promise<{ ok: boolean; kr: import("./types").OkrKeyResultItem }> {
+    validatePathSegment(krId, "KR ID");
     const safeId = this.assertOkrEntityId(krId, "KR ID");
     const cas = this.assertOkrVersion(input?.if_match_updated_at);
     if (input?.title !== undefined) {
@@ -5528,6 +5577,7 @@ export class AgentChatREST {
     input: import("./types").UpdateOkrKrProgressInput,
     opts?: { bearerToken?: string },
   ): Promise<{ ok: boolean; kr: import("./types").OkrKeyResultItem }> {
+    validatePathSegment(krId, "KR ID");
     const safeId = this.assertOkrEntityId(krId, "KR ID");
     const cas = this.assertOkrVersion(input?.if_match_updated_at);
     if (!Number.isFinite(input?.current) || input.current < 0) throw new Error("Invalid KR current progress");
@@ -5548,6 +5598,7 @@ export class AgentChatREST {
     input: import("./types").CreateOkrTaskInput,
     opts?: { bearerToken?: string },
   ): Promise<{ ok: boolean; task: import("./types").OkrTaskItem }> {
+    validatePathSegment(objectiveId, "objective ID");
     const safeOid = this.assertOkrEntityId(objectiveId, "objective ID");
     const title = input?.title?.trim() ?? "";
     if (!title || title.length > 200) throw new Error("Invalid task title");
@@ -5575,6 +5626,7 @@ export class AgentChatREST {
     input: import("./types").UpdateOkrTaskInput,
     opts?: { bearerToken?: string },
   ): Promise<{ ok: boolean; task: import("./types").OkrTaskItem }> {
+    validatePathSegment(taskId, "task ID");
     const safeId = this.assertOkrEntityId(taskId, "task ID");
     const cas = this.assertOkrVersion(input?.if_match_updated_at);
     if (input?.title !== undefined) {
@@ -5646,6 +5698,7 @@ export class AgentChatREST {
     input: import("./types").UpdateOkrTaskInput,
     opts?: { bearerToken?: string },
   ): Promise<{ ok: boolean; task: import("./types").OkrTaskItem }> {
+    validatePathSegment(taskId, "task ID");
     return this.updateTask(taskId, input, opts);
   }
 
@@ -5654,6 +5707,7 @@ export class AgentChatREST {
     text: string,
     opts?: { bearerToken?: string },
   ): Promise<{ ok: boolean; comment: import("./types").OkrTaskCommentItem }> {
+    validatePathSegment(taskId, "task ID");
     const safeId = this.assertOkrEntityId(taskId, "task ID");
     const trimmed = text?.trim() ?? "";
     if (!trimmed || trimmed.length > 2000) throw new Error("Invalid task comment text");
@@ -5668,6 +5722,7 @@ export class AgentChatREST {
     taskId: string,
     opts?: { limit?: number; bearerToken?: string },
   ): Promise<import("./types").OkrTaskCommentsListResponse> {
+    validatePathSegment(taskId, "task ID");
     const safeId = this.assertOkrEntityId(taskId, "task ID");
     let query = "";
     if (opts?.limit !== undefined) {
@@ -5686,6 +5741,7 @@ export class AgentChatREST {
     taskId: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").OkrTaskBlockersResponse> {
+    validatePathSegment(taskId, "task ID");
     const safeId = this.assertOkrEntityId(taskId, "task ID");
     return this.get(`/api/okr/tasks/${encodeURIComponent(safeId)}/blockers`, {
       "Cache-Control": "no-store",
@@ -5697,6 +5753,7 @@ export class AgentChatREST {
     taskId: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").OkrTaskBlocksResponse> {
+    validatePathSegment(taskId, "task ID");
     const safeId = this.assertOkrEntityId(taskId, "task ID");
     return this.get(`/api/okr/tasks/${encodeURIComponent(safeId)}/blocks`, {
       "Cache-Control": "no-store",
@@ -5709,6 +5766,7 @@ export class AgentChatREST {
     input?: import("./types").LogOkrTaskProgressInput,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").LogOkrTaskProgressResponse> {
+    validatePathSegment(taskId, "task ID");
     const safeId = this.assertOkrEntityId(taskId, "task ID");
     const body: Record<string, unknown> = {};
     if (input?.note !== undefined) {
@@ -5754,6 +5812,7 @@ export class AgentChatREST {
     input: import("./types").SetOkrLinksInput,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").SetOkrLinksResponse> {
+    validatePathSegment(targetId, "target ID");
     if (!["objective", "kr", "task"].includes(targetType)) {
       throw new Error("Invalid OKR link targetType");
     }
@@ -5838,6 +5897,7 @@ export class AgentChatREST {
     input: import("./types").TransferOkrObjectiveInput,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").TransferOkrObjectiveResponse> {
+    validatePathSegment(objectiveId, "objective ID");
     const safeOid = this.assertOkrEntityId(objectiveId, "objective ID");
     const newOwner = typeof input?.new_owner === "string" ? input.new_owner.trim() : "";
     if (!newOwner || newOwner.length > 160 || /[\x00-\x1f\x7f/]/.test(newOwner) || this.containsMemorySecretShape(newOwner)) {
@@ -5880,6 +5940,7 @@ export class AgentChatREST {
     channelId: string,
     opts?: { level?: 1 | 2 | 3 | 4; active_only?: boolean; bearerToken?: string },
   ): Promise<import("./types").ChannelDocsListResponse> {
+    validatePathSegment(channelId, "channel ID");
     const safeCh = this.assertChannelDocRoomId(channelId);
     const params = new URLSearchParams();
     if (opts?.level !== undefined) {
@@ -5899,6 +5960,8 @@ export class AgentChatREST {
     docId: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").ChannelDocDetailItem> {
+    validatePathSegment(channelId, "channel ID");
+    validatePathSegment(docId, "channel doc ID");
     const safeCh = this.assertChannelDocRoomId(channelId);
     const safeDoc = this.assertChannelDocId(docId);
     return this.get<import("./types").ChannelDocDetailItem>(
@@ -5912,6 +5975,8 @@ export class AgentChatREST {
     docId: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").ChannelDocRevisionsResponse> {
+    validatePathSegment(channelId, "channel ID");
+    validatePathSegment(docId, "channel doc ID");
     const safeCh = this.assertChannelDocRoomId(channelId);
     const safeDoc = this.assertChannelDocId(docId);
     return this.get<import("./types").ChannelDocRevisionsResponse>(
@@ -5926,6 +5991,8 @@ export class AgentChatREST {
     input: import("./types").SaveChannelDocInput,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").ChannelDocDetailItem> {
+    validatePathSegment(channelId, "channel ID");
+    validatePathSegment(docId, "channel doc ID");
     const safeCh = this.assertChannelDocRoomId(channelId);
     const safeDoc = this.assertChannelDocId(docId);
     const title = input?.title?.trim() ?? "";
@@ -5972,6 +6039,8 @@ export class AgentChatREST {
     expectedVersion?: number,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").ArchiveChannelDocResponse> {
+    validatePathSegment(channelId, "channel ID");
+    validatePathSegment(docId, "channel doc ID");
     const safeCh = this.assertChannelDocRoomId(channelId);
     const safeDoc = this.assertChannelDocId(docId);
     if (expectedVersion !== undefined && (!Number.isSafeInteger(expectedVersion) || expectedVersion < 1)) {
@@ -6016,6 +6085,7 @@ export class AgentChatREST {
     agentId: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").RotateAgentKeyResponse> {
+    validatePathSegment(agentId, "agent ID");
     const trimmed = agentId?.trim() ?? "";
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/.test(trimmed) || /^(?:ac_|sk[-_])/i.test(trimmed)) {
       throw new Error("Invalid agent ID");
@@ -6033,6 +6103,7 @@ export class AgentChatREST {
     channelId: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").ChannelThreadsResponse> {
+    validatePathSegment(channelId, "channel ID");
     const safeChannel = typeof channelId === "string" ? channelId.trim() : "";
     if (
       !safeNonDmChannelId(safeChannel) ||
@@ -6091,6 +6162,7 @@ export class AgentChatREST {
     channelId: string,
     opts?: { include_archived?: boolean; bearerToken?: string },
   ): Promise<import("./types").ChannelOkrSnapshotResponse> {
+    validatePathSegment(channelId, "channel ID");
     const safeChannel = typeof channelId === "string" ? channelId.trim() : "";
     if (
       !safeChannel ||
@@ -6127,6 +6199,7 @@ export class AgentChatREST {
     capabilities: string[],
     opts?: { bearerToken?: string },
   ): Promise<import("./types").UpdateAgentCapabilitiesResponse> {
+    validatePathSegment(agentId, "agent ID");
     const safeAgentId = agentId?.trim() ?? "";
     if (
       !/^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/.test(safeAgentId) ||
@@ -6173,6 +6246,7 @@ export class AgentChatREST {
     channelId: string,
     opts?: { limit?: number; bearerToken?: string },
   ): Promise<import("./types").ChannelMembersResponse> {
+    validatePathSegment(channelId, "channel ID");
     const safeChannel = channelId?.trim() ?? "";
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) || /^(?:ac_|sk[-_])/i.test(safeChannel)) {
       throw new Error("Invalid channel ID");
@@ -6192,6 +6266,7 @@ export class AgentChatREST {
     channelId: string,
     opts?: { limit?: number; bearerToken?: string },
   ): Promise<import("./types").ChannelCollaborationRosterResponse> {
+    validatePathSegment(channelId, "channel ID");
     const safeChannel = typeof channelId === "string" ? channelId.trim() : "";
     if (
       !safeChannel ||
@@ -6328,6 +6403,7 @@ export class AgentChatREST {
     channelId: string,
     opts?: { sender_id?: string; bearerToken?: string },
   ): Promise<import("./types").ChannelJoinResponse> {
+    validatePathSegment(channelId, "channel ID");
     const safeChannel = channelId?.trim() ?? "";
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) || /^(?:ac_|sk[-_])/i.test(safeChannel)) {
       throw new Error("Invalid channel ID");
@@ -6351,6 +6427,7 @@ export class AgentChatREST {
     channelId: string,
     opts?: { sender_id?: string; bearerToken?: string },
   ): Promise<import("./types").ChannelLeaveResponse> {
+    validatePathSegment(channelId, "channel ID");
     const safeChannel = channelId?.trim() ?? "";
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) || /^(?:ac_|sk[-_])/i.test(safeChannel)) {
       throw new Error("Invalid channel ID");
@@ -6374,6 +6451,7 @@ export class AgentChatREST {
     channelId: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").ChannelDetailResponse> {
+    validatePathSegment(channelId, "channel ID");
     const safeChannel = channelId?.trim() ?? "";
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) || /^(?:ac_|sk[-_])/i.test(safeChannel)) {
       throw new Error("Invalid channel ID");
@@ -6406,6 +6484,8 @@ export class AgentChatREST {
     agentId: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").ChannelInviteMutationResponse> {
+    validatePathSegment(channelId, "channel ID");
+    validatePathSegment(agentId, "target ID");
     const safeChannel = channelId?.trim() ?? "";
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) || /^(?:ac_|sk[-_])/i.test(safeChannel)) {
       throw new Error("Invalid channel ID");
@@ -6422,6 +6502,7 @@ export class AgentChatREST {
     channelId: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").ChannelOutgoingInvitesResponse> {
+    validatePathSegment(channelId, "channel ID");
     const safeChannel = channelId?.trim() ?? "";
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) || /^(?:ac_|sk[-_])/i.test(safeChannel)) {
       throw new Error("Invalid channel ID");
@@ -6447,6 +6528,8 @@ export class AgentChatREST {
     action: import("./types").ChannelInviteAction,
     opts?: { bearerToken?: string },
   ): Promise<{ ok: boolean }> {
+    validatePathSegment(channelId, "channel ID");
+    validatePathSegment(targetId, "target ID");
     const safeChannel = channelId?.trim() ?? "";
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) || /^(?:ac_|sk[-_])/i.test(safeChannel)) {
       throw new Error("Invalid channel ID");
@@ -6466,6 +6549,7 @@ export class AgentChatREST {
     channelId: string,
     opts?: import("./types").RequestChannelJoinInput,
   ): Promise<import("./types").RequestChannelJoinResponse> {
+    validatePathSegment(channelId, "channel ID");
     const safeChannel = channelId?.trim() ?? "";
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) || /^(?:ac_|sk[-_])/i.test(safeChannel)) {
       throw new Error("Invalid channel ID");
@@ -6502,6 +6586,7 @@ export class AgentChatREST {
     channelId: string,
     opts?: { bearerToken?: string },
   ): Promise<{ ok: boolean }> {
+    validatePathSegment(channelId, "channel ID");
     const safeChannel = channelId?.trim() ?? "";
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) || /^(?:ac_|sk[-_])/i.test(safeChannel)) {
       throw new Error("Invalid channel ID");
@@ -6517,6 +6602,7 @@ export class AgentChatREST {
     channelId: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").ChannelJoinRequestsResponse> {
+    validatePathSegment(channelId, "channel ID");
     const safeChannel = channelId?.trim() ?? "";
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) || /^(?:ac_|sk[-_])/i.test(safeChannel)) {
       throw new Error("Invalid channel ID");
@@ -6542,6 +6628,8 @@ export class AgentChatREST {
     action: import("./types").ChannelJoinRequestAction,
     opts?: { bearerToken?: string },
   ): Promise<{ ok: boolean }> {
+    validatePathSegment(channelId, "channel ID");
+    validatePathSegment(accountId, "account ID");
     const safeChannel = channelId?.trim() ?? "";
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(safeChannel) || /^(?:ac_|sk[-_])/i.test(safeChannel)) {
       throw new Error("Invalid channel ID");
@@ -6580,6 +6668,7 @@ export class AgentChatREST {
     name: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").AgentMemoryDetailItem> {
+    validatePathSegment(name, "memory name");
     const safeName = this.assertMemorySlug(name);
     return this.get<import("./types").AgentMemoryDetailItem>(
       `/api/memory/${encodeURIComponent(safeName)}`,
@@ -6591,6 +6680,7 @@ export class AgentChatREST {
     name: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").AgentMemoryRevisionsResponse> {
+    validatePathSegment(name, "memory name");
     const safeName = this.assertMemorySlug(name);
     return this.get<import("./types").AgentMemoryRevisionsResponse>(
       `/api/memory/${encodeURIComponent(safeName)}/revisions`,
@@ -6602,6 +6692,7 @@ export class AgentChatREST {
     name: string,
     input: import("./types").SaveAgentMemoryInput,
   ): Promise<import("./types").SaveAgentMemoryResponse> {
+    validatePathSegment(name, "memory name");
     const safeName = this.assertMemorySlug(name);
     if (typeof input?.body_markdown !== "string" || !input.body_markdown.trim()) {
       throw new Error("Memory body_markdown is required");
@@ -6647,6 +6738,7 @@ export class AgentChatREST {
     name: string,
     opts?: { if_match_version?: number; bearerToken?: string },
   ): Promise<import("./types").DeleteAgentMemoryResponse> {
+    validatePathSegment(name, "memory name");
     const safeName = this.assertMemorySlug(name);
     if (
       opts?.if_match_version !== undefined &&
@@ -6671,6 +6763,8 @@ export class AgentChatREST {
     channelId: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").CloudAgentChannelMutationResponse> {
+    validatePathSegment(agentId, "cloud agent ID");
+    validatePathSegment(channelId, "channel ID");
     const safeAgent = agentId?.trim() ?? "";
     if (!isSafeCloudRoomAgentId(safeAgent)) {
       throw new Error("Invalid cloud agent ID");
@@ -6691,6 +6785,8 @@ export class AgentChatREST {
     channelId: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").CloudAgentChannelMutationResponse> {
+    validatePathSegment(agentId, "cloud agent ID");
+    validatePathSegment(channelId, "channel ID");
     const safeAgent = agentId?.trim() ?? "";
     if (!isSafeCloudRoomAgentId(safeAgent)) {
       throw new Error("Invalid cloud agent ID");
@@ -6713,6 +6809,7 @@ export class AgentChatREST {
     agentId: string,
     input?: import("./types").WakeCloudAgentInput,
   ): Promise<import("./types").WakeCloudAgentResponse> {
+    validatePathSegment(agentId, "cloud agent ID");
     const safeAgent = agentId?.trim() ?? "";
     if (!isSafeCloudRoomAgentId(safeAgent)) {
       throw new Error("Invalid cloud agent ID");
@@ -6748,6 +6845,7 @@ export class AgentChatREST {
   }
 
   private assertCloudAgentId(rawId: string): string {
+    validatePathSegment(rawId, "cloud agent ID");
     const safe = rawId?.trim() ?? "";
     if (!isValidMemoryAgentId(safe)) {
       throw new Error("Invalid cloud agent ID");
@@ -6818,6 +6916,7 @@ export class AgentChatREST {
     agentId: string,
     input: import("./types").TuneCloudAgentInput,
   ): Promise<import("./types").TuneCloudAgentResponse> {
+    validatePathSegment(agentId, "cloud agent ID");
     const safeAgent = this.assertCloudAgentId(agentId);
     if (!input || typeof input !== "object") {
       throw new Error("Cloud agent tuning input object is required");
@@ -6902,6 +7001,7 @@ export class AgentChatREST {
     agentId: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").CloudAgentMemoryListResponse> {
+    validatePathSegment(agentId, "cloud agent ID");
     const safeAgent = this.assertCloudAgentId(agentId);
     return this.get<import("./types").CloudAgentMemoryListResponse>(
       `/api/cloud-agents/${encodeURIComponent(safeAgent)}/memory`,
@@ -6918,6 +7018,8 @@ export class AgentChatREST {
     name: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").CloudAgentMemoryDetailResponse> {
+    validatePathSegment(agentId, "cloud agent ID");
+    validatePathSegment(name, "memory name");
     const safeAgent = this.assertCloudAgentId(agentId);
     const safeName = this.assertMemorySlug(name);
     return this.get<import("./types").CloudAgentMemoryDetailResponse>(
@@ -6935,6 +7037,8 @@ export class AgentChatREST {
     name: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").AgentMemoryRevisionsResponse> {
+    validatePathSegment(agentId, "cloud agent ID");
+    validatePathSegment(name, "memory name");
     const safeAgent = this.assertCloudAgentId(agentId);
     const safeName = this.assertMemorySlug(name);
     return this.get<import("./types").AgentMemoryRevisionsResponse>(
@@ -6952,6 +7056,8 @@ export class AgentChatREST {
     name: string,
     input: import("./types").SaveAgentMemoryInput,
   ): Promise<import("./types").SaveCloudAgentMemoryResponse> {
+    validatePathSegment(agentId, "cloud agent ID");
+    validatePathSegment(name, "memory name");
     const safeAgent = this.assertCloudAgentId(agentId);
     const safeName = this.assertMemorySlug(name);
     if (typeof input?.body_markdown !== "string" || !input.body_markdown.trim()) {
@@ -7003,6 +7109,8 @@ export class AgentChatREST {
     name: string,
     opts?: { if_match_version?: number; bearerToken?: string },
   ): Promise<import("./types").DeleteAgentMemoryResponse> {
+    validatePathSegment(agentId, "cloud agent ID");
+    validatePathSegment(name, "memory name");
     const safeAgent = this.assertCloudAgentId(agentId);
     const safeName = this.assertMemorySlug(name);
     if (
@@ -7031,6 +7139,7 @@ export class AgentChatREST {
     agentId: string,
     input?: import("./types").RecoverCloudAgentInput,
   ): Promise<import("./types").RecoverCloudAgentResponse> {
+    validatePathSegment(agentId, "cloud agent ID");
     const safeAgent = this.assertCloudAgentId(agentId);
     const body: Record<string, unknown> = {};
     if (input?.gemini_api_key !== undefined) {
@@ -7061,6 +7170,7 @@ export class AgentChatREST {
     agentId: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").CloudAgentLoopsListResponse> {
+    validatePathSegment(agentId, "cloud agent ID");
     const safeAgent = this.assertCloudAgentId(agentId);
     return this.get<import("./types").CloudAgentLoopsListResponse>(
       `/api/cloud-agents/${encodeURIComponent(safeAgent)}/loops`,
@@ -7076,6 +7186,8 @@ export class AgentChatREST {
     channelId: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").CloudAgentLoopObjectivesResponse> {
+    validatePathSegment(agentId, "cloud agent ID");
+    validatePathSegment(channelId, "channel ID");
     const safeAgent = this.assertCloudAgentId(agentId);
     const trimmedChannel = typeof channelId === "string" ? channelId.trim() : "";
     if (
@@ -7103,6 +7215,7 @@ export class AgentChatREST {
     agentId: string,
     input: import("./types").CreateCloudAgentLoopInput,
   ): Promise<import("./types").CreateCloudAgentLoopResponse> {
+    validatePathSegment(agentId, "cloud agent ID");
     const safeAgent = this.assertCloudAgentId(agentId);
     const channelId = typeof input?.channel_id === "string" ? input.channel_id.trim() : "";
     if (
@@ -7214,6 +7327,8 @@ export class AgentChatREST {
     loopId: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").MutateCloudAgentLoopResponse> {
+    validatePathSegment(agentId, "cloud agent ID");
+    validatePathSegment(loopId, "loop ID");
     const safeAgent = this.assertCloudAgentId(agentId);
     const safeLoop = this.assertCloudLoopId(loopId);
     return this.post<import("./types").MutateCloudAgentLoopResponse>(
@@ -7231,6 +7346,8 @@ export class AgentChatREST {
     loopId: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").MutateCloudAgentLoopResponse> {
+    validatePathSegment(agentId, "cloud agent ID");
+    validatePathSegment(loopId, "loop ID");
     const safeAgent = this.assertCloudAgentId(agentId);
     const safeLoop = this.assertCloudLoopId(loopId);
     return this.post<import("./types").MutateCloudAgentLoopResponse>(
@@ -7248,6 +7365,8 @@ export class AgentChatREST {
     loopId: string,
     intervalInput: { interval?: string; interval_ms?: number; bearerToken?: string },
   ): Promise<import("./types").MutateCloudAgentLoopResponse> {
+    validatePathSegment(agentId, "cloud agent ID");
+    validatePathSegment(loopId, "loop ID");
     const safeAgent = this.assertCloudAgentId(agentId);
     const safeLoop = this.assertCloudLoopId(loopId);
     const body: Record<string, unknown> = {};
@@ -7282,6 +7401,8 @@ export class AgentChatREST {
     loopId: string,
     opts?: { bearerToken?: string },
   ): Promise<import("./types").MutateCloudAgentLoopResponse> {
+    validatePathSegment(agentId, "cloud agent ID");
+    validatePathSegment(loopId, "loop ID");
     const safeAgent = this.assertCloudAgentId(agentId);
     const safeLoop = this.assertCloudLoopId(loopId);
     return this.del<import("./types").MutateCloudAgentLoopResponse>(
@@ -7305,6 +7426,7 @@ export class AgentChatREST {
     channelId: string,
     input: import("./types").KickChannelMemberInput,
   ): Promise<import("./types").KickChannelMemberResponse> {
+    validatePathSegment(channelId, "channel ID");
     const trimmedChannel = typeof channelId === "string" ? channelId.trim() : "";
     if (
       !trimmedChannel ||
@@ -7369,12 +7491,16 @@ export class AgentChatREST {
         if (signal?.aborted) throw signal.reason ?? new Error("Request aborted");
         if (value) {
           bytes += value.byteLength;
-          if (bytes > MAX_RESPONSE_BYTES) throw new Error("JSON response exceeds 10 MiB limit");
+          if (bytes > MAX_RESPONSE_BYTES) throw new Error("JSON response exceeds 4 MiB limit");
           text += decoder.decode(value, { stream: true });
         }
         if (done) break;
       }
-      return JSON.parse(text + decoder.decode());
+      const parsed = JSON.parse(text + decoder.decode());
+      if (parsed && typeof parsed === "object" && Object.prototype.hasOwnProperty.call(parsed, "__proto__")) {
+        throw new Error("Invalid JSON response object");
+      }
+      return parsed;
     } finally {
       signal?.removeEventListener("abort", onAbort);
       void reader.cancel().catch(() => {});
@@ -7401,7 +7527,7 @@ export class AgentChatREST {
     (timer as unknown as { unref?: () => void })?.unref?.();
     let response: Response | undefined;
     try {
-      const res = response = await this.fetchImpl(url, { ...(init ?? {}), redirect: init?.redirect ?? "error", signal: controller.signal });
+      const res = response = await this.fetchImpl(url, { ...(init ?? {}), redirect: "error", signal: controller.signal });
       // Failed handshakes are finite HTTP responses: bound their error body too.
       if (!res.ok) {
         const error = await this.readResponseJson(res, controller.signal).catch(error => {
@@ -7448,7 +7574,7 @@ export class AgentChatREST {
     (timer as unknown as { unref?: () => void })?.unref?.();
     let response: Response | undefined;
     try {
-      const res = response = await this.fetchImpl(url, { ...(init ?? {}), redirect: init?.redirect ?? "error", signal: controller.signal });
+      const res = response = await this.fetchImpl(url, { ...(init ?? {}), redirect: "error", signal: controller.signal });
       return await consume(res, controller.signal);
     } catch (err) {
       if (timedOut) {
