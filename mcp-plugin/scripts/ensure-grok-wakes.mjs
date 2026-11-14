@@ -98,6 +98,48 @@ export function isLockOwnerAlive(pid, deps = {}) {
   return cmd.includes(LOCK_OWNER_MARKER) || cmd.includes("agentschat-ensure-grok-wakes");
 }
 
+const RESERVED_BIND_KEYS = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+  "profile",
+  "grok-binds",
+  "grok-binds.meta",
+  "session-binds",
+  "agy-session-binds",
+]);
+
+function isSystemDarwinRootSymlink(p) {
+  return process.platform === "darwin" && (p === "/var" || p === "/tmp" || p === "/etc");
+}
+
+/**
+ * Returns false if `dirPath` or any existing ancestor directory is a symlink
+ * (except macOS system root symlinks `/var`, `/tmp`, `/etc`).
+ * @param {string} dirPath
+ */
+export function hasSafeAncestorDirs(dirPath) {
+  let cur = resolve(dirPath);
+  const visited = new Set();
+  while (cur && !visited.has(cur)) {
+    visited.add(cur);
+    try {
+      const st = lstatSync(cur);
+      if (st.isSymbolicLink()) {
+        if (!isSystemDarwinRootSymlink(cur)) return false;
+      } else if (!st.isDirectory()) {
+        return false;
+      }
+    } catch (e) {
+      if (/** @type {any} */ (e)?.code !== "ENOENT") return false;
+    }
+    const parent = dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+  return true;
+}
+
 /**
  * Non-blocking run lock. Returns a release() on success, or null when another
  * live run holds it. Stale locks (dead/recycled pid, unreadable content) are
@@ -109,6 +151,7 @@ export function isLockOwnerAlive(pid, deps = {}) {
 export function acquireRunLock(lockPath, opts = {}) {
   const pid = opts.pid ?? process.pid;
   const isAlive = opts.isAlive ?? ((p) => isLockOwnerAlive(p));
+  if (!hasSafeAncestorDirs(dirname(resolve(lockPath)))) return null;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const fd = openSync(lockPath, "wx", 0o600);
@@ -132,7 +175,8 @@ export function acquireRunLock(lockPath, opts = {}) {
       let holder = NaN;
       try {
         const st = lstatSync(lockPath);
-        if (!st.isSymbolicLink() && st.isFile() && st.size <= 65_536) {
+        if (st.isSymbolicLink() || !st.isFile()) return null;
+        if (st.size <= 65_536) {
           holder = Number(readFileSync(lockPath, "utf8").trim());
         }
       } catch {
@@ -159,7 +203,16 @@ export function parseBinds(raw) {
     if (typeof v !== "string") continue;
     const name = v.trim();
     const key = k.trim();
-    if (!name || !key || ["__proto__", "constructor", "prototype"].includes(key.toLowerCase())) continue;
+    if (
+      !name ||
+      !key ||
+      key.length > 128 ||
+      name.length > 128 ||
+      RESERVED_BIND_KEYS.has(key.toLowerCase()) ||
+      RESERVED_BIND_KEYS.has(name.toLowerCase())
+    ) {
+      continue;
+    }
     if (!/^[A-Za-z0-9_-]+$/.test(key) || !/^[A-Za-z0-9_-]+$/.test(name)) continue;
     out[key] = name;
   }
@@ -426,11 +479,13 @@ export function stopWakePid(pid) {
  */
 export function startWakeDaemon(opts) {
   const logDir = opts.logDir;
+  if (!logDir || !hasSafeAncestorDirs(logDir)) return false;
   try {
     spawnSync("mkdir", ["-p", logDir], { stdio: "ignore" });
   } catch {
     /* best-effort */
   }
+  if (!hasSafeAncestorDirs(logDir)) return false;
   const logPath = join(logDir, `agentschat-wake-${safeLogName(opts.profileName)}.log`);
   try {
     const st = lstatSync(logPath);

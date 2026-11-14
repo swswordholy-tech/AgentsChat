@@ -97,7 +97,11 @@ export function redactWakeLog(value) {
   for (const secret of [process.env.AGENTCHAT_WAKE_SECRET, process.env.AGENTCHAT_TOKEN]) {
     if (secret) text = text.split(secret).join("[redacted]");
   }
-  return text.replace(/(?:ac_|agent_key_|sk-|sk_|ghp_|github_pat_)[A-Za-z0-9_-]+/gi, "[redacted]")
+  return text
+    .replace(
+      /(?:mcp_(?:at|rt|code)_|ac_|agent_key_|whsec_|sk-|sk_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|AIza|AKIA|ASIA)[A-Za-z0-9+/=_-]+/gi,
+      "[redacted]",
+    )
     .replace(/(?:Bearer|Basic)\s+[^\s]+/gi, "[redacted]")
     .replace(/[\r\n\x00-\x1f\x7f]/g, " ");
 }
@@ -106,7 +110,36 @@ function log(msg) {
   process.stderr.write(`${new Date().toISOString()} ${redactWakeLog(msg)}\n`);
 }
 
+function isSystemDarwinRootSymlink(p) {
+  return process.platform === "darwin" && (p === "/var" || p === "/tmp" || p === "/etc");
+}
+
+export function hasSafeParentDirs(dirPath) {
+  let cur = path.resolve(dirPath);
+  const visited = new Set();
+  while (cur && !visited.has(cur)) {
+    visited.add(cur);
+    try {
+      const st = fs.lstatSync(cur);
+      if (st.isSymbolicLink()) {
+        if (!isSystemDarwinRootSymlink(cur)) return false;
+      } else if (!st.isDirectory()) {
+        return false;
+      }
+    } catch (e) {
+      if (e?.code !== "ENOENT") return false;
+    }
+    const parent = path.dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+  return true;
+}
+
 export function atomicWriteJson(filename, value) {
+  if (!hasSafeParentDirs(path.dirname(path.resolve(filename)))) {
+    throw new Error("Refusing to write inside symlinked or non-directory parent");
+  }
   try {
     const existing = fs.lstatSync(filename);
     if (existing.isSymbolicLink() || !existing.isFile()) {
@@ -227,9 +260,19 @@ export function withoutCursorSessionEnv(base) {
 /** Env that could override or contradict the pinned identity in the host's MCP. */
 export const IDENTITY_OVERRIDE_ENV = ["AGENTCHAT_PROFILE", "AGENTCHAT_TOKEN", "AGENTCHAT_AGENT_ID"];
 
-const PROFILE_NAME_RE = /^[A-Za-z0-9_-]+$/;
+const PROFILE_NAME_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const AGENT_ID_PIN_RE = /^[A-Za-z0-9._:-]{1,128}$/;
 const RESERVED_PROTO_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+const RESERVED_PROFILE_NAMES = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+  "profile",
+  "grok-binds",
+  "grok-binds.meta",
+  "session-binds",
+  "agy-session-binds",
+]);
 export const MAX_QUEUE_JOBS = 1000;
 
 /**
@@ -246,10 +289,15 @@ export function requireIdentityPin(env) {
       "AGENTCHAT_URL_WAKE_PROFILE and AGENTCHAT_URL_WAKE_AGENT_ID are required (identity pin) — refusing to start",
     );
   }
-  if (!PROFILE_NAME_RE.test(profile) || RESERVED_PROTO_KEYS.has(profile.toLowerCase())) {
+  if (!PROFILE_NAME_RE.test(profile) || RESERVED_PROFILE_NAMES.has(profile.toLowerCase())) {
     throw new Error("AGENTCHAT_URL_WAKE_PROFILE must be a plain profile name");
   }
-  if (!AGENT_ID_PIN_RE.test(agentId) || RESERVED_PROTO_KEYS.has(agentId.toLowerCase())) {
+  if (
+    !AGENT_ID_PIN_RE.test(agentId) ||
+    agentId === "." ||
+    agentId.includes("..") ||
+    RESERVED_PROTO_KEYS.has(agentId.toLowerCase())
+  ) {
     throw new Error("AGENTCHAT_URL_WAKE_AGENT_ID must be a safe agent identifier");
   }
   return { profile, agentId };
@@ -260,6 +308,7 @@ export function requireIdentityPin(env) {
  * infinitely if a stale lock path cannot be unlinked (e.g. directory or EACCES).
  */
 export function tryAcquireSingleFlightLock(lockPath, isBusyFn, pid = process.pid) {
+  if (!hasSafeParentDirs(path.dirname(path.resolve(lockPath)))) return false;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const fd = fs.openSync(lockPath, "wx", 0o600);
@@ -271,7 +320,8 @@ export function tryAcquireSingleFlightLock(lockPath, isBusyFn, pid = process.pid
         if (attempt === 0 && !isBusyFn()) {
           try {
             const st = fs.lstatSync(lockPath);
-            if (st.isSymbolicLink() || st.isFile()) fs.unlinkSync(lockPath);
+            if (!st.isSymbolicLink() && st.isFile()) fs.unlinkSync(lockPath);
+            else return false;
           } catch {
             return false;
           }
@@ -308,19 +358,30 @@ export function identityCheckLines(pin) {
   ];
 }
 
+function sanitizePromptHeaderField(value, maxLen = 128) {
+  return String(value ?? "")
+    .replace(/[\x00-\x1f\x7f]+/g, " ")
+    .trim()
+    .slice(0, maxLen);
+}
+
 /** Build a prompt string hosts can inject into one dedicated session. */
 export function buildHostPrompt(job, pin) {
   const mentioned = Array.isArray(job.mentioned_ids)
-    ? job.mentioned_ids.join(",")
-    : String(job.mentioned_ids ?? "");
+    ? job.mentioned_ids
+        .slice(0, 32)
+        .map((id) => sanitizePromptHeaderField(id, 128))
+        .filter(Boolean)
+        .join(",")
+    : sanitizePromptHeaderField(job.mentioned_ids, 512);
   return [
     "[AgentsChat inbound]",
     ...(pin ? identityCheckLines(pin) : []),
-    `channel_id=${job.channel_id ?? ""}`,
-    `message_id=${job.message_id ?? ""}`,
-    `sender_id=${job.sender_id ?? ""}`,
+    `channel_id=${sanitizePromptHeaderField(job.channel_id, 128)}`,
+    `message_id=${sanitizePromptHeaderField(job.message_id, 128)}`,
+    `sender_id=${sanitizePromptHeaderField(job.sender_id, 128)}`,
     `mentioned_ids=${mentioned}`,
-    `timestamp=${job.timestamp ?? ""}`,
+    `timestamp=${sanitizePromptHeaderField(job.timestamp, 64)}`,
     "content:",
     String(job.content ?? ""),
     "",
