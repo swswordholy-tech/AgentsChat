@@ -33,7 +33,9 @@
  */
 import { spawn, spawnSync } from "node:child_process";
 import {
+  constants as fsConstants,
   existsSync,
+  lstatSync,
   openSync,
   readFileSync,
   readdirSync,
@@ -63,7 +65,7 @@ export function defaultLockPath() {
 /** @param {string | undefined} raw */
 export function resolveRunTimeoutMs(raw) {
   const n = Number(raw);
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_RUN_TIMEOUT_MS;
+  return Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), 2_147_483_647) : DEFAULT_RUN_TIMEOUT_MS;
 }
 
 /**
@@ -117,7 +119,10 @@ export function acquireRunLock(lockPath, opts = {}) {
         if (released) return;
         released = true;
         try {
-          if (readFileSync(lockPath, "utf8").trim() === String(pid)) unlinkSync(lockPath);
+          const st = lstatSync(lockPath);
+          if (!st.isSymbolicLink() && st.isFile() && st.size <= 65_536) {
+            if (readFileSync(lockPath, "utf8").trim() === String(pid)) unlinkSync(lockPath);
+          }
         } catch {
           /* already gone */
         }
@@ -126,7 +131,10 @@ export function acquireRunLock(lockPath, opts = {}) {
       if (!(e && /** @type {any} */ (e).code === "EEXIST")) throw e;
       let holder = NaN;
       try {
-        holder = Number(readFileSync(lockPath, "utf8").trim());
+        const st = lstatSync(lockPath);
+        if (!st.isSymbolicLink() && st.isFile() && st.size <= 65_536) {
+          holder = Number(readFileSync(lockPath, "utf8").trim());
+        }
       } catch {
         /* unreadable → stale */
       }
@@ -135,7 +143,7 @@ export function acquireRunLock(lockPath, opts = {}) {
       try {
         unlinkSync(lockPath);
       } catch {
-        /* raced with another cleaner */
+        return null;
       }
     }
   }
@@ -424,9 +432,20 @@ export function startWakeDaemon(opts) {
     /* best-effort */
   }
   const logPath = join(logDir, `agentschat-wake-${safeLogName(opts.profileName)}.log`);
+  try {
+    const st = lstatSync(logPath);
+    if (st.isSymbolicLink() || !st.isFile()) return false;
+  } catch (e) {
+    if (/** @type {any} */ (e)?.code !== "ENOENT") return false;
+  }
   let logFd;
   try {
-    logFd = openSync(logPath, "a");
+    const flags =
+      fsConstants.O_WRONLY |
+      fsConstants.O_CREAT |
+      fsConstants.O_APPEND |
+      (typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0);
+    logFd = openSync(logPath, flags, 0o600);
   } catch {
     return false;
   }
@@ -503,6 +522,11 @@ async function main() {
   if (existsSync(bindsPath)) {
     let text;
     try {
+      const st = lstatSync(bindsPath);
+      if (st.isSymbolicLink() || !st.isFile() || st.size > 1_048_576) {
+        console.error(`failed binds-unsafe path=${bindsPath}`);
+        process.exit(1);
+      }
       text = readFileSync(bindsPath, "utf8");
     } catch {
       console.error(`failed binds-read path=${bindsPath}`);

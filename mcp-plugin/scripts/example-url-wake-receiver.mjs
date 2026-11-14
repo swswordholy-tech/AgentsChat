@@ -107,9 +107,25 @@ function log(msg) {
 }
 
 export function atomicWriteJson(filename, value) {
+  try {
+    const existing = fs.lstatSync(filename);
+    if (existing.isSymbolicLink() || !existing.isFile()) {
+      throw new Error("Refusing to overwrite symlink or non-regular file");
+    }
+  } catch (e) {
+    if (e?.code !== "ENOENT") throw e;
+  }
   const tmp = `${filename}.${process.pid}.${crypto.randomBytes(8).toString("hex")}.tmp`;
   try {
     fs.writeFileSync(tmp, JSON.stringify(value), { mode: 0o600, flag: "wx" });
+    try {
+      const targetStat = fs.lstatSync(filename);
+      if (targetStat.isSymbolicLink() || !targetStat.isFile()) {
+        throw new Error("Refusing to overwrite symlink or non-regular file");
+      }
+    } catch (e) {
+      if (e?.code !== "ENOENT") throw e;
+    }
     fs.renameSync(tmp, filename);
   } finally {
     try { fs.unlinkSync(tmp); } catch { /* renamed or failed */ }
@@ -149,6 +165,10 @@ export function readBody(req, maxBytes = WAKE_BODY_MAX_BYTES) {
 
 /** Kill the whole shell group on timeout; never inherit credential-bearing output. */
 export function runWakeCommand(cmd, input, env, timeoutMs = 180_000) {
+  const boundedTimeoutMs =
+    typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? Math.min(Math.floor(timeoutMs), 2_147_483_647)
+      : 180_000;
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, { shell: true, detached: process.platform !== "win32",
       env, stdio: ["pipe", "ignore", "ignore"] });
@@ -158,7 +178,8 @@ export function runWakeCommand(cmd, input, env, timeoutMs = 180_000) {
         else child.kill("SIGKILL");
       } catch { /* already exited */ }
       reject(new Error("wake command timed out"));
-    }, timeoutMs);
+    }, boundedTimeoutMs);
+    timer.unref?.();
     child.stdin.on("error", () => { /* early child exit / EPIPE */ });
     child.once("error", () => { clearTimeout(timer); reject(new Error("wake command spawn failed")); });
     child.once("close", (code) => {
@@ -207,6 +228,9 @@ export function withoutCursorSessionEnv(base) {
 export const IDENTITY_OVERRIDE_ENV = ["AGENTCHAT_PROFILE", "AGENTCHAT_TOKEN", "AGENTCHAT_AGENT_ID"];
 
 const PROFILE_NAME_RE = /^[A-Za-z0-9_-]+$/;
+const AGENT_ID_PIN_RE = /^[A-Za-z0-9._:-]{1,128}$/;
+const RESERVED_PROTO_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+export const MAX_QUEUE_JOBS = 1000;
 
 /**
  * Read the required identity pin from env. Throws (receiver must not start)
@@ -222,10 +246,43 @@ export function requireIdentityPin(env) {
       "AGENTCHAT_URL_WAKE_PROFILE and AGENTCHAT_URL_WAKE_AGENT_ID are required (identity pin) — refusing to start",
     );
   }
-  if (!PROFILE_NAME_RE.test(profile)) {
+  if (!PROFILE_NAME_RE.test(profile) || RESERVED_PROTO_KEYS.has(profile.toLowerCase())) {
     throw new Error("AGENTCHAT_URL_WAKE_PROFILE must be a plain profile name");
   }
+  if (!AGENT_ID_PIN_RE.test(agentId) || RESERVED_PROTO_KEYS.has(agentId.toLowerCase())) {
+    throw new Error("AGENTCHAT_URL_WAKE_AGENT_ID must be a safe agent identifier");
+  }
   return { profile, agentId };
+}
+
+/**
+ * Bounded single-flight lock acquisition (at most 2 attempts) — never recurses
+ * infinitely if a stale lock path cannot be unlinked (e.g. directory or EACCES).
+ */
+export function tryAcquireSingleFlightLock(lockPath, isBusyFn, pid = process.pid) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = fs.openSync(lockPath, "wx", 0o600);
+      fs.writeFileSync(fd, String(pid));
+      fs.closeSync(fd);
+      return true;
+    } catch (e) {
+      if (e && e.code === "EEXIST") {
+        if (attempt === 0 && !isBusyFn()) {
+          try {
+            const st = fs.lstatSync(lockPath);
+            if (st.isSymbolicLink() || st.isFile()) fs.unlinkSync(lockPath);
+          } catch {
+            return false;
+          }
+          continue;
+        }
+        return false;
+      }
+      throw e;
+    }
+  }
+  return false;
 }
 
 /**
@@ -286,6 +343,10 @@ function startServer() {
     process.exit(1);
   }
   const port = Number(envOr("AGENTCHAT_URL_WAKE_PORT", "18765"));
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    console.error("AGENTCHAT_URL_WAKE_PORT must be an integer port between 1 and 65535");
+    process.exit(1);
+  }
   const wakePath = envOr("AGENTCHAT_URL_WAKE_PATH", "/wake");
   const cmd = process.env.AGENTCHAT_URL_WAKE_CMD || "";
   const stateDir = path.resolve(envOr("AGENTCHAT_URL_WAKE_DIR", "./url-wake-state"));
@@ -296,6 +357,8 @@ function startServer() {
 
   function loadSeen() {
     try {
+      const st = fs.lstatSync(dedupePath);
+      if (st.isSymbolicLink() || !st.isFile() || st.size > 1_048_576) return [];
       const arr = JSON.parse(fs.readFileSync(dedupePath, "utf8"));
       return Array.isArray(arr) ? arr : [];
     } catch {
@@ -327,6 +390,8 @@ function startServer() {
 
   function isBusy() {
     try {
+      const st = fs.lstatSync(lockPath);
+      if (st.isSymbolicLink() || !st.isFile() || st.size > 65_536) return false;
       const pid = Number(fs.readFileSync(lockPath, "utf8").trim());
       if (!Number.isSafeInteger(pid) || pid <= 0) return false;
       try {
@@ -341,30 +406,17 @@ function startServer() {
   }
 
   function tryAcquireLock() {
-    try {
-      const fd = fs.openSync(lockPath, "wx", 0o600);
-      fs.writeFileSync(fd, String(process.pid));
-      fs.closeSync(fd);
-      return true;
-    } catch (e) {
-      if (e && e.code === "EEXIST") {
-        if (!isBusy()) {
-          try {
-            fs.unlinkSync(lockPath);
-          } catch {
-            /* ignore */
-          }
-          return tryAcquireLock();
-        }
-        return false;
-      }
-      throw e;
-    }
+    return tryAcquireSingleFlightLock(lockPath, isBusy, process.pid);
   }
 
   function releaseLock() {
     try {
-      fs.unlinkSync(lockPath);
+      const st = fs.lstatSync(lockPath);
+      if (!st.isSymbolicLink() && st.isFile() && st.size <= 65_536) {
+        if (fs.readFileSync(lockPath, "utf8").trim() === String(process.pid)) {
+          fs.unlinkSync(lockPath);
+        }
+      }
     } catch {
       /* ignore */
     }
@@ -471,6 +523,10 @@ function startServer() {
       if (messageId && wasSeen(messageId)) {
         log(`dedupe skip message_id=${messageId}`);
         sendJson(res, 202, { ok: true, deduped: true });
+        return;
+      }
+      if (queueLen() >= MAX_QUEUE_JOBS) {
+        sendJson(res, 503, { ok: false, error: "queue full" });
         return;
       }
       const qid = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
