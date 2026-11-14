@@ -14,12 +14,12 @@ export function loadBots(file = defaultRegistry(), home = homedir()): BotConfig[
   } catch { throw new Error("Cannot read bot registry JSON"); }
   const object = (x: any) => x && typeof x === "object" && !Array.isArray(x);
   const fields = (x: any, keys: string[]) => {
-    if (!object(x) || Object.keys(x).some(k => !keys.includes(k))) throw new Error("Unknown or invalid bot registry field");
+    if (!object(x) || Object.getOwnPropertyNames(x).some(k => !keys.includes(k))) throw new Error("Unknown or invalid bot registry field");
   };
   const text = (x: unknown): x is string => typeof x === "string" && x.trim().length > 0 && !/[\x00-\x1f\x7f]/.test(x);
   const reserved = (s: string) => ["__proto__", "constructor", "prototype"].includes(s.toLowerCase());
   fields(doc, ["version", "default_workdir", "codex_bin", "bots"]);
-  if (doc.version !== 1 || !Array.isArray(doc.bots)) throw new Error("Registry requires version 1 and bots array");
+  if (doc.version !== 1 || !Array.isArray(doc.bots) || doc.bots.length > 128) throw new Error("Registry requires version 1 and bots array");
   for (const k of ["default_workdir", "codex_bin"]) if (doc[k] !== undefined && !text(doc[k])) throw new Error(`Invalid ${k}`);
   const path = (value: string) => /^~[\\/]/.test(value) ? join(home, value.slice(2)) : isAbsolute(value) ? value : resolve(dirname(file), value);
   const defaultDir = doc.default_workdir ? path(doc.default_workdir) : join(home, ".agentschat/workspace");
@@ -37,8 +37,18 @@ export function loadBots(file = defaultRegistry(), home = homedir()): BotConfig[
       reserved(bot.profile) || reserved(bot.profile.replace(/\.json$/i, ""))) {
       throw new Error(`Bot ${bot.name}: profile must be a central profile name`);
     }
-    if (!doc.default_workdir && !bot.workdir) mkdirSync(defaultDir, { recursive: true, mode: 0o700 });
-    const cwd = realpathSync(bot.workdir ? path(bot.workdir) : defaultDir);
+    const directoryLeaf = (dir: string) => {
+      const info = lstatSync(dir, { throwIfNoEntry: false });
+      if (info && (info.isSymbolicLink() || !info.isDirectory())) throw new Error("Bot workdir must be a directory, not a symlink");
+    };
+    if (!doc.default_workdir && !bot.workdir) {
+      directoryLeaf(join(home, ".agentschat"));
+      directoryLeaf(defaultDir);
+      mkdirSync(defaultDir, { recursive: true, mode: 0o700 });
+    }
+    const workdir = bot.workdir ? path(bot.workdir) : defaultDir;
+    directoryLeaf(workdir);
+    const cwd = realpathSync(workdir);
     const settings: IdentitySettings = {};
     for (const k of ["agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort", "model", "codex_home_mode"] as const) if (bot[k] !== undefined) (settings as any)[k] = bot[k];
     if (bot.state_root !== undefined) { if (!text(bot.state_root)) throw new Error("Invalid state_root"); settings.state_root = path(bot.state_root); }

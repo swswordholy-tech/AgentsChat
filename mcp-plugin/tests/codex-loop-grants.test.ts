@@ -121,3 +121,34 @@ test("verifyLoopTick forwards platform and UID options on both authorization rea
   expect(reads).toBe(2);
   expect(await verifyLoopTick(tick, c, "owner", async () => { chmodSync(file, 0o644); return { loops: [row] }; }, { platform: "linux", getuid: () => uid })).toBeNull();
 });
+
+test("grant document and entries reject own prototype keys and cap total grants",()=>{
+ const {c,grant,tick,file,save}=fixture();
+ for(const doc of [`{"version":1,"grants":[${JSON.stringify(grant)}],"__proto__":{}}`,`{"version":1,"grants":[${JSON.stringify(grant).slice(0,-1)},"__proto__":{}}]}`]) {
+  writeFileSync(file,doc);expect(authorizedLoopTick(tick,c)).toBeNull();
+ }
+ const other=Array.from({length:255},(_,i)=>({...grant,loop_id:`loop_other${i}`}));
+ save([grant,...other]);expect(authorizedLoopTick(tick,c)).not.toBeNull();
+ save([grant,...other,{...grant,loop_id:"loop_extra"}]);expect(authorizedLoopTick(tick,c)).toBeNull();
+});
+
+test("every grant routing ID rejects whitespace, paths, reserved keys and overlength",()=>{
+ const {c,grant,tick,save}=fixture();
+ for(const field of ["loop_id","channel_id","agent_id","owner_id"] as const) {
+  for(const value of [" "+grant[field],grant[field]+" ",".","..","a.b","a/b","a\\b","__PrOtO__","CoNsTrUcToR","PrOtOtYpE","a".repeat(129),"loop_"+"a".repeat(124)]) {
+   const changed={...grant,[field]:value};save([changed]);
+   expect(authorizedLoopTick({...tick,channel_id:changed.channel_id,sender_id:changed.agent_id,meta:{...tick.meta,loop_id:changed.loop_id}},{...c,agentId:changed.agent_id})).toBeNull();
+  }
+  const value=field==="loop_id"?"loop_"+"a".repeat(123):"a".repeat(128),changed={...grant,[field]:value};save([changed]);
+  expect(authorizedLoopTick({...tick,channel_id:changed.channel_id,sender_id:changed.agent_id,meta:{...tick.meta,loop_id:changed.loop_id}},{...c,agentId:changed.agent_id})).not.toBeNull();
+ }
+});
+
+test("live loop response permits 1024 rows and rejects larger arrays before inspecting rows",async()=>{
+ const {c,tick,row}=fixture();
+ const loops=Array.from({length:1024},(_,i)=>i===0?row:{loop_id:`loop_other${i}`});
+ expect(await verifyLoopTick(tick,c,"owner",async()=>({loops}))).not.toBeNull();
+ loops.push({loop_id:"extra"});let inspected=false;
+ Object.defineProperty(loops,0,{get(){inspected=true;throw Error("must not scan");}});
+ expect(await verifyLoopTick(tick,c,"owner",async()=>({loops}))).toBeNull();expect(inspected).toBe(false);
+});

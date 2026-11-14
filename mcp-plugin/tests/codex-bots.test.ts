@@ -236,3 +236,35 @@ test("manager shutdown lock cleanup tolerates absent files and removes only its 
   rmSync(file); mkdirSync(file); expect(()=>removeOwnedLock(file)).not.toThrow(); expect(lstatSync(file).isDirectory()).toBe(true);
  } finally {rmSync(dir,{recursive:true,force:true});}
 });
+
+test("registry rejects own prototype fields and bounds even disabled bots",()=>{
+ const home=mkdtempSync(join(tmpdir(),"bots-shape-")),file=join(home,"bots.json");
+ try {
+  for(const doc of ['{"version":1,"bots":[],"__proto__":{}}','{"version":1,"bots":[{"name":"off","enabled":false,"__proto__":{}}]}']) {
+   writeFileSync(file,doc);expect(()=>loadBots(file,home)).toThrow("field");
+  }
+  const bots=Array.from({length:128},(_,i)=>({name:`off${i}`,enabled:false}));
+  writeFileSync(file,JSON.stringify({version:1,bots}));expect(loadBots(file,home)).toEqual([]);
+  writeFileSync(file,JSON.stringify({version:1,bots:[...bots,{name:"extra",enabled:false}]}));expect(()=>loadBots(file,home)).toThrow();
+ } finally {rmSync(home,{recursive:true,force:true});}
+});
+
+test("registry checks directory leaves before default creation and canonicalizes parent aliases",()=>{
+ const home=mkdtempSync(join(tmpdir(),"bots-leaves-")),file=join(home,"bots.json"),outside=join(home,"outside");mkdirSync(outside);
+ const write=(bot:any={},extra:any={})=>writeFileSync(file,JSON.stringify({version:1,bots:[{name:"one",profile:"one",...bot}],...extra}));
+ try {
+  for(const leaf of [".agentschat",".agentschat/workspace"]) for(const kind of ["link","dangling","file"]) {
+   if(leaf.includes("/"))mkdirSync(join(home,".agentschat"),{recursive:true});
+   const target=join(home,leaf);
+   if(kind==="file")writeFileSync(target,"keep");else symlinkSync(kind==="link"?outside:join(home,"absent"),target);
+   write();expect(()=>loadBots(file,home)).toThrow("workdir");expect(readdirSync(outside)).toEqual([]);
+   rmSync(target,{force:true});
+  }
+  mkdirSync(join(home,".agentschat/profiles"),{recursive:true});
+  writeFileSync(join(home,".agentschat/profiles/one.json"),JSON.stringify({agent_id:"test-bot",token:"ac_test_bot_token"}),{mode:0o600});
+  const alias=join(home,"alias");symlinkSync(outside,alias);
+  for(const extra of [false,true]) {write(extra?{}:{workdir:alias},extra?{default_workdir:alias}:{});expect(()=>loadBots(file,home)).toThrow("workdir");}
+  mkdirSync(join(outside,"project"));write({workdir:join(alias,"project")});
+  expect(loadBots(file,home)[0]!.cwd).toBe(realpathSync(join(outside,"project")));
+ } finally {rmSync(home,{recursive:true,force:true});}
+});
