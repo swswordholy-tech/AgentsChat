@@ -43,3 +43,20 @@ describe("ingestAgentsChatFrame — multiplex cursor vs shared dedup", () => {
     expect(advanced).toEqual([]);
   });
 });
+
+
+test("DM dash/colon aliases isolate dedup per bot and filter self before peer delivery", () => {
+  const a = { botId: "a", agentId: "agent-a" }, b = { botId: "b", agentId: "agent-b" };
+  for (const channel_id of ["dm-room", "DM-room", "dm:room", "DM:room"]) {
+    const advanced: string[] = [];
+    const deps = { dedup: new MessageDedup(), advanceCursor: (id: { botId: string }) => { advanced.push(id.botId); } };
+    const frame = { id: "shared", channel_id, sender_id: a.agentId, content: "hello", timestamp: "2026-11-14T00:00:00Z" };
+    expect(ingestAgentsChatFrame(a, frame, deps)).toBe(false);
+    expect(ingestAgentsChatFrame(b, frame, deps)).toBe(true);
+    expect(ingestAgentsChatFrame(b, frame, deps)).toBe(false);
+    expect(advanced).toEqual(["a", "b", "b"]);
+    const other = { ...frame, id: "from-human", sender_id: "human" };
+    expect(ingestAgentsChatFrame(a, other, deps)).toBe(true);
+    expect(ingestAgentsChatFrame(b, other, deps)).toBe(true);
+  }
+});

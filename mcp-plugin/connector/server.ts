@@ -148,7 +148,7 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
       return;
     }
     const auth = req.headers.authorization ?? "";
-    const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+    const token = auth.length <= 8192 && auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
     const payload = peekPayload(token);
     const secrets = payload && Object.prototype.hasOwnProperty.call(config.secrets, payload) &&
       Array.isArray(config.secrets[payload]) ? config.secrets[payload] : undefined;
@@ -173,9 +173,12 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
 
     ws.on("message", async (data) => {
       // Newline-delimited: the gateway may batch frames; split and handle each.
+      const bytes = Array.isArray(data) ? data.reduce((n, chunk) => n + chunk.byteLength, 0) : data.byteLength;
+      if (bytes > 2 * 1024 * 1024) { ws.close(1009, "message too large"); return; }
       const text = data.toString();
-      for (const line of text.split("\n")) {
-        if (!line.trim()) continue;
+      const lines = text.split("\n").filter(line => line.trim());
+      if (lines.length > 128) { ws.close(1009, "batch too large"); return; }
+      for (const line of lines) {
         let frame: any;
         try {
           frame = JSON.parse(line);
@@ -252,6 +255,11 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
     if (!identity) {
       log(`[connector] outbound failed: no usable identity for botId=${requested ?? "?"}`);
       return { success: false, error: `no usable identity for outbound (botId=${requested ?? "?"})` };
+    }
+    if (typeof chatId !== "string" || chatId !== chatId.trim() || chatId.length < 1 || chatId.length > 128 ||
+        /[\x00-\x1f\x7f/\\]/.test(chatId) || chatId === "." || chatId.includes("..") ||
+        ["__proto__", "constructor", "prototype"].includes(chatId.toLowerCase())) {
+      return { success: false, error: "invalid chat_id" };
     }
     switch (op) {
       case "send": {

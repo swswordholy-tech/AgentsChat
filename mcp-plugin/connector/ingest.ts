@@ -29,7 +29,7 @@ export function ingestAgentsChatFrame(
     deps.advanceCursor(id, frame.channel_id, frame.timestamp);
   }
   const key = messageDedupKey(frame as { id?: string; channel_id?: string });
-  const isDm = typeof frame.channel_id === "string" && /^dm-/i.test(frame.channel_id);
+  const isDm = typeof frame.channel_id === "string" && /^dm[-:]/i.test(frame.channel_id);
   const scopedKey = key && (isDm ? JSON.stringify([id.botId, frame.channel_id, frame.id]) : key);
   if (scopedKey && deps.dedup.recordOrSkip(scopedKey)) return false;
   // Group fanout must filter self per TARGET, not per arrival socket: A can

@@ -1,5 +1,9 @@
 import { afterEach, expect, test } from "bun:test";
-import WebSocket from "ws";
+import WebSocket, { WebSocketServer } from "ws";
+import { createServer } from "node:http";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { makeUpgradeToken } from "../../connector/auth.ts";
 import { startConnector, type AgentsChatHooks } from "../../connector/server.ts";
 import type { Identity } from "../../connector/identities.ts";
@@ -238,3 +242,160 @@ test("hello is bound to BOTH authenticated gateway and signing secret", async ()
   expect((await (await dial()).hello(c.botId)).type).toBe("error");
   expect((await (await dial()).hello()).type).toBe("descriptor");
 });
+
+test("all outbound hooks reject malformed chat IDs before platform IO and accept boundary IDs", async () => {
+  const { server, dial, calls } = setup([a]); await server.ready;
+  const client = await dial(); await client.hello();
+  for (const chat_id of [undefined, null, 0, true, {}, [], "", " x", "x ", ".", "..", "a..b", "a/b", "a\\b", "a\0b", "a\nb", "a\x7fb", "__proto__", "CONSTRUCTOR", "Prototype", "a".repeat(129)]) {
+    for (const op of ["send", "typing", "get_chat_info"]) {
+      const frame = outbound(a.botId, op); (frame.action as any).chat_id = chat_id;
+      expect((await client.request(frame)).result).toEqual({ success: false, error: "invalid chat_id" });
+    }
+  }
+  expect(calls).toEqual([]);
+  for (const chat_id of ["a", "x".repeat(128), "dm:peer", "DM-peer", "toString", "room.1", "中文频道"]) {
+    for (const op of ["send", "typing", "get_chat_info"]) {
+      const frame = outbound(a.botId, op); frame.action.chat_id = chat_id;
+      await client.request(frame);
+    }
+  }
+  expect(calls).toHaveLength(21);
+  expect(calls.filter(call => call.chatId === "dm:peer")).toHaveLength(3);
+});
+
+test("relay batches allow 128 non-empty lines and reject 129 before any hook runs", async () => {
+  const { server, dial, calls } = setup([a]); await server.ready;
+  const client = await dial(); await client.hello();
+  const line = JSON.stringify(outbound(a.botId));
+  client.ws.send(("\n  \n" + line + "\n").repeat(128));
+  for (let n = 0; n < 100 && calls.length < 128; n++) await new Promise(r => setTimeout(r, 5));
+  expect(calls).toHaveLength(128);
+  const closed = new Promise<[number, string]>(resolve => client.ws.once("close", (code, reason) => resolve([code, reason.toString()])));
+  client.ws.send((line + "\n").repeat(129));
+  expect(await closed).toEqual([1009, "batch too large"]);
+  expect(calls).toHaveLength(128);
+});
+
+test("relay raw-message ceiling counts bytes and preserves exact 2 MiB messages", async () => {
+  const { server, dial, calls } = setup([a]); await server.ready;
+  const client = await dial(); await client.hello();
+  const cap = 2 * 1024 * 1024;
+  // Whitespace keeps the exact-boundary message a single valid outbound frame.
+  const line = JSON.stringify(outbound(a.botId));
+  const frame = line + " ".repeat(cap - Buffer.byteLength(line));
+  client.ws.send(frame);
+  for (let n = 0; n < 100 && calls.length < 1; n++) await new Promise(r => setTimeout(r, 5));
+  expect(calls).toHaveLength(1);
+  const closed = new Promise<number>(resolve => client.ws.once("close", resolve));
+  client.ws.send("汉".repeat(Math.floor(cap / 3) + 1));
+  expect(await closed).toBe(1009);
+  expect(calls).toHaveLength(1);
+});
+
+test("upgrade authorization is bounded before trimming even when the inner token is valid", async () => {
+  const { server } = setup([a]); await server.ready;
+  const token = `Bearer ${makeUpgradeToken(a.gatewayId, a.secret, 0)}`;
+  async function upgrade(length: number, accepted: boolean) {
+    const ws = new WebSocket(`ws://127.0.0.1:${server.port}/relay`, {
+      // Internal whitespace survives HTTP header parsing, then token.trim() would remove it.
+      headers: { Authorization: "Bearer " + " ".repeat(length - token.length) + token.slice(7) },
+    });
+    cleanup.push(() => ws.terminate());
+    if (accepted) {
+      await new Promise<void>((resolve, reject) => { ws.once("open", resolve); ws.once("error", reject); });
+      ws.close();
+    } else {
+      const code = await new Promise<number>((resolve, reject) => { ws.once("close", resolve); ws.once("error", reject); });
+      expect(code).toBe(4401);
+    }
+  }
+  await upgrade(8192, true);
+  await upgrade(8193, false);
+});
+
+test("real CLI refuses authenticated redirects in all six HTTP paths with RELAY_PORT=0", async () => {
+  const seen: string[] = [], leaked: string[] = [];
+  let redirectMine = false;
+  const upstream = createServer((req, res) => {
+    const key = `${req.method} ${req.url}`;
+    if (req.url === "/trap") {
+      leaked.push(req.headers.authorization ?? "missing");
+      res.end("{}"); return;
+    }
+    seen.push(key);
+    expect(req.headers.authorization).toBe(`Bearer ${a.token}`);
+    if (req.url === "/api/channels/mine" && !redirectMine) {
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify([{ id: "same-chat" }])); return;
+    }
+    res.writeHead(307, { Location: "/trap" }); res.end();
+  });
+  const sockets = new Set<WebSocket>();
+  const wss = new WebSocketServer({ server: upstream });
+  wss.on("connection", ws => {
+    sockets.add(ws);
+    ws.on("message", raw => {
+      const frame = JSON.parse(raw.toString());
+      if (frame.type === "auth") ws.send(JSON.stringify({ type: "auth_ok" }));
+    });
+  });
+  await new Promise<void>(resolve => upstream.listen(0, "127.0.0.1", resolve));
+  const address = upstream.address() as { port: number };
+  const cursorDir = mkdtempSync(join(tmpdir(), "connector-redirects-"));
+  const child = Bun.spawn([process.execPath, new URL("../../connector/run.ts", import.meta.url).pathname], {
+    env: { ...process.env, RELAY_IDENTITIES_FILE: "", RELAY_IDENTITIES: JSON.stringify([a]),
+      RELAY_PORT: "0", AGENTCHAT_CURSOR_DIR: cursorDir, AGENTCHAT_API_URL: `http://127.0.0.1:${address.port}`,
+      AGENTCHAT_WS_URL: `ws://127.0.0.1:${address.port}/ws`,
+    }, stdout: "ignore", stderr: "pipe",
+  });
+  let output = "";
+  const logs = (async () => {
+    const reader = child.stderr.getReader(), decoder = new TextDecoder();
+    for (;;) { const { done, value } = await reader.read(); if (done) break; output += decoder.decode(value); }
+  })();
+  let relay: WebSocket | undefined;
+  async function until(predicate: () => boolean, label: string) {
+    const deadline = Date.now() + 4000;
+    while (!predicate()) {
+      if (Date.now() > deadline) throw new Error(`timed out: ${label}; seen=${JSON.stringify(seen)}; logs=${output}`);
+      await new Promise(r => setTimeout(r, 5));
+    }
+  }
+  try {
+    await until(() => /listening on .*:(\d+) /.test(output), "CLI listen");
+    const port = Number(output.match(/listening on .*:(\d+) /)![1]);
+    expect(port).toBeGreaterThan(0);
+    relay = new WebSocket(`ws://127.0.0.1:${port}/relay`, { headers: { Authorization: `Bearer ${makeUpgradeToken(a.gatewayId, a.secret, 0)}` } });
+    const frames: any[] = [];
+    relay.on("message", raw => frames.push(JSON.parse(raw.toString())));
+    await new Promise<void>((resolve, reject) => { relay!.once("open", resolve); relay!.once("error", reject); });
+    relay.send(JSON.stringify({ type: "hello", platform: "agentschat", botId: a.botId }));
+    await until(() => frames.some(f => f.type === "descriptor"), "hello");
+    for (const op of ["send", "get_chat_info"]) relay.send(JSON.stringify(outbound(a.botId, op, op)));
+    await until(() => frames.filter(f => f.type === "outbound_result").length === 2, "outbound redirects");
+    for (const f of frames.filter(f => f.type === "outbound_result")) expect(f.result.success).toBe(false);
+    await until(() => sockets.size === 1, "upstream WS");
+    const ws = [...sockets][0];
+    await until(() => seen.includes("GET /api/channels/same-chat/messages?limit=1"), "scheduled backfill");
+    ws.send(JSON.stringify({ ...message("context-trigger", "@agent-a hi"), type: "message" }));
+    ws.send(JSON.stringify({ ...message("tick-trigger", "(loop tick — check)"), type: "message", sender_id: a.agentId,
+      sender_type: "agent", content_type: "text", timestamp: "2026-11-14T00:00:00Z",
+      meta: { kind: "loop_tick", loop_id: "loop_test", prompt: "check", interval_ms: 60000, next_tick_ms: 120000, expires_at: null },
+    }));
+    await until(() => seen.includes("GET /api/channels/same-chat/messages?limit=50") && seen.includes("GET /api/loops/mine"), "context and loops");
+    redirectMine = true;
+    ws.send(JSON.stringify({ type: "auth_ok" }));
+    await until(() => seen.filter(s => s === "GET /api/channels/mine").length === 2, "membership redirect");
+    await until(() => output.includes("join-on-auth failed"), "membership redirect refused");
+    expect(new Set(seen).size).toBe(6);
+    expect(leaked).toEqual([]);
+  } finally {
+    relay?.terminate();
+    child.kill("SIGTERM");
+    await child.exited; await logs;
+    for (const ws of sockets) ws.terminate();
+    wss.close();
+    await new Promise<void>(resolve => upstream.close(() => resolve()));
+    rmSync(cursorDir, { recursive: true, force: true });
+  }
+}, 10000);
