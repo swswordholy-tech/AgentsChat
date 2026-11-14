@@ -3,7 +3,7 @@ import { redactSecrets } from "../src/redact.ts";
 import { getBotOwner } from "./owner.ts";
 import { getOnboardingStatus } from "../src/onboarding-status.ts";
 import { GuiChannel } from "./gui-channel.ts";
-import { readFileSync } from "node:fs";
+import { readFileSync, lstatSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { loadBots } from "./bots-config.ts";
@@ -42,6 +42,10 @@ See codex/README.md for setup, verification, limitations and recovery.
 `;
 
 let codex: AppServer | undefined, bridge: Bridge | undefined, transport: AgentsChatTransport | undefined;
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value) &&
+    (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
+}
 async function main() {
   const { values } = parseArgs({ options: { "codex-bridge": { type: "boolean" }, cwd: { type: "string" },
     "state-root": { type: "string" }, "codex-home-mode": { type: "string" }, "conversations": { type: "boolean" }, "read-conversation": { type: "string" }, "gui-thread": { type: "string" }, "gui-message-file": { type: "string" }, "gui-status": { type: "boolean" }, "managed-worker": { type: "boolean" }, registry: { type: "string" }, bot: { type: "string" }, profile: { type: "string" }, "codex-bin": { type: "string" }, check: { type: "boolean" }, "onboarding-status": { type: "boolean" },
@@ -51,6 +55,9 @@ async function main() {
     const channel = new GuiChannel(join(homedir(), ".agentschat/codex-gui-outbox"), values["gui-thread"] ? [values["gui-thread"]] : []);
     if (values["gui-status"]) { console.log(JSON.stringify(channel.list().map(({prompt, ...receipt}) => receipt))); return; }
     if (!values["gui-thread"] || !values["gui-message-file"]) throw new Error("GUI submission requires --gui-thread and --gui-message-file");
+    const stat = lstatSync(values["gui-message-file"]);
+    if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("GUI message must be a regular file, not a symlink");
+    if (stat.size > 256 * 1024) throw new Error("GUI message file exceeds 256 KiB");
     const {prompt, ...receipt} = channel.enqueue(values["gui-thread"], readFileSync(values["gui-message-file"], "utf8"));
     console.log(JSON.stringify(receipt)); return;
   }
@@ -58,7 +65,12 @@ async function main() {
   const snapshot = values["managed-worker"] ? await new Promise<BridgeConfig>((resolve, reject) => {
     if (!process.connected) { reject(new Error("Managed worker needs parent IPC")); return; }
     const timer = setTimeout(() => reject(new Error("Parent configuration missing")), 10000);
-    process.once("message", config => { clearTimeout(timer); resolve(config as BridgeConfig); });
+    timer.unref?.();
+    process.once("message", config => {
+      clearTimeout(timer);
+      if (!isPlainObject(config) || !Object.keys(config).length) { reject(new Error("Invalid parent configuration")); return; }
+      resolve(config as unknown as BridgeConfig);
+    });
   }) : undefined;
   const c = snapshot ?? (values.bot ? loadBots(values.registry).find(b => b.name === values.bot) : resolveConfig({ cwd: values.cwd, profile: values.profile, codexBin: values["codex-bin"], stateRoot: values["state-root"], codexHomeMode: values["codex-home-mode"] }));
   if (!c) throw new Error("Bot is absent or disabled");
@@ -73,15 +85,24 @@ async function main() {
   codex = new AppServer(c.codexBin, undefined, undefined, c.permissions, runtime, c.effort, c.model, { profileFile: c.profileFile, agentId: c.agentId, apiUrl: c.apiUrl, wsUrl: c.wsUrl });
   if (values.conversations || values["read-conversation"]) {
     const state = JSON.parse(readFileSync(join(c.stateDir, "state.json"), "utf8"));
-    const channels = state.channels ?? {};
-    if (values.conversations) { console.log(JSON.stringify(Object.entries(channels).map(([channel, data]: [string, any]) => ({channel, thread:data.thread, isolated:data.namespace===runtime.home})))); return; }
-    const channel = channels[values["read-conversation"]!];
-    if (!channel) throw new Error("Unknown conversation channel");
+    const channels = state?.channels === undefined ? {} : state.channels;
+    if (!isPlainObject(channels)) throw new Error("Invalid conversation channels");
+    const safeOutput = (value: unknown) => {
+      const text = JSON.stringify(value);
+      return redactSecrets(typeof c.token === "string" && c.token.length > 0 ? text.split(c.token).join("[REDACTED]") : text);
+    };
+    if (values.conversations) { console.log(safeOutput(Object.entries(channels).map(([channel, data]: [string, any]) => ({channel, thread:data.thread, isolated:data.namespace===runtime.home})))); return; }
+    const key = values["read-conversation"]!;
+    if (!Object.prototype.hasOwnProperty.call(channels, key)) throw new Error("Unknown conversation channel");
+    const channel = channels[key];
+    if (!isPlainObject(channel) || typeof channel.thread !== "string" || !channel.thread) throw new Error("Invalid conversation channel");
     if (channel.namespace && channel.namespace !== runtime.home) throw new Error("Conversation belongs to a different runtime home");
     await codex.start();
-    const history = channel.namespace ? await codex.readThread(channel.thread) : await codex.readLegacyThread(channel.thread);
-    console.log(redactSecrets(JSON.stringify(history).split(c.token).join("[REDACTED]")));
-    codex.close(); return;
+    try {
+      const history = channel.namespace ? await codex.readThread(channel.thread) : await codex.readLegacyThread(channel.thread);
+      console.log(safeOutput(history));
+    } finally { codex.close(); }
+    return;
   }
   if (c.permissions === "full-access") {
     const identityStatus = await getOnboardingStatus(c.apiUrl, c.agentId, c.token);
@@ -91,9 +112,11 @@ async function main() {
   }
   if (values.check) {
     await codex.start();
-    console.log("Official app-server initialization: OK (no chat connection or generation)");
-    console.log(JSON.stringify({ authentication: await codex.authenticationStatus(), generation_verified: false, reply_verified: false, codex_home_mode: c.codexHomeMode ?? "linked" }));
-    codex.close(); return;
+    try {
+      console.log("Official app-server initialization: OK (no chat connection or generation)");
+      console.log(JSON.stringify({ authentication: await codex.authenticationStatus(), generation_verified: false, reply_verified: false, codex_home_mode: c.codexHomeMode ?? "linked" }));
+    } finally { codex.close(); }
+    return;
   }
   transport = new AgentsChatTransport(c, m => { bridge!.accept(m); }, console.error, m => bridge!.recover(m));
   bridge = new Bridge(c, codex, (chat, text) => transport!.send(chat, text), console.error, (chat, active) => transport!.setTyping(chat, active), () => getBotOwner(c.apiUrl, c.agentId, c.token), () => transport!.api("/api/loops/mine"));
@@ -108,6 +131,7 @@ async function main() {
 }
 main().catch(async e => {
   // Do not echo arbitrary parse errors or subprocess output containing credentials.
-  console.error(`Bridge startup failed: ${e instanceof Error && !/token|secret/i.test(e.message) ? e.message : "invalid configuration"}`);
+  const diagnostic = e instanceof Error ? redactSecrets(e.message) : "invalid configuration";
+  console.error(`Bridge startup failed: ${/token|secret|bearer|password|key/i.test(diagnostic) ? "invalid configuration" : diagnostic}`);
   transport?.stop(); codex?.close(); await bridge?.stop(); process.exitCode = 1;
 });
