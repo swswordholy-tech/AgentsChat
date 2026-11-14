@@ -113,3 +113,12 @@ test("empty string remains valid for backfill while context requires visible tex
   expect(planBackfill("2026-09-01T10:00:00Z", [empty], A).replay).toEqual([empty]);
   expect(selectChannelContextMessages([empty])).toEqual([]);
 });
+
+
+test("cursor filenames replace case-insensitive prototype keys with default", () => {
+  for (const id of ["__proto__", "constructor", "prototype", "CONSTRUCTOR", "Prototype", ".", ""]) {
+    expect(safeCursorBotFile("/tmp/cursors", id)).toBe("/tmp/cursors/last-seen-msg-ts-default.json");
+  }
+  expect(safeCursorBotFile("/tmp/cursors", "toString")).toEndWith("-toString.json");
+  expect(safeCursorBotFile("/tmp/cursors", "a".repeat(129))).toEndWith(`-${"a".repeat(128)}.json`);
+});

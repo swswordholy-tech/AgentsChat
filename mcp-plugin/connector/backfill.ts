@@ -86,6 +86,7 @@ export function safeCursorBotFile(cursorDir: string, botId: string): string {
   const cleaned = String(botId || "default")
     .replace(/[^A-Za-z0-9._-]/g, "_")
     .replace(/\.{2,}/g, "_");
-  const safeId = cleaned && cleaned !== "." ? cleaned.slice(0, 128) : "default";
+  const safeId = cleaned && cleaned !== "." && !["__proto__", "constructor", "prototype"].includes(cleaned.toLowerCase())
+    ? cleaned.slice(0, 128) : "default";
   return join(cursorDir, `last-seen-msg-ts-${safeId}.json`);
 }

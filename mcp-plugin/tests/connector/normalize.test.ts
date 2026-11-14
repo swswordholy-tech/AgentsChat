@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
-import { clampTimerMs, isConnectorEntrypoint, loadIdentities } from "../../connector/run.ts";
+import { clampTimerMs, isConnectorEntrypoint, loadIdentities, parseIdentitiesJson, readConnectorConfig, readBoundedJson } from "../../connector/run.ts";
 import { toWireEvent, type WireEvent } from "../../connector/normalize.ts";
 
 /** toWireEvent returns WireEvent | null; these tests assert the non-null cases. */
@@ -186,4 +186,63 @@ describe("connector input and startup hardening", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+});
+
+
+test("identity JSON caps rows, rejects non-objects, own proto keys and controls in all six fields", () => {
+  const row = { botId: "bot", agentId: "agent", token: "ac_fixture", gatewayId: "gateway", secret: "fixture", profile: "main" };
+  const parse = (entries: unknown) => parseIdentitiesJson(JSON.stringify(entries), "fixture");
+  expect(parse([row])).toEqual([row]);
+  const rows = Array.from({ length: 256 }, (_, n) => ({ ...row, botId: `bot-${n}` }));
+  expect(parse(rows)).toHaveLength(256);
+  expect(() => parse([...rows, { ...row, botId: "overflow" }])).toThrow();
+  for (const entry of [null, 0, false, "bot", [], [row], JSON.parse('{"__proto__":{},"botId":"bot","token":"ac_fixture","gatewayId":"gw","secret":"fixture"}')]) {
+    expect(() => parse([entry])).toThrow();
+  }
+  for (const key of Object.keys(row)) for (const code of [0, 9, 10, 13, 31, 127]) {
+    expect(() => parse([{ ...row, [key]: `a${String.fromCharCode(code)}b` }])).toThrow();
+  }
+  expect(() => parse([{ ...row, profile: "中文 main" }])).not.toThrow();
+});
+
+test("startup validates ports and endpoint protocols, credentials, API query/hash and insecure hosts", () => {
+  expect(readConnectorConfig({}).PORT).toBe(8765);
+  for (const port of ["0", "1", "65535"]) expect(readConnectorConfig({ RELAY_PORT: port }).PORT).toBe(Number(port));
+  for (const port of ["-1", "65536", "1.5", "NaN", "Infinity"]) expect(() => readConnectorConfig({ RELAY_PORT: port })).toThrow("invalid RELAY_PORT");
+  for (const host of ["127.0.0.1", "localhost", "[::1]"]) {
+    const cfg = readConnectorConfig({ AGENTCHAT_API_URL: `http://${host}:1234/`, AGENTCHAT_WS_URL: `ws://${host}:1234/ws?x=1` });
+    expect(cfg.API).toBe(`http://${host}:1234`);
+  }
+  for (const [key, values] of Object.entries({
+    AGENTCHAT_API_URL: ["garbage", "ftp://example.com", "https://u:p@example.com", "https://example.com:0", "https://example.com?x=1", "https://example.com#x", "https://example.com?", "https://example.com#", "http://example.com", "http://localhost.evil", "http://192.168.1.1"],
+    AGENTCHAT_WS_URL: ["garbage", "https://example.com/ws", "wss://u:p@example.com/ws", "wss://example.com:0/ws", "ws://example.com/ws", "ws://localhost.evil/ws"],
+  })) for (const value of values) {
+    expect(() => readConnectorConfig({ [key]: value })).toThrow(`invalid ${key}`);
+  }
+  expect(readConnectorConfig({ AGENTCHAT_API_URL: "http://example.com", AGENTSCHAT_ALLOW_INSECURE_HTTP: "1" }).WS_URL).toBe("ws://example.com/ws");
+  expect(() => readConnectorConfig({ AGENTCHAT_API_URL: "http://example.com", AGENTSCHAT_ALLOW_INSECURE_HTTP: "true" })).toThrow();
+  expect(() => readConnectorConfig({ AGENTCHAT_API_URL: "https://example.com/base", AGENTCHAT_WS_URL: "wss://example.com/ws" })).not.toThrow();
+});
+
+test("JSON reader enforces exact 4 MiB actual UTF-8 bytes and handles split codepoints", async () => {
+  const cap = 4 * 1024 * 1024;
+  const text = JSON.stringify("汉".repeat(Math.floor((cap - 2) / 3)) + "aa");
+  expect(Buffer.byteLength(text)).toBe(cap);
+  expect((await readBoundedJson(new Response(text)) as string).length).toBe(Math.floor((cap - 2) / 3) + 2);
+  await expect(readBoundedJson(new Response(text + " ", { headers: { "Content-Length": "1" } }))).rejects.toThrow("JSON response too large");
+  const bytes = new TextEncoder().encode('{"text":"汉😀"}');
+  const chunks = new ReadableStream<Uint8Array>({ start(c) { for (const b of bytes) c.enqueue(Uint8Array.of(b)); c.close(); } });
+  expect(await readBoundedJson(new Response(chunks))).toEqual({ text: "汉😀" });
+  for (const body of ["{", new Uint8Array([34, 255, 34])]) await expect(readBoundedJson(new Response(body))).rejects.toThrow();
+});
+
+test("oversized streaming JSON cancels without waiting for an uncooperative source", async () => {
+  let cancelled = false;
+  const body = new ReadableStream<Uint8Array>({
+    start(c) { c.enqueue(new Uint8Array(4 * 1024 * 1024 + 1)); },
+    cancel() { cancelled = true; return new Promise(() => {}); },
+  });
+  await expect(readBoundedJson(new Response(body))).rejects.toThrow("JSON response too large");
+  expect(cancelled).toBe(true);
+  expect(body.locked).toBe(false);
 });

@@ -57,28 +57,78 @@ function need(name: string): string {
   return v;
 }
 
-const API = (process.env.AGENTCHAT_API_URL || "https://agents-chat.com").replace(/\/$/, "");
-const WS_URL = process.env.AGENTCHAT_WS_URL || API.replace(/^http/, "ws") + "/ws";
-const PORT = Number(process.env.RELAY_PORT || 8765);
-const HOST = process.env.RELAY_HOST || "127.0.0.1";
+/** Validate startup addresses before opening listeners or sending credentials. */
+export function readConnectorConfig(env: NodeJS.ProcessEnv = process.env) {
+  const API = (env.AGENTCHAT_API_URL || "https://agents-chat.com").replace(/\/$/, "");
+  const WS_URL = env.AGENTCHAT_WS_URL || API.replace(/^http/, "ws") + "/ws";
+  const PORT = Number(env.RELAY_PORT || 8765);
+  if (!Number.isInteger(PORT) || PORT < 0 || PORT > 65535) throw new Error("invalid RELAY_PORT");
+  for (const [name, raw, protocols] of [
+    ["AGENTCHAT_API_URL", API, ["http:", "https:"]],
+    ["AGENTCHAT_WS_URL", WS_URL, ["ws:", "wss:"]],
+  ] as const) {
+    let url: URL;
+    try { url = new URL(raw); } catch { throw new Error(`invalid ${name}`); }
+    const loopback = ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname);
+    if (!(protocols as readonly string[]).includes(url.protocol) || url.username || url.password || url.port === "0" ||
+        (name === "AGENTCHAT_API_URL" && (url.search || url.hash || raw.includes("?") || raw.includes("#"))) ||
+        ((url.protocol === "http:" || url.protocol === "ws:") && !loopback && env.AGENTSCHAT_ALLOW_INSECURE_HTTP !== "1")) {
+      throw new Error(`invalid ${name}`);
+    }
+  }
+  return { API, WS_URL, PORT, HOST: env.RELAY_HOST || "127.0.0.1" };
+}
+
+/** Count actual response bytes, including chunked bodies and dishonest headers. */
+export async function readBoundedJson(response: Response): Promise<unknown> {
+  const limit = 4 * 1024 * 1024;
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("invalid JSON response");
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let bytes = 0;
+  let text = "";
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > limit) throw new Error("JSON response too large");
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+    return JSON.parse(text);
+  } catch (error) {
+    void reader.cancel().catch(() => {});
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+}
 
 // ── Resolve identities: multiplex (RELAY_IDENTITIES[_FILE]) or single-tenant (legacy env) ──
 
-function parseIdentitiesJson(raw: string, source: string): Identity[] {
+export function parseIdentitiesJson(raw: string, source: string): Identity[] {
   let parsed: any;
   try {
     parsed = JSON.parse(raw);
   } catch {
     throw new Error(`${source} is not valid JSON`);
   }
-  if (!Array.isArray(parsed) || parsed.length === 0) {
-    throw new Error(`${source} must be a non-empty JSON array`);
+  if (!Array.isArray(parsed) || parsed.length === 0 || parsed.length > 256) {
+    throw new Error(`${source} must be a JSON array of 1..256 identities`);
   }
   const seen = new Set<string>();
   for (const [index, it] of parsed.entries()) {
+    if (!it || typeof it !== "object" || Object.getPrototypeOf(it) !== Object.prototype ||
+        Object.prototype.hasOwnProperty.call(it, "__proto__")) {
+      throw new Error(`${source} entry ${index}: invalid identity object`);
+    }
     const invalid = ["botId", "token", "gatewayId", "secret"].filter(k => typeof it?.[k] !== "string" || !it[k].trim());
     for (const k of ["agentId", "profile"]) {
       if (it?.[k] !== undefined && (typeof it[k] !== "string" || !it[k].trim())) invalid.push(k);
+    }
+    for (const k of ["botId", "agentId", "token", "gatewayId", "secret", "profile"]) {
+      if (typeof it[k] === "string" && /[\x00-\x1f\x7f]/.test(it[k])) invalid.push(k);
     }
     if (invalid.length) throw new Error(`${source} entry ${index}: missing or invalid string fields: ${invalid.join(", ")}`);
     if (seen.has(it.botId)) throw new Error(`${source} entry ${index}: duplicate botId`);
@@ -142,6 +192,7 @@ export function isConnectorEntrypoint(entry: string | undefined, moduleUrl: stri
 }
 
 async function main() {
+const { API, WS_URL, PORT, HOST } = readConnectorConfig();
 /** Mutable identity list — hooks and reload close over this binding. */
 let identities = resolveIdentitiesAtStartup();
 
@@ -255,6 +306,7 @@ function joinChannel(ws: WS, id: Identity, channelId: string, name?: string) {
 async function joinMemberships(ws: WS, id: Identity) {
   try {
     const r = await fetch(`${API}/api/channels/mine`, {
+      redirect: "error",
       headers: { Authorization: `Bearer ${id.token}` },
       signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
     });
@@ -263,7 +315,7 @@ async function joinMemberships(ws: WS, id: Identity) {
       log(`list mine failed: ${r.status}`);
       return;
     }
-    const body = await r.json() as any;
+    const body = await readBoundedJson(r) as any;
     if (!currentIdentity(id) || socketsByBot.get(id.botId) !== ws) return;
     const channels = Array.isArray(body) ? body : (body.channels || []);
     const joined: string[] = [];
@@ -297,6 +349,7 @@ async function backfillIdentity(id: Identity, channelIds: string[]) {
       const after = s.map.get(channelId);
       const params = after ? `?after=${encodeURIComponent(after)}&limit=50` : `?limit=1`;
       const r = await fetch(`${API}/api/channels/${encodeURIComponent(channelId)}/messages${params}`, {
+        redirect: "error",
         headers: { Authorization: `Bearer ${id.token}` },
         signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
       });
@@ -304,7 +357,7 @@ async function backfillIdentity(id: Identity, channelIds: string[]) {
         await r.body?.cancel().catch(() => {});
         continue;
       }
-      const msgs = (((await r.json()) as any)?.messages ?? []) as any[];
+      const msgs = (((await readBoundedJson(r)) as any)?.messages ?? []) as any[];
       if (!currentIdentity(id)) return;
       const plan = planBackfill(after, msgs, id.agentId);
       if (plan.seed) {
@@ -457,6 +510,7 @@ const connector = startConnector({
     async sendMessage(botId, chatId, content, replyTo) {
       const id = requireIdentity(identities, botId);
       const res = await fetch(`${API}/api/channels/${encodeURIComponent(chatId)}/messages`, {
+        redirect: "error",
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${id.token}` },
         body: JSON.stringify({ sender_id: id.agentId, content_type: "text", content, ...(replyTo ? { parent_id: replyTo } : {}) }),
@@ -466,23 +520,25 @@ const connector = startConnector({
         await res.body?.cancel().catch(() => {});
         throw new PlatformHttpError(res.status);
       }
-      const data = (await res.json()) as any;
+      const data = (await readBoundedJson(res)) as any;
       return { id: data?.id };
     },
     async getLoops(botId) {
       const id = requireIdentity(identities, botId);
       const res = await fetch(`${API}/api/loops/mine`, {
+        redirect: "error",
         headers: { Authorization: `Bearer ${id.token}` }, signal: AbortSignal.timeout(5000),
       });
       if (!res.ok) {
         await res.body?.cancel().catch(() => {});
         throw new PlatformHttpError(res.status);
       }
-      return await res.json();
+      return await readBoundedJson(res);
     },
     async getChatInfo(botId, chatId) {
       const id = requireIdentity(identities, botId);
       const res = await fetch(`${API}/api/channels/${encodeURIComponent(chatId)}`, {
+        redirect: "error",
         headers: { Authorization: `Bearer ${id.token}` },
         signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
       });
@@ -490,7 +546,7 @@ const connector = startConnector({
         await res.body?.cancel().catch(() => {});
         return { name: chatId, type: /^dm[-:]/i.test(chatId) ? "dm" : "group" };
       }
-      const data = (await res.json()) as any;
+      const data = (await readBoundedJson(res)) as any;
       return { name: data?.name ?? chatId, type: /^dm[-:]/i.test(chatId) ? "dm" : "group" };
     },
     async sendTyping(botId, chatId) {
@@ -510,6 +566,7 @@ const connector = startConnector({
       let res: Response;
       try {
         res = await fetch(`${API}/api/channels/${encodeURIComponent(chatId)}/messages?limit=50`, {
+          redirect: "error",
           signal: boundedSignal,
           headers: { Authorization: `Bearer ${id.token}` },
         });
@@ -517,7 +574,7 @@ const connector = startConnector({
           await res.body?.cancel().catch(() => {});
           return null;
         }
-        const rawMsgs = (((await res.json()) as any)?.messages ?? []) as any[];
+        const rawMsgs = (((await readBoundedJson(res)) as any)?.messages ?? []) as any[];
         const tail = selectChannelContextMessages(rawMsgs, sinceTs, excludeId);
         if (!tail.length) return null;
         return tail.map((m: any) => ({
