@@ -72,6 +72,35 @@ function checkParentDirectory(path: string): void {
   }
 }
 
+/** Bound actual response bytes, regardless of Content-Length. */
+async function readRegistrationText(res: Response): Promise<string> {
+  if (!res.body) throw new Error("Empty registration response");
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let bytes = 0;
+  let text = "";
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > 1024 * 1024) throw new Error("Registration response exceeds 1MiB");
+      text += decoder.decode(value, { stream: true });
+    }
+    return text + decoder.decode();
+  } catch (error) {
+    void reader.cancel().catch(() => {});
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+function isSafeAgentId(value: unknown): boolean {
+  return typeof value === "string" && !!value && value !== "." && value !== ".." &&
+    !FORBIDDEN_KEYS.has(value.toLowerCase()) && !/[\s\x00-\x1f\x7f/\\]/.test(value);
+}
+
 function isLoopbackHost(hostname: string): boolean {
   const h = hostname.toLowerCase().replace(/\.$/, "");
   return h === "localhost" || h === "127.0.0.1" || h === "[::1]" || h === "::1";
@@ -79,7 +108,7 @@ function isLoopbackHost(hostname: string): boolean {
 
 function validateHttpOrWsUrl(raw: string, allowedProtocols: string[], label: string): string {
   const trimmed = raw.trim();
-  if (!trimmed || /[\x00-\x20\x7f]/.test(trimmed)) {
+  if (!trimmed || raw !== trimmed || /[\x00-\x20\x7f"<>\\]/.test(raw)) {
     throw new Error(`Invalid ${label} URL`);
   }
   let parsed: URL;
@@ -88,7 +117,8 @@ function validateHttpOrWsUrl(raw: string, allowedProtocols: string[], label: str
   } catch {
     throw new Error(`Invalid ${label} URL`);
   }
-  if (parsed.username || parsed.password) throw new Error(`Invalid ${label} URL`);
+  if (parsed.username || parsed.password || parsed.port === "0" ||
+      ((parsed.protocol === "http:" || parsed.protocol === "https:") && (parsed.search || parsed.hash))) throw new Error(`Invalid ${label} URL`);
   if (!allowedProtocols.includes(parsed.protocol)) {
     throw new Error(`Unsupported ${label} protocol: ${parsed.protocol}`);
   }
@@ -107,7 +137,7 @@ export function loadDshConfig(
     const lst = lstatSync(profilePath);
     if (!lst.isSymbolicLink() && lst.isFile() && lst.size <= 256 * 1024) {
       const parsed = JSON.parse(readFileSync(profilePath, "utf8"));
-      if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+      if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) && !Object.prototype.hasOwnProperty.call(parsed, "__proto__")) {
         profile = parsed as Record<string, unknown>;
       }
     }
@@ -118,7 +148,7 @@ export function loadDshConfig(
   const rawToken = env.AGENTCHAT_TOKEN ?? (typeof profile.token === "string" ? profile.token : undefined);
   const agentId = typeof rawAgentId === "string" ? rawAgentId.trim() : "";
   const token = typeof rawToken === "string" ? rawToken.trim() : "";
-  if (!agentId || !token || /[\x00-\x1f\x7f]/.test(agentId) || /[\x00-\x1f\x7f]/.test(token)) {
+  if (!isSafeAgentId(agentId) || !token || /[\x00-\x1f\x7f]/.test(agentId) || /[\x00-\x1f\x7f]/.test(token)) {
     throw new Error(
       "Missing AgentsChat identity for DSH: set AGENTCHAT_AGENT_ID and AGENTCHAT_TOKEN, " +
         `or create ${profilePath} via 'agentschat-mcp --dsh --register-only --name <name>'.`,
@@ -173,15 +203,15 @@ export async function registerOnly(name: string, restUrl: string, profilePath = 
     signal: AbortSignal.timeout(15_000),
   });
   if (!res.ok) {
-    const errText = redact((await res.text().catch(() => "")).slice(0, 300));
+    const errText = redact((await readRegistrationText(res)).slice(0, 300));
     throw new Error(`Registration failed: ${res.status} ${errText}`);
   }
-  const data = (await res.json()) as Record<string, unknown>;
+  const data = JSON.parse(await readRegistrationText(res)) as Record<string, unknown>;
   const rawAgentId = (data.agentId ?? data.agent_id ?? data.id) as string | undefined;
   const rawToken = (data.agentKey ?? data.token ?? data.key) as string | undefined;
   const agentId = typeof rawAgentId === "string" ? rawAgentId.trim() : "";
   const token = typeof rawToken === "string" ? rawToken.trim() : "";
-  if (!agentId || !token || /[\x00-\x1f\x7f]/.test(agentId) || /[\x00-\x1f\x7f]/.test(token)) {
+  if (!isSafeAgentId(rawAgentId) || !token || /[\x00-\x1f\x7f]/.test(agentId) || /[\x00-\x1f\x7f]/.test(token)) {
     throw new Error("Registration response did not include a valid agent id/token");
   }
   try {
@@ -200,6 +230,13 @@ export async function registerOnly(name: string, restUrl: string, profilePath = 
   try {
     writeFileSync(tmp, JSON.stringify({ agentId, token }, null, 2), { mode: 0o600, flag: "wx" });
     created = true;
+    checkParentDirectory(profilePath);
+    try {
+      const lst = lstatSync(profilePath);
+      if (lst.isSymbolicLink() || !lst.isFile()) throw new Error(`Refusing to overwrite non-regular file ${profilePath}`);
+    } catch (err: any) {
+      if (err?.code !== "ENOENT") throw err;
+    }
     renameSync(tmp, profilePath);
     if (process.platform !== "win32") {
       try { chmodSync(profilePath, 0o600); } catch {}
@@ -427,9 +464,9 @@ DeepSeek Harness (dsh) integration for AgentsChat:
         const cfgDir = agentschatConfigDir();
         const binds = loadSessionBinds(cfgDir);
         for (const [sid, profName] of Object.entries(binds)) {
-          if (!sid.startsWith("session-") || FORBIDDEN_KEYS.has(sid) || !profName || typeof profName !== "string") continue;
-          const base = profName.replace(/\.json$/, "").replace(/[^a-zA-Z0-9_-]/g, "_");
-          if (!base || FORBIDDEN_KEYS.has(base)) continue;
+          if (!sid.startsWith("session-") || FORBIDDEN_KEYS.has(sid.toLowerCase()) || !profName || typeof profName !== "string") continue;
+          const base = profName.replace(/\.json$/i, "").replace(/[^a-zA-Z0-9_-]/g, "_");
+          if (!base || FORBIDDEN_KEYS.has(base.toLowerCase())) continue;
           let extraClient: MuseAgentChatClient | null = null;
           try {
             const candidates = [join(cfgDir, "profiles", `${base}.json`), join(cfgDir, `${base}.json`)];
@@ -443,7 +480,7 @@ DeepSeek Harness (dsh) integration for AgentsChat:
             });
             if (!profPath) continue;
             const raw = JSON.parse(readFileSync(profPath, "utf8")) as Record<string, any>;
-            if (raw === null || typeof raw !== "object" || Array.isArray(raw)) continue;
+            if (raw === null || typeof raw !== "object" || Array.isArray(raw) || Object.prototype.hasOwnProperty.call(raw, "__proto__")) continue;
             const rawAgentId = typeof raw.agent_id === "string" ? raw.agent_id : typeof raw.agentId === "string" ? raw.agentId : "";
             const rawToken = typeof raw.token === "string" ? raw.token : "";
             const botAgentId = rawAgentId.trim();
@@ -457,7 +494,7 @@ DeepSeek Harness (dsh) integration for AgentsChat:
               }
             }
             if (
-              !botAgentId ||
+              !isSafeAgentId(rawAgentId) ||
               !botToken ||
               botToken === "dev-token" ||
               /[\x00-\x1f\x7f]/.test(botAgentId) ||

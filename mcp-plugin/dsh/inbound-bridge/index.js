@@ -44,6 +44,10 @@
 
 import {
   appendFileSync,
+  closeSync,
+  constants,
+  fstatSync,
+  openSync,
   chmodSync,
   existsSync,
   lstatSync,
@@ -55,7 +59,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
@@ -117,7 +121,8 @@ function isSafeKey(value) {
     typeof value === 'string' &&
     value.length > 0 &&
     value.length <= 128 &&
-    !FORBIDDEN_KEYS.has(value) &&
+    !FORBIDDEN_KEYS.has(value.toLowerCase()) &&
+    value !== '.' && value !== '..' && !/[\/\\]/.test(value) &&
     !/[\x00-\x1f\x7f]/.test(value)
   );
 }
@@ -127,7 +132,10 @@ function scrubSecrets(text) {
   return text
     .replace(/Bearer\s+[^\s"',;]+/gi, 'Bearer [REDACTED]')
     .replace(/\bac_[A-Za-z0-9_-]{8,}/g, 'ac_[REDACTED]')
-    .replace(/\bsk-[A-Za-z0-9_-]{8,}/g, 'sk-[REDACTED]');
+    .replace(/\bsk-[A-Za-z0-9_-]{8,}/g, 'sk-[REDACTED]')
+    .replace(/mcp_(?:at|rt|code)_[A-Za-z0-9_-]{8,}/g, '[REDACTED]')
+    .replace(/whsec_[A-Za-z0-9_-]{8,}/g, '[REDACTED]')
+    .replace(/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, '[REDACTED]');
 }
 /**
  * Identifies the code the *running* instance actually has in memory.
@@ -161,21 +169,97 @@ function settleWithin(promise, ms) {
   ]).finally(() => clearTimeout(timer));
 }
 
-function writeLog(logPath, line) {
+function checkParentDirectory(path) {
+  let parent = dirname(resolve(path));
+  for (;;) {
+    if (!(process.platform === 'darwin' && ['/var', '/tmp', '/etc'].includes(parent))) {
+      try {
+        const lst = lstatSync(parent);
+        if (lst.isSymbolicLink() || !lst.isDirectory()) throw new Error('Refusing unsafe parent directory');
+      } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+      }
+    }
+    const next = dirname(parent);
+    if (next === parent) break;
+    parent = next;
+  }
+}
+
+function checkTarget(path) {
   try {
-    try {
-      const lst = lstatSync(logPath);
-      if (lst.isSymbolicLink()) return;
-      if (lst.size > LOG_MAX_BYTES) writeFileSync(logPath, '', { mode: 0o600 });
-    } catch {}
+    const lst = lstatSync(path);
+    if (lst.isSymbolicLink() || !lst.isFile()) throw new Error('Refusing non-regular target');
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+}
+
+/** Bound actual response bytes, regardless of Content-Length. */
+async function readRegistrationText(res) {
+  if (!res.body) throw new Error("Empty registration response");
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let bytes = 0;
+  let text = "";
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > 1024 * 1024) throw new Error("Registration response exceeds 1MiB");
+      text += decoder.decode(value, { stream: true });
+    }
+    return text + decoder.decode();
+  } catch (error) {
+    void reader.cancel().catch(() => {});
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+function isSafeAgentId(value) {
+  return typeof value === "string" && !!value && value !== "." && value !== ".." &&
+    !FORBIDDEN_KEYS.has(value.toLowerCase()) && !/[\s\x00-\x1f\x7f/\\]/.test(value);
+}
+
+function writeLog(logPath, line) {
+  let fd;
+  try {
+    checkParentDirectory(logPath);
     mkdirSync(dirname(logPath), { recursive: true });
-    appendFileSync(logPath, `${new Date().toISOString()} ${line}\n`, { mode: 0o600 });
-  } catch {}
+    checkParentDirectory(logPath);
+    checkTarget(logPath);
+    fd = openSync(logPath, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | (constants.O_NOFOLLOW ?? 0), 0o600);
+    const lst = fstatSync(fd);
+    if (!lst.isFile()) return;
+    if (lst.size > LOG_MAX_BYTES) {
+      closeSync(fd);
+      fd = undefined;
+      const tmp = `${logPath}.${process.pid}.${Date.now()}.${++inboundTmpSeq}.tmp`;
+      let created = false;
+      try {
+        writeFileSync(tmp, '', { flag: 'wx', mode: 0o600 });
+        created = true;
+        checkParentDirectory(logPath);
+        checkTarget(logPath);
+        renameSync(tmp, logPath);
+      } finally {
+        if (created) { try { unlinkSync(tmp); } catch {} }
+      }
+      fd = openSync(logPath, constants.O_WRONLY | constants.O_APPEND | (constants.O_NOFOLLOW ?? 0));
+    }
+    appendFileSync(fd, `${new Date().toISOString()} ${line}\n`);
+  } catch {} finally {
+    if (fd !== undefined) closeSync(fd);
+  }
 }
 
 /** Read the shared wake secret, creating it (0600) atomically when absent. */
 function loadSecret(secretPath, logFn) {
   try {
+    checkParentDirectory(secretPath);
     try {
       const lst = lstatSync(secretPath);
       if (lst.isSymbolicLink() || !lst.isFile()) {
@@ -188,10 +272,15 @@ function loadSecret(secretPath, logFn) {
       if (err?.code !== 'ENOENT') throw err;
     }
     mkdirSync(dirname(secretPath), { recursive: true, mode: 0o700 });
+    checkParentDirectory(secretPath);
     const secret = randomBytes(32).toString('hex');
     const tmp = `${secretPath}.${process.pid}.${Date.now()}.${++inboundTmpSeq}.tmp`;
+    let created = false;
     try {
-      writeFileSync(tmp, `${secret}\n`, { mode: 0o600 });
+      writeFileSync(tmp, `${secret}\n`, { flag: 'wx', mode: 0o600 });
+      created = true;
+      checkParentDirectory(secretPath);
+      checkTarget(secretPath);
       renameSync(tmp, secretPath);
       try {
         chmodSync(secretPath, 0o600);
@@ -200,7 +289,7 @@ function loadSecret(secretPath, logFn) {
       }
     } catch (err) {
       try {
-        unlinkSync(tmp);
+        if (created) unlinkSync(tmp);
       } catch {}
       throw err;
     }
@@ -223,13 +312,14 @@ export function verifySignature(body, sigHex, secret) {
 
 /** Render the inbound message as a normal user turn for the agent. */
 function renderInbound(payload) {
-  const channel = payload.channel_id ?? '(unknown)';
-  const kind = channel.startsWith('dm-') ? 'direct message' : 'channel message';
+  const header = (value) => String(value ?? '(unknown)').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 128);
+  const channel = header(payload.channel_id);
+  const kind = /^dm[-:]/i.test(channel) ? 'direct message' : 'channel message';
   return [
     '[AgentsChat inbound message]',
     `channel_id: ${channel}`,
-    payload.message_id ? `message_id: ${payload.message_id}` : undefined,
-    `from: ${payload.sender_id ?? '(unknown)'}`,
+    payload.message_id ? `message_id: ${header(payload.message_id)}` : undefined,
+    `from: ${header(payload.sender_id)}`,
     `kind: ${kind}`,
     'content:',
     payload.content ?? '(empty)',
@@ -494,19 +584,19 @@ export function apply(ctx, config = {}) {
     const scan = (dir) => {
       let files;
       try {
-        files = readdirSync(dir).filter((file) => file.endsWith('.json'));
+        files = readdirSync(dir).filter((file) => /\.json$/i.test(file));
       } catch {
         return;
       }
       for (const file of files) {
-        const name = file.replace(/\.json$/, '');
+        const name = file.replace(/\.json$/i, '');
         if (!isSafeKey(name) || seenNames.has(name)) continue;
         const path = join(dir, file);
         try {
           const lst = lstatSync(path);
           if (lst.isSymbolicLink() || !lst.isFile() || lst.size > 256 * 1024) continue;
           const parsed = JSON.parse(readFileSync(path, 'utf8'));
-          if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
+          if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed) || Object.prototype.hasOwnProperty.call(parsed, '__proto__')) continue;
           const agentId = typeof parsed.agent_id === 'string' ? parsed.agent_id.trim() : '';
           if (!agentId || /[\x00-\x1f\x7f]/.test(agentId)) continue;
           seenNames.add(name);
@@ -530,7 +620,7 @@ export function apply(ctx, config = {}) {
       const lst = lstatSync(bindsPath);
       if (lst.isSymbolicLink() || !lst.isFile() || lst.size > 256 * 1024) return {};
       const parsed = JSON.parse(readFileSync(bindsPath, 'utf8'));
-      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed) || Object.prototype.hasOwnProperty.call(parsed, '__proto__')) return {};
       const clean = {};
       for (const [k, v] of Object.entries(parsed)) {
         if (!isSafeKey(k) || typeof v !== 'string') continue;
@@ -546,6 +636,7 @@ export function apply(ctx, config = {}) {
 
   /** Same shape the MCP server reads: `{ [sessionId]: profileName }`. */
   function writeBinds(binds) {
+    checkParentDirectory(bindsPath);
     try {
       const lst = lstatSync(bindsPath);
       if (lst.isSymbolicLink() || !lst.isFile()) {
@@ -555,16 +646,21 @@ export function apply(ctx, config = {}) {
       if (err?.code !== 'ENOENT') throw err;
     }
     mkdirSync(agentschatDir, { recursive: true, mode: 0o700 });
+    checkParentDirectory(bindsPath);
     const tmp = `${bindsPath}.${process.pid}.${Date.now()}.${++inboundTmpSeq}.tmp`;
+    let created = false;
     try {
-      writeFileSync(tmp, `${JSON.stringify(binds, null, 2)}\n`, { mode: 0o600 });
+      writeFileSync(tmp, `${JSON.stringify(binds, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+      created = true;
+      checkParentDirectory(bindsPath);
+      checkTarget(bindsPath);
       renameSync(tmp, bindsPath);
       try {
         chmodSync(bindsPath, 0o600);
       } catch {}
     } catch (err) {
       try {
-        unlinkSync(tmp);
+        if (created) unlinkSync(tmp);
       } catch {}
       throw err;
     }
@@ -705,6 +801,12 @@ export function apply(ctx, config = {}) {
         const baseName = isSafeKey(sanitizedBase) ? sanitizedBase : `DSH_${randomBytes(3).toString('hex')}`;
         let profileName = baseName;
         let suffix = 2;
+        try {
+          checkParentDirectory(join(profilesDir, 'placeholder'));
+        } catch {
+          sendJson(res, 500, { ok: false, error: 'refusing unsafe profiles directory' }, corsHeaders);
+          return;
+        }
         mkdirSync(profilesDir, { recursive: true, mode: 0o700 });
         while (existsSync(join(profilesDir, `${profileName}.json`)) || existsSync(join(agentschatDir, `${profileName}.json`))) {
           profileName = `${baseName}_${suffix++}`;
@@ -724,7 +826,11 @@ export function apply(ctx, config = {}) {
           sendJson(res, 400, { ok: false, error: 'invalid API URL' }, corsHeaders);
           return;
         }
-        if (parsedRest.protocol !== 'http:' && parsedRest.protocol !== 'https:') {
+        const host = parsedRest.hostname.toLowerCase().replace(/\.$/, '');
+        const loopback = ['localhost', '127.0.0.1', '::1', '[::1]'].includes(host);
+        if ((parsedRest.protocol !== 'https:' && !(parsedRest.protocol === 'http:' && loopback)) ||
+            parsedRest.username || parsedRest.password || parsedRest.port === '0' || parsedRest.search || parsedRest.hash ||
+            /[\x00-\x20\x7f"<>\\]/.test(restBase)) {
           sendJson(res, 400, { ok: false, error: 'unsupported API URL protocol' }, corsHeaders);
           return;
         }
@@ -744,16 +850,16 @@ export function apply(ctx, config = {}) {
             signal: AbortSignal.timeout(15_000),
           });
           if (!regRes.ok) {
-            const errText = scrubSecrets((await regRes.text().catch(() => '')).slice(0, 200));
+            const errText = scrubSecrets(await readRegistrationText(regRes)).slice(0, 200);
             sendJson(res, 502, { ok: false, error: `register HTTP ${regRes.status}: ${errText}` }, corsHeaders);
             return;
           }
-          const data = await regRes.json();
+          const data = JSON.parse(await readRegistrationText(regRes));
           const rawAgentId = data?.agentId ?? data?.agent_id ?? data?.id;
           const rawToken = data?.agentKey ?? data?.token ?? data?.key;
           const agentId = typeof rawAgentId === 'string' ? rawAgentId.trim() : '';
           const token = typeof rawToken === 'string' ? rawToken.trim() : '';
-          if (!agentId || !token || /[\x00-\x1f\x7f]/.test(agentId) || /[\x00-\x1f\x7f]/.test(token)) {
+          if (!isSafeAgentId(rawAgentId) || !token || /[\x00-\x1f\x7f]/.test(agentId) || /[\x00-\x1f\x7f]/.test(token)) {
             sendJson(res, 502, { ok: false, error: 'register response missing agent_id/token' }, corsHeaders);
             return;
           }
@@ -777,15 +883,19 @@ export function apply(ctx, config = {}) {
             created_at: new Date().toISOString(),
           };
           const tmp = `${profilePath}.${process.pid}.${Date.now()}.${++inboundTmpSeq}.tmp`;
+          let created = false;
           try {
-            writeFileSync(tmp, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+            writeFileSync(tmp, `${JSON.stringify(record, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+            created = true;
+            checkParentDirectory(profilePath);
+            checkTarget(profilePath);
             renameSync(tmp, profilePath);
             try {
               chmodSync(profilePath, 0o600);
             } catch {}
           } catch (err) {
             try {
-              unlinkSync(tmp);
+              if (created) unlinkSync(tmp);
             } catch {}
             throw err;
           }

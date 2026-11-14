@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 
 export interface DshPatchOptions {
@@ -35,7 +35,7 @@ function checkParentDirectory(path: string): void {
 
 export function resolveDshPatchPath(opts: DshPatchOptions = {}): string {
   const home = opts.dshHome ?? process.env.DSH_HOME ?? join(homedir(), ".dsh");
-  if (!home || /[\x00-\x1f\x7f]/.test(home)) {
+  if (!home || home.length > 4096 || home.startsWith("-") || !isAbsolute(home) || /[\x00-\x1f\x7f]/.test(home)) {
     throw new Error("Invalid DSH home path");
   }
   if (opts.dshProfile !== undefined) {
@@ -46,7 +46,7 @@ export function resolveDshPatchPath(opts: DshPatchOptions = {}): string {
       !/^[A-Za-z0-9._-]+$/.test(profile) ||
       profile === "." ||
       profile.includes("..") ||
-      FORBIDDEN_KEYS.has(profile)
+      FORBIDDEN_KEYS.has(profile.toLowerCase())
     ) {
       throw new Error("Invalid DSH profile name");
     }
@@ -70,7 +70,7 @@ export function buildMcpAgentsChatArgs(opts: DshPatchOptions = {}): string[] {
       profile.includes("..") ||
       profile.includes("/") ||
       profile.includes("\\") ||
-      FORBIDDEN_KEYS.has(profile) ||
+      FORBIDDEN_KEYS.has(profile.toLowerCase()) ||
       /[\x00-\x1f\x7f]/.test(profile)
     ) {
       throw new Error("Invalid AgentsChat profile name");
@@ -93,6 +93,7 @@ export function buildMcpAgentsChatArgs(opts: DshPatchOptions = {}): string[] {
     if (
       parsed.username ||
       parsed.password ||
+      parsed.port === "0" || parsed.search || parsed.hash ||
       (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && isLoopback))
     ) {
       throw new Error("Invalid AgentsChat API URL");
