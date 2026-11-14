@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 
 // dsh/src/cli.ts
-import { chmodSync as chmodSync3, lstatSync as lstatSync6, mkdirSync as mkdirSync4, readFileSync as readFileSync6, renameSync as renameSync3, unlinkSync as unlinkSync4, writeFileSync as writeFileSync3 } from "node:fs";
+import { chmodSync as chmodSync3, lstatSync as lstatSync7, mkdirSync as mkdirSync4, readFileSync as readFileSync7, renameSync as renameSync3, unlinkSync as unlinkSync4, writeFileSync as writeFileSync3 } from "node:fs";
 import { randomBytes as randomBytes3 } from "node:crypto";
 import { spawn } from "node:child_process";
-import { dirname as dirname3, join as join6, resolve as resolve2 } from "node:path";
+import { dirname as dirname4, join as join6, resolve as resolve2 } from "node:path";
 import { homedir as homedir5 } from "node:os";
 
 // muse/src/policy.ts
@@ -36,7 +36,7 @@ function shouldDispatch(message, opts) {
     return false;
   if (opts.channelKind === "direct")
     return true;
-  if (!opts.channelKind && typeof message.channel_id === "string" && /^dm-/i.test(message.channel_id))
+  if (!opts.channelKind && typeof message.channel_id === "string" && /^dm[-:]/i.test(message.channel_id))
     return true;
   return isMentioned(message.content, opts.agentId, opts.displayName);
 }
@@ -629,10 +629,30 @@ class MuseAgentChatClient {
 }
 
 // muse/src/config.ts
+import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, isAbsolute, join, sep } from "node:path";
 var PROFILE_PATH = join(homedir(), ".agentschat", "muse.json");
 var MAX_PROFILE_BYTES = 64 * 1024;
+function assertSafeParentDirectories(file) {
+  let dir = dirname(isAbsolute(file) ? file : `${process.cwd()}${sep}${file}`);
+  while (true) {
+    try {
+      const st = lstatSync(dir);
+      const systemLink = process.platform === "darwin" && ["/var", "/tmp", "/etc"].includes(dir) && st.isSymbolicLink() && realpathSync(dir) === `/private${dir}` && !lstatSync(`/private${dir}`).isSymbolicLink() && lstatSync(`/private${dir}`).isDirectory();
+      if (!systemLink && st.isSymbolicLink() || !st.isDirectory() && !systemLink) {
+        throw new Error("Refusing to write Muse file inside symlinked or non-directory parent");
+      }
+    } catch (err) {
+      if (err?.code !== "ENOENT")
+        throw err;
+    }
+    const parent = dirname(dir);
+    if (parent === dir)
+      break;
+    dir = parent;
+  }
+}
 function redact(value) {
   if (!value)
     return "(missing)";
@@ -643,8 +663,8 @@ function redact(value) {
 
 // muse/src/wake.ts
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { appendFileSync, chmodSync, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { appendFileSync, chmodSync, lstatSync as lstatSync2, mkdirSync, readFileSync as readFileSync2, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname as dirname2 } from "node:path";
 var WAKE_SIG_HEADER = "x-agentschat-signature";
 var WAKE_CONTENT_MAX = 500;
 function redactSecrets(text) {
@@ -679,6 +699,31 @@ function sanitizeWakeLogUrl(rawUrl) {
 function signWakeBody(body, secret) {
   return createHmac("sha256", secret).update(body, "utf8").digest("hex");
 }
+function isUnsafeWakeHost(hostname) {
+  const host = hostname.toLowerCase().replace(/\.$/, "");
+  if (["metadata.google.internal", "metadata.goog"].includes(host))
+    return true;
+  const unsafeV4 = (ip) => {
+    const [a, b] = ip.split(".").map(Number);
+    return a === 0 || a === 10 || a === 169 && b === 254 || a === 172 && b >= 16 && b <= 31 || a === 192 && b === 168 || a >= 224;
+  };
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host))
+    return unsafeV4(host);
+  if (host.startsWith("[")) {
+    const address = host.slice(1, -1);
+    const [left, right = ""] = address.split("::");
+    const head = left ? left.split(":") : [];
+    const tail = right ? right.split(":") : [];
+    const words = address.includes("::") ? [...head, ...Array(8 - head.length - tail.length).fill("0"), ...tail].map((x) => parseInt(x, 16)) : head.map((x) => parseInt(x, 16));
+    if (words.length !== 8)
+      return true;
+    const mapped = words.slice(0, 5).every((x) => x === 0) && words[5] === 65535 || words.slice(0, 4).every((x) => x === 0) && words[4] === 65535 && words[5] === 0;
+    if (mapped)
+      return unsafeV4(`${words[6] >> 8}.${words[6] & 255}.${words[7] >> 8}.${words[7] & 255}`);
+    return words.every((x) => x === 0) || (words[0] & 65472) === 65152 || (words[0] & 65024) === 64512 || (words[0] & 65280) === 65280;
+  }
+  return false;
+}
 async function fireWake(msg, cfg) {
   const log = cfg.logger ?? (() => {});
   const url = (cfg.url ?? "").trim();
@@ -694,6 +739,10 @@ async function fireWake(msg, cfg) {
   }
   if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
     log(`[muse-agentchat] wake POST rejected unsupported protocol: ${parsedUrl.protocol}`);
+    return;
+  }
+  if (parsedUrl.port === "0" || parsedUrl.username || parsedUrl.password || isUnsafeWakeHost(parsedUrl.hostname)) {
+    log(`[muse-agentchat] wake POST rejected unsafe URL: ${safeLogUrl}`);
     return;
   }
   const timeoutMs = typeof cfg.timeoutMs === "number" && Number.isFinite(cfg.timeoutMs) && cfg.timeoutMs >= 1 ? Math.min(cfg.timeoutMs, 60000) : 5000;
@@ -734,16 +783,15 @@ var MAX_WAKE_QUEUE_LINES = 500;
 var MAX_WAKE_QUEUE_BYTES = 16 * 1024 * 1024;
 var wakeTmpSeq = 0;
 function appendWakeQueue(queueFile, payload, maxLines = MAX_WAKE_QUEUE_LINES) {
-  const dir = dirname(queueFile);
+  const dir = dirname2(queueFile);
+  assertSafeParentDirectories(queueFile);
   mkdirSync(dir, { recursive: true, mode: 448 });
-  if (lstatSync(dir).isSymbolicLink()) {
-    throw new Error("Refusing to write Muse wake queue inside symlinked directory");
-  }
+  assertSafeParentDirectories(queueFile);
   const line = JSON.stringify(payload);
   let existingLines = [];
   let existedBefore = false;
   try {
-    const st = lstatSync(queueFile);
+    const st = lstatSync2(queueFile);
     if (st.isSymbolicLink() || !st.isFile()) {
       throw new Error("Refusing to use symlink or non-regular file for Muse wake queue");
     }
@@ -756,7 +804,7 @@ function appendWakeQueue(queueFile, payload, maxLines = MAX_WAKE_QUEUE_LINES) {
       throw err;
   }
   if (existedBefore) {
-    const existing = readFileSync(queueFile, "utf8");
+    const existing = readFileSync2(queueFile, "utf8");
     existingLines = existing.split(`
 `).filter((l) => l.length > 0);
     if (payload.message_id && existingLines.some((l) => {
@@ -771,14 +819,16 @@ function appendWakeQueue(queueFile, payload, maxLines = MAX_WAKE_QUEUE_LINES) {
   }
   const cap = Number.isFinite(maxLines) ? Math.max(1, Math.floor(maxLines)) : MAX_WAKE_QUEUE_LINES;
   if (existingLines.length >= cap) {
-    const kept = [...existingLines.slice(-(cap - 1)), line];
+    const kept = [...cap === 1 ? [] : existingLines.slice(-(cap - 1)), line];
     const tmp = `${queueFile}.${process.pid}.${Date.now()}.${++wakeTmpSeq}.${randomBytes(6).toString("hex")}.tmp`;
     try {
+      assertSafeParentDirectories(queueFile);
       writeFileSync(tmp, `${kept.join(`
 `)}
 `, { mode: 384, flag: "wx" });
       try {
-        if (lstatSync(queueFile).isSymbolicLink()) {
+        const st = lstatSync2(queueFile);
+        if (st.isSymbolicLink() || !st.isFile()) {
           throw new Error("Refusing to use symlink or non-regular file for Muse wake queue");
         }
       } catch (err) {
@@ -807,7 +857,7 @@ function appendWakeQueue(queueFile, payload, maxLines = MAX_WAKE_QUEUE_LINES) {
     } catch (err) {
       if (err?.code !== "EEXIST")
         throw err;
-      const st = lstatSync(queueFile);
+      const st = lstatSync2(queueFile);
       if (st.isSymbolicLink() || !st.isFile()) {
         throw new Error("Refusing to use symlink or non-regular file for Muse wake queue");
       }
@@ -816,18 +866,23 @@ function appendWakeQueue(queueFile, payload, maxLines = MAX_WAKE_QUEUE_LINES) {
       }
     }
   }
+  assertSafeParentDirectories(queueFile);
+  const finalTarget = lstatSync2(queueFile);
+  if (finalTarget.isSymbolicLink() || !finalTarget.isFile()) {
+    throw new Error("Refusing to use symlink or non-regular file for Muse wake queue");
+  }
   appendFileSync(queueFile, `${line}
 `, { mode: 384 });
   return true;
 }
 
 // src/session-route.ts
-import { lstatSync as lstatSync3, readFileSync as readFileSync3 } from "node:fs";
+import { lstatSync as lstatSync4, readFileSync as readFileSync4 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
-import { isAbsolute, join as join3 } from "node:path";
+import { isAbsolute as isAbsolute2, join as join3 } from "node:path";
 
 // src/session-bind.ts
-import { closeSync, lstatSync as lstatSync2, mkdirSync as mkdirSync2, openSync, readFileSync as readFileSync2, readSync, readdirSync, unlinkSync as unlinkSync2 } from "node:fs";
+import { closeSync, lstatSync as lstatSync3, mkdirSync as mkdirSync2, openSync, readFileSync as readFileSync3, readSync, readdirSync, unlinkSync as unlinkSync2 } from "node:fs";
 import { join as join2 } from "node:path";
 
 // src/profile-store.ts
@@ -852,17 +907,17 @@ var MAX_SESSION_BINDS_ENTRIES = 1024;
 var CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
 function readBoundedRegularJson(path, maxBytes) {
   try {
-    const st = lstatSync2(path);
+    const st = lstatSync3(path);
     if (st.isSymbolicLink() || !st.isFile() || st.size > maxBytes)
       return null;
-    return JSON.parse(readFileSync2(path, "utf8"));
+    return JSON.parse(readFileSync3(path, "utf8"));
   } catch {
     return null;
   }
 }
 function isSafeDirOrMissing(dirPath) {
   try {
-    const st = lstatSync2(dirPath);
+    const st = lstatSync3(dirPath);
     return !st.isSymbolicLink() && st.isDirectory();
   } catch (e) {
     return Boolean(e && typeof e === "object" && e.code === "ENOENT");
@@ -925,7 +980,7 @@ function isSafeAbsoluteDirEnv(raw) {
   if (typeof raw !== "string")
     return false;
   const s = raw.trim();
-  return s.length > 0 && s.length <= MAX_DIR_PATH_LENGTH && !s.startsWith("-") && !/[\x00-\x1f\x7f]/.test(s) && isAbsolute(s);
+  return s.length > 0 && s.length <= MAX_DIR_PATH_LENGTH && !s.startsWith("-") && !/[\x00-\x1f\x7f]/.test(s) && isAbsolute2(s);
 }
 function agentschatConfigDir(env = process.env) {
   if (isSafeAbsoluteDirEnv(env.AGENTSCHAT_CONFIG_DIR)) {
@@ -940,7 +995,7 @@ function isSafeAgentId(id) {
 }
 function isSafeRegularProfileFile(path) {
   try {
-    const st = lstatSync3(path);
+    const st = lstatSync4(path);
     return !st.isSymbolicLink() && st.isFile() && st.size <= MAX_PROFILE_BYTES2;
   } catch {
     return false;
@@ -948,7 +1003,7 @@ function isSafeRegularProfileFile(path) {
 }
 function isSafeRealDir(path) {
   try {
-    const st = lstatSync3(path);
+    const st = lstatSync4(path);
     return !st.isSymbolicLink() && st.isDirectory();
   } catch {
     return false;
@@ -974,7 +1029,7 @@ function readAgentId(path) {
   try {
     if (!isSafeRegularProfileFile(path))
       return;
-    const parsed = JSON.parse(readFileSync3(path, "utf8"));
+    const parsed = JSON.parse(readFileSync4(path, "utf8"));
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || Object.prototype.hasOwnProperty.call(parsed, "__proto__")) {
       return;
     }
@@ -1009,7 +1064,7 @@ function resolveSessionForAgent(agentId, opts = {}) {
 }
 
 // src/wake.ts
-import { existsSync, lstatSync as lstatSync4, readFileSync as readFileSync4 } from "node:fs";
+import { existsSync as existsSync2, lstatSync as lstatSync5, readFileSync as readFileSync5 } from "node:fs";
 import { homedir as homedir3 } from "node:os";
 import { join as join4, win32 as pathWin32 } from "node:path";
 var GROK_GATEWAY_PATH_CANDIDATES = [
@@ -1030,8 +1085,8 @@ function resolveWindowsCliSpawn(cmd, args, opts) {
     return { cmd: trimmed, args };
   }
   const env = opts?.env ?? process.env;
-  const exists = opts?.existsImpl ?? existsSync;
-  const readText = opts?.readTextImpl ?? ((p) => readFileSync4(p, "utf8"));
+  const exists = opts?.existsImpl ?? existsSync2;
+  const readText = opts?.readTextImpl ?? ((p) => readFileSync5(p, "utf8"));
   const hasSep = /[\\/]/.test(trimmed) || /^[A-Za-z]:/.test(trimmed);
   const hasWinExt = /\.(?:exe|cmd|bat)$/i.test(trimmed);
   const candidates = [];
@@ -1083,17 +1138,17 @@ function resolveWindowsCliSpawn(cmd, args, opts) {
 
 // dsh/src/patch.ts
 import { randomBytes as randomBytes2 } from "node:crypto";
-import { chmodSync as chmodSync2, lstatSync as lstatSync5, mkdirSync as mkdirSync3, readFileSync as readFileSync5, renameSync as renameSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2 } from "node:fs";
-import { dirname as dirname2, isAbsolute as isAbsolute2, join as join5, resolve } from "node:path";
+import { chmodSync as chmodSync2, lstatSync as lstatSync6, mkdirSync as mkdirSync3, readFileSync as readFileSync6, renameSync as renameSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2 } from "node:fs";
+import { dirname as dirname3, isAbsolute as isAbsolute3, join as join5, resolve } from "node:path";
 import { homedir as homedir4 } from "node:os";
 var FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 var DARWIN_ROOT_LINKS = new Set(["/var", "/tmp", "/etc"]);
 function checkParentDirectory(path) {
-  let parent = dirname2(resolve(path));
+  let parent = dirname3(resolve(path));
   for (;; ) {
     if (!(process.platform === "darwin" && DARWIN_ROOT_LINKS.has(parent))) {
       try {
-        const stat = lstatSync5(parent);
+        const stat = lstatSync6(parent);
         if (stat.isSymbolicLink() || !stat.isDirectory()) {
           throw new Error(`Refusing symlinked or non-directory parent: ${parent}`);
         }
@@ -1102,7 +1157,7 @@ function checkParentDirectory(path) {
           throw err;
       }
     }
-    const next = dirname2(parent);
+    const next = dirname3(parent);
     if (next === parent)
       break;
     parent = next;
@@ -1110,7 +1165,7 @@ function checkParentDirectory(path) {
 }
 function resolveDshPatchPath(opts = {}) {
   const home = opts.dshHome ?? process.env.DSH_HOME ?? join5(homedir4(), ".dsh");
-  if (!home || home.length > 4096 || home.startsWith("-") || !isAbsolute2(home) || /[\x00-\x1f\x7f]/.test(home)) {
+  if (!home || home.length > 4096 || home.startsWith("-") || !isAbsolute3(home) || /[\x00-\x1f\x7f]/.test(home)) {
     throw new Error("Invalid DSH home path");
   }
   if (opts.dshProfile !== undefined) {
@@ -1242,7 +1297,7 @@ function applyDshCordisPatchFile(opts = {}) {
   let existed = false;
   let mode = 384;
   try {
-    const lst = lstatSync5(patchPath);
+    const lst = lstatSync6(patchPath);
     if (lst.isSymbolicLink() || !lst.isFile()) {
       throw new Error(`Refusing to modify non-regular or symlinked DSH patch file: ${patchPath}`);
     }
@@ -1255,10 +1310,10 @@ function applyDshCordisPatchFile(opts = {}) {
     if (err?.code !== "ENOENT")
       throw err;
   }
-  const existing = existed ? readFileSync5(patchPath, "utf8") : "";
+  const existing = existed ? readFileSync6(patchPath, "utf8") : "";
   const { content, changed } = mergeDshCordisPatch(existing, opts);
   if (changed) {
-    mkdirSync3(dirname2(patchPath), { recursive: true });
+    mkdirSync3(dirname3(patchPath), { recursive: true });
     checkParentDirectory(patchPath);
     const tmp = `${patchPath}.${process.pid}.${randomBytes2(4).toString("hex")}.tmp`;
     let created = false;
@@ -1266,7 +1321,7 @@ function applyDshCordisPatchFile(opts = {}) {
       writeFileSync2(tmp, content, { encoding: "utf8", mode, flag: "wx" });
       created = true;
       try {
-        if (lstatSync5(patchPath).isSymbolicLink()) {
+        if (lstatSync6(patchPath).isSymbolicLink()) {
           throw new Error(`Refusing to overwrite symlinked DSH patch file: ${patchPath}`);
         }
       } catch (err) {
@@ -1305,11 +1360,11 @@ function has(name, argv) {
 var FORBIDDEN_KEYS2 = new Set(["__proto__", "constructor", "prototype"]);
 var DARWIN_ROOT_LINKS2 = new Set(["/var", "/tmp", "/etc"]);
 function checkParentDirectory2(path) {
-  let parent = dirname3(resolve2(path));
+  let parent = dirname4(resolve2(path));
   for (;; ) {
     if (!(process.platform === "darwin" && DARWIN_ROOT_LINKS2.has(parent))) {
       try {
-        const stat = lstatSync6(parent);
+        const stat = lstatSync7(parent);
         if (stat.isSymbolicLink() || !stat.isDirectory()) {
           throw new Error(`Refusing symlinked or non-directory parent: ${parent}`);
         }
@@ -1318,7 +1373,7 @@ function checkParentDirectory2(path) {
           throw err;
       }
     }
-    const next = dirname3(parent);
+    const next = dirname4(parent);
     if (next === parent)
       break;
     parent = next;
@@ -1380,9 +1435,9 @@ function validateHttpOrWsUrl(raw, allowedProtocols, label) {
 function loadDshConfig(env = process.env, profilePath = DSH_PROFILE_PATH) {
   let profile = {};
   try {
-    const lst = lstatSync6(profilePath);
+    const lst = lstatSync7(profilePath);
     if (!lst.isSymbolicLink() && lst.isFile() && lst.size <= 256 * 1024) {
-      const parsed = JSON.parse(readFileSync6(profilePath, "utf8"));
+      const parsed = JSON.parse(readFileSync7(profilePath, "utf8"));
       if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) && !Object.prototype.hasOwnProperty.call(parsed, "__proto__")) {
         profile = parsed;
       }
@@ -1448,7 +1503,7 @@ async function registerOnly(name, restUrl, profilePath = DSH_PROFILE_PATH) {
     throw new Error("Registration response did not include a valid agent id/token");
   }
   try {
-    const lst = lstatSync6(profilePath);
+    const lst = lstatSync7(profilePath);
     if (lst.isSymbolicLink() || !lst.isFile()) {
       throw new Error(`Refusing to overwrite non-regular file ${profilePath}`);
     }
@@ -1457,7 +1512,7 @@ async function registerOnly(name, restUrl, profilePath = DSH_PROFILE_PATH) {
       throw err;
   }
   checkParentDirectory2(profilePath);
-  mkdirSync4(dirname3(profilePath), { recursive: true, mode: 448 });
+  mkdirSync4(dirname4(profilePath), { recursive: true, mode: 448 });
   checkParentDirectory2(profilePath);
   const tmp = `${profilePath}.${process.pid}.${randomBytes3(4).toString("hex")}.tmp`;
   let created = false;
@@ -1466,7 +1521,7 @@ async function registerOnly(name, restUrl, profilePath = DSH_PROFILE_PATH) {
     created = true;
     checkParentDirectory2(profilePath);
     try {
-      const lst = lstatSync6(profilePath);
+      const lst = lstatSync7(profilePath);
       if (lst.isSymbolicLink() || !lst.isFile())
         throw new Error(`Refusing to overwrite non-regular file ${profilePath}`);
     } catch (err) {
@@ -1686,7 +1741,7 @@ DeepSeek Harness (dsh) integration for AgentsChat:
             const candidates = [join6(cfgDir, "profiles", `${base}.json`), join6(cfgDir, `${base}.json`)];
             const profPath = candidates.find((p) => {
               try {
-                const lst = lstatSync6(p);
+                const lst = lstatSync7(p);
                 return !lst.isSymbolicLink() && lst.isFile() && lst.size <= 256 * 1024;
               } catch {
                 return false;
@@ -1694,7 +1749,7 @@ DeepSeek Harness (dsh) integration for AgentsChat:
             });
             if (!profPath)
               continue;
-            const raw = JSON.parse(readFileSync6(profPath, "utf8"));
+            const raw = JSON.parse(readFileSync7(profPath, "utf8"));
             if (raw === null || typeof raw !== "object" || Array.isArray(raw) || Object.prototype.hasOwnProperty.call(raw, "__proto__"))
               continue;
             const rawAgentId = typeof raw.agent_id === "string" ? raw.agent_id : typeof raw.agentId === "string" ? raw.agentId : "";

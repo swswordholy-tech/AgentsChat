@@ -2072,10 +2072,23 @@ function normalizeProfileSlug(s) {
 }
 var MAX_GROK_BIND_ENTRIES = 1024;
 var MAX_GROK_BINDS_PATH_LEN = 4096;
+var RESERVED_BIND_BASENAMES = new Set([
+  "profile",
+  "grok-binds",
+  "grok-binds.meta",
+  "session-binds",
+  "agy-session-binds"
+]);
+function hasPathOrTraversalSyntax(s) {
+  return /[\/\\]/.test(s) || s === "." || s.includes("..");
+}
 function isSafeProfileBindName(name) {
   if (!name || name.length > 256 || hasControlChars(name))
     return false;
-  if (isUnsafeObjectKey(name) || name === "." || name.includes("..") || /[\/\\]/.test(name))
+  if (isUnsafeObjectKey(name) || hasPathOrTraversalSyntax(name))
+    return false;
+  const base = name.replace(/\.json$/i, "").trim().toLowerCase();
+  if (!base || isUnsafeObjectKey(base) || RESERVED_BIND_BASENAMES.has(base))
     return false;
   return true;
 }
@@ -2151,9 +2164,10 @@ function gateSwitchProfile(input) {
   const reqRaw = typeof input.requestedProfileName === "string" ? input.requestedProfileName.trim() : "";
   if (!reqRaw)
     return { kind: "allow" };
+  const reqHasPath = hasPathOrTraversalSyntax(reqRaw);
   const reqSlug = normalizeProfileSlug(reqRaw);
   const binds = input.binds && typeof input.binds === "object" ? input.binds : {};
-  const bindValues = Object.values(binds).filter((v) => typeof v === "string" && v.trim().length > 0 && !hasControlChars(v));
+  const bindValues = Object.values(binds).filter((v) => typeof v === "string" && isSafeProfileBindName(v.trim()));
   if (bindValues.length === 0)
     return { kind: "allow" };
   const lockedMessage = (lockedName) => {
@@ -2162,7 +2176,7 @@ function gateSwitchProfile(input) {
   };
   const bound = boundProfileForConversation(input.conversationId, binds);
   if (bound) {
-    if (reqSlug === normalizeProfileSlug(bound))
+    if (!reqHasPath && reqSlug === normalizeProfileSlug(bound))
       return { kind: "allow" };
     return {
       kind: "locked",
@@ -2174,12 +2188,43 @@ function gateSwitchProfile(input) {
   const current = typeof input.currentProfileName === "string" ? input.currentProfileName.trim() : "";
   const currentSlug = current ? normalizeProfileSlug(current) : "";
   if (current && bindValues.some((v) => normalizeProfileSlug(v) === currentSlug)) {
-    if (reqSlug === currentSlug)
+    if (!reqHasPath && reqSlug === currentSlug)
       return { kind: "allow" };
     return {
       kind: "locked",
       boundProfileName: current.replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 128),
       requestedProfileName: reqRaw.replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 128),
+      message: lockedMessage(current)
+    };
+  }
+  return { kind: "allow" };
+}
+function gateGrokProfileMutation(input) {
+  const binds = input.binds && typeof input.binds === "object" ? input.binds : {};
+  const bindValues = Object.values(binds).filter((v) => typeof v === "string" && isSafeProfileBindName(v.trim()));
+  if (bindValues.length === 0)
+    return { kind: "allow" };
+  const reqLabel = typeof input.requestedName === "string" && input.requestedName.trim() ? input.requestedName.trim().replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 128) : `(${input.action})`;
+  const lockedMessage = (lockedName) => {
+    const clean = lockedName.replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 128);
+    return `Outbound identity is locked to grok-bind profile "${clean}" on this shared MCP; ` + `use a separate MCP process / wake daemon, do not switch_profile or disconnect_profile.`;
+  };
+  const bound = boundProfileForConversation(input.conversationId, binds);
+  if (bound) {
+    return {
+      kind: "locked",
+      boundProfileName: bound,
+      requestedProfileName: reqLabel,
+      message: lockedMessage(bound)
+    };
+  }
+  const current = typeof input.currentProfileName === "string" ? input.currentProfileName.trim() : "";
+  const currentSlug = current ? normalizeProfileSlug(current) : "";
+  if (current && bindValues.some((v) => normalizeProfileSlug(v) === currentSlug)) {
+    return {
+      kind: "locked",
+      boundProfileName: current.replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 128),
+      requestedProfileName: reqLabel,
       message: lockedMessage(current)
     };
   }
@@ -6183,14 +6228,15 @@ function profileNameToPaths(name) {
     return [join13(homeDir, name.slice(2))];
   if (name.includes("/") || name.includes("\\"))
     return [name];
-  name = name.replace(/\.json$/, "");
+  name = name.replace(/\.json$/i, "");
   const safeName = name.replace(/[^a-zA-Z0-9_-]/g, "_");
   return profileDirs.map((dir) => join13(dir, `${safeName}.json`));
 }
 function nameToPath(name) {
   const candidates = profileNameToPaths(name);
-  const nested = join13(configDir, "profiles", name.replace(/\.json$/, "") + ".json");
-  if (!name.includes("/") && !name.includes("\\") && existsSync2(nested))
+  const safeBase = name.replace(/\.json$/i, "").replace(/[^a-zA-Z0-9_-]/g, "_");
+  const nested = join13(configDir, "profiles", safeBase + ".json");
+  if (!name.includes("/") && !name.includes("\\") && safeBase && existsSync2(nested))
     return nested;
   return candidates.find((path) => existsSync2(path)) || candidates[0];
 }
@@ -6200,12 +6246,13 @@ function listProfileFiles() {
   for (const dir of [join13(configDir, "profiles"), ...profileDirs]) {
     let files = [];
     try {
-      files = readdirSync5(dir).filter((f) => f.endsWith(".json"));
+      files = readdirSync5(dir).filter((f) => /\.json$/i.test(f));
     } catch {}
     for (const file of files) {
-      if (file === DEFAULT_GROK_BINDS_FILENAME || file === GROK_BINDS_META_FILENAME || file === DEFAULT_SESSION_BINDS_FILENAME || file === LEGACY_AGY_BINDS_FILENAME)
+      const lowerFile = file.toLowerCase();
+      if (lowerFile === DEFAULT_GROK_BINDS_FILENAME.toLowerCase() || lowerFile === GROK_BINDS_META_FILENAME.toLowerCase() || lowerFile === DEFAULT_SESSION_BINDS_FILENAME.toLowerCase() || lowerFile === LEGACY_AGY_BINDS_FILENAME.toLowerCase())
         continue;
-      const name = file.replace(/\.json$/, "");
+      const name = file.replace(/\.json$/i, "");
       if (seen.has(name))
         continue;
       seen.add(name);
@@ -9486,12 +9533,22 @@ async function registerAndConnectProfile(displayName, bindSessionId) {
   if (!cleanName) {
     return { content: [{ type: "text", text: "Error: register_name / profile_name must be a non-empty string." }], isError: true };
   }
-  const safeBase = cleanName.replace(/\.json$/, "").replace(/[^a-zA-Z0-9_-]/g, "_");
-  if (safeBase.toLowerCase() === "profile") {
+  const safeBase = cleanName.replace(/\.json$/i, "").replace(/[^a-zA-Z0-9_-]/g, "_");
+  const reservedRegisterBases = new Set([
+    "profile",
+    "grok-binds",
+    "grok-binds_meta",
+    "session-binds",
+    "agy-session-binds",
+    "__proto__",
+    "constructor",
+    "prototype"
+  ]);
+  if (!safeBase || reservedRegisterBases.has(safeBase.toLowerCase())) {
     return {
       content: [{
         type: "text",
-        text: 'Error: "profile" (profile.json) is reserved and cannot be registered as a named agent profile. Choose a distinct profile name (e.g. "Antigravity", "Claude_Work", "Codex_Dev").'
+        text: `Error: "${safeBase || cleanName}" is reserved and cannot be registered as a named agent profile. Choose a distinct profile name (e.g. "Antigravity", "Claude_Work", "Codex_Dev").`
       }],
       isError: true
     };
@@ -9579,7 +9636,21 @@ async function handleProfileSwitchOrConnect(args) {
     disconnect,
     conversation_id
   } = args || {};
+  const switchBinds = loadGrokBinds();
+  const bindApplies = currentGrokBindApplicability(switchBinds);
+  const currentBoundProfile = profileNameFromPath(activeProfileFile);
   if (disconnect) {
+    if (bindApplies.applies) {
+      const discGate = gateGrokProfileMutation({
+        conversationId: process.env.CURSOR_CONVERSATION_ID,
+        binds: switchBinds,
+        currentProfileName: currentBoundProfile,
+        action: "disconnect"
+      });
+      if (discGate.kind === "locked") {
+        return { content: [{ type: "text", text: discGate.message }], isError: true };
+      }
+    }
     const { prevAgentId, prevProfileName } = disconnectCurrentProfile();
     return {
       content: [{
@@ -9590,18 +9661,28 @@ async function handleProfileSwitchOrConnect(args) {
   }
   const explicitSessionId = typeof conversation_id === "string" && conversation_id.trim() ? conversation_id.trim() : null;
   if (typeof register_name === "string" && register_name.trim()) {
+    if (bindApplies.applies) {
+      const regGate = gateGrokProfileMutation({
+        conversationId: process.env.CURSOR_CONVERSATION_ID,
+        binds: switchBinds,
+        currentProfileName: currentBoundProfile,
+        action: "register",
+        requestedName: register_name.trim()
+      });
+      if (regGate.kind === "locked") {
+        return { content: [{ type: "text", text: regGate.message }], isError: true };
+      }
+    }
     return await registerAndConnectProfile(register_name.trim(), explicitSessionId);
   }
   if (!profile_name) {
     return { content: [{ type: "text", text: formatProfileList() }] };
   }
-  const switchBinds = loadGrokBinds();
-  const bindApplies = currentGrokBindApplicability(switchBinds);
   const switchGate = !bindApplies.applies ? { kind: "allow" } : gateSwitchProfile({
     conversationId: process.env.CURSOR_CONVERSATION_ID,
     binds: switchBinds,
     requestedProfileName: profile_name,
-    currentProfileName: profileNameFromPath(activeProfileFile)
+    currentProfileName: currentBoundProfile
   });
   if (switchGate.kind === "locked") {
     return { content: [{ type: "text", text: switchGate.message }], isError: true };
@@ -9664,6 +9745,19 @@ Scope: this switch applies only to THIS MCP process.${bindNote} It is not saved 
 }
 HANDLERS.set("connect_profile", async (args) => handleProfileSwitchOrConnect(args));
 HANDLERS.set("disconnect_profile", async (args) => {
+  const switchBinds = loadGrokBinds();
+  const bindApplies = currentGrokBindApplicability(switchBinds);
+  if (bindApplies.applies) {
+    const discGate = gateGrokProfileMutation({
+      conversationId: process.env.CURSOR_CONVERSATION_ID,
+      binds: switchBinds,
+      currentProfileName: profileNameFromPath(activeProfileFile),
+      action: "disconnect"
+    });
+    if (discGate.kind === "locked") {
+      return { content: [{ type: "text", text: discGate.message }], isError: true };
+    }
+  }
   const { keep_binding } = args || {};
   const { prevAgentId, prevProfileName } = disconnectCurrentProfile({ keepBinding: keep_binding });
   return {

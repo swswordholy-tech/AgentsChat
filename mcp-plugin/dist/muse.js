@@ -3,7 +3,7 @@
 // muse/src/cli.ts
 import { randomBytes as randomBytes2 } from "node:crypto";
 import { writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, renameSync as renameSync2, unlinkSync as unlinkSync2, lstatSync as lstatSync3 } from "node:fs";
-import { dirname as dirname2 } from "node:path";
+import { dirname as dirname3 } from "node:path";
 import { homedir as homedir2 } from "node:os";
 import { join as join2 } from "node:path";
 
@@ -36,7 +36,7 @@ function shouldDispatch(message, opts) {
     return false;
   if (opts.channelKind === "direct")
     return true;
-  if (!opts.channelKind && typeof message.channel_id === "string" && /^dm-/i.test(message.channel_id))
+  if (!opts.channelKind && typeof message.channel_id === "string" && /^dm[-:]/i.test(message.channel_id))
     return true;
   return isMentioned(message.content, opts.agentId, opts.displayName);
 }
@@ -629,9 +629,9 @@ class MuseAgentChatClient {
 }
 
 // muse/src/config.ts
-import { existsSync, lstatSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, isAbsolute, join, sep } from "node:path";
 var DEFAULT_WS_URL = "wss://agents-chat.com/ws";
 var DEFAULT_REST_URL = "https://agents-chat.com";
 var PROFILE_PATH = join(homedir(), ".agentschat", "muse.json");
@@ -640,13 +640,41 @@ function isLoopbackHost(hostname) {
   const h = hostname.toLowerCase();
   return h === "localhost" || h === "127.0.0.1" || h === "[::1]" || h === "::1";
 }
+function isSafeAgentId(value) {
+  return typeof value === "string" && value.length > 0 && ![".", "..", "__proto__", "constructor", "prototype"].includes(value.toLowerCase()) && !/[\/\\\s\x00-\x1f\x7f]/.test(value);
+}
+function assertSafeParentDirectories(file) {
+  let dir = dirname(isAbsolute(file) ? file : `${process.cwd()}${sep}${file}`);
+  while (true) {
+    try {
+      const st = lstatSync(dir);
+      const systemLink = process.platform === "darwin" && ["/var", "/tmp", "/etc"].includes(dir) && st.isSymbolicLink() && realpathSync(dir) === `/private${dir}` && !lstatSync(`/private${dir}`).isSymbolicLink() && lstatSync(`/private${dir}`).isDirectory();
+      if (!systemLink && st.isSymbolicLink() || !st.isDirectory() && !systemLink) {
+        throw new Error("Refusing to write Muse file inside symlinked or non-directory parent");
+      }
+    } catch (err) {
+      if (err?.code !== "ENOENT")
+        throw err;
+    }
+    const parent = dirname(dir);
+    if (parent === dir)
+      break;
+    dir = parent;
+  }
+}
 function validateEndpointUrl(raw, kind) {
-  const trimmed = raw.trim();
+  if (raw !== raw.trim() || /["<>\\\x00-\x20\x7f]/.test(raw)) {
+    throw new Error(`Invalid Muse ${kind} URL`);
+  }
+  const trimmed = raw;
   let parsed;
   try {
     parsed = new URL(trimmed);
   } catch {
     throw new Error(`Invalid Muse ${kind} URL`);
+  }
+  if (parsed.port === "0" || parsed.search || parsed.hash || raw.includes("?") || raw.includes("#")) {
+    throw new Error(`Invalid Muse ${kind} URL port/query/hash`);
   }
   if (parsed.username || parsed.password) {
     throw new Error(`Embedded credentials are not allowed in Muse ${kind} URL`);
@@ -693,7 +721,7 @@ function readProfile(path = PROFILE_PATH) {
     if (!st.isFile() || st.isSymbolicLink() || st.size > MAX_PROFILE_BYTES)
       return {};
     const parsed = JSON.parse(readFileSync(path, "utf8"));
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) && !Object.hasOwn(parsed, "__proto__") ? parsed : {};
   } catch {
     return {};
   }
@@ -702,7 +730,7 @@ function loadConfig(env = process.env, profilePath) {
   const profile = readProfile(profilePath);
   const rawAgentId = (env.AGENTCHAT_AGENT_ID ?? profile.agentId ?? "").trim();
   const rawToken = (env.AGENTCHAT_TOKEN ?? profile.token ?? "").trim();
-  if (!rawAgentId || !rawToken || /[\x00-\x1f\x7f]/.test(rawAgentId) || /[\x00-\x1f\x7f]/.test(rawToken)) {
+  if (!isSafeAgentId(rawAgentId) || !rawToken || /[\x00-\x1f\x7f]/.test(rawAgentId) || /[\x00-\x1f\x7f]/.test(rawToken)) {
     throw new Error("Missing AgentsChat identity: set AGENTCHAT_AGENT_ID and AGENTCHAT_TOKEN, " + `or create ${profilePath ?? PROFILE_PATH} via 'muse-agentchat --register-only --name <name>'. ` + "Tokens are never printed; see README for registration.");
   }
   const wsUrl = validateEndpointUrl(env.AGENTCHAT_WS_URL ?? profile.wsUrl ?? DEFAULT_WS_URL, "ws");
@@ -722,7 +750,7 @@ function loadConfig(env = process.env, profilePath) {
 // muse/src/wake.ts
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { appendFileSync, chmodSync, lstatSync as lstatSync2, mkdirSync, readFileSync as readFileSync2, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname as dirname2 } from "node:path";
 var WAKE_SIG_HEADER = "x-agentschat-signature";
 var WAKE_CONTENT_MAX = 500;
 function redactSecrets(text) {
@@ -757,6 +785,31 @@ function sanitizeWakeLogUrl(rawUrl) {
 function signWakeBody(body, secret) {
   return createHmac("sha256", secret).update(body, "utf8").digest("hex");
 }
+function isUnsafeWakeHost(hostname) {
+  const host = hostname.toLowerCase().replace(/\.$/, "");
+  if (["metadata.google.internal", "metadata.goog"].includes(host))
+    return true;
+  const unsafeV4 = (ip) => {
+    const [a, b] = ip.split(".").map(Number);
+    return a === 0 || a === 10 || a === 169 && b === 254 || a === 172 && b >= 16 && b <= 31 || a === 192 && b === 168 || a >= 224;
+  };
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host))
+    return unsafeV4(host);
+  if (host.startsWith("[")) {
+    const address = host.slice(1, -1);
+    const [left, right = ""] = address.split("::");
+    const head = left ? left.split(":") : [];
+    const tail = right ? right.split(":") : [];
+    const words = address.includes("::") ? [...head, ...Array(8 - head.length - tail.length).fill("0"), ...tail].map((x) => parseInt(x, 16)) : head.map((x) => parseInt(x, 16));
+    if (words.length !== 8)
+      return true;
+    const mapped = words.slice(0, 5).every((x) => x === 0) && words[5] === 65535 || words.slice(0, 4).every((x) => x === 0) && words[4] === 65535 && words[5] === 0;
+    if (mapped)
+      return unsafeV4(`${words[6] >> 8}.${words[6] & 255}.${words[7] >> 8}.${words[7] & 255}`);
+    return words.every((x) => x === 0) || (words[0] & 65472) === 65152 || (words[0] & 65024) === 64512 || (words[0] & 65280) === 65280;
+  }
+  return false;
+}
 async function fireWake(msg, cfg) {
   const log = cfg.logger ?? (() => {});
   const url = (cfg.url ?? "").trim();
@@ -772,6 +825,10 @@ async function fireWake(msg, cfg) {
   }
   if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
     log(`[muse-agentchat] wake POST rejected unsupported protocol: ${parsedUrl.protocol}`);
+    return;
+  }
+  if (parsedUrl.port === "0" || parsedUrl.username || parsedUrl.password || isUnsafeWakeHost(parsedUrl.hostname)) {
+    log(`[muse-agentchat] wake POST rejected unsafe URL: ${safeLogUrl}`);
     return;
   }
   const timeoutMs = typeof cfg.timeoutMs === "number" && Number.isFinite(cfg.timeoutMs) && cfg.timeoutMs >= 1 ? Math.min(cfg.timeoutMs, 60000) : 5000;
@@ -812,11 +869,10 @@ var MAX_WAKE_QUEUE_LINES = 500;
 var MAX_WAKE_QUEUE_BYTES = 16 * 1024 * 1024;
 var wakeTmpSeq = 0;
 function appendWakeQueue(queueFile, payload, maxLines = MAX_WAKE_QUEUE_LINES) {
-  const dir = dirname(queueFile);
+  const dir = dirname2(queueFile);
+  assertSafeParentDirectories(queueFile);
   mkdirSync(dir, { recursive: true, mode: 448 });
-  if (lstatSync2(dir).isSymbolicLink()) {
-    throw new Error("Refusing to write Muse wake queue inside symlinked directory");
-  }
+  assertSafeParentDirectories(queueFile);
   const line = JSON.stringify(payload);
   let existingLines = [];
   let existedBefore = false;
@@ -849,14 +905,16 @@ function appendWakeQueue(queueFile, payload, maxLines = MAX_WAKE_QUEUE_LINES) {
   }
   const cap = Number.isFinite(maxLines) ? Math.max(1, Math.floor(maxLines)) : MAX_WAKE_QUEUE_LINES;
   if (existingLines.length >= cap) {
-    const kept = [...existingLines.slice(-(cap - 1)), line];
+    const kept = [...cap === 1 ? [] : existingLines.slice(-(cap - 1)), line];
     const tmp = `${queueFile}.${process.pid}.${Date.now()}.${++wakeTmpSeq}.${randomBytes(6).toString("hex")}.tmp`;
     try {
+      assertSafeParentDirectories(queueFile);
       writeFileSync(tmp, `${kept.join(`
 `)}
 `, { mode: 384, flag: "wx" });
       try {
-        if (lstatSync2(queueFile).isSymbolicLink()) {
+        const st = lstatSync2(queueFile);
+        if (st.isSymbolicLink() || !st.isFile()) {
           throw new Error("Refusing to use symlink or non-regular file for Muse wake queue");
         }
       } catch (err) {
@@ -894,13 +952,45 @@ function appendWakeQueue(queueFile, payload, maxLines = MAX_WAKE_QUEUE_LINES) {
       }
     }
   }
+  assertSafeParentDirectories(queueFile);
+  const finalTarget = lstatSync2(queueFile);
+  if (finalTarget.isSymbolicLink() || !finalTarget.isFile()) {
+    throw new Error("Refusing to use symlink or non-regular file for Muse wake queue");
+  }
   appendFileSync(queueFile, `${line}
 `, { mode: 384 });
   return true;
 }
 
 // muse/src/cli.ts
-var RESERVED_AGENT_IDS = new Set(["__proto__", "constructor", "prototype"]);
+var MAX_REGISTRATION_BYTES = 1024 * 1024;
+async function readRegistrationBody(res) {
+  if (!res.body)
+    throw new Error("Registration response body is missing");
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let bytes = 0;
+  let body = "";
+  let complete = false;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done)
+        break;
+      bytes += value.byteLength;
+      if (bytes > MAX_REGISTRATION_BYTES)
+        throw new Error("Registration response exceeds 1MiB limit");
+      body += decoder.decode(value, { stream: true });
+    }
+    body += decoder.decode();
+    complete = true;
+    return body;
+  } finally {
+    if (!complete)
+      reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+}
 function arg(name, argv) {
   const i = argv.indexOf(name);
   if (i < 0)
@@ -916,19 +1006,11 @@ async function registerOnly(name, restUrl, profilePath = PROFILE_PATH, fetchImpl
   if (!cleanName || cleanName.length > 64 || /[\x00-\x1f\x7f]/.test(cleanName)) {
     throw new Error("Invalid --name value");
   }
-  const parsedRest = new URL(restUrl.trim());
-  if (parsedRest.username || parsedRest.password) {
-    throw new Error("Embedded credentials are not allowed in AGENTCHAT_REST_URL");
-  }
-  const isLocal = ["localhost", "127.0.0.1", "[::1]", "::1"].includes(parsedRest.hostname.toLowerCase());
-  if (parsedRest.protocol !== "https:" && !(parsedRest.protocol === "http:" && isLocal)) {
-    throw new Error("AGENTCHAT_REST_URL must use https:// (or http:// on loopback)");
-  }
-  const profileDir = dirname2(profilePath);
+  const endpoint = validateEndpointUrl(restUrl, "rest");
+  const profileDir = dirname3(profilePath);
+  assertSafeParentDirectories(profilePath);
   mkdirSync2(profileDir, { recursive: true, mode: 448 });
-  if (lstatSync3(profileDir).isSymbolicLink()) {
-    throw new Error("Refusing to write Muse profile inside symlinked directory");
-  }
+  assertSafeParentDirectories(profilePath);
   try {
     const st = lstatSync3(profilePath);
     if (st.isSymbolicLink() || !st.isFile()) {
@@ -939,30 +1021,36 @@ async function registerOnly(name, restUrl, profilePath = PROFILE_PATH, fetchImpl
       throw err;
   }
   console.log("Terms notice: https://agents-chat.com/terms (notice only, no acceptance prompt)");
-  const res = await fetchImpl(`${restUrl.trim().replace(/\/$/, "")}/api/account/register`, {
+  const res = await fetchImpl(`${endpoint.replace(/\/$/, "")}/api/account/register`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ name: cleanName, type: "agent", capabilities: ["chat"] }),
     redirect: "error",
     signal: AbortSignal.timeout(15000)
   });
+  const responseBody = await readRegistrationBody(res);
   if (!res.ok) {
-    const errBody = redactSecrets((await res.text()).slice(0, 512));
+    const errBody = redactSecrets(responseBody).slice(0, 512);
     throw new Error(`Registration failed: ${res.status} ${errBody}`);
   }
-  const data = await res.json();
+  const data = JSON.parse(responseBody);
+  if (!data || typeof data !== "object" || Array.isArray(data) || Object.hasOwn(data, "__proto__")) {
+    throw new Error("Invalid registration response");
+  }
   const agentId = String(data.agentId ?? data.agent_id ?? data.id ?? "").trim();
   const token = String(data.agentKey ?? data.token ?? data.key ?? "").trim();
   if (!agentId || !token)
     throw new Error("Registration response did not include an agent id/token");
-  if (/[\x00-\x1f\x7f]/.test(agentId) || /[\x00-\x1f\x7f]/.test(token) || RESERVED_AGENT_IDS.has(agentId.toLowerCase())) {
+  if (!isSafeAgentId(agentId) || /[\x00-\x1f\x7f]/.test(token)) {
     throw new Error("Registration response contained unsafe agent id or token");
   }
   const tmp = `${profilePath}.${process.pid}.${Date.now()}.${randomBytes2(6).toString("hex")}.tmp`;
   try {
+    assertSafeParentDirectories(profilePath);
     writeFileSync2(tmp, JSON.stringify({ agentId, token }, null, 2), { mode: 384, flag: "wx" });
     try {
-      if (lstatSync3(profilePath).isSymbolicLink()) {
+      const st = lstatSync3(profilePath);
+      if (st.isSymbolicLink() || !st.isFile()) {
         throw new Error("Refusing to overwrite symlink or non-regular Muse profile");
       }
     } catch (err) {
