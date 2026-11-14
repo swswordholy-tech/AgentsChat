@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { safeWriteProfile } from "../src/profile-store.ts";
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, statSync, existsSync, rmSync, renameSync } from "node:fs";
+import { safeWriteProfile, findDefaultProfileCollision } from "../src/profile-store.ts";
+import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, statSync, existsSync, rmSync, renameSync, symlinkSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -78,5 +78,34 @@ describe("safeWriteProfile keeps the agent key 0600", () => {
     const warnings: string[] = [];
     safeWriteProfile(join(dir, "p.json"), { token: "ac_secret" }, (m) => warnings.push(m));
     expect(warnings).toEqual([]);
+  });
+
+  test("unlinks a dangling .tmp symlink instead of writing the private key through it, and rejects symlinked target paths", () => {
+    const p = join(dir, "p.json");
+    const tmp = p + ".tmp";
+    const victim = join(dir, "victim-outside.json");
+    // Dangling symlink: existsSync(tmp) is FALSE, so naive code would follow it on writeFileSync!
+    symlinkSync(victim, tmp);
+    expect(existsSync(tmp)).toBe(false);
+
+    safeWriteProfile(p, { token: "ac_live_secret" });
+    expect(existsSync(victim)).toBe(false);
+    expect(JSON.parse(readFileSync(p, "utf8")).token).toBe("ac_live_secret");
+    expect(mode(p)).toBe(0o600);
+
+    // Symlinked target path itself must fail closed
+    const realTarget = join(dir, "real.json");
+    writeFileSync(realTarget, '{"token":"keep"}');
+    const symTarget = join(dir, "sym-profile.json");
+    symlinkSync(realTarget, symTarget);
+    expect(() => safeWriteProfile(symTarget, { token: "ac_overwrite" })).toThrow(/symlink/i);
+    expect(JSON.parse(readFileSync(realTarget, "utf8")).token).toBe("keep");
+
+    // findDefaultProfileCollision ignores symlinked candidate profiles
+    const defPath = join(dir, "profile.json");
+    writeFileSync(defPath, JSON.stringify({ agent_id: "bot_1", display_name: "Bot 1", token: "ac_1" }));
+    const symCand = join(dir, "Shadow.json");
+    symlinkSync(defPath, symCand);
+    expect(findDefaultProfileCollision(dir, defPath)).toBeNull();
   });
 });

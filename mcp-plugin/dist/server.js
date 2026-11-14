@@ -83,17 +83,22 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 
 // src/redact.ts
 function redactSecrets(text, opts) {
+  if (typeof text !== "string" || !text)
+    return "";
   const step = opts?.preserveAcKeys ? text : text.replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***");
   return step.replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
 }
-var PHONE_PII_RE = /^\+?\d[\d\s()-]{5,}$/;
+var PHONE_PII_RE = /^\+?\d[\d\s()-]{5,}[\d)]$/;
+function isPhoneShapedPii(s) {
+  return PHONE_PII_RE.test(s) && s.replace(/\D/g, "").length >= 7;
+}
 function isHumanPiiHandle(rawId) {
   const s = String(rawId ?? "").trim();
   if (!s)
     return false;
   if (s.includes("@"))
     return true;
-  if (PHONE_PII_RE.test(s))
+  if (isPhoneShapedPii(s))
     return true;
   return false;
 }
@@ -106,7 +111,7 @@ function redactParticipantPii(rawId) {
     const local = s.slice(0, atIdx).replace(/[^a-zA-Z0-9]/g, "");
     return `user:${(local.slice(0, 2) || "u").toLowerCase()}***`;
   }
-  if (PHONE_PII_RE.test(s)) {
+  if (isPhoneShapedPii(s)) {
     const digits = s.replace(/\D/g, "");
     return `user:phone_***${digits.slice(-2) || "00"}`;
   }
@@ -2082,10 +2087,15 @@ import { join as join3, win32 as pathWin32 } from "node:path";
 
 // src/redact.ts
 function redactSecrets2(text, opts) {
+  if (typeof text !== "string" || !text)
+    return "";
   const step = opts?.preserveAcKeys ? text : text.replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***");
   return step.replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
 }
-var PHONE_PII_RE2 = /^\+?\d[\d\s()-]{5,}$/;
+var PHONE_PII_RE2 = /^\+?\d[\d\s()-]{5,}[\d)]$/;
+function isPhoneShapedPii2(s) {
+  return PHONE_PII_RE2.test(s) && s.replace(/\D/g, "").length >= 7;
+}
 function redactParticipantPii2(rawId) {
   const s = String(rawId ?? "").trim();
   if (!s)
@@ -2095,7 +2105,7 @@ function redactParticipantPii2(rawId) {
     const local = s.slice(0, atIdx).replace(/[^a-zA-Z0-9]/g, "");
     return `user:${(local.slice(0, 2) || "u").toLowerCase()}***`;
   }
-  if (PHONE_PII_RE2.test(s)) {
+  if (isPhoneShapedPii2(s)) {
     const digits = s.replace(/\D/g, "");
     return `user:phone_***${digits.slice(-2) || "00"}`;
   }
@@ -2593,22 +2603,54 @@ import { join as join4 } from "node:path";
 import { spawnSync } from "node:child_process";
 
 // src/profile-store.ts
-import { existsSync as existsSync2, writeFileSync, renameSync, copyFileSync, chmodSync, unlinkSync, statSync, readdirSync, readFileSync as readFileSync4 } from "fs";
+import {
+  lstatSync as lstatSync2,
+  writeFileSync,
+  renameSync,
+  copyFileSync,
+  chmodSync,
+  unlinkSync,
+  statSync,
+  readdirSync,
+  readFileSync as readFileSync4
+} from "fs";
 var defaultWarn = (m) => process.stderr.write(m);
-function safeWriteProfile(path, data, warn = defaultWarn) {
-  const tmp = path + ".tmp";
+var MAX_PROFILE_JSON_BYTES = 64 * 1024;
+function safeLstat2(target) {
   try {
-    if (existsSync2(tmp))
-      unlinkSync(tmp);
-  } catch (e) {
-    warn(`[agentchat] WARNING: stale ${tmp} could not be removed: ${e}
-`);
+    return lstatSync2(target);
+  } catch (err) {
+    if (err && err.code === "ENOENT")
+      return;
+    throw err;
   }
-  writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 384 });
+}
+function safeWriteProfile(path, data, warn = defaultWarn) {
+  const pathStat = safeLstat2(path);
+  if (pathStat?.isSymbolicLink()) {
+    throw new Error(`Refusing to write profile through symlink: ${path}`);
+  }
+  const tmp = path + ".tmp";
+  const tmpStat = safeLstat2(tmp);
+  if (tmpStat) {
+    try {
+      unlinkSync(tmp);
+    } catch (e) {
+      warn(`[agentchat] WARNING: stale ${tmp} could not be removed: ${e}
+`);
+    }
+  }
+  writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 384, flag: "wx" });
   try {
     renameSync(tmp, path);
   } catch (err) {
     if (process.platform === "win32" && (err?.code === "EPERM" || err?.code === "EACCES")) {
+      if (safeLstat2(path)?.isSymbolicLink()) {
+        try {
+          unlinkSync(tmp);
+        } catch {}
+        throw new Error(`Refusing to overwrite symlinked profile: ${path}`);
+      }
       copyFileSync(tmp, path);
       try {
         unlinkSync(tmp);
@@ -3784,23 +3826,55 @@ import { join as join12, dirname as dirname2 } from "path";
 import { fileURLToPath } from "url";
 
 // src/profile-store.ts
-import { existsSync as existsSync6, writeFileSync as writeFileSync2, renameSync as renameSync2, copyFileSync as copyFileSync2, chmodSync as chmodSync2, unlinkSync as unlinkSync4, statSync as statSync4, readdirSync as readdirSync4, readFileSync as readFileSync8 } from "fs";
+import {
+  lstatSync as lstatSync3,
+  writeFileSync as writeFileSync2,
+  renameSync as renameSync2,
+  copyFileSync as copyFileSync2,
+  chmodSync as chmodSync2,
+  unlinkSync as unlinkSync4,
+  statSync as statSync4,
+  readdirSync as readdirSync4,
+  readFileSync as readFileSync8
+} from "fs";
 import { join as join7, resolve as resolve2 } from "path";
 var defaultWarn2 = (m) => process.stderr.write(m);
-function safeWriteProfile2(path, data, warn = defaultWarn2) {
-  const tmp = path + ".tmp";
+var MAX_PROFILE_JSON_BYTES2 = 64 * 1024;
+function safeLstat3(target) {
   try {
-    if (existsSync6(tmp))
-      unlinkSync4(tmp);
-  } catch (e) {
-    warn(`[agentchat] WARNING: stale ${tmp} could not be removed: ${e}
-`);
+    return lstatSync3(target);
+  } catch (err) {
+    if (err && err.code === "ENOENT")
+      return;
+    throw err;
   }
-  writeFileSync2(tmp, JSON.stringify(data, null, 2), { mode: 384 });
+}
+function safeWriteProfile2(path, data, warn = defaultWarn2) {
+  const pathStat = safeLstat3(path);
+  if (pathStat?.isSymbolicLink()) {
+    throw new Error(`Refusing to write profile through symlink: ${path}`);
+  }
+  const tmp = path + ".tmp";
+  const tmpStat = safeLstat3(tmp);
+  if (tmpStat) {
+    try {
+      unlinkSync4(tmp);
+    } catch (e) {
+      warn(`[agentchat] WARNING: stale ${tmp} could not be removed: ${e}
+`);
+    }
+  }
+  writeFileSync2(tmp, JSON.stringify(data, null, 2), { mode: 384, flag: "wx" });
   try {
     renameSync2(tmp, path);
   } catch (err) {
     if (process.platform === "win32" && (err?.code === "EPERM" || err?.code === "EACCES")) {
+      if (safeLstat3(path)?.isSymbolicLink()) {
+        try {
+          unlinkSync4(tmp);
+        } catch {}
+        throw new Error(`Refusing to overwrite symlinked profile: ${path}`);
+      }
       copyFileSync2(tmp, path);
       try {
         unlinkSync4(tmp);
@@ -3839,8 +3913,12 @@ var NON_PROFILE_JSON_FILES2 = new Set([
   "config.json"
 ]);
 function findDefaultProfileCollision(configDir, defaultProfilePath) {
-  if (!defaultProfilePath || !existsSync6(defaultProfilePath))
+  if (!defaultProfilePath)
     return null;
+  const defStat = safeLstat3(defaultProfilePath);
+  if (!defStat || defStat.isSymbolicLink() || !defStat.isFile() || defStat.size > MAX_PROFILE_JSON_BYTES2) {
+    return null;
+  }
   let defParsed;
   try {
     defParsed = JSON.parse(readFileSync8(defaultProfilePath, "utf8"));
@@ -3855,7 +3933,8 @@ function findDefaultProfileCollision(configDir, defaultProfilePath) {
     return null;
   const resolvedDefault = resolve2(defaultProfilePath);
   for (const dir of [join7(configDir, "profiles"), configDir]) {
-    if (!existsSync6(dir))
+    const dirStat = safeLstat3(dir);
+    if (!dirStat || dirStat.isSymbolicLink() || !dirStat.isDirectory())
       continue;
     let files = [];
     try {
@@ -3872,6 +3951,10 @@ function findDefaultProfileCollision(configDir, defaultProfilePath) {
       const baseName = file.replace(/\.json$/, "");
       if (baseName.toLowerCase() === "profile")
         continue;
+      const candStat = safeLstat3(candidatePath);
+      if (!candStat || candStat.isSymbolicLink() || !candStat.isFile() || candStat.size > MAX_PROFILE_JSON_BYTES2) {
+        continue;
+      }
       let candidate;
       try {
         candidate = JSON.parse(readFileSync8(candidatePath, "utf8"));

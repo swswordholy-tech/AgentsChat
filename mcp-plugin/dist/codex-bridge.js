@@ -115,6 +115,8 @@ function prepareRuntimeHome(stateDir, source = process.env.CODEX_HOME || join(ho
 
 // src/redact.ts
 function redactSecrets(text, opts) {
+  if (typeof text !== "string" || !text)
+    return "";
   const step = opts?.preserveAcKeys ? text : text.replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***");
   return step.replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
 }
@@ -2046,22 +2048,54 @@ import { homedir as homedir5, tmpdir } from "node:os";
 import { join as join8 } from "node:path";
 
 // src/profile-store.ts
-import { existsSync as existsSync4, writeFileSync as writeFileSync3, renameSync as renameSync3, copyFileSync, chmodSync as chmodSync2, unlinkSync as unlinkSync2, statSync as statSync2, readdirSync as readdirSync3, readFileSync as readFileSync7 } from "fs";
+import {
+  lstatSync as lstatSync4,
+  writeFileSync as writeFileSync3,
+  renameSync as renameSync3,
+  copyFileSync,
+  chmodSync as chmodSync2,
+  unlinkSync as unlinkSync2,
+  statSync as statSync2,
+  readdirSync as readdirSync3,
+  readFileSync as readFileSync7
+} from "fs";
 var defaultWarn = (m) => process.stderr.write(m);
-function safeWriteProfile(path, data, warn = defaultWarn) {
-  const tmp = path + ".tmp";
+var MAX_PROFILE_JSON_BYTES = 64 * 1024;
+function safeLstat(target) {
   try {
-    if (existsSync4(tmp))
-      unlinkSync2(tmp);
-  } catch (e) {
-    warn(`[agentchat] WARNING: stale ${tmp} could not be removed: ${e}
-`);
+    return lstatSync4(target);
+  } catch (err) {
+    if (err && err.code === "ENOENT")
+      return;
+    throw err;
   }
-  writeFileSync3(tmp, JSON.stringify(data, null, 2), { mode: 384 });
+}
+function safeWriteProfile(path, data, warn = defaultWarn) {
+  const pathStat = safeLstat(path);
+  if (pathStat?.isSymbolicLink()) {
+    throw new Error(`Refusing to write profile through symlink: ${path}`);
+  }
+  const tmp = path + ".tmp";
+  const tmpStat = safeLstat(tmp);
+  if (tmpStat) {
+    try {
+      unlinkSync2(tmp);
+    } catch (e) {
+      warn(`[agentchat] WARNING: stale ${tmp} could not be removed: ${e}
+`);
+    }
+  }
+  writeFileSync3(tmp, JSON.stringify(data, null, 2), { mode: 384, flag: "wx" });
   try {
     renameSync3(tmp, path);
   } catch (err) {
     if (process.platform === "win32" && (err?.code === "EPERM" || err?.code === "EACCES")) {
+      if (safeLstat(path)?.isSymbolicLink()) {
+        try {
+          unlinkSync2(tmp);
+        } catch {}
+        throw new Error(`Refusing to overwrite symlinked profile: ${path}`);
+      }
       copyFileSync(tmp, path);
       try {
         unlinkSync2(tmp);

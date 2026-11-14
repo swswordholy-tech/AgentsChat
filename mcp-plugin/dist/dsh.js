@@ -714,6 +714,7 @@ import { closeSync, existsSync as existsSync2, mkdirSync as mkdirSync2, openSync
 import { join as join2 } from "node:path";
 
 // src/profile-store.ts
+var MAX_PROFILE_JSON_BYTES = 64 * 1024;
 var NON_PROFILE_JSON_FILES = new Set([
   "session-binds.json",
   "agy-binds.json",

@@ -15,33 +15,68 @@
  *    bare `catch {}` — the key could sit world-readable with nothing said. Never swallow
  *    it, and verify the result instead of assuming it took.
  */
-import { existsSync, writeFileSync, renameSync, copyFileSync, chmodSync, unlinkSync, statSync, readdirSync, readFileSync } from "fs";
+import {
+  existsSync,
+  lstatSync,
+  writeFileSync,
+  renameSync,
+  copyFileSync,
+  chmodSync,
+  unlinkSync,
+  statSync,
+  readdirSync,
+  readFileSync,
+  type Stats,
+} from "fs";
 import { join, resolve } from "path";
 
 /** Where diagnostics go. Injectable so tests can assert on them. */
 export type Warn = (message: string) => void;
 
 const defaultWarn: Warn = (m) => process.stderr.write(m);
+const MAX_PROFILE_JSON_BYTES = 64 * 1024;
+
+function safeLstat(target: string): Stats | undefined {
+  try {
+    return lstatSync(target);
+  } catch (err: any) {
+    if (err && err.code === "ENOENT") return undefined;
+    throw err;
+  }
+}
 
 export function safeWriteProfile(path: string, data: unknown, warn: Warn = defaultWarn): void {
-  const tmp = path + ".tmp";
-
-  // Residue from an earlier crash would keep its own (possibly 0644) permissions.
-  try {
-    if (existsSync(tmp)) unlinkSync(tmp);
-  } catch (e) {
-    warn(`[agentchat] WARNING: stale ${tmp} could not be removed: ${e}\n`);
+  const pathStat = safeLstat(path);
+  if (pathStat?.isSymbolicLink()) {
+    throw new Error(`Refusing to write profile through symlink: ${path}`);
   }
 
-  // Created fresh → `mode` actually applies, so the key is 0600 from the instant it exists.
-  writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600 });
+  const tmp = path + ".tmp";
+
+  // Residue from an earlier crash (including dangling symlinks where existsSync is false!)
+  // must be unlinked via lstatSync first so exclusive create (`wx`) always starts fresh at 0600.
+  const tmpStat = safeLstat(tmp);
+  if (tmpStat) {
+    try {
+      unlinkSync(tmp);
+    } catch (e) {
+      warn(`[agentchat] WARNING: stale ${tmp} could not be removed: ${e}\n`);
+    }
+  }
+
+  // Created fresh with exclusive `wx` → refuses symlinks/races and guarantees mode 0600 from instant of creation.
+  writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600, flag: "wx" });
   try {
     renameSync(tmp, path);
   } catch (err: any) {
     if (process.platform === "win32" && (err?.code === "EPERM" || err?.code === "EACCES")) {
       // On Windows NTFS, antivirus or search indexers can momentarily hold `path` open,
       // causing atomic MoveFileEx to return EPERM/EACCES. Fall back to copy+unlink when
-      // `path` is not a directory (`copyFileSync` still throws on directories).
+      // `path` is not a symlink or directory.
+      if (safeLstat(path)?.isSymbolicLink()) {
+        try { unlinkSync(tmp); } catch {}
+        throw new Error(`Refusing to overwrite symlinked profile: ${path}`);
+      }
       copyFileSync(tmp, path);
       try {
         unlinkSync(tmp);
@@ -100,7 +135,11 @@ export function findDefaultProfileCollision(
   configDir: string,
   defaultProfilePath: string,
 ): DefaultProfileCollision | null {
-  if (!defaultProfilePath || !existsSync(defaultProfilePath)) return null;
+  if (!defaultProfilePath) return null;
+  const defStat = safeLstat(defaultProfilePath);
+  if (!defStat || defStat.isSymbolicLink() || !defStat.isFile() || defStat.size > MAX_PROFILE_JSON_BYTES) {
+    return null;
+  }
   let defParsed: { agent_id?: unknown; display_name?: unknown; token?: unknown };
   try {
     defParsed = JSON.parse(readFileSync(defaultProfilePath, "utf8"));
@@ -115,7 +154,8 @@ export function findDefaultProfileCollision(
 
   const resolvedDefault = resolve(defaultProfilePath);
   for (const dir of [join(configDir, "profiles"), configDir]) {
-    if (!existsSync(dir)) continue;
+    const dirStat = safeLstat(dir);
+    if (!dirStat || dirStat.isSymbolicLink() || !dirStat.isDirectory()) continue;
     let files: string[] = [];
     try {
       files = readdirSync(dir).filter((f) => f.endsWith(".json"));
@@ -129,6 +169,10 @@ export function findDefaultProfileCollision(
       const baseName = file.replace(/\.json$/, "");
       if (baseName.toLowerCase() === "profile") continue;
 
+      const candStat = safeLstat(candidatePath);
+      if (!candStat || candStat.isSymbolicLink() || !candStat.isFile() || candStat.size > MAX_PROFILE_JSON_BYTES) {
+        continue;
+      }
       let candidate: { agent_id?: unknown; display_name?: unknown; token?: unknown };
       try {
         candidate = JSON.parse(readFileSync(candidatePath, "utf8"));

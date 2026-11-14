@@ -15,13 +15,18 @@ export interface RedactOptions {
 }
 
 export function redactSecrets(text: string, opts?: RedactOptions): string {
+  if (typeof text !== "string" || !text) return "";
   const step = opts?.preserveAcKeys
     ? text
     : text.replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***");
   return step.replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
 }
 
-const PHONE_PII_RE = /^\+?\d[\d\s()-]{5,}$/;
+const PHONE_PII_RE = /^\+?\d[\d\s()-]{5,}[\d)]$/;
+
+function isPhoneShapedPii(s: string): boolean {
+  return PHONE_PII_RE.test(s) && s.replace(/\D/g, "").length >= 7;
+}
 
 /**
  * True when an identifier looks like a human login email or phone number
@@ -31,7 +36,7 @@ export function isHumanPiiHandle(rawId: unknown): boolean {
   const s = String(rawId ?? "").trim();
   if (!s) return false;
   if (s.includes("@")) return true;
-  if (PHONE_PII_RE.test(s)) return true;
+  if (isPhoneShapedPii(s)) return true;
   return false;
 }
 
@@ -48,7 +53,7 @@ export function redactParticipantPii(rawId: unknown): string {
     const local = s.slice(0, atIdx).replace(/[^a-zA-Z0-9]/g, "");
     return `user:${(local.slice(0, 2) || "u").toLowerCase()}***`;
   }
-  if (PHONE_PII_RE.test(s)) {
+  if (isPhoneShapedPii(s)) {
     const digits = s.replace(/\D/g, "");
     return `user:phone_***${digits.slice(-2) || "00"}`;
   }

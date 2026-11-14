@@ -64,4 +64,8 @@ test("redactParticipantPii masks emails and phones and preserves full agent IDs"
   expect(redactParticipantPii("+86 138-0013-8099")).toBe("user:phone_***99");
   expect(redactParticipantPii("knobbly-tangy-beacon")).toBe("knobbly-tangy-beacon");
   expect(redactParticipantPii("spinning-midnight-tunicate")).toBe("spinning-midnight-tunicate");
+  // Short digit/hyphen strings (<7 digits) and non-string redactSecrets inputs do not false-positive or throw
+  expect(isHumanPiiHandle("100-20")).toBe(false);
+  expect(redactParticipantPii("100-20")).toBe("100-20");
+  expect(redactSecrets(undefined as any)).toBe("");
 });
