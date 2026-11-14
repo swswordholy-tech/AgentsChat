@@ -16,7 +16,8 @@
  *    any message arriving at/after `__init_ts__` is delivered immediately without
  *    being swallowed by cold-start seeding.
  */
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { matchesMention } from "./mentions.ts";
 import { safeWriteProfile } from "./profile-store.ts";
@@ -63,6 +64,18 @@ const MAX_SSE_STREAMS = 3;
 const MAX_SSE_LINE_CHARS = 512 * 1024;
 const MAX_SEEN_IDS = 200;
 const DEFAULT_HTTP_TIMEOUT_MS = 15_000;
+export const MAX_TIMER_MS = 2_147_483_647;
+const MAX_STATE_FILE_BYTES = 1_048_576;
+const MAX_PID_FILE_BYTES = 64 * 1024;
+const DIRECT_CHANNEL_RE = /^dm[-:]/i;
+const PROTOTYPE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+export function clampTimerMs(raw: unknown, fallback: number, minMs = 0): number {
+  if (typeof raw !== "number" || !Number.isFinite(raw)) return fallback;
+  const floored = Math.floor(raw);
+  if (floored < minMs) return fallback;
+  return Math.min(MAX_TIMER_MS, floored);
+}
 
 async function fetchWithDeadline(
   f: typeof fetch,
@@ -81,13 +94,17 @@ async function fetchWithDeadline(
   if (parentSignal) {
     parentSignal.addEventListener("abort", onParentAbort, { once: true });
   }
+  const safeTimeoutMs =
+    typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? Math.min(MAX_TIMER_MS, Math.floor(timeoutMs))
+      : 0;
   const timer =
-    timeoutMs > 0
+    safeTimeoutMs > 0
       ? setTimeout(() => {
-          const err = new Error(`HTTP request timed out after ${timeoutMs}ms`);
+          const err = new Error(`HTTP request timed out after ${safeTimeoutMs}ms`);
           err.name = "TimeoutError";
           ctrl.abort(err);
-        }, timeoutMs)
+        }, safeTimeoutMs)
       : null;
   timer?.unref?.();
   try {
@@ -158,9 +175,10 @@ export interface WakeOnceEvent {
   should_rearm?: boolean;
 }
 
-function loadSeenIds(file: string): string[] {
-  if (!existsSync(file)) return [];
+export function loadSeenIds(file: string): string[] {
   try {
+    const stat = lstatSync(file);
+    if (stat.isSymbolicLink() || !stat.isFile() || stat.size > MAX_STATE_FILE_BYTES) return [];
     const parsed = JSON.parse(readFileSync(file, "utf8"));
     return Array.isArray(parsed) ? parsed.filter((x) => typeof x === "string") : [];
   } catch {
@@ -176,15 +194,73 @@ function saveSeenIds(file: string, ids: Iterable<string>): void {
   } catch {}
 }
 
-function loadJsonMap(file: string): Record<string, string> {
-  if (!existsSync(file)) return {};
+export function loadJsonMap(file: string): Record<string, string> {
+  const out: Record<string, string> = Object.create(null);
   try {
+    const stat = lstatSync(file);
+    if (stat.isSymbolicLink() || !stat.isFile() || stat.size > MAX_STATE_FILE_BYTES) return out;
     const raw = JSON.parse(readFileSync(file, "utf8"));
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
-    return raw as Record<string, string>;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+    for (const [k, v] of Object.entries(raw)) {
+      if (!k || PROTOTYPE_KEYS.has(k.toLowerCase()) || typeof v !== "string") continue;
+      out[k] = v;
+    }
+    return out;
   } catch {
-    return {};
+    return out;
   }
+}
+
+export function acquireWakePidFile(
+  wakePidFile: string,
+  pid = process.pid,
+  killFn: (targetPid: number, sig: NodeJS.Signals) => unknown = process.kill,
+): boolean {
+  let tmp = "";
+  let created = false;
+  try {
+    const dirStat = lstatSync(dirname(wakePidFile));
+    if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) return false;
+    try {
+      const existing = lstatSync(wakePidFile);
+      if (existing.isSymbolicLink() || !existing.isFile()) return false;
+      if (existing.size <= MAX_PID_FILE_BYTES) {
+        const raw = readFileSync(wakePidFile, "utf8").trim();
+        if (/^\d+$/.test(raw)) {
+          const oldPid = Number(raw);
+          if (Number.isSafeInteger(oldPid) && oldPid > 1 && oldPid !== pid) {
+            try {
+              killFn(oldPid, "SIGTERM");
+            } catch {}
+          }
+        }
+      }
+    } catch (e: any) {
+      if (e?.code !== "ENOENT") return false;
+    }
+    tmp = `${wakePidFile}.${pid}.${randomBytes(4).toString("hex")}.tmp`;
+    writeFileSync(tmp, `${pid}\n`, { mode: 0o600, flag: "wx" });
+    created = true;
+    renameSync(tmp, wakePidFile);
+    return true;
+  } catch {
+    if (created && tmp) {
+      try {
+        unlinkSync(tmp);
+      } catch {}
+    }
+    return false;
+  }
+}
+
+export function releaseWakePidFile(wakePidFile: string, pid = process.pid): void {
+  try {
+    const stat = lstatSync(wakePidFile);
+    if (stat.isSymbolicLink() || !stat.isFile() || stat.size > MAX_PID_FILE_BYTES) return;
+    if (readFileSync(wakePidFile, "utf8").trim() === String(pid)) {
+      unlinkSync(wakePidFile);
+    }
+  } catch {}
 }
 
 function saveJsonMap(file: string, data: Record<string, string>): void {
@@ -385,7 +461,7 @@ export function isMessageAddressedToAgent(
   if (isOwnLoopTick) return true;
 
   const channelId = String(msg.channel_id || "");
-  if (channelId.startsWith("dm-")) return true;
+  if (DIRECT_CHANNEL_RE.test(channelId)) return true;
   if (Array.isArray(msg.mentioned_ids) && msg.mentioned_ids.includes(agentId)) return true;
   const content = String(msg.content || "");
   if (matchesMention(content, agentId)) return true;
@@ -419,15 +495,14 @@ export async function wakeOnce(opts: {
   const nowIso = opts.nowIso ?? (() => new Date().toISOString());
   const baseUrl = opts.restUrl.replace(/\/$/, "");
   const { configDir, agentId, displayName, token } = opts;
-  const timeoutMs = opts.timeoutMs !== undefined && Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : 240_000;
-  const requestTimeoutMs =
-    opts.requestTimeoutMs !== undefined && Number.isFinite(opts.requestTimeoutMs) && opts.requestTimeoutMs >= 0
-      ? opts.requestTimeoutMs
-      : DEFAULT_HTTP_TIMEOUT_MS;
-  const pollIntervalMs =
-    opts.pollIntervalMs !== undefined && Number.isFinite(opts.pollIntervalMs) && opts.pollIntervalMs >= 10
-      ? Math.floor(opts.pollIntervalMs)
-      : 15_000;
+  const timeoutMs =
+    opts.timeoutMs !== undefined && Number.isFinite(opts.timeoutMs)
+      ? opts.timeoutMs > 0
+        ? Math.min(MAX_TIMER_MS, Math.floor(opts.timeoutMs))
+        : 0
+      : 240_000;
+  const requestTimeoutMs = clampTimerMs(opts.requestTimeoutMs, DEFAULT_HTTP_TIMEOUT_MS, 0);
+  const pollIntervalMs = clampTimerMs(opts.pollIntervalMs, 15_000, 10);
   const enableSse = opts.enableSse ?? true;
 
   mkdirSync(configDir, { recursive: true });
@@ -440,18 +515,7 @@ export async function wakeOnce(opts: {
 
   // When running against live network (not unit test mock fetch), ensure at most one wake-once listener per agent
   if (!opts.fetchImpl) {
-    try {
-      if (existsSync(wakePidFile)) {
-        const oldPid = parseInt(readFileSync(wakePidFile, "utf-8").trim(), 10);
-        if (Number.isFinite(oldPid) && oldPid > 1 && oldPid !== process.pid) {
-          try {
-            process.kill(oldPid, "SIGTERM");
-          } catch {}
-        }
-      }
-      writeFileSync(wakePidFile, `${process.pid}\n`, { mode: 0o600 });
-      wrotePidFile = true;
-    } catch {}
+    wrotePidFile = acquireWakePidFile(wakePidFile);
   }
 
   const cursor = loadCursor(lastSeenFile, warn);
@@ -508,7 +572,7 @@ export async function wakeOnce(opts: {
   const abortCtrl = new AbortController();
 
   async function buildGroupContextPrefix(channelId: string, triggerMsgId: string, triggerTs: string): Promise<string> {
-    if (channelId.startsWith("dm-")) return "";
+    if (DIRECT_CHANNEL_RE.test(channelId)) return "";
     const mentionMap = loadJsonMap(mentionTsFile);
     const mentionKey = `${agentId}:${channelId}`;
     const lastTs = mentionMap[mentionKey] || mentionMap[channelId] || "";
@@ -534,6 +598,8 @@ export async function wakeOnce(opts: {
             .join("\n");
           prefix = `[频道上下文 - 最近 ${trimmed.length} 条消息]\n${context}\n\n[你被 @mention 了，请回复]\n`;
         }
+      } else {
+        await res.body?.cancel().catch(() => {});
       }
     } catch {}
     if (triggerTs) {
@@ -695,11 +761,7 @@ export async function wakeOnce(opts: {
       if (pollTimer) clearInterval(pollTimer);
       if (timeoutTimer) clearTimeout(timeoutTimer);
       if (wrotePidFile) {
-        try {
-          if (existsSync(wakePidFile) && readFileSync(wakePidFile, "utf-8").trim() === String(process.pid)) {
-            unlinkSync(wakePidFile);
-          }
-        } catch {}
+        releaseWakePidFile(wakePidFile);
       }
       try {
         abortCtrl.abort();
@@ -818,6 +880,8 @@ export async function wakeOnce(opts: {
               channelList.push({ id: ch.id, last_message_at: ch.last_message_at });
             }
           }
+        } else {
+          await mineRes.body?.cancel().catch(() => {});
         }
         for (const extra of opts.channels ?? []) {
           if (extra && !seenCh.has(extra)) {
@@ -828,8 +892,8 @@ export async function wakeOnce(opts: {
 
         // Prioritize DMs first for SSE slots, then explicit channels
         const sortedForSse = [...channelList].sort((a, b) => {
-          const aDm = a.id.startsWith("dm-") ? 0 : 1;
-          const bDm = b.id.startsWith("dm-") ? 0 : 1;
+          const aDm = DIRECT_CHANNEL_RE.test(a.id) ? 0 : 1;
+          const bDm = DIRECT_CHANNEL_RE.test(b.id) ? 0 : 1;
           return aDm - bDm;
         });
         for (const ch of sortedForSse) {
@@ -859,7 +923,10 @@ export async function wakeOnce(opts: {
             requestTimeoutMs,
             abortCtrl.signal,
           );
-          if (!msgRes.ok) continue;
+          if (!msgRes.ok) {
+            await msgRes.body?.cancel().catch(() => {});
+            continue;
+          }
           initialSyncedChannels.add(ch.id);
           const msgData = (await msgRes.json()) as { messages?: any[] };
           const wakeEv = await inspectChannelMessages(ch.id, msgData.messages || []);

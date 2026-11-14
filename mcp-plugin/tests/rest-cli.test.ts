@@ -1,13 +1,27 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
+  acquireWakePidFile,
+  clampTimerMs,
   CURSOR_INIT_KEY,
   CURSOR_LAST_ACTIVE_KEY,
   CURSOR_MAX_IDLE_KEY,
+  isMessageAddressedToAgent,
   joinChannelRest,
+  loadJsonMap,
+  loadSeenIds,
+  MAX_TIMER_MS,
   parseMaxIdleMs,
+  releaseWakePidFile,
   sendRestMessage,
   wakeOnce,
 } from "../src/rest-cli.ts";
@@ -657,6 +671,140 @@ describe("rest-cli (--join, --send, --wake-once) & unified per-channel cursor", 
 
       const seeded = loadCursor(cursorFileForAgent(dir, "user:bot@c92"), () => {});
       expect(seeded.get("general")).toBe("2026-11-14T15:00:00.500Z");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("Campaign #107 KR3: 32-bit timer overflow clamping, lstatSync/wx PID & JSON map symlink/prototype guards, DM-/dm: direct-channel parity, and !ok stream cleanup", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "rest-cli-c107-"));
+    try {
+      // 1. clampTimerMs prevents >2^31-1 overflow & NaN
+      expect(clampTimerMs(Number.NaN, 15_000, 10)).toBe(15_000);
+      expect(clampTimerMs(5, 15_000, 10)).toBe(15_000);
+      expect(clampTimerMs(3_000_000_000, 15_000, 10)).toBe(MAX_TIMER_MS);
+
+      // 2. loadSeenIds & loadJsonMap reject symlinks, directories, >1MiB files, and prototype keys
+      const targetJson = join(dir, "real.json");
+      writeFileSync(targetJson, JSON.stringify(["seen-1"]));
+      const symlinkJson = join(dir, "link.json");
+      symlinkSync(targetJson, symlinkJson);
+      expect(loadSeenIds(symlinkJson)).toEqual([]);
+      expect(loadSeenIds(dir)).toEqual([]);
+
+      const mapFile = join(dir, "map.json");
+      writeFileSync(
+        mapFile,
+        '{"__proto__":{"polluted":true},"constructor":"bad","ok:room":"2026-11-15T00:00:00Z","num":123}',
+      );
+      const mapLink = join(dir, "map-link.json");
+      symlinkSync(mapFile, mapLink);
+      expect(Object.keys(loadJsonMap(mapLink))).toEqual([]);
+      const loadedMap = loadJsonMap(mapFile);
+      expect(Object.getPrototypeOf(loadedMap)).toBeNull();
+      expect(({} as any).polluted).toBeUndefined();
+      expect(Object.keys(loadedMap)).toEqual(["ok:room"]);
+
+      // 3. acquireWakePidFile / releaseWakePidFile refuse symlinks & garbage PIDs and unlink only owned PID
+      const victim = join(dir, "victim.txt");
+      writeFileSync(victim, "keep-me");
+      const pidLink = join(dir, "wake-link.pid");
+      symlinkSync(victim, pidLink);
+      const killed: number[] = [];
+      expect(acquireWakePidFile(pidLink, 4242, (p) => killed.push(p))).toBe(false);
+      expect(readFileSync(victim, "utf8")).toBe("keep-me");
+      releaseWakePidFile(pidLink, 4242);
+      expect(readFileSync(victim, "utf8")).toBe("keep-me");
+
+      const realPidFile = join(dir, "wake-real.pid");
+      writeFileSync(realPidFile, "999abc\n");
+      expect(acquireWakePidFile(realPidFile, 4242, (p) => killed.push(p))).toBe(true);
+      expect(killed).toEqual([]); // garbage PID must not be parsed via parseInt("999abc") -> 999
+      expect(readFileSync(realPidFile, "utf8").trim()).toBe("4242");
+
+      // Valid numeric prior PID triggers SIGTERM once and replaces atomically
+      expect(acquireWakePidFile(realPidFile, 5353, (p) => killed.push(p))).toBe(true);
+      expect(killed).toEqual([4242]);
+      releaseWakePidFile(realPidFile, 4242); // wrong owner -> preserved
+      expect(readFileSync(realPidFile, "utf8").trim()).toBe("5353");
+      releaseWakePidFile(realPidFile, 5353); // matching owner -> removed
+      expect(loadSeenIds(realPidFile)).toEqual([]);
+
+      // 4. Case-insensitive DM- / dm: channels + >2^31-1 timeoutMs does NOT fire 1ms idle_timeout + !ok body streams cancel
+      expect(
+        isMessageAddressedToAgent(
+          { channel_id: "DM-UPPER-1", sender_id: "alice", content: "hi" },
+          "bot-c107",
+        ),
+      ).toBe(true);
+      expect(
+        isMessageAddressedToAgent(
+          { channel_id: "dm:colon-1", sender_id: "alice", content: "hi" },
+          "bot-c107",
+        ),
+      ).toBe(true);
+
+      let cancelledStreams = 0;
+      let mineAttempt = 0;
+      const makeErrorResponse = (status: number) =>
+        new Response(
+          new ReadableStream({
+            start(c) {
+              c.enqueue(new TextEncoder().encode("err"));
+            },
+            cancel() {
+              cancelledStreams++;
+            },
+          }),
+          { status },
+        );
+
+      const wakeEv = await wakeOnce({
+        restUrl: "https://agents-chat.com",
+        configDir: dir,
+        agentId: "bot-c107",
+        token: "ac_test_token_123456",
+        timeoutMs: 3_000_000_000, // > 2^31-1: must clamp, NOT wrap to 1ms idle_timeout!
+        requestTimeoutMs: 3_000_000_000,
+        pollIntervalMs: 15,
+        enableSse: false,
+        nowIso: () => "2026-11-15T00:00:00.000Z",
+        fetchImpl: (async (url: any) => {
+          const u = String(url);
+          if (u.endsWith("/api/channels/mine")) {
+            mineAttempt++;
+            if (mineAttempt === 1) return makeErrorResponse(502);
+            return Response.json({
+              channels: [
+                { id: "flaky-room", last_message_at: "2026-11-15T00:00:01.000Z" },
+                { id: "DM-UPPER-1", last_message_at: "2026-11-15T00:00:02.000Z" },
+              ],
+            });
+          }
+          if (u.includes("/api/channels/flaky-room/messages")) {
+            return makeErrorResponse(500);
+          }
+          if (u.includes("/api/channels/DM-UPPER-1/messages")) {
+            return Response.json({
+              messages: [
+                {
+                  id: "dm-upper-msg-1",
+                  channel_id: "DM-UPPER-1",
+                  sender_id: "owner",
+                  content: "uppercase DM wakes cleanly",
+                  timestamp: "2026-11-15T00:00:02.000Z",
+                },
+              ],
+            });
+          }
+          return Response.json({ messages: [] });
+        }) as any,
+      });
+
+      expect(wakeEv.event).toBe("agentschat_wake");
+      expect(wakeEv.channel_id).toBe("DM-UPPER-1");
+      expect(wakeEv.message_id).toBe("dm-upper-msg-1");
+      expect(cancelledStreams).toBe(2);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
