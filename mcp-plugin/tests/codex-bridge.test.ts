@@ -3,8 +3,9 @@
  * Goal: exercise disk state and actual WS/HTTP/stdio boundaries, including ambiguous delivery.
  * Migration: retain with the Codex bridge; fake only the external hub and model process.
  */
-import { test, expect, afterEach } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, chmodSync, realpathSync, existsSync, symlinkSync, lstatSync, readdirSync, truncateSync } from "node:fs";
+import { test, expect, afterEach, spyOn } from "bun:test";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, chmodSync, realpathSync, existsSync, symlinkSync, lstatSync, readdirSync, truncateSync, renameSync } from "node:fs";
+import * as fs from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
@@ -816,5 +817,114 @@ test("empty token redaction preserves text and channel lookup ignores inherited 
     for (const key of ["__proto__", "CONSTRUCTOR", "prototype"]) await expect(bridge.prepareChannel(key)).rejects.toThrow("Invalid channel");
     expect((await bridge.prepareChannel("toString")).thread).toBe("new-thread");
     expect(existing).toBeUndefined();
+  } finally { await bridge.stop(); }
+});
+
+test("state root rejects directories replaced with symlinks and non-directories before startup writes", () => {
+  for (const kind of ["symlink", "dangling", "file"]) {
+    const { c, root } = fixture();
+    const target = join(root, "external");
+    c.stateDir = join(root, "state");
+    if (kind === "file") writeFileSync(c.stateDir, "preserve");
+    else {
+      if (kind === "symlink") mkdirSync(target);
+      symlinkSync(target, c.stateDir);
+    }
+    expect(() => ownedBridge(c, { thread: async () => "t", generate: async () => "ok" }, async () => {}, () => {})).toThrow("Unsafe bridge state directory");
+    if (kind === "symlink") expect(readdirSync(target)).toEqual([]);
+    if (kind === "dangling") expect(existsSync(target)).toBe(false);
+    if (kind === "file") expect(readFileSync(c.stateDir, "utf8")).toBe("preserve");
+  }
+});
+
+test("snapshot checks the state root before writing and again before renaming", async () => {
+  for (const phase of ["before-write", "before-rename"]) {
+    const { c, root } = fixture();
+    const bridge = ownedBridge(c, { thread: async () => "t", generate: async () => "ok" }, async () => {}, () => {});
+    const moved = `${c.stateDir}-moved`, target = join(root, "external");
+    mkdirSync(target); writeFileSync(join(target, "state.json"), "preserve");
+    const swap = () => { renameSync(c.stateDir, moved); symlinkSync(target, c.stateDir); };
+    const write = fs.writeFileSync;
+    const spy = phase === "before-rename" ? spyOn(fs, "writeFileSync").mockImplementation(((...args: any[]) => {
+      const result = (write as any)(...args);
+      if (String(args[0]).includes("state.json.tmp.")) swap();
+      return result;
+    }) as any) : undefined;
+    try {
+      if (phase === "before-write") swap();
+      expect(() => (bridge as any).save()).toThrow("Unsafe bridge state directory");
+      expect(readdirSync(target)).toEqual(["state.json"]);
+      expect(readFileSync(join(target, "state.json"), "utf8")).toBe("preserve");
+    } finally {
+      spy?.mockRestore(); rmSync(c.stateDir); renameSync(moved, c.stateDir); await bridge.stop();
+    }
+  }
+});
+
+test("malformed durable entries fail closed and release the bridge lock without rewriting history", () => {
+  const valid = { message: message(), status: "pending" };
+  const invalid = [null, [], "entry", {}, { ...valid, status: "unknown" },
+    ...[null, [], {}, { ...message(), content: 42 }].map(m => ({ ...valid, message: m })),
+    ...["id", "channel_id", "sender_id"].flatMap(field => ["", " \t", "bad\0id", "constructor"].map(value => ({ ...valid, message: { ...message(), [field]: value } })))];
+  for (const entry of invalid) {
+    const { c } = fixture(); mkdirSync(c.stateDir, { recursive: true });
+    const file = join(c.stateDir, "state.json"), original = JSON.stringify({ version: 1, threads: {}, entries: [valid, entry] });
+    writeFileSync(file, original);
+    expect(() => ownedBridge(c, { thread: async () => "t", generate: async () => "ok" }, async () => {}, () => {})).toThrow("Cannot load bridge state");
+    expect(existsSync(join(c.stateDir, "bridge.lock"))).toBe(false);
+    expect(readFileSync(file, "utf8")).toBe(original);
+  }
+});
+
+test("all valid durable statuses including empty terminal content retain recovery semantics", async () => {
+  const { c } = fixture(); mkdirSync(c.stateDir, { recursive: true });
+  const statuses = ["pending", "running", "ready", "sending", "sent", "failed", "uncertain", "blocked", "skipped"];
+  writeFileSync(join(c.stateDir, "state.json"), JSON.stringify({ version: 1, threads: {}, entries: statuses.map((status, i) => ({ message: { ...message(String(i)), content: "" }, status })) }));
+  const bridge = ownedBridge(c, { thread: async () => "t", generate: async () => "ok" }, async () => {}, () => {});
+  try {
+    expect((bridge as any).state.entries.map((e: any) => e.status)).toEqual(["pending", "failed", "ready", "uncertain", "sent", "failed", "uncertain", "blocked", "skipped"]);
+  } finally { await bridge.stop(); }
+});
+
+test("addressed and accept reject controls and prototype keys in each routing ID before persistence", async () => {
+  const { c } = fixture();
+  const bridge = ownedBridge(c, { thread: async () => "t", generate: async () => "ok" }, async () => {}, () => {});
+  const original = readFileSync(join(c.stateDir, "state.json"), "utf8");
+  try {
+    for (const field of ["id", "channel_id", "sender_id"]) {
+      for (const value of ["__proto__", "constructor", "prototype", "__PROTO__", "Constructor", "PROTOTYPE", ...Array.from({ length: 32 }, (_, i) => `dm-a${String.fromCharCode(i)}b`), "dm-a\x7fb"]) {
+        const raw = { ...message(), [field]: value, mentions: [c.agentId] };
+        expect(addressed(raw, c)).toBe(false); expect(bridge.accept(raw)).toBe(false);
+      }
+    }
+    expect(readFileSync(join(c.stateDir, "state.json"), "utf8")).toBe(original);
+  } finally { await bridge.stop(); }
+});
+
+test("mention arrays require at most 128 strings even on directly addressed DMs", async () => {
+  const { c } = fixture();
+  const bridge = ownedBridge(c, { thread: async () => "t", generate: async () => "ok" }, async () => {}, () => {});
+  try {
+    for (const field of ["mentions", "mentioned_ids"]) {
+      for (const value of [null, "project", {}, [c.agentId, null], [c.agentId, 1], Array(129).fill(c.agentId), Array(2)]) {
+        const raw = { ...message(), [field]: value };
+        expect(addressed(raw, c)).toBe(false); expect(bridge.accept(raw)).toBe(false);
+      }
+      const raw = { ...message(field), [field]: Array(128).fill(c.agentId) };
+      expect(addressed(raw, c)).toBe(true); expect(bridge.accept(raw)).toBe(true); await bridge.drain();
+      expect((bridge as any).state.entries.find((e: any) => e.message.id === field).message[field]).toHaveLength(128);
+    }
+  } finally { await bridge.stop(); }
+});
+
+test("busy retry timer is unreferenced and cleared by stop", async () => {
+  const { c } = fixture();
+  const bridge = ownedBridge(c, { thread: async () => { throw new ThreadBusyError(); }, generate: async () => "unused" }, async () => {}, () => {});
+  try {
+    expect(bridge.accept(message())).toBe(true); await bridge.drain();
+    const timer = (bridge as any).retry;
+    expect(timer).toBeDefined(); expect(timer.hasRef()).toBe(false);
+    expect((bridge as any).state.entries[0].status).toBe("pending");
+    await bridge.stop(); expect((bridge as any).retry).toBeUndefined();
   } finally { await bridge.stop(); }
 });
