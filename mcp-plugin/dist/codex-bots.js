@@ -1103,13 +1103,13 @@ function loadBots(file = defaultRegistry(), home = homedir2()) {
   }
   const object = (x) => x && typeof x === "object" && !Array.isArray(x);
   const fields = (x, keys) => {
-    if (!object(x) || Object.keys(x).some((k) => !keys.includes(k)))
+    if (!object(x) || Object.getOwnPropertyNames(x).some((k) => !keys.includes(k)))
       throw new Error("Unknown or invalid bot registry field");
   };
   const text = (x) => typeof x === "string" && x.trim().length > 0 && !/[\x00-\x1f\x7f]/.test(x);
   const reserved = (s) => ["__proto__", "constructor", "prototype"].includes(s.toLowerCase());
   fields(doc, ["version", "default_workdir", "codex_bin", "bots"]);
-  if (doc.version !== 1 || !Array.isArray(doc.bots))
+  if (doc.version !== 1 || !Array.isArray(doc.bots) || doc.bots.length > 128)
     throw new Error("Registry requires version 1 and bots array");
   for (const k of ["default_workdir", "codex_bin"])
     if (doc[k] !== undefined && !text(doc[k]))
@@ -1132,9 +1132,19 @@ function loadBots(file = defaultRegistry(), home = homedir2()) {
     if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/.test(bot.profile) || bot.profile.includes("..") || reserved(bot.profile) || reserved(bot.profile.replace(/\.json$/i, ""))) {
       throw new Error(`Bot ${bot.name}: profile must be a central profile name`);
     }
-    if (!doc.default_workdir && !bot.workdir)
+    const directoryLeaf = (dir) => {
+      const info = lstatSync2(dir, { throwIfNoEntry: false });
+      if (info && (info.isSymbolicLink() || !info.isDirectory()))
+        throw new Error("Bot workdir must be a directory, not a symlink");
+    };
+    if (!doc.default_workdir && !bot.workdir) {
+      directoryLeaf(join2(home, ".agentschat"));
+      directoryLeaf(defaultDir);
       mkdirSync(defaultDir, { recursive: true, mode: 448 });
-    const cwd = realpathSync2(bot.workdir ? path(bot.workdir) : defaultDir);
+    }
+    const workdir = bot.workdir ? path(bot.workdir) : defaultDir;
+    directoryLeaf(workdir);
+    const cwd = realpathSync2(workdir);
     const settings = {};
     for (const k of ["agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort", "model", "codex_home_mode"])
       if (bot[k] !== undefined)

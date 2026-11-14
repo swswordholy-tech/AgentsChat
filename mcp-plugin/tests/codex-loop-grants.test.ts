@@ -132,15 +132,23 @@ test("grant document and entries reject own prototype keys and cap total grants"
  save([grant,...other,{...grant,loop_id:"loop_extra"}]);expect(authorizedLoopTick(tick,c)).toBeNull();
 });
 
-test("every grant routing ID rejects whitespace, paths, reserved keys and overlength",()=>{
+test("every grant routing ID rejects whitespace, paths, reserved keys and overlength while preserving email/Apple owner_ids",()=>{
  const {c,grant,tick,save}=fixture();
- for(const field of ["loop_id","channel_id","agent_id","owner_id"] as const) {
-  for(const value of [" "+grant[field],grant[field]+" ",".","..","a.b","a/b","a\\b","__PrOtO__","CoNsTrUcToR","PrOtOtYpE","a".repeat(129),"loop_"+"a".repeat(124)]) {
+ for(const field of ["loop_id","channel_id","agent_id"] as const) {
+  for(const value of [" "+grant[field],grant[field]+" ",".","..","a.b","a/b","a\\b","a b","__PrOtO__","CoNsTrUcToR","PrOtOtYpE","a".repeat(129),"loop_"+"a".repeat(124)]) {
    const changed={...grant,[field]:value};save([changed]);
    expect(authorizedLoopTick({...tick,channel_id:changed.channel_id,sender_id:changed.agent_id,meta:{...tick.meta,loop_id:changed.loop_id}},{...c,agentId:changed.agent_id})).toBeNull();
   }
   const value=field==="loop_id"?"loop_"+"a".repeat(123):"a".repeat(128),changed={...grant,[field]:value};save([changed]);
   expect(authorizedLoopTick({...tick,channel_id:changed.channel_id,sender_id:changed.agent_id,meta:{...tick.meta,loop_id:changed.loop_id}},{...c,agentId:changed.agent_id})).not.toBeNull();
+ }
+ for(const badOwner of [" owner","owner ",".","..","owner..evil","owner/b","owner\\b","owner b","__PrOtO__","CoNsTrUcToR","PrOtOtYpE","a".repeat(255)]) {
+  save([{...grant,owner_id:badOwner}]);
+  expect(authorizedLoopTick(tick,c)).toBeNull();
+ }
+ for(const realOwner of ["owner@example.com","apple:001234.abcdef.1234","a".repeat(254)]) {
+  save([{...grant,owner_id:realOwner}]);
+  expect(authorizedLoopTick(tick,c)?.owner_id).toBe(realOwner);
  }
 });
 

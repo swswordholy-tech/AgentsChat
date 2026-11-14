@@ -18,10 +18,24 @@ function executablePath(bin) {
     }
   }
 }
+function assertDirectoryLeaf(path, label) {
+  const info = lstatSync(path, { throwIfNoEntry: false });
+  if (info?.isSymbolicLink())
+    throw new Error(`${label} must not be a symlink`);
+  if (info && !info.isDirectory())
+    throw new Error(`${label} must be a directory`);
+}
+function prepareHomeDirectory(stateDir, home) {
+  assertDirectoryLeaf(stateDir, "Bot state directory");
+  assertDirectoryLeaf(home, "Bot runtime home");
+  mkdirSync(home, { recursive: true, mode: 448 });
+}
 function assertIndependentTree(home, allowedAuthOrigin, codexExecutable) {
   if (lstatSync(home).isSymbolicLink())
     throw new Error("Independent Codex home must not be a symlink");
-  const inspect = (dir) => {
+  const inspect = (dir, depth = 0) => {
+    if (depth > 32)
+      throw new Error("Independent Codex home directory depth exceeds 32");
     for (const name of readdirSync(dir)) {
       const path = join(dir, name), info = lstatSync(path);
       if (info.isSymbolicLink()) {
@@ -37,7 +51,7 @@ function assertIndependentTree(home, allowedAuthOrigin, codexExecutable) {
         throw new Error("Independent Codex home must not link configuration or runtime state");
       }
       if (info.isDirectory())
-        inspect(path);
+        inspect(path, depth + 1);
       else if (!info.isFile())
         throw new Error("Independent Codex home must contain only regular files and directories");
     }
@@ -49,7 +63,7 @@ function prepareRuntimeHome(stateDir, source = process.env.CODEX_HOME || join(ho
     throw new Error("Invalid Codex home mode");
   if (mode === "isolated") {
     const home2 = join(stateDir, "codex-home-isolated");
-    mkdirSync(home2, { recursive: true, mode: 448 });
+    prepareHomeDirectory(stateDir, home2);
     assertIndependentTree(home2, undefined, executablePath(codexBin));
     return { home: realpathSync(home2) };
   }
@@ -59,7 +73,7 @@ function prepareRuntimeHome(stateDir, source = process.env.CODEX_HOME || join(ho
     if (!lstatSync(origin).isFile())
       throw new Error("auth-only requires an existing regular auth.json; authorize its use explicitly");
     const home2 = join(stateDir, "codex-home-auth-only");
-    mkdirSync(home2, { recursive: true, mode: 448 });
+    prepareHomeDirectory(stateDir, home2);
     if (lstatSync(home2).isSymbolicLink() || realpathSync(home2) === legacyHome2)
       throw new Error("auth-only home must be independent");
     for (const name of ["config.toml", "AGENTS.md", "rules", "plugins", "hooks.json"]) {
@@ -73,7 +87,8 @@ function prepareRuntimeHome(stateDir, source = process.env.CODEX_HOME || join(ho
       throw new Error("auth-only home contains unexpected configuration; use a fresh state root");
     }
     const skills = join(home2, "skills");
-    if (existsSync(skills) && (!lstatSync(skills).isDirectory() || readdirSync(skills).some((name) => name !== ".system")))
+    const skillsInfo = lstatSync(skills, { throwIfNoEntry: false });
+    if (skillsInfo && (skillsInfo.isSymbolicLink() || !skillsInfo.isDirectory() || readdirSync(skills).some((name) => name !== ".system")))
       throw new Error("auth-only home contains unexpected custom skills");
     assertIndependentTree(home2, origin, executablePath(codexBin));
     const target = join(home2, "auth.json");
@@ -90,7 +105,7 @@ function prepareRuntimeHome(stateDir, source = process.env.CODEX_HOME || join(ho
   }
   const legacyHome = existsSync(source) ? realpathSync(source) : resolve(source);
   const home = join(stateDir, "codex-home");
-  mkdirSync(home, { recursive: true, mode: 448 });
+  prepareHomeDirectory(stateDir, home);
   if (realpathSync(home) === legacyHome)
     throw new Error("Bot runtime home must differ from desktop Codex home");
   if (lstatSync(home).isSymbolicLink())
@@ -486,7 +501,7 @@ ${text}`,
 // codex/run.ts
 import { readFileSync as readFileSync11, lstatSync as lstatSync12 } from "node:fs";
 import { homedir as homedir6 } from "node:os";
-import { join as join11 } from "node:path";
+import { join as join12 } from "node:path";
 
 // codex/bots-config.ts
 import { readFileSync as readFileSync3, realpathSync as realpathSync3, mkdirSync as mkdirSync3, lstatSync as lstatSync4 } from "node:fs";
@@ -1580,13 +1595,13 @@ function loadBots(file = defaultRegistry(), home = homedir3()) {
   }
   const object = (x) => x && typeof x === "object" && !Array.isArray(x);
   const fields = (x, keys) => {
-    if (!object(x) || Object.keys(x).some((k) => !keys.includes(k)))
+    if (!object(x) || Object.getOwnPropertyNames(x).some((k) => !keys.includes(k)))
       throw new Error("Unknown or invalid bot registry field");
   };
   const text = (x) => typeof x === "string" && x.trim().length > 0 && !/[\x00-\x1f\x7f]/.test(x);
   const reserved = (s) => ["__proto__", "constructor", "prototype"].includes(s.toLowerCase());
   fields(doc, ["version", "default_workdir", "codex_bin", "bots"]);
-  if (doc.version !== 1 || !Array.isArray(doc.bots))
+  if (doc.version !== 1 || !Array.isArray(doc.bots) || doc.bots.length > 128)
     throw new Error("Registry requires version 1 and bots array");
   for (const k of ["default_workdir", "codex_bin"])
     if (doc[k] !== undefined && !text(doc[k]))
@@ -1609,9 +1624,19 @@ function loadBots(file = defaultRegistry(), home = homedir3()) {
     if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/.test(bot.profile) || bot.profile.includes("..") || reserved(bot.profile) || reserved(bot.profile.replace(/\.json$/i, ""))) {
       throw new Error(`Bot ${bot.name}: profile must be a central profile name`);
     }
-    if (!doc.default_workdir && !bot.workdir)
+    const directoryLeaf = (dir) => {
+      const info = lstatSync4(dir, { throwIfNoEntry: false });
+      if (info && (info.isSymbolicLink() || !info.isDirectory()))
+        throw new Error("Bot workdir must be a directory, not a symlink");
+    };
+    if (!doc.default_workdir && !bot.workdir) {
+      directoryLeaf(join4(home, ".agentschat"));
+      directoryLeaf(defaultDir);
       mkdirSync3(defaultDir, { recursive: true, mode: 448 });
-    const cwd = realpathSync3(bot.workdir ? path(bot.workdir) : defaultDir);
+    }
+    const workdir = bot.workdir ? path(bot.workdir) : defaultDir;
+    directoryLeaf(workdir);
+    const cwd = realpathSync3(workdir);
     const settings = {};
     for (const k of ["agent_id", "channels", "senders", "api_url", "ws_url", "permissions", "effort", "model", "codex_home_mode"])
       if (bot[k] !== undefined)
@@ -2044,7 +2069,7 @@ function isTeamLeadSkillInvocation(prompt) {
 
 // codex/bridge.ts
 import { lstatSync as lstatSync10, mkdirSync as mkdirSync6, readFileSync as readFileSync9, renameSync as renameSync4, writeFileSync as writeFileSync4, openSync as openSync2, closeSync as closeSync2, unlinkSync as unlinkSync4 } from "node:fs";
-import { join as join9 } from "node:path";
+import { join as join10 } from "node:path";
 import { randomBytes as randomBytes2 } from "node:crypto";
 
 // codex/thread-history.ts
@@ -2207,9 +2232,12 @@ function grants(config, opts) {
         return [];
     }
     const doc = JSON.parse(readFileSync6(file, "utf8"));
-    if (doc?.version !== 1 || !Array.isArray(doc.grants))
+    const ownProto = (value) => Object.prototype.hasOwnProperty.call(value, "__proto__");
+    if (doc?.version !== 1 || ownProto(doc) || !Array.isArray(doc.grants) || doc.grants.length > 256)
       return [];
-    return doc.grants.filter((g) => g && [g.loop_id, g.channel_id, g.agent_id, g.owner_id, g.prompt].every((v) => typeof v === "string" && v.trim()) && /^loop_[A-Za-z0-9_-]+$/.test(g.loop_id) && [g.loop_id, g.channel_id, g.agent_id, g.owner_id].every((v) => !/[\x00-\x1f\x7f]/.test(v)) && g.agent_id === config.agentId && g.prompt.length <= 4000 && Number.isSafeInteger(g.interval_ms) && g.interval_ms >= 60000 && g.interval_ms <= 86400000);
+    const safeId = (value) => typeof value === "string" && value.length > 0 && value.length <= 128 && value.trim() === value && !/[.\/\\\s\x00-\x1f\x7f]/.test(value) && !["__proto__", "constructor", "prototype"].includes(value.toLowerCase());
+    const safeOwnerId = (value) => typeof value === "string" && value.length > 0 && value.length <= 254 && value.trim() === value && value !== "." && !value.includes("..") && !/[\/\\\s\x00-\x1f\x7f]/.test(value) && !["__proto__", "constructor", "prototype"].includes(value.toLowerCase());
+    return doc.grants.filter((g) => g && !ownProto(g) && [g.loop_id, g.channel_id, g.agent_id, g.owner_id, g.prompt].every((v) => typeof v === "string" && v.trim()) && /^loop_[A-Za-z0-9_-]+$/.test(g.loop_id) && [g.loop_id, g.channel_id, g.agent_id].every(safeId) && safeOwnerId(g.owner_id) && g.agent_id === config.agentId && g.prompt.length <= 4000 && Number.isSafeInteger(g.interval_ms) && g.interval_ms >= 60000 && g.interval_ms <= 86400000);
   } catch {
     return [];
   }
@@ -2236,7 +2264,7 @@ async function verifyLoopTick(raw, config, owner, list, opts) {
   } catch {
     return null;
   }
-  const rows = Array.isArray(response?.loops) ? response.loops.filter((r) => r?.loop_id === grant.loop_id) : [];
+  const rows = Array.isArray(response?.loops) && response.loops.length <= 1024 ? response.loops.filter((r) => r?.loop_id === grant.loop_id) : [];
   if (rows.length !== 1)
     return null;
   const loop = rows[0];
@@ -2248,9 +2276,9 @@ async function verifyLoopTick(raw, config, owner, list, opts) {
 
 // src/session-bind.ts
 import { createHash as createHash3 } from "node:crypto";
-import { closeSync, existsSync as existsSync4, lstatSync as lstatSync9, mkdirSync as mkdirSync5, openSync, readFileSync as readFileSync8, readSync, readdirSync as readdirSync4, statSync as statSync2, unlinkSync as unlinkSync3 } from "node:fs";
+import { closeSync, lstatSync as lstatSync9, mkdirSync as mkdirSync5, openSync, readFileSync as readFileSync8, readSync, readdirSync as readdirSync4, unlinkSync as unlinkSync3 } from "node:fs";
 import { homedir as homedir5, tmpdir } from "node:os";
-import { join as join8 } from "node:path";
+import { join as join9 } from "node:path";
 
 // src/profile-store.ts
 import {
@@ -2260,12 +2288,16 @@ import {
   copyFileSync,
   chmodSync as chmodSync2,
   unlinkSync as unlinkSync2,
-  statSync,
   readdirSync as readdirSync3,
   readFileSync as readFileSync7
 } from "fs";
+import { dirname as dirname2, join as join8, resolve as resolve4 } from "path";
 var defaultWarn = (m) => process.stderr.write(m);
 var MAX_PROFILE_JSON_BYTES = 64 * 1024;
+var CONTROL_CHAR_GLOBAL_RE = /[\x00-\x1f\x7f]/g;
+function sanitizeWarnPart(value) {
+  return String(value ?? "").replace(CONTROL_CHAR_GLOBAL_RE, "?");
+}
 function safeLstat(target) {
   try {
     return lstatSync8(target);
@@ -2276,9 +2308,14 @@ function safeLstat(target) {
   }
 }
 function safeWriteProfile(path, data, warn = defaultWarn) {
+  const parentDir = dirname2(path);
+  const parentStat = safeLstat(parentDir);
+  if (!parentStat || parentStat.isSymbolicLink() || !parentStat.isDirectory()) {
+    throw new Error(`Refusing to write profile into invalid or symlinked parent directory: ${sanitizeWarnPart(parentDir)}`);
+  }
   const pathStat = safeLstat(path);
   if (pathStat?.isSymbolicLink()) {
-    throw new Error(`Refusing to write profile through symlink: ${path}`);
+    throw new Error(`Refusing to write profile through symlink: ${sanitizeWarnPart(path)}`);
   }
   const tmp = path + ".tmp";
   const tmpStat = safeLstat(tmp);
@@ -2286,20 +2323,34 @@ function safeWriteProfile(path, data, warn = defaultWarn) {
     try {
       unlinkSync2(tmp);
     } catch (e) {
-      warn(`[agentchat] WARNING: stale ${tmp} could not be removed: ${e}
+      warn(`[agentchat] WARNING: stale ${sanitizeWarnPart(tmp)} could not be removed: ${sanitizeWarnPart(e)}
 `);
     }
   }
   writeFileSync3(tmp, JSON.stringify(data, null, 2), { mode: 384, flag: "wx" });
+  const currentParent = safeLstat(parentDir);
+  if (!currentParent || currentParent.isSymbolicLink() || !currentParent.isDirectory()) {
+    try {
+      unlinkSync2(tmp);
+    } catch {}
+    throw new Error(`Refusing to write profile into symlinked parent directory: ${sanitizeWarnPart(parentDir)}`);
+  }
+  if (safeLstat(path)?.isSymbolicLink()) {
+    try {
+      unlinkSync2(tmp);
+    } catch {}
+    throw new Error(`Refusing to overwrite symlinked profile: ${sanitizeWarnPart(path)}`);
+  }
   try {
     renameSync3(tmp, path);
   } catch (err) {
     if (process.platform === "win32" && (err?.code === "EPERM" || err?.code === "EACCES")) {
-      if (safeLstat(path)?.isSymbolicLink()) {
+      const winTarget = safeLstat(path);
+      if (winTarget?.isSymbolicLink() || winTarget?.isDirectory()) {
         try {
           unlinkSync2(tmp);
         } catch {}
-        throw new Error(`Refusing to overwrite symlinked profile: ${path}`);
+        throw new Error(`Refusing to overwrite symlinked or directory profile: ${sanitizeWarnPart(path)}`);
       }
       copyFileSync(tmp, path);
       try {
@@ -2310,20 +2361,32 @@ function safeWriteProfile(path, data, warn = defaultWarn) {
     }
   }
   if (process.platform !== "win32") {
+    const postStat = safeLstat(path);
+    if (!postStat || postStat.isSymbolicLink() || !postStat.isFile()) {
+      warn(`[agentchat] WARNING: could not verify permissions of ${sanitizeWarnPart(path)}: non-regular target
+`);
+      return;
+    }
     try {
       chmodSync2(path, 384);
     } catch (e) {
-      warn(`[agentchat] WARNING: could not chmod ${path} to 0600: ${e}
+      warn(`[agentchat] WARNING: could not chmod ${sanitizeWarnPart(path)} to 0600: ${sanitizeWarnPart(e)}
 `);
     }
     try {
-      const mode = statSync(path).mode & 511;
+      const verified = safeLstat(path);
+      if (!verified || verified.isSymbolicLink() || !verified.isFile()) {
+        warn(`[agentchat] WARNING: could not verify permissions of ${sanitizeWarnPart(path)}: non-regular target
+`);
+        return;
+      }
+      const mode = verified.mode & 511;
       if (mode !== 384) {
-        warn(`[agentchat] WARNING: ${path} is mode ${mode.toString(8)}, expected 600 — it holds your agent key. Fix: chmod 600 ${path}
+        warn(`[agentchat] WARNING: ${sanitizeWarnPart(path)} is mode ${mode.toString(8)}, expected 600 — it holds your agent key. Fix: chmod 600 ${sanitizeWarnPart(path)}
 `);
       }
     } catch (e) {
-      warn(`[agentchat] WARNING: could not verify permissions of ${path}: ${e}
+      warn(`[agentchat] WARNING: could not verify permissions of ${sanitizeWarnPart(path)}: ${sanitizeWarnPart(e)}
 `);
     }
   }
@@ -2358,9 +2421,10 @@ function resolveLockDir(homeDir, env = process.env) {
     return explicit;
   const hash = createHash3("sha256").update(homeDir || ".").digest("hex").slice(0, 12);
   const baseTmp = process.platform === "win32" ? tmpdir() : "/tmp";
-  return join8(baseTmp, `agentschat-locks-${hash}`);
+  return join9(baseTmp, `agentschat-locks-${hash}`);
 }
 var LOCK_FILE_MAX_BYTES = 64 * 1024;
+var LOCK_KEY_MAX_CHARS = 128;
 var SESSION_BINDS_MAX_BYTES = 1024 * 1024;
 function readBoundedRegularJson(path, maxBytes) {
   try {
@@ -2389,8 +2453,16 @@ function isSafeDirOrMissing(dirPath) {
   }
 }
 function lockFilePath(lockDir, agentId) {
-  const safe = String(agentId || "").trim().replace(/[^a-zA-Z0-9_-]/g, "_");
-  return join8(lockDir, `${safe}.lock`);
+  const trimmed = String(agentId || "").trim();
+  let safe = trimmed.replace(/[^a-zA-Z0-9_-]/g, "_");
+  if (safe.length > LOCK_KEY_MAX_CHARS) {
+    const digest = createHash3("sha256").update(trimmed).digest("hex").slice(0, 12);
+    safe = `${safe.slice(0, LOCK_KEY_MAX_CHARS - 13)}_${digest}`;
+  }
+  if (!safe || isUnsafeBindKey(safe)) {
+    safe = `_${safe}`;
+  }
+  return join9(lockDir, `${safe}.lock`);
 }
 function readAgentLock(lockDir, agentId) {
   if (!agentId)
@@ -2452,6 +2524,11 @@ function releaseAgentLock(opts) {
     return false;
   }
 }
+function isUnsafeBindKey(key) {
+  const lower = key.toLowerCase();
+  return lower === "__proto__" || lower === "constructor" || lower === "prototype";
+}
+var DSH_HEALTH_MAX_BYTES = 256 * 1024;
 
 // codex/bridge.ts
 var MAX_BRIDGE_TERMINAL_ENTRIES = 500;
@@ -2507,8 +2584,8 @@ class Bridge {
     this.owner = owner;
     this.loops = loops;
     mkdirSync6(config.stateDir, { recursive: true, mode: 448 });
-    this.file = join9(config.stateDir, "state.json");
-    this.lock = join9(config.stateDir, "bridge.lock");
+    this.file = join10(config.stateDir, "state.json");
+    this.lock = join10(config.stateDir, "bridge.lock");
     try {
       const stat = lstatSync10(this.lock);
       if (!stat.isSymbolicLink() && stat.isFile() && stat.size <= 64 * 1024) {
@@ -2718,7 +2795,7 @@ This scheduled skill run supports ${TEAM_LEAD_NO_UPDATE}; return it alone only w
 Authorized task:
 ${authorizedTask}` : `You are the online AgentsChat bot ${this.config.agentId}, running through Codex App Server in ${this.config.cwd}. This message was delivered to you live. If asked whether you are online, confirm your own availability.
 Use this channel's shared conversation and configured tools to carry out the request.
-Recurring-task setup, only when requested: create the server loop as this bot in this same channel. Then verify its record with list_loops and confirm this bot is claimed with whoami and obtain its owner_account_id with my_entitlements. Maintain the private file ${join9(this.config.stateDir, "loop-grants.json")} (mode 0600): {"version":1,"grants":[{"loop_id":"server loop ID","channel_id":"this channel ID","agent_id":"this bot ID","owner_id":"verified owner ID","interval_ms":60000,"prompt":"exact server prompt"}]}. Use the actual server interval, preserve other grants, and confirm setup only after both server registration and the matching local grant exist. Stopping a loop also removes its grant. Do not change unrelated loops.
+Recurring-task setup, only when requested: create the server loop as this bot in this same channel. Then verify its record with list_loops and confirm this bot is claimed with whoami and obtain its owner_account_id with my_entitlements. Maintain the private file ${join10(this.config.stateDir, "loop-grants.json")} (mode 0600): {"version":1,"grants":[{"loop_id":"server loop ID","channel_id":"this channel ID","agent_id":"this bot ID","owner_id":"verified owner ID","interval_ms":60000,"prompt":"exact server prompt"}]}. Use the actual server interval, preserve other grants, and confirm setup only after both server registration and the matching local grant exist. Stopping a loop also removes its grant. Do not change unrelated loops.
 AgentsChat message:
 ` + JSON.stringify(e.message);
           e.answer = this.redact(await this.codex.generate(channel.thread, (channel.bootstrap ?? "") + prompt));
@@ -2892,7 +2969,7 @@ function resolveDrainReconnectDelay(frame, rand = Math.random) {
 // codex/inbox-sync.ts
 import { chmodSync as chmodSync3, lstatSync as lstatSync11, mkdirSync as mkdirSync7, readFileSync as readFileSync10, renameSync as renameSync5, unlinkSync as unlinkSync5, writeFileSync as writeFileSync5 } from "node:fs";
 import { randomBytes as randomBytes3 } from "node:crypto";
-import { join as join10 } from "node:path";
+import { join as join11 } from "node:path";
 
 // src/timestamps.ts
 var ISO_OFFSET_RE = /^(\d{4}-\d{2}-\d{2})[Tt ](\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|z|[+-]\d{2}:\d{2})$/;
@@ -2982,7 +3059,7 @@ class InboxSync {
       throw new Error("Invalid inbound state directory");
     if (process.platform !== "win32")
       chmodSync3(stateDir, 448);
-    this.file = join10(stateDir, "inbound-cursors.json");
+    this.file = join11(stateDir, "inbound-cursors.json");
     let fileStat;
     try {
       fileStat = lstatSync11(this.file);
@@ -3243,13 +3320,13 @@ class AgentsChatTransport {
       if (this.pending.size >= 256)
         throw new Error("AgentsChat pending message limit reached");
       const id = randomUUID2();
-      await new Promise((resolve4, reject) => {
+      await new Promise((resolve5, reject) => {
         const timer = setTimeout(() => {
           this.pending.delete(id);
           reject(new Error("AgentsChat acknowledgement timed out"));
         }, 15000);
         timer.unref?.();
-        this.pending.set(id, { resolve: resolve4, reject, timer });
+        this.pending.set(id, { resolve: resolve5, reject, timer });
         try {
           this.socket.send(JSON.stringify({
             type: "message",
@@ -3305,7 +3382,7 @@ class AgentsChatTransport {
         } catch {}
       }
     };
-    const join11 = (channel) => {
+    const join12 = (channel) => {
       if (safeChannel(channel) && (!this.config.channels.length || this.config.channels.includes(channel))) {
         this.inboxSync?.watch(channel);
         send({ type: "join_channel", channel_id: channel, agent_id: this.config.agentId });
@@ -3350,7 +3427,7 @@ class AgentsChatTransport {
           const ids = channels.map((c) => c?.id ?? c?.channel_id).filter((id) => safeChannel(id) && (!this.config.channels.length || this.config.channels.includes(id)));
           this.inboxSync?.memberships(ids);
           for (const id of ids)
-            join11(id);
+            join12(id);
           this.inboxSync?.sync();
         }).catch(() => {
           if (current()) {
@@ -3366,7 +3443,7 @@ class AgentsChatTransport {
           pending.resolve();
         }
       } else if (data.type === "channel_created" && typeof data.channel_id === "string")
-        join11(data.channel_id);
+        join12(data.channel_id);
       else if (["message", "thread_reply"].includes(data.type))
         this.receive(data);
       else if (data.type === "shard_moved" || data.type === "please_reconnect") {
@@ -3470,7 +3547,7 @@ async function main() {
     return;
   }
   if (values["gui-thread"] || values["gui-message-file"] || values["gui-status"]) {
-    const channel = new GuiChannel(join11(homedir6(), ".agentschat/codex-gui-outbox"), values["gui-thread"] ? [values["gui-thread"]] : []);
+    const channel = new GuiChannel(join12(homedir6(), ".agentschat/codex-gui-outbox"), values["gui-thread"] ? [values["gui-thread"]] : []);
     if (values["gui-status"]) {
       console.log(JSON.stringify(channel.list().map(({ prompt: prompt2, ...receipt2 }) => receipt2)));
       return;
@@ -3488,7 +3565,7 @@ async function main() {
   }
   if ((values.bot || values["managed-worker"]) && (values["state-root"] || values["codex-home-mode"]))
     throw new Error("For managed bots, configure state_root/codex_home_mode in the bot registry");
-  const snapshot = values["managed-worker"] ? await new Promise((resolve4, reject) => {
+  const snapshot = values["managed-worker"] ? await new Promise((resolve5, reject) => {
     if (!process.connected) {
       reject(new Error("Managed worker needs parent IPC"));
       return;
@@ -3501,7 +3578,7 @@ async function main() {
         reject(new Error("Invalid parent configuration"));
         return;
       }
-      resolve4(config);
+      resolve5(config);
     });
   }) : undefined;
   const c = snapshot ?? (values.bot ? loadBots(values.registry).find((b) => b.name === values.bot) : resolveConfig({ cwd: values.cwd, profile: values.profile, codexBin: values["codex-bin"], stateRoot: values["state-root"], codexHomeMode: values["codex-home-mode"] }));
@@ -3523,7 +3600,7 @@ async function main() {
   const runtime = prepareRuntimeHome(c.stateDir, undefined, c.codexHomeMode, c.codexBin);
   codex = new AppServer(c.codexBin, undefined, undefined, c.permissions, runtime, c.effort, c.model, { profileFile: c.profileFile, agentId: c.agentId, apiUrl: c.apiUrl, wsUrl: c.wsUrl });
   if (values.conversations || values["read-conversation"]) {
-    const state = JSON.parse(readFileSync11(join11(c.stateDir, "state.json"), "utf8"));
+    const state = JSON.parse(readFileSync11(join12(c.stateDir, "state.json"), "utf8"));
     const channels = state?.channels === undefined ? {} : state.channels;
     if (!isPlainObject2(channels))
       throw new Error("Invalid conversation channels");

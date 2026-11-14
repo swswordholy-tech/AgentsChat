@@ -827,7 +827,7 @@ import { homedir as homedir2 } from "node:os";
 import { join as join3 } from "node:path";
 
 // src/session-bind.ts
-import { closeSync, existsSync, lstatSync as lstatSync2, mkdirSync as mkdirSync2, openSync, readFileSync as readFileSync2, readSync, readdirSync, statSync, unlinkSync as unlinkSync2 } from "node:fs";
+import { closeSync, lstatSync as lstatSync2, mkdirSync as mkdirSync2, openSync, readFileSync as readFileSync2, readSync, readdirSync, unlinkSync as unlinkSync2 } from "node:fs";
 import { join as join2 } from "node:path";
 
 // src/profile-store.ts
@@ -848,6 +848,7 @@ var DEFAULT_SESSION_BINDS_FILENAME = "session-binds.json";
 var LEGACY_AGY_BINDS_FILENAME = "agy-binds.json";
 var LOCK_FILE_MAX_BYTES = 64 * 1024;
 var SESSION_BINDS_MAX_BYTES = 1024 * 1024;
+var MAX_SESSION_BINDS_ENTRIES = 1024;
 var CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
 function readBoundedRegularJson(path, maxBytes) {
   try {
@@ -857,6 +858,14 @@ function readBoundedRegularJson(path, maxBytes) {
     return JSON.parse(readFileSync2(path, "utf8"));
   } catch {
     return null;
+  }
+}
+function isSafeDirOrMissing(dirPath) {
+  try {
+    const st = lstatSync2(dirPath);
+    return !st.isSymbolicLink() && st.isDirectory();
+  } catch (e) {
+    return Boolean(e && typeof e === "object" && e.code === "ENOENT");
   }
 }
 function isValidBindToken(value) {
@@ -870,23 +879,32 @@ function parseSessionBinds(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw))
     return {};
   const out = {};
+  let count = 0;
   for (const [k, v] of Object.entries(raw)) {
+    if (count >= MAX_SESSION_BINDS_ENTRIES)
+      break;
     const key = k.trim();
     if (!isValidBindToken(key) || isUnsafeBindKey(key))
       continue;
     if (typeof v === "string") {
       const val = v.trim();
-      if (isValidBindToken(val))
+      if (isValidBindToken(val) && !isUnsafeBindKey(val)) {
         out[key] = val;
+        count += 1;
+      }
     } else if (v && typeof v === "object" && typeof v.profile === "string") {
       const val = v.profile.trim();
-      if (isValidBindToken(val))
+      if (isValidBindToken(val) && !isUnsafeBindKey(val)) {
         out[key] = val;
+        count += 1;
+      }
     }
   }
   return out;
 }
 function loadSessionBinds(configDir) {
+  if (!isSafeDirOrMissing(configDir))
+    return {};
   const merged = {};
   for (const filename of [LEGACY_AGY_BINDS_FILENAME, DEFAULT_SESSION_BINDS_FILENAME]) {
     const path = join2(configDir, filename);
@@ -897,6 +915,7 @@ function loadSessionBinds(configDir) {
   }
   return merged;
 }
+var DSH_HEALTH_MAX_BYTES = 256 * 1024;
 
 // src/session-route.ts
 var MAX_PROFILE_BYTES2 = 64 * 1024;
@@ -979,7 +998,7 @@ function resolveSessionForAgent(agentId, opts = {}) {
 }
 
 // src/wake.ts
-import { existsSync as existsSync2, lstatSync as lstatSync4, readFileSync as readFileSync4 } from "node:fs";
+import { existsSync, lstatSync as lstatSync4, readFileSync as readFileSync4 } from "node:fs";
 import { homedir as homedir3 } from "node:os";
 import { join as join4, win32 as pathWin32 } from "node:path";
 var GROK_GATEWAY_PATH_CANDIDATES = [
@@ -1000,7 +1019,7 @@ function resolveWindowsCliSpawn(cmd, args, opts) {
     return { cmd: trimmed, args };
   }
   const env = opts?.env ?? process.env;
-  const exists = opts?.existsImpl ?? existsSync2;
+  const exists = opts?.existsImpl ?? existsSync;
   const readText = opts?.readTextImpl ?? ((p) => readFileSync4(p, "utf8"));
   const hasSep = /[\\/]/.test(trimmed) || /^[A-Za-z]:/.test(trimmed);
   const hasWinExt = /\.(?:exe|cmd|bat)$/i.test(trimmed);
