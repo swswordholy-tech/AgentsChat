@@ -5,17 +5,24 @@ export interface ProcessRow { pid: number; ppid: number; command: string }
 export function parseProcesses(text: string): ProcessRow[] {
   return text.split(/\r?\n/).flatMap(line => {
     const m = /^\s*(\d+)\s+(\d+)\s+(.+)$/.exec(line);
-    return m ? [{ pid: Number(m[1]), ppid: Number(m[2]), command: m[3]!.trim() }] : [];
+    if (!m) return [];
+    const pid = Number(m[1]), ppid = Number(m[2]);
+    return Number.isSafeInteger(pid) && pid > 0 && Number.isSafeInteger(ppid) && ppid >= 0
+      ? [{ pid, ppid, command: m[3]!.trim() }] : [];
   });
 }
 function commandBasename(cmd: string): string {
-  const trimmed = cmd.trim().replace(/^"+|"+$/g, "");
-  const parts = trimmed.split(/[\\/]/);
-  const base = (parts[parts.length - 1] || trimmed).trim();
-  return base.replace(/\.(?:exe|cmd|bat)$/i, "").toLowerCase();
+  const trimmed = cmd.trim();
+  const basename = (path: string) => (path.split(/[\\/]/).pop() || "").trim().replace(/\.(?:exe|cmd|bat)$/i, "").toLowerCase();
+  if (trimmed.startsWith('"')) {
+    const end = trimmed.indexOf('"', 1);
+    return end < 0 ? "" : basename(trimmed.slice(1, end));
+  }
+  const first = trimmed.split(/\s+/, 1)[0]!;
+  return basename(first) === "codex" ? "codex" : basename(trimmed);
 }
 export function externalCodexPresent(rows: ProcessRow[], managerPid: number): boolean {
-  const children = new Set([managerPid]);
+  const children = new Set<number>(Number.isSafeInteger(managerPid) && managerPid > 0 ? [managerPid] : []);
   let changed = true;
   while (changed) { changed = false; for (const row of rows) if (children.has(row.ppid) && !children.has(row.pid)) { children.add(row.pid); changed = true; } }
   return rows.some(r => !children.has(r.pid) && commandBasename(r.command) === "codex");

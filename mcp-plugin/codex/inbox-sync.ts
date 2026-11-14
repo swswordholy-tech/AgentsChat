@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 import { normalizeTimestampForCursor } from "../src/timestamps.ts";
 
@@ -13,6 +14,14 @@ function timestamp(value: unknown): string {
   if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) throw new Error("Invalid history timestamp");
   return normalizeTimestampForCursor(value, "after")!;
 }
+function validChannel(channel: unknown): channel is string {
+  return typeof channel === "string" && channel.trim().length > 0
+    && !/[\x00-\x1f\x7f-\x9f]/.test(channel)
+    && !["__proto__", "constructor", "prototype"].includes(channel.trim());
+}
+function validateChannel(channel: unknown): asserts channel is string {
+  if (!validChannel(channel)) throw new Error("Invalid inbound channel");
+}
 
 /** REST checkpoints, independent of live WS delivery. Advancing a live cursor
  * could otherwise jump over messages that were silently lost before it. */
@@ -25,24 +34,39 @@ export class InboxSync {
     private receive: (message: unknown) => boolean, private active: () => boolean,
     private log: (message: string) => void = console.error) {
     mkdirSync(stateDir, {recursive:true, mode:0o700});
+    const dirStat = lstatSync(stateDir);
+    if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) throw new Error("Invalid inbound state directory");
+    if (process.platform !== "win32") chmodSync(stateDir, 0o700);
     this.file = join(stateDir, "inbound-cursors.json");
-    this.state = existsSync(this.file) ? JSON.parse(readFileSync(this.file, "utf8")) : {version:1, channels:{}};
-    if (this.state.version !== 1 || !this.state.channels || typeof this.state.channels !== "object" || Array.isArray(this.state.channels))
+    let fileStat;
+    try { fileStat = lstatSync(this.file); }
+    catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
+    if (fileStat && (fileStat.isSymbolicLink() || !fileStat.isFile())) throw new Error("Invalid inbound cursors file");
+    this.state = fileStat ? JSON.parse(readFileSync(this.file, "utf8")) : {version:1, channels:{}};
+    if (!this.state || this.state.version !== 1 || !this.state.channels || typeof this.state.channels !== "object" || Array.isArray(this.state.channels))
       throw new Error("Invalid inbound cursors; refusing to discard checkpoint");
-    for (const value of Object.values(this.state.channels)) timestamp(value);
-    this.state.channels = Object.assign(Object.create(null), this.state.channels);
+    const channels: Record<string, string> = Object.create(null);
+    for (const [channel, value] of Object.entries(this.state.channels)) {
+      if (!validChannel(channel)) continue;
+      timestamp(value);
+      channels[channel] = value;
+    }
+    this.state.channels = channels;
   }
   private save() {
-    const tmp = `${this.file}.tmp.${process.pid}.${Date.now()}`;
+    const tmp = `${this.file}.${process.pid}.${Date.now()}.${randomBytes(4).toString("hex")}.tmp`;
+    let created = false;
     try {
-      writeFileSync(tmp, JSON.stringify(this.state), {mode:0o600});
+      writeFileSync(tmp, JSON.stringify(this.state), {mode:0o600, flag:"wx"});
+      created = true;
       renameSync(tmp, this.file);
     } catch (err) {
-      try { unlinkSync(tmp); } catch {}
+      if (created) { try { unlinkSync(tmp); } catch {} }
       throw err;
     }
   }
   watch(channel: string) {
+    validateChannel(channel);
     this.channels.add(channel);
     // First installation/new membership starts now, never replays old requests.
     if (!Object.hasOwn(this.state.channels, channel)) {
@@ -50,8 +74,16 @@ export class InboxSync {
     }
   }
   memberships(channels: string[]) {
-    this.channels.clear();
-    for (const channel of channels) this.watch(channel);
+    for (const channel of channels) validateChannel(channel);
+    this.channels = new Set(channels);
+    let changed = false;
+    for (const channel of this.channels) {
+      if (!Object.hasOwn(this.state.channels, channel)) {
+        this.state.channels[channel] = timestamp(new Date().toISOString());
+        changed = true;
+      }
+    }
+    if (changed) this.save();
   }
   sync(): Promise<void> {
     if (!this.running) this.running = this.run().finally(() => {this.running = undefined;});
@@ -70,7 +102,7 @@ export class InboxSync {
         const messages = Array.isArray(body) ? body : body?.messages;
         if (!Array.isArray(messages)) throw new Error("Invalid history response");
         const rows = messages.map(m => {
-          if (!m || m.channel_id !== channel || typeof m.id !== "string") throw new Error("Invalid history message");
+          if (!m || m.channel_id !== channel || typeof m.id !== "string" || m.id.trim().length === 0) throw new Error("Invalid history message");
           return {message:m, time:timestamp(m.timestamp)};
         }).sort((a,b) => a.time.localeCompare(b.time));
         // One bounded page per channel per pass. Full pages continue next pass.

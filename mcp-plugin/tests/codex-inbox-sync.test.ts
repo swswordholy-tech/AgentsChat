@@ -1,5 +1,5 @@
-import { afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { afterEach, expect, spyOn, test } from 'bun:test';
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { InboxSync } from '../codex/inbox-sync.ts';
@@ -66,4 +66,89 @@ test('history pagination is bounded and resumes from completed page', async () =
   },(m:any)=>{seen.push(m.id);return true;},()=>true);
   sync.watch('group');await sync.sync();expect(seen).toHaveLength(50);
   await sync.sync();expect(seen).toHaveLength(75);expect(new Set(seen).size).toBe(75);
+});
+
+function idle(dir:string) { return new InboxSync(dir,async()=>[],()=>true,()=>true,()=>{}); }
+
+test('state directory and live or dangling checkpoint symlinks are rejected', () => {
+  const f=fixture(), alias=join(f.dir,'alias');
+  symlinkSync(f.dir,alias,'dir');
+  expect(()=>idle(alias)).toThrow();
+  for(const target of [join(f.dir,'target'),join(f.dir,'missing')]) {
+    if(target.endsWith('target')) writeFileSync(target,readFileSync(f.file,'utf8')); rmSync(f.file);
+    symlinkSync(target,f.file);
+    expect(()=>idle(f.dir)).toThrow();
+    expect(lstatSync(f.file).isSymbolicLink()).toBe(true);
+  }
+});
+
+test('only a missing checkpoint permits cold start; malformed structures fail closed', () => {
+  const f=fixture();
+  for(const value of ['null','{','[]','{"version":1,"channels":[]}','{"version":2,"channels":{}}','{"version":1,"channels":{"group":"bad"}}']) {
+    writeFileSync(f.file,value); expect(()=>idle(f.dir)).toThrow(); expect(readFileSync(f.file,'utf8')).toBe(value);
+  }
+  rmSync(f.file); mkdirSync(f.file); expect(()=>idle(f.dir)).toThrow();
+});
+
+test('legacy invalid channel keys are filtered before timestamp validation', () => {
+  const f=fixture(), channels=Object.create(null);
+  for(const key of ['__proto__','constructor','prototype','','  ','bad\u0000key','bad\u007fkey']) channels[key]='bad';
+  channels.group=f.seed;
+  writeFileSync(f.file,JSON.stringify({version:1,channels}));
+  idle(f.dir).watch('new');
+  expect(Object.keys(f.state().channels).sort()).toEqual(['group','new']);
+  expect(f.state().channels.group).toBe(f.seed);
+});
+
+test('watch and memberships reject invalid channel IDs without changing membership', async () => {
+  const f=fixture(), paths:string[]=[];
+  const sync=new InboxSync(f.dir,async path=>{paths.push(path);return [];},()=>true,()=>true);
+  sync.watch('group');
+  for(const bad of [null,undefined,42,{},'', '  ','__proto__','constructor','prototype','bad\nkey','bad\u0085key']) {
+    expect(()=>sync.watch(bad as any)).toThrow();
+    expect(()=>sync.memberships(['new',bad as any])).toThrow();
+  }
+  await sync.sync(); expect(paths).toHaveLength(1); expect(paths[0]).toContain('/group/');
+  expect(Object.keys(f.state().channels)).toEqual(['group']);
+});
+
+test('batch membership saves once for 100 new channels and never for unchanged channels', () => {
+  const f=fixture(), sync=idle(f.dir), save=spyOn(sync as any,'save');
+  const channels=Array.from({length:100},(_,i)=>`room-${i}`);
+  sync.memberships([...channels,...channels]); expect(save).toHaveBeenCalledTimes(1);
+  expect(Object.keys(f.state().channels)).toHaveLength(101);
+  sync.memberships(channels); sync.memberships([]); expect(save).toHaveBeenCalledTimes(1);
+  save.mockRestore();
+});
+
+test('state permissions are private and repeated same-millisecond saves leave no temp files', () => {
+  const f=fixture(); chmodSync(f.dir,0o777);
+  const clock=spyOn(Date,'now').mockReturnValue(12345);
+  try {
+    const sync=idle(f.dir); sync.watch('one'); sync.watch('two');
+    expect(Object.keys(f.state().channels)).toEqual(['group','one','two']);
+    expect(readdirSync(f.dir)).toEqual(['inbound-cursors.json']);
+    if(process.platform!=='win32') {
+      expect(lstatSync(f.dir).mode & 0o777).toBe(0o700);
+      expect(lstatSync(f.file).mode & 0o777).toBe(0o600);
+    }
+  } finally { clock.mockRestore(); }
+});
+
+test('blank or non-string history IDs reject the full page and preserve its checkpoint', async () => {
+  for(const bad of ['', '  ', '\t', 12, null]) {
+    const f=fixture(); let delivered=0;
+    const sync=new InboxSync(f.dir,async()=>[f.row('good',1),{...f.row('bad',2),id:bad}],()=>{delivered++;return true;},()=>true,()=>{});
+    sync.watch('group'); await sync.sync();
+    expect(delivered).toBe(0); expect(f.state().channels.group).toBe(f.seed); expect(f.state().last_error).toBeString();
+  }
+});
+
+test('failed atomic replacement removes its private temporary file', () => {
+  const f=fixture(), sync=idle(f.dir);
+  const original=(sync as any).state;
+  (sync as any).state={...original,toJSON(){rmSync(f.file);mkdirSync(f.file);return original;}};
+  expect(()=>sync.watch('new')).toThrow();
+  expect(lstatSync(f.file).isDirectory()).toBe(true);
+  expect(readdirSync(f.dir)).toEqual(['inbound-cursors.json']);
 });
