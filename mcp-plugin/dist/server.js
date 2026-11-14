@@ -3991,7 +3991,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema
 } from "@modelcontextprotocol/sdk/types.js";
-import { readFileSync as readFileSync12, existsSync as existsSync7, writeFileSync as writeFileSync6, mkdirSync as mkdirSync4, readdirSync as readdirSync5 } from "fs";
+import { readFileSync as readFileSync12, existsSync as existsSync6, writeFileSync as writeFileSync6, mkdirSync as mkdirSync4, readdirSync as readdirSync5 } from "fs";
 import { homedir as homedir6 } from "os";
 import { join as join12, dirname as dirname2 } from "path";
 import { fileURLToPath } from "url";
@@ -4337,7 +4337,8 @@ function flushCursor(state, persist) {
 }
 
 // src/rest-cli.ts
-import { existsSync as existsSync6, mkdirSync as mkdirSync3, readFileSync as readFileSync11, unlinkSync as unlinkSync7, writeFileSync as writeFileSync5 } from "node:fs";
+import { randomBytes as randomBytes3 } from "node:crypto";
+import { lstatSync as lstatSync9, mkdirSync as mkdirSync3, readFileSync as readFileSync11, renameSync as renameSync5, unlinkSync as unlinkSync7, writeFileSync as writeFileSync5 } from "node:fs";
 import { dirname, join as join11 } from "node:path";
 
 // src/mentions.ts
@@ -4552,6 +4553,19 @@ var MAX_SSE_STREAMS = 3;
 var MAX_SSE_LINE_CHARS = 512 * 1024;
 var MAX_SEEN_IDS = 200;
 var DEFAULT_HTTP_TIMEOUT_MS = 15000;
+var MAX_TIMER_MS = 2147483647;
+var MAX_STATE_FILE_BYTES = 1048576;
+var MAX_PID_FILE_BYTES = 64 * 1024;
+var DIRECT_CHANNEL_RE = /^dm[-:]/i;
+var PROTOTYPE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+function clampTimerMs(raw, fallback, minMs = 0) {
+  if (typeof raw !== "number" || !Number.isFinite(raw))
+    return fallback;
+  const floored = Math.floor(raw);
+  if (floored < minMs)
+    return fallback;
+  return Math.min(MAX_TIMER_MS, floored);
+}
 async function fetchWithDeadline(f, url, init, timeoutMs, parentSignal) {
   if (parentSignal?.aborted) {
     const err = new Error("Aborted");
@@ -4563,11 +4577,12 @@ async function fetchWithDeadline(f, url, init, timeoutMs, parentSignal) {
   if (parentSignal) {
     parentSignal.addEventListener("abort", onParentAbort, { once: true });
   }
-  const timer = timeoutMs > 0 ? setTimeout(() => {
-    const err = new Error(`HTTP request timed out after ${timeoutMs}ms`);
+  const safeTimeoutMs = typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.min(MAX_TIMER_MS, Math.floor(timeoutMs)) : 0;
+  const timer = safeTimeoutMs > 0 ? setTimeout(() => {
+    const err = new Error(`HTTP request timed out after ${safeTimeoutMs}ms`);
     err.name = "TimeoutError";
     ctrl.abort(err);
-  }, timeoutMs) : null;
+  }, safeTimeoutMs) : null;
   timer?.unref?.();
   try {
     return await f(url, { ...init, signal: ctrl.signal });
@@ -4595,9 +4610,10 @@ function sleepAbortable(ms, signal) {
   });
 }
 function loadSeenIds(file) {
-  if (!existsSync6(file))
-    return [];
   try {
+    const stat = lstatSync9(file);
+    if (stat.isSymbolicLink() || !stat.isFile() || stat.size > MAX_STATE_FILE_BYTES)
+      return [];
     const parsed = JSON.parse(readFileSync11(file, "utf8"));
     return Array.isArray(parsed) ? parsed.filter((x) => typeof x === "string") : [];
   } catch {
@@ -4612,16 +4628,74 @@ function saveSeenIds(file, ids) {
   } catch {}
 }
 function loadJsonMap(file) {
-  if (!existsSync6(file))
-    return {};
+  const out = Object.create(null);
   try {
+    const stat = lstatSync9(file);
+    if (stat.isSymbolicLink() || !stat.isFile() || stat.size > MAX_STATE_FILE_BYTES)
+      return out;
     const raw = JSON.parse(readFileSync11(file, "utf8"));
     if (!raw || typeof raw !== "object" || Array.isArray(raw))
-      return {};
-    return raw;
+      return out;
+    for (const [k, v] of Object.entries(raw)) {
+      if (!k || PROTOTYPE_KEYS.has(k.toLowerCase()) || typeof v !== "string")
+        continue;
+      out[k] = v;
+    }
+    return out;
   } catch {
-    return {};
+    return out;
   }
+}
+function acquireWakePidFile(wakePidFile, pid = process.pid, killFn = process.kill) {
+  let tmp = "";
+  let created = false;
+  try {
+    const dirStat = lstatSync9(dirname(wakePidFile));
+    if (dirStat.isSymbolicLink() || !dirStat.isDirectory())
+      return false;
+    try {
+      const existing = lstatSync9(wakePidFile);
+      if (existing.isSymbolicLink() || !existing.isFile())
+        return false;
+      if (existing.size <= MAX_PID_FILE_BYTES) {
+        const raw = readFileSync11(wakePidFile, "utf8").trim();
+        if (/^\d+$/.test(raw)) {
+          const oldPid = Number(raw);
+          if (Number.isSafeInteger(oldPid) && oldPid > 1 && oldPid !== pid) {
+            try {
+              killFn(oldPid, "SIGTERM");
+            } catch {}
+          }
+        }
+      }
+    } catch (e) {
+      if (e?.code !== "ENOENT")
+        return false;
+    }
+    tmp = `${wakePidFile}.${pid}.${randomBytes3(4).toString("hex")}.tmp`;
+    writeFileSync5(tmp, `${pid}
+`, { mode: 384, flag: "wx" });
+    created = true;
+    renameSync5(tmp, wakePidFile);
+    return true;
+  } catch {
+    if (created && tmp) {
+      try {
+        unlinkSync7(tmp);
+      } catch {}
+    }
+    return false;
+  }
+}
+function releaseWakePidFile(wakePidFile, pid = process.pid) {
+  try {
+    const stat = lstatSync9(wakePidFile);
+    if (stat.isSymbolicLink() || !stat.isFile() || stat.size > MAX_PID_FILE_BYTES)
+      return;
+    if (readFileSync11(wakePidFile, "utf8").trim() === String(pid)) {
+      unlinkSync7(wakePidFile);
+    }
+  } catch {}
 }
 function saveJsonMap(file, data) {
   try {
@@ -4773,7 +4847,7 @@ function isMessageAddressedToAgent(msg, agentId, displayName) {
   if (isOwnLoopTick)
     return true;
   const channelId = String(msg.channel_id || "");
-  if (channelId.startsWith("dm-"))
+  if (DIRECT_CHANNEL_RE.test(channelId))
     return true;
   if (Array.isArray(msg.mentioned_ids) && msg.mentioned_ids.includes(agentId))
     return true;
@@ -4790,9 +4864,9 @@ async function wakeOnce(opts) {
   const nowIso = opts.nowIso ?? (() => new Date().toISOString());
   const baseUrl = opts.restUrl.replace(/\/$/, "");
   const { configDir, agentId, displayName, token } = opts;
-  const timeoutMs = opts.timeoutMs !== undefined && Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : 240000;
-  const requestTimeoutMs = opts.requestTimeoutMs !== undefined && Number.isFinite(opts.requestTimeoutMs) && opts.requestTimeoutMs >= 0 ? opts.requestTimeoutMs : DEFAULT_HTTP_TIMEOUT_MS;
-  const pollIntervalMs = opts.pollIntervalMs !== undefined && Number.isFinite(opts.pollIntervalMs) && opts.pollIntervalMs >= 10 ? Math.floor(opts.pollIntervalMs) : 15000;
+  const timeoutMs = opts.timeoutMs !== undefined && Number.isFinite(opts.timeoutMs) ? opts.timeoutMs > 0 ? Math.min(MAX_TIMER_MS, Math.floor(opts.timeoutMs)) : 0 : 240000;
+  const requestTimeoutMs = clampTimerMs(opts.requestTimeoutMs, DEFAULT_HTTP_TIMEOUT_MS, 0);
+  const pollIntervalMs = clampTimerMs(opts.pollIntervalMs, 15000, 10);
   const enableSse = opts.enableSse ?? true;
   mkdirSync3(configDir, { recursive: true });
   const safeSlug = safeAgentCursorSlug2(agentId);
@@ -4802,19 +4876,7 @@ async function wakeOnce(opts) {
   const wakePidFile = join11(configDir, `wake-once-${safeSlug}.pid`);
   let wrotePidFile = false;
   if (!opts.fetchImpl) {
-    try {
-      if (existsSync6(wakePidFile)) {
-        const oldPid = parseInt(readFileSync11(wakePidFile, "utf-8").trim(), 10);
-        if (Number.isFinite(oldPid) && oldPid > 1 && oldPid !== process.pid) {
-          try {
-            process.kill(oldPid, "SIGTERM");
-          } catch {}
-        }
-      }
-      writeFileSync5(wakePidFile, `${process.pid}
-`, { mode: 384 });
-      wrotePidFile = true;
-    } catch {}
+    wrotePidFile = acquireWakePidFile(wakePidFile);
   }
   const cursor = loadCursor2(lastSeenFile, warn);
   let cursorDirty = false;
@@ -4861,7 +4923,7 @@ async function wakeOnce(opts) {
   let resolved = false;
   const abortCtrl = new AbortController;
   async function buildGroupContextPrefix(channelId, triggerMsgId, triggerTs) {
-    if (channelId.startsWith("dm-"))
+    if (DIRECT_CHANNEL_RE.test(channelId))
       return "";
     const mentionMap = loadJsonMap(mentionTsFile);
     const mentionKey = `${agentId}:${channelId}`;
@@ -4883,6 +4945,8 @@ ${context}
 [你被 @mention 了，请回复]
 `;
         }
+      } else {
+        await res.body?.cancel().catch(() => {});
       }
     } catch {}
     if (triggerTs) {
@@ -5023,11 +5087,7 @@ ${context}
       if (timeoutTimer)
         clearTimeout(timeoutTimer);
       if (wrotePidFile) {
-        try {
-          if (existsSync6(wakePidFile) && readFileSync11(wakePidFile, "utf-8").trim() === String(process.pid)) {
-            unlinkSync7(wakePidFile);
-          }
-        } catch {}
+        releaseWakePidFile(wakePidFile);
       }
       try {
         abortCtrl.abort();
@@ -5145,6 +5205,8 @@ ${context}
               channelList.push({ id: ch.id, last_message_at: ch.last_message_at });
             }
           }
+        } else {
+          await mineRes.body?.cancel().catch(() => {});
         }
         for (const extra of opts.channels ?? []) {
           if (extra && !seenCh.has(extra)) {
@@ -5153,8 +5215,8 @@ ${context}
           }
         }
         const sortedForSse = [...channelList].sort((a, b) => {
-          const aDm = a.id.startsWith("dm-") ? 0 : 1;
-          const bDm = b.id.startsWith("dm-") ? 0 : 1;
+          const aDm = DIRECT_CHANNEL_RE.test(a.id) ? 0 : 1;
+          const bDm = DIRECT_CHANNEL_RE.test(b.id) ? 0 : 1;
           return aDm - bDm;
         });
         for (const ch of sortedForSse) {
@@ -5175,8 +5237,10 @@ ${context}
           }
           const qs = existingAfter ? `?after=${encodeURIComponent(existingAfter)}&limit=50` : `?limit=20`;
           const msgRes = await fetchWithDeadline(f, `${baseUrl}/api/channels/${encodeURIComponent(ch.id)}/messages${qs}`, { headers }, requestTimeoutMs, abortCtrl.signal);
-          if (!msgRes.ok)
+          if (!msgRes.ok) {
+            await msgRes.body?.cancel().catch(() => {});
             continue;
+          }
           initialSyncedChannels.add(ch.id);
           const msgData = await msgRes.json();
           const wakeEv = await inspectChannelMessages(ch.id, msgData.messages || []);
@@ -5414,9 +5478,9 @@ function profileNameToPaths(name) {
 function nameToPath(name) {
   const candidates = profileNameToPaths(name);
   const nested = join12(configDir, "profiles", name.replace(/\.json$/, "") + ".json");
-  if (!name.includes("/") && !name.includes("\\") && existsSync7(nested))
+  if (!name.includes("/") && !name.includes("\\") && existsSync6(nested))
     return nested;
-  return candidates.find((path) => existsSync7(path)) || candidates[0];
+  return candidates.find((path) => existsSync6(path)) || candidates[0];
 }
 function listProfileFiles() {
   const seen = new Set;
@@ -5458,7 +5522,7 @@ function resolveProfile() {
   let binds = {};
   if (!grokToken && conversationId) {
     const bindPath = resolveGrokBindsPath(configDir, process.env.AGENTCHAT_GROK_BINDS);
-    if (existsSync7(bindPath)) {
+    if (existsSync6(bindPath)) {
       try {
         const parsed = parseGrokBindsText(readFileSync12(bindPath, "utf-8"));
         binds = parsed.binds;
@@ -5496,7 +5560,7 @@ function resolveProfile() {
     const boundProfile = sessionBinds[bootSession.sessionId];
     if (boundProfile) {
       const boundPath = nameToPath(boundProfile);
-      if (existsSync7(boundPath)) {
+      if (existsSync6(boundPath)) {
         process.stderr.write(`[agentchat] session-bind (${bootSession.runtime}): ${bootSession.sessionId} \u2192 profile "${boundProfile}"
 `);
         return { path: boundPath, source: "session-bind", declaredName: boundProfile };
@@ -5549,7 +5613,7 @@ if (hasToken && !explicitAgentId && profileSource === "default") {
   process.exit(1);
 }
 var identity = decideIdentity({
-  profileExists: existsSync7(profileFile),
+  profileExists: existsSync6(profileFile),
   source: profileSource,
   profileFile,
   cliName: cliArgs.name,
@@ -5775,7 +5839,7 @@ if (!anonymousMode && AGENT_ID && !isOneShotCli && !toolOnlyMode) {
       runtimeSession = { sessionId: resolvedSid, runtime: "antigravity" };
       if (profileSource === "default" && existingAgentRoute?.profileName && existingAgentRoute.profileName !== activeName) {
         const aliasPath = nameToPath(existingAgentRoute.profileName);
-        if (existsSync7(aliasPath)) {
+        if (existsSync6(aliasPath)) {
           activeProfileFile = aliasPath;
           activeName = existingAgentRoute.profileName;
         }
@@ -8199,7 +8263,7 @@ function mimeFromPath(p, kindHint) {
   return MEDIA_MIME_BY_EXT[ext] ?? "application/octet-stream";
 }
 async function uploadLocalFile(path, kindHint) {
-  if (!existsSync7(path))
+  if (!existsSync6(path))
     throw new Error(`file not found: ${path}`);
   const mime = mimeFromPath(path, kindHint);
   const buf = readFileSync12(path);
@@ -8399,7 +8463,7 @@ HANDLERS.set("transcribe", async (args) => {
 });
 function loadGrokBinds() {
   const bindPath = resolveGrokBindsPath(configDir, process.env.AGENTCHAT_GROK_BINDS);
-  if (!existsSync7(bindPath))
+  if (!existsSync6(bindPath))
     return {};
   try {
     return parseGrokBindsText(readFileSync12(bindPath, "utf-8")).binds;
@@ -8721,7 +8785,7 @@ async function registerAndConnectProfile(displayName, bindSessionId) {
     };
   }
   const existingTargetFile = nameToPath(cleanName);
-  if (existsSync7(existingTargetFile)) {
+  if (existsSync6(existingTargetFile)) {
     return {
       content: [{
         type: "text",
@@ -8731,7 +8795,7 @@ async function registerAndConnectProfile(displayName, bindSessionId) {
     };
   }
   const existingDefaultPath = nameToPath("profile");
-  if (existsSync7(existingDefaultPath)) {
+  if (existsSync6(existingDefaultPath)) {
     try {
       const defParsed = JSON.parse(readFileSync12(existingDefaultPath, "utf-8"));
       const defDisplay = typeof defParsed?.display_name === "string" ? defParsed.display_name.trim().toLowerCase() : "";
@@ -8831,7 +8895,7 @@ async function handleProfileSwitchOrConnect(args) {
     return { content: [{ type: "text", text: switchGate.message }], isError: true };
   }
   const targetFile = nameToPath(profile_name);
-  if (!existsSync7(targetFile)) {
+  if (!existsSync6(targetFile)) {
     if (register) {
       return await registerAndConnectProfile(profile_name, explicitSessionId);
     }
@@ -8907,7 +8971,7 @@ function ensureGrokBoundIdentity() {
   if (!boundName)
     return;
   const boundPath = nameToPath(boundName);
-  if (!existsSync7(boundPath))
+  if (!existsSync6(boundPath))
     return;
   let boundProfile;
   try {
@@ -9030,7 +9094,7 @@ var handleToolCall = async (request) => {
           }
         } else if (!isProfileControlTool || name === "disconnect_profile") {
           const boundPath = nameToPath(boundProfileName);
-          if (existsSync7(boundPath)) {
+          if (existsSync6(boundPath)) {
             try {
               const candidate = readIdentityProfile(boundPath);
               const aliasSlot = candidate?.agent_id ? findSlotByAgentId(candidate.agent_id) : undefined;
@@ -11734,7 +11798,7 @@ function syncOpenBoundSessions() {
     if (!boundProf || profileSlots.has(boundProf))
       continue;
     const boundPath = nameToPath(boundProf);
-    if (!existsSync7(boundPath))
+    if (!existsSync6(boundPath))
       continue;
     try {
       const candidate = readIdentityProfile(boundPath);
@@ -11967,8 +12031,8 @@ ${context}
         if (process.env.AGENTCHAT_WAKE_MODE === "grok") {
           (async () => {
             try {
-              const { readFileSync: readFileSync13, existsSync: existsSync8 } = await import("fs");
-              const gwPath = resolveGrokGatewayPath(process.env.AGENTCHAT_GROK_GATEWAY, existsSync8);
+              const { readFileSync: readFileSync13, existsSync: existsSync7 } = await import("fs");
+              const gwPath = resolveGrokGatewayPath(process.env.AGENTCHAT_GROK_GATEWAY, existsSync7);
               let agentId = process.env.AGENTCHAT_GROK_AGENT_ID || "";
               if (!agentId) {
                 agentId = await resolveGrokAgentId({
@@ -12046,7 +12110,7 @@ ${context}
                   let soleMatchesAgent = false;
                   if (soleBoundProf) {
                     const p = nameToPath(soleBoundProf);
-                    if (existsSync7(p)) {
+                    if (existsSync6(p)) {
                       try {
                         soleMatchesAgent = readIdentityProfile(p)?.agent_id === slot.agentId;
                       } catch {}

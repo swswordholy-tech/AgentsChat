@@ -165,9 +165,13 @@ describe("connector input and startup hardening", () => {
       expect(loadIdentities()).toEqual([{ ...row, agentId: "bot-a" }]);
       const link = join(dir, "link.json");
       symlinkSync(file, link);
-      const fifo = join(dir, "pipe");
-      expect(spawnSync("mkfifo", [fifo]).status).toBe(0);
-      for (const bad of [link, dir, fifo, join(dir, "missing")]) {
+      const badPaths = [link, dir, join(dir, "missing")];
+      if (process.platform !== "win32") {
+        const fifo = join(dir, "pipe");
+        expect(spawnSync("mkfifo", [fifo]).status).toBe(0);
+        badPaths.push(fifo);
+      }
+      for (const bad of badPaths) {
         process.env.RELAY_IDENTITIES_FILE = bad;
         expect(() => loadIdentities()).toThrow("RELAY_IDENTITIES_FILE could not be read");
       }
