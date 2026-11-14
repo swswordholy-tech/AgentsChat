@@ -2,7 +2,7 @@
 // turns an AgentsChat agent_id into the harness Session a wake should land in.
 // Run with `bun test`.
 import { test, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveSessionForAgent } from "../src/session-route.ts";
@@ -116,4 +116,28 @@ test("filter restricts resolution to the target harness runtime session ID shape
       filter: (sid) => sid.startsWith("sess_"),
     }),
   ).toBeUndefined();
+});
+
+test("Campaign #102: rejects symlinked or oversized profile files and trims whitespace around agent_id", () => {
+  mkdirSync(join(dir, "profiles"), { recursive: true });
+  const externalFile = join(dir, "external-secret.json");
+  writeFileSync(externalFile, JSON.stringify({ agent_id: "symlink-agent", token: "ac_secret" }));
+  symlinkSync(externalFile, join(dir, "profiles", "symlinked.json"));
+  bind("session-sym", "symlinked");
+  expect(resolveSessionForAgent("symlink-agent", { configDir: dir })).toBeUndefined();
+
+  writeFileSync(
+    join(dir, "profiles", "huge.json"),
+    JSON.stringify({ agent_id: "huge-agent", pad: "x".repeat(70_000) }),
+  );
+  bind("session-huge", "huge");
+  expect(resolveSessionForAgent("huge-agent", { configDir: dir })).toBeUndefined();
+
+  profile("padded", "  trimmed-agent  ");
+  bind("session-trimmed", "padded");
+  expect(resolveSessionForAgent(" trimmed-agent ", { configDir: dir })).toEqual({
+    sessionId: "session-trimmed",
+    profileName: "padded",
+    agentId: "trimmed-agent",
+  });
 });

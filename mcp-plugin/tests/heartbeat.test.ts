@@ -115,3 +115,27 @@ test("start() then stop() leaves a live socket alone (ping, no reconnect)", () =
   expect(calls.ping).toBe(1);
   expect(calls.reconnect).toBe(0);
 });
+
+test("Campaign #102: CONNECTING at clock=0 still expires, sendPing throw triggers reconnect, and non-positive intervals fall back safely", () => {
+  now = 0;
+  const { m, calls } = harness(WS_CONNECTING, { ping: Number.NaN, pong: -5, connect: 5_000 });
+  expect(m.pingInterval).toBe(30_000);
+  expect(m.pongTimeout).toBe(90_000);
+  m.tick(); // records connectingSince = 0 (must not treat 0 as falsy!)
+  now = 5_001;
+  m.tick();
+  expect(calls.reconnect).toBe(1);
+
+  let reconnects = 0;
+  const throwingMonitor = new HeartbeatMonitor({
+    sendPing: () => {
+      throw new Error("Socket is closing");
+    },
+    reconnect: () => {
+      reconnects++;
+    },
+    getReadyState: () => WS_OPEN,
+  });
+  throwingMonitor.tick();
+  expect(reconnects).toBe(1);
+});

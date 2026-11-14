@@ -28,15 +28,22 @@ export class HeartbeatMonitor {
   /** Guard against overlapping reconnect calls */
   private reconnecting = false;
 
+  public readonly pingInterval: number;
+  public readonly pongTimeout: number;
+  public readonly connectTimeout: number;
+
   constructor(
     private deps: HeartbeatDeps,
     /** How often to send a ping (ms) */
-    public readonly pingInterval: number = 30_000,
+    pingInterval: number = 30_000,
     /** Max time without a pong before we consider connection dead (ms) */
-    public readonly pongTimeout: number = 90_000,
+    pongTimeout: number = 90_000,
     /** Max time to stay in CONNECTING before forcing retry (ms) */
-    public readonly connectTimeout: number = 30_000,
+    connectTimeout: number = 30_000,
   ) {
+    this.pingInterval = Number.isFinite(pingInterval) && pingInterval > 0 ? Math.min(pingInterval, 2_147_483_647) : 30_000;
+    this.pongTimeout = Number.isFinite(pongTimeout) && pongTimeout > 0 ? pongTimeout : 90_000;
+    this.connectTimeout = Number.isFinite(connectTimeout) && connectTimeout > 0 ? connectTimeout : 30_000;
     this.lastPong = Date.now();
   }
 
@@ -81,13 +88,17 @@ export class HeartbeatMonitor {
         this.safeReconnect("pong timeout");
         return;
       }
-      this.deps.sendPing();
+      try {
+        this.deps.sendPing();
+      } catch {
+        this.safeReconnect("ping send failed");
+      }
       return;
     }
 
     if (state === WS_CONNECTING) {
       // Track how long we've been stuck in CONNECTING
-      if (!this.connectingSince) {
+      if (this.connectingSince === null) {
         this.connectingSince = Date.now();
       } else if (Date.now() - this.connectingSince > this.connectTimeout) {
         // Stuck in CONNECTING too long (server probably still down) — force retry

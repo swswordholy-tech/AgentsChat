@@ -13,10 +13,13 @@
  * `undefined`, which leaves the receiver on its existing fallback. Routing must
  * never turn a delivery problem into a lost message.
  */
-import { existsSync, readFileSync } from "node:fs";
+import { lstatSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { loadSessionBinds } from "./session-bind.ts";
+
+const MAX_PROFILE_BYTES = 64 * 1024;
+const RESERVED_PROFILE_KEY = /^(?:__proto__|constructor|prototype)$/i;
 
 export interface AgentSessionRoute {
   /** Harness session the wake should be delivered to. */
@@ -41,19 +44,31 @@ export function agentschatConfigDir(env: Record<string, string | undefined> = pr
  * contains a path separator is skipped rather than guessed, because a wrong path
  * would silently route a wake into the wrong identity.
  */
+function isSafeRegularProfileFile(path: string): boolean {
+  try {
+    const st = lstatSync(path);
+    return !st.isSymbolicLink() && st.isFile() && st.size <= MAX_PROFILE_BYTES;
+  } catch {
+    return false;
+  }
+}
+
 function profilePathForName(configDir: string, name: string): string | undefined {
-  if (!name || name.includes("/") || name.includes("\\")) return undefined;
+  if (!name || name === "." || name === ".." || name.includes("/") || name.includes("\\")) return undefined;
   const base = name.replace(/\.json$/, "").replace(/[^a-zA-Z0-9_-]/g, "_");
+  if (!base || RESERVED_PROFILE_KEY.test(base)) return undefined;
   const nested = join(configDir, "profiles", `${base}.json`);
-  if (existsSync(nested)) return nested;
+  if (isSafeRegularProfileFile(nested)) return nested;
   const flat = join(configDir, `${base}.json`);
-  return existsSync(flat) ? flat : undefined;
+  return isSafeRegularProfileFile(flat) ? flat : undefined;
 }
 
 function readAgentId(path: string): string | undefined {
   try {
+    if (!isSafeRegularProfileFile(path)) return undefined;
     const parsed = JSON.parse(readFileSync(path, "utf8")) as { agent_id?: unknown };
-    return typeof parsed.agent_id === "string" && parsed.agent_id ? parsed.agent_id : undefined;
+    const id = typeof parsed?.agent_id === "string" ? parsed.agent_id.trim() : "";
+    return id && !RESERVED_PROFILE_KEY.test(id) ? id : undefined;
   } catch {
     return undefined;
   }
@@ -74,7 +89,8 @@ export function resolveSessionForAgent(
     filter?: (sessionId: string) => boolean;
   } = {},
 ): AgentSessionRoute | undefined {
-  if (typeof agentId !== "string" || agentId.length === 0) return undefined;
+  const targetAgentId = typeof agentId === "string" ? agentId.trim() : "";
+  if (!targetAgentId || RESERVED_PROFILE_KEY.test(targetAgentId)) return undefined;
   const configDir = opts.configDir ?? agentschatConfigDir(opts.env);
   let binds: Record<string, string>;
   try {
@@ -86,8 +102,8 @@ export function resolveSessionForAgent(
     if (opts.filter && !opts.filter(sessionId)) continue;
     const path = profilePathForName(configDir, profileName);
     if (path === undefined) continue;
-    if (readAgentId(path) !== agentId) continue;
-    return { sessionId, profileName, agentId };
+    if (readAgentId(path) !== targetAgentId) continue;
+    return { sessionId, profileName, agentId: targetAgentId };
   }
   return undefined;
 }

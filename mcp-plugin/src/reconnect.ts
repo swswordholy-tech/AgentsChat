@@ -6,9 +6,18 @@
  * min() a long outage would push each successive reconnect unboundedly far out.
  * Extracted from ws.onclose so the cap and jitter bound can be unit-tested.
  */
+const MAX_TIMEOUT_MS = 2_147_483_647;
+
+function safeUnitRand(rand: () => number): number {
+  const r = rand();
+  if (!Number.isFinite(r) || r < 0) return 0;
+  return r >= 1 ? 0.999999 : r;
+}
+
 export function computeReconnectDelay(attempt: number, rand: () => number = Math.random): number {
-  const jitter = rand() * 3000; // 0–3s
-  return Math.min(attempt * 2, 30) * 1000 + jitter;
+  const safeAttempt = typeof attempt === "number" && !Number.isNaN(attempt) ? Math.max(0, attempt) : 0;
+  const jitter = safeUnitRand(rand) * 3000; // 0–3s
+  return Math.min(safeAttempt * 2, 30) * 1000 + jitter;
 }
 
 export function computePleaseReconnectDelay(jitterMs?: unknown, rand: () => number = Math.random): number {
@@ -16,7 +25,7 @@ export function computePleaseReconnectDelay(jitterMs?: unknown, rand: () => numb
     typeof jitterMs === "number" && Number.isFinite(jitterMs) && jitterMs > 0
       ? Math.min(Math.floor(jitterMs), 10_000)
       : 2_000;
-  return 200 + Math.floor(rand() * maxJitter);
+  return 200 + Math.floor(safeUnitRand(rand) * maxJitter);
 }
 
 /**
@@ -41,7 +50,14 @@ export function withTimeoutController(
   timeoutMs: number,
 ): { signal: AbortSignal; cleanup: () => void } {
   const controller = new AbortController();
-  const onParentAbort = () => controller.abort(parentSignal?.reason);
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const onParentAbort = () => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    controller.abort(parentSignal?.reason);
+  };
   if (parentSignal) {
     if (parentSignal.aborted) {
       controller.abort(parentSignal.reason);
@@ -49,19 +65,27 @@ export function withTimeoutController(
     }
     parentSignal.addEventListener("abort", onParentAbort, { once: true });
   }
-  const timer =
-    timeoutMs > 0
-      ? setTimeout(() => {
-          const err = new Error(`HTTP request timed out after ${timeoutMs}ms`);
-          err.name = "TimeoutError";
-          controller.abort(err);
-        }, timeoutMs)
-      : null;
-  (timer as any)?.unref?.();
+  const boundedTimeoutMs =
+    typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? Math.min(Math.floor(timeoutMs), MAX_TIMEOUT_MS)
+      : 0;
+  if (boundedTimeoutMs > 0) {
+    timer = setTimeout(() => {
+      timer = null;
+      if (parentSignal) parentSignal.removeEventListener("abort", onParentAbort);
+      const err = new Error(`HTTP request timed out after ${boundedTimeoutMs}ms`);
+      err.name = "TimeoutError";
+      controller.abort(err);
+    }, boundedTimeoutMs);
+    (timer as any)?.unref?.();
+  }
   return {
     signal: controller.signal,
     cleanup: () => {
-      if (timer) clearTimeout(timer);
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
       if (parentSignal) parentSignal.removeEventListener("abort", onParentAbort);
     },
   };

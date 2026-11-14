@@ -67,3 +67,20 @@ test("withTimeoutController composes parentSignal with timeoutMs instead of drop
     clean2();
   }
 });
+
+test("Campaign #102: computeReconnectDelay guards NaN/negative attempts & out-of-range rand, and withTimeoutController clamps >32-bit timeoutMs", async () => {
+  expect(computeReconnectDelay(Number.NaN, () => 0)).toBe(0);
+  expect(computeReconnectDelay(-10, () => 0)).toBe(0);
+  expect(computeReconnectDelay(Number.POSITIVE_INFINITY, () => 0)).toBe(30_000);
+  expect(computeReconnectDelay(1, () => Number.NaN)).toBe(2000);
+  expect(computeReconnectDelay(1, () => 5)).toBeLessThan(5000);
+
+  // 2^32 ms previously overflowed 32-bit signed int in setTimeout and fired in ~1ms!
+  const { signal, cleanup } = withTimeoutController(undefined, 5_000_000_000);
+  try {
+    await new Promise((r) => setTimeout(r, 25));
+    expect(signal.aborted).toBe(false);
+  } finally {
+    cleanup();
+  }
+});
