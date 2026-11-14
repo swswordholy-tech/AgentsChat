@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // dsh/src/cli.ts
-import { chmodSync as chmodSync3, lstatSync as lstatSync5, mkdirSync as mkdirSync4, readFileSync as readFileSync6, renameSync as renameSync3, unlinkSync as unlinkSync4, writeFileSync as writeFileSync3 } from "node:fs";
+import { chmodSync as chmodSync3, lstatSync as lstatSync6, mkdirSync as mkdirSync4, readFileSync as readFileSync6, renameSync as renameSync3, unlinkSync as unlinkSync4, writeFileSync as writeFileSync3 } from "node:fs";
 import { randomBytes as randomBytes2 } from "node:crypto";
 import { spawn } from "node:child_process";
 import { dirname as dirname3, join as join6, resolve as resolve2 } from "node:path";
@@ -929,7 +929,7 @@ function resolveSessionForAgent(agentId, opts = {}) {
 }
 
 // src/wake.ts
-import { existsSync as existsSync3, readFileSync as readFileSync4 } from "node:fs";
+import { existsSync as existsSync3, lstatSync as lstatSync4, readFileSync as readFileSync4 } from "node:fs";
 import { homedir as homedir3 } from "node:os";
 import { join as join4, win32 as pathWin32 } from "node:path";
 var GROK_GATEWAY_PATH_CANDIDATES = [
@@ -1003,7 +1003,7 @@ function resolveWindowsCliSpawn(cmd, args, opts) {
 
 // dsh/src/patch.ts
 import { randomBytes } from "node:crypto";
-import { chmodSync as chmodSync2, lstatSync as lstatSync4, mkdirSync as mkdirSync3, readFileSync as readFileSync5, renameSync as renameSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2 } from "node:fs";
+import { chmodSync as chmodSync2, lstatSync as lstatSync5, mkdirSync as mkdirSync3, readFileSync as readFileSync5, renameSync as renameSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2 } from "node:fs";
 import { dirname as dirname2, join as join5, resolve } from "node:path";
 import { homedir as homedir4 } from "node:os";
 var FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
@@ -1013,7 +1013,7 @@ function checkParentDirectory(path) {
   for (;; ) {
     if (!(process.platform === "darwin" && DARWIN_ROOT_LINKS.has(parent))) {
       try {
-        const stat = lstatSync4(parent);
+        const stat = lstatSync5(parent);
         if (stat.isSymbolicLink() || !stat.isDirectory()) {
           throw new Error(`Refusing symlinked or non-directory parent: ${parent}`);
         }
@@ -1160,7 +1160,7 @@ function applyDshCordisPatchFile(opts = {}) {
   let existed = false;
   let mode = 384;
   try {
-    const lst = lstatSync4(patchPath);
+    const lst = lstatSync5(patchPath);
     if (lst.isSymbolicLink() || !lst.isFile()) {
       throw new Error(`Refusing to modify non-regular or symlinked DSH patch file: ${patchPath}`);
     }
@@ -1216,7 +1216,7 @@ function checkParentDirectory2(path) {
   for (;; ) {
     if (!(process.platform === "darwin" && DARWIN_ROOT_LINKS2.has(parent))) {
       try {
-        const stat = lstatSync5(parent);
+        const stat = lstatSync6(parent);
         if (stat.isSymbolicLink() || !stat.isDirectory()) {
           throw new Error(`Refusing symlinked or non-directory parent: ${parent}`);
         }
@@ -1252,7 +1252,7 @@ function validateHttpOrWsUrl(raw, allowedProtocols, label) {
 function loadDshConfig(env = process.env, profilePath = DSH_PROFILE_PATH) {
   let profile = {};
   try {
-    const lst = lstatSync5(profilePath);
+    const lst = lstatSync6(profilePath);
     if (!lst.isSymbolicLink() && lst.isFile() && lst.size <= 256 * 1024) {
       const parsed = JSON.parse(readFileSync6(profilePath, "utf8"));
       if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
@@ -1316,7 +1316,7 @@ async function registerOnly(name, restUrl, profilePath = DSH_PROFILE_PATH) {
     throw new Error("Registration response did not include a valid agent id/token");
   }
   try {
-    const lst = lstatSync5(profilePath);
+    const lst = lstatSync6(profilePath);
     if (lst.isSymbolicLink() || !lst.isFile()) {
       throw new Error(`Refusing to overwrite non-regular file ${profilePath}`);
     }
@@ -1541,7 +1541,7 @@ DeepSeek Harness (dsh) integration for AgentsChat:
             const candidates = [join6(cfgDir, "profiles", `${base}.json`), join6(cfgDir, `${base}.json`)];
             const profPath = candidates.find((p) => {
               try {
-                const lst = lstatSync5(p);
+                const lst = lstatSync6(p);
                 return !lst.isSymbolicLink() && lst.isFile() && lst.size <= 256 * 1024;
               } catch {
                 return false;

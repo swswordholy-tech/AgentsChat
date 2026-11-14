@@ -421,7 +421,7 @@ ${text}`,
 }
 
 // codex/run.ts
-import { readFileSync as readFileSync11, lstatSync as lstatSync9 } from "node:fs";
+import { readFileSync as readFileSync11, lstatSync as lstatSync11 } from "node:fs";
 import { homedir as homedir6 } from "node:os";
 import { join as join11 } from "node:path";
 
@@ -1555,7 +1555,7 @@ import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 
 // src/wake.ts
-import { existsSync as existsSync3, readFileSync as readFileSync4 } from "node:fs";
+import { existsSync as existsSync3, lstatSync as lstatSync4, readFileSync as readFileSync4 } from "node:fs";
 import { homedir as homedir4 } from "node:os";
 import { join as join5, win32 as pathWin32 } from "node:path";
 var GROK_GATEWAY_PATH_CANDIDATES = [
@@ -1958,12 +1958,13 @@ function isTeamLeadSkillInvocation(prompt) {
 }
 
 // codex/bridge.ts
-import { existsSync as existsSync6, mkdirSync as mkdirSync6, readFileSync as readFileSync9, renameSync as renameSync4, writeFileSync as writeFileSync4, openSync as openSync2, closeSync as closeSync2, unlinkSync as unlinkSync4 } from "node:fs";
+import { lstatSync as lstatSync9, mkdirSync as mkdirSync6, readFileSync as readFileSync9, renameSync as renameSync4, writeFileSync as writeFileSync4, openSync as openSync2, closeSync as closeSync2, unlinkSync as unlinkSync4 } from "node:fs";
 import { join as join9 } from "node:path";
+import { randomBytes as randomBytes2 } from "node:crypto";
 
 // codex/thread-history.ts
 import { createHash as createHash2, randomBytes } from "node:crypto";
-import { chmodSync, lstatSync as lstatSync4, mkdirSync as mkdirSync4, renameSync as renameSync2, unlinkSync, writeFileSync as writeFileSync2 } from "node:fs";
+import { chmodSync, lstatSync as lstatSync5, mkdirSync as mkdirSync4, renameSync as renameSync2, unlinkSync, writeFileSync as writeFileSync2 } from "node:fs";
 import { join as join6 } from "node:path";
 function priorChannelThreads(threads, channel) {
   if (!threads || typeof threads !== "object" || typeof channel !== "string" || !channel)
@@ -1986,13 +1987,13 @@ function priorChannelThreads(threads, channel) {
 function preserveChannelHistory(directory, channel, histories, redact) {
   const root = join6(directory, "history");
   mkdirSync4(root, { recursive: true, mode: 448 });
-  if (lstatSync4(root).isSymbolicLink())
+  if (lstatSync5(root).isSymbolicLink())
     throw new Error("History directory must not be a symlink");
   if (process.platform !== "win32")
     chmodSync(root, 448);
   const file = join6(root, createHash2("sha256").update(channel).digest("hex").slice(0, 24) + ".json");
   try {
-    if (lstatSync4(file).isSymbolicLink())
+    if (lstatSync5(file).isSymbolicLink())
       throw new Error("History archive must not be a symlink");
   } catch (e) {
     if (e.code !== "ENOENT")
@@ -2084,14 +2085,17 @@ End of historical context.
 }
 
 // codex/loop-grants.ts
-import { lstatSync as lstatSync5, readFileSync as readFileSync6 } from "node:fs";
+import { lstatSync as lstatSync6, readFileSync as readFileSync6 } from "node:fs";
 import { join as join7 } from "node:path";
 function grants(config, opts) {
   try {
     const platform = opts?.platform ?? process.platform;
     const getuid = opts && "getuid" in opts ? opts.getuid : process.getuid;
-    const file = join7(config.stateDir, "loop-grants.json"), stat = lstatSync5(file);
-    if (!stat.isFile())
+    const directory = lstatSync6(config.stateDir);
+    if (directory.isSymbolicLink() || !directory.isDirectory())
+      return [];
+    const file = join7(config.stateDir, "loop-grants.json"), stat = lstatSync6(file);
+    if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 1048576)
       return [];
     if (platform !== "win32") {
       if (typeof getuid !== "function" || (stat.mode & 63) !== 0 || stat.uid !== getuid())
@@ -2100,7 +2104,7 @@ function grants(config, opts) {
     const doc = JSON.parse(readFileSync6(file, "utf8"));
     if (doc?.version !== 1 || !Array.isArray(doc.grants))
       return [];
-    return doc.grants.filter((g) => g && [g.loop_id, g.channel_id, g.agent_id, g.owner_id, g.prompt].every((v) => typeof v === "string" && v.trim()) && g.agent_id === config.agentId && g.prompt.length <= 4000 && Number.isSafeInteger(g.interval_ms) && g.interval_ms >= 60000 && g.interval_ms <= 86400000);
+    return doc.grants.filter((g) => g && [g.loop_id, g.channel_id, g.agent_id, g.owner_id, g.prompt].every((v) => typeof v === "string" && v.trim()) && /^loop_[A-Za-z0-9_-]+$/.test(g.loop_id) && [g.loop_id, g.channel_id, g.agent_id, g.owner_id].every((v) => !/[\x00-\x1f\x7f]/.test(v)) && g.agent_id === config.agentId && g.prompt.length <= 4000 && Number.isSafeInteger(g.interval_ms) && g.interval_ms >= 60000 && g.interval_ms <= 86400000);
   } catch {
     return [];
   }
@@ -2117,8 +2121,8 @@ function authorizedLoopTick(raw, config, opts) {
     return null;
   return grant;
 }
-async function verifyLoopTick(raw, config, owner, list) {
-  const grant = authorizedLoopTick(raw, config);
+async function verifyLoopTick(raw, config, owner, list, opts) {
+  const grant = authorizedLoopTick(raw, config, opts);
   if (!grant || owner !== grant.owner_id || config.permissions !== "full-access")
     return null;
   let response;
@@ -2133,19 +2137,19 @@ async function verifyLoopTick(raw, config, owner, list) {
   const loop = rows[0];
   if (!loop || loop.status !== "active" || loop.channel_id !== grant.channel_id || loop.prompt !== grant.prompt || loop.interval_ms !== grant.interval_ms || loop.expires_at !== null || loop.mode !== undefined && loop.mode !== "static" || !Number.isSafeInteger(loop.last_tick_at) || loop.last_tick_at <= 0 || !Number.isSafeInteger(loop.next_tick_ms) || loop.next_tick_ms !== raw.meta.next_tick_ms || loop.last_tick_at + grant.interval_ms !== loop.next_tick_ms)
     return null;
-  const current = authorizedLoopTick(raw, config);
+  const current = authorizedLoopTick(raw, config, opts);
   return current && current.owner_id === owner ? current : null;
 }
 
 // src/session-bind.ts
 import { createHash as createHash3 } from "node:crypto";
-import { closeSync, existsSync as existsSync5, lstatSync as lstatSync7, mkdirSync as mkdirSync5, openSync, readFileSync as readFileSync8, readSync, readdirSync as readdirSync4, statSync as statSync3, unlinkSync as unlinkSync3 } from "node:fs";
+import { closeSync, existsSync as existsSync5, lstatSync as lstatSync8, mkdirSync as mkdirSync5, openSync, readFileSync as readFileSync8, readSync, readdirSync as readdirSync4, statSync as statSync3, unlinkSync as unlinkSync3 } from "node:fs";
 import { homedir as homedir5, tmpdir } from "node:os";
 import { join as join8 } from "node:path";
 
 // src/profile-store.ts
 import {
-  lstatSync as lstatSync6,
+  lstatSync as lstatSync7,
   writeFileSync as writeFileSync3,
   renameSync as renameSync3,
   copyFileSync,
@@ -2159,7 +2163,7 @@ var defaultWarn = (m) => process.stderr.write(m);
 var MAX_PROFILE_JSON_BYTES = 64 * 1024;
 function safeLstat(target) {
   try {
-    return lstatSync6(target);
+    return lstatSync7(target);
   } catch (err) {
     if (err && err.code === "ENOENT")
       return;
@@ -2255,7 +2259,7 @@ var LOCK_FILE_MAX_BYTES = 64 * 1024;
 var SESSION_BINDS_MAX_BYTES = 1024 * 1024;
 function readBoundedRegularJson(path, maxBytes) {
   try {
-    const st = lstatSync7(path);
+    const st = lstatSync8(path);
     if (st.isSymbolicLink() || !st.isFile() || st.size > maxBytes)
       return null;
     return JSON.parse(readFileSync8(path, "utf8"));
@@ -2265,7 +2269,7 @@ function readBoundedRegularJson(path, maxBytes) {
 }
 function isSafeTargetFileOrMissing(path) {
   try {
-    const st = lstatSync7(path);
+    const st = lstatSync8(path);
     return !st.isSymbolicLink() && st.isFile();
   } catch (e) {
     return Boolean(e && typeof e === "object" && e.code === "ENOENT");
@@ -2273,7 +2277,7 @@ function isSafeTargetFileOrMissing(path) {
 }
 function isSafeDirOrMissing(dirPath) {
   try {
-    const st = lstatSync7(dirPath);
+    const st = lstatSync8(dirPath);
     return !st.isSymbolicLink() && st.isDirectory();
   } catch (e) {
     return Boolean(e && typeof e === "object" && e.code === "ENOENT");
@@ -2323,7 +2327,7 @@ function releaseAgentLock(opts) {
   const existing = readAgentLock(opts.lockDir, opts.agentId);
   if (!existing) {
     try {
-      const st = lstatSync7(file);
+      const st = lstatSync8(file);
       if (!st.isSymbolicLink() && st.isFile() && Date.now() - st.mtimeMs > 1000) {
         unlinkSync3(file);
         return true;
@@ -2351,8 +2355,14 @@ function permitted(m, c) {
     return authorizedLoopTick(m, c) !== null;
   return (!c.channels.length || c.channels.includes(m.channel_id)) && (!c.senders.length || c.senders.includes(m.sender_id));
 }
+var isPrototypeKey = (key) => /^(?:__proto__|constructor|prototype)$/i.test(key);
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
+}
 function addressed(m, c) {
   if (!m || ["id", "channel_id", "sender_id", "content"].some((k) => typeof m[k] !== "string" || !m[k].trim()))
+    return false;
+  if (isPrototypeKey(m.channel_id))
     return false;
   if (m.content === "__typing__" || m.content.length > 32000)
     return false;
@@ -2365,7 +2375,7 @@ function addressed(m, c) {
   if (!permitted(m, c))
     return false;
   const escaped = c.agentId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return m.channel_id.startsWith("dm-") || [m.mentions, m.mentioned_ids].some((a) => Array.isArray(a) && a.includes(c.agentId)) || new RegExp(`@${escaped}(?![\\w-])|@[^\\n(]+\\(${escaped}\\)`).test(m.content);
+  return /^dm[-:]/i.test(m.channel_id) || [m.mentions, m.mentioned_ids].some((a) => Array.isArray(a) && a.includes(c.agentId)) || new RegExp(`@${escaped}(?![\\w-])|@[^\\n(]+\\(${escaped}\\)`).test(m.content);
 }
 
 class Bridge {
@@ -2394,13 +2404,15 @@ class Bridge {
     mkdirSync6(config.stateDir, { recursive: true, mode: 448 });
     this.file = join9(config.stateDir, "state.json");
     this.lock = join9(config.stateDir, "bridge.lock");
-    if (existsSync6(this.lock)) {
-      try {
-        const holderPid = Number(readFileSync9(this.lock, "utf8").trim());
-        if (!Number.isInteger(holderPid) || holderPid <= 0 || !isPidAlive(holderPid))
+    try {
+      const stat = lstatSync9(this.lock);
+      if (!stat.isSymbolicLink() && stat.isFile() && stat.size <= 64 * 1024) {
+        const content = readFileSync9(this.lock, "utf8");
+        const holderPid = /^\d+$/.test(content) && content.trim() === content ? Number(content) : NaN;
+        if (!Number.isSafeInteger(holderPid) || holderPid <= 0 || !isPidAlive(holderPid))
           unlinkSync4(this.lock);
-      } catch {}
-    }
+      }
+    } catch {}
     try {
       const fd = openSync2(this.lock, "wx", 384);
       writeFileSync4(fd, String(process.pid));
@@ -2411,8 +2423,18 @@ class Bridge {
     const homeDir = process.env.HOME || process.env.USERPROFILE || ".";
     const lockDir = resolveLockDir(homeDir, process.env);
     try {
-      this.state = existsSync6(this.file) ? JSON.parse(readFileSync9(this.file, "utf8")) : { version: 1, threads: {}, entries: [] };
-      if (this.state.version !== 1 || !this.state.threads || !Array.isArray(this.state.entries))
+      let hasState = false;
+      try {
+        const stat = lstatSync9(this.file);
+        if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 16 * 1024 * 1024)
+          throw new Error("Unsafe bridge state");
+        hasState = true;
+      } catch (error) {
+        if (error.code !== "ENOENT")
+          throw error;
+      }
+      this.state = hasState ? JSON.parse(readFileSync9(this.file, "utf8")) : { version: 1, threads: {}, entries: [] };
+      if (this.state?.version !== 1 || !isPlainObject(this.state.threads) || !Array.isArray(this.state.entries) || Object.prototype.hasOwnProperty.call(this.state, "channels") && !isPlainObject(this.state.channels))
         throw new Error("Invalid bridge state");
       for (const e of this.state.entries) {
         if (e.status === "sending")
@@ -2450,9 +2472,16 @@ class Bridge {
         return true;
       });
     }
-    const tmp = `${this.file}.tmp.${process.pid}.${Date.now()}`;
+    const tmp = `${this.file}.tmp.${process.pid}.${Date.now()}.${randomBytes2(16).toString("hex")}`;
     try {
-      writeFileSync4(tmp, JSON.stringify(this.state), { mode: 384 });
+      writeFileSync4(tmp, JSON.stringify(this.state), { mode: 384, flag: "wx" });
+      try {
+        if (lstatSync9(this.file).isSymbolicLink())
+          throw new Error("Bridge state must not be a symlink");
+      } catch (error) {
+        if (error.code !== "ENOENT")
+          throw error;
+      }
       renameSync4(tmp, this.file);
     } catch (err) {
       try {
@@ -2496,7 +2525,7 @@ class Bridge {
     return true;
   }
   redact(text) {
-    return redactSecrets(text.split(this.config.token).join("[REDACTED]"));
+    return redactSecrets(this.config.token ? text.split(this.config.token).join("[REDACTED]") : text);
   }
   recover(raw) {
     if (this.stopped)
@@ -2520,8 +2549,10 @@ class Bridge {
     return this.draining;
   }
   async prepareChannel(chat) {
+    if (isPrototypeKey(chat))
+      throw new Error("Invalid channel ID");
     this.state.channels ??= {};
-    let channel = this.state.channels[chat];
+    let channel = Object.prototype.hasOwnProperty.call(this.state.channels, chat) ? this.state.channels[chat] : undefined;
     if (!this.loaded.has(chat)) {
       const namespace = this.codex.namespace;
       if (channel?.namespace && channel.namespace !== namespace)
@@ -2640,8 +2671,14 @@ AgentsChat message:
   async stop() {
     this.pause();
     await this.draining;
-    if (existsSync6(this.lock))
-      unlinkSync4(this.lock);
+    try {
+      const stat = lstatSync9(this.lock);
+      if (!stat.isSymbolicLink() && stat.isFile() && stat.size <= 64 * 1024 && readFileSync9(this.lock, "utf8") === String(process.pid))
+        unlinkSync4(this.lock);
+    } catch (error) {
+      if (error.code !== "ENOENT")
+        throw error;
+    }
     const homeDir = process.env.HOME || process.env.USERPROFILE || ".";
     releaseAgentLock({ lockDir: resolveLockDir(homeDir, process.env), agentId: this.config.agentId });
   }
@@ -2744,8 +2781,8 @@ function resolveDrainReconnectDelay(frame, rand = Math.random) {
 }
 
 // codex/inbox-sync.ts
-import { chmodSync as chmodSync3, lstatSync as lstatSync8, mkdirSync as mkdirSync7, readFileSync as readFileSync10, renameSync as renameSync5, unlinkSync as unlinkSync5, writeFileSync as writeFileSync5 } from "node:fs";
-import { randomBytes as randomBytes2 } from "node:crypto";
+import { chmodSync as chmodSync3, lstatSync as lstatSync10, mkdirSync as mkdirSync7, readFileSync as readFileSync10, renameSync as renameSync5, unlinkSync as unlinkSync5, writeFileSync as writeFileSync5 } from "node:fs";
+import { randomBytes as randomBytes3 } from "node:crypto";
 import { join as join10 } from "node:path";
 
 // src/timestamps.ts
@@ -2802,7 +2839,7 @@ class InboxSync {
     this.active = active;
     this.log = log;
     mkdirSync7(stateDir, { recursive: true, mode: 448 });
-    const dirStat = lstatSync8(stateDir);
+    const dirStat = lstatSync10(stateDir);
     if (dirStat.isSymbolicLink() || !dirStat.isDirectory())
       throw new Error("Invalid inbound state directory");
     if (process.platform !== "win32")
@@ -2810,7 +2847,7 @@ class InboxSync {
     this.file = join10(stateDir, "inbound-cursors.json");
     let fileStat;
     try {
-      fileStat = lstatSync8(this.file);
+      fileStat = lstatSync10(this.file);
     } catch (err) {
       if (err.code !== "ENOENT")
         throw err;
@@ -2830,7 +2867,7 @@ class InboxSync {
     this.state.channels = channels;
   }
   save() {
-    const tmp = `${this.file}.${process.pid}.${Date.now()}.${randomBytes2(4).toString("hex")}.tmp`;
+    const tmp = `${this.file}.${process.pid}.${Date.now()}.${randomBytes3(4).toString("hex")}.tmp`;
     let created = false;
     try {
       writeFileSync5(tmp, JSON.stringify(this.state), { mode: 384, flag: "wx" });
@@ -3222,7 +3259,7 @@ See codex/README.md for setup, verification, limitations and recovery.
 var codex;
 var bridge;
 var transport;
-function isPlainObject(value) {
+function isPlainObject2(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value) && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
 }
 async function main() {
@@ -3257,7 +3294,7 @@ async function main() {
     }
     if (!values["gui-thread"] || !values["gui-message-file"])
       throw new Error("GUI submission requires --gui-thread and --gui-message-file");
-    const stat = lstatSync9(values["gui-message-file"]);
+    const stat = lstatSync11(values["gui-message-file"]);
     if (stat.isSymbolicLink() || !stat.isFile())
       throw new Error("GUI message must be a regular file, not a symlink");
     if (stat.size > 256 * 1024)
@@ -3277,7 +3314,7 @@ async function main() {
     timer.unref?.();
     process.once("message", (config) => {
       clearTimeout(timer);
-      if (!isPlainObject(config) || !Object.keys(config).length) {
+      if (!isPlainObject2(config) || !Object.keys(config).length) {
         reject(new Error("Invalid parent configuration"));
         return;
       }
@@ -3305,7 +3342,7 @@ async function main() {
   if (values.conversations || values["read-conversation"]) {
     const state = JSON.parse(readFileSync11(join11(c.stateDir, "state.json"), "utf8"));
     const channels = state?.channels === undefined ? {} : state.channels;
-    if (!isPlainObject(channels))
+    if (!isPlainObject2(channels))
       throw new Error("Invalid conversation channels");
     const safeOutput = (value) => {
       const text = JSON.stringify(value);
@@ -3319,7 +3356,7 @@ async function main() {
     if (!Object.prototype.hasOwnProperty.call(channels, key))
       throw new Error("Unknown conversation channel");
     const channel = channels[key];
-    if (!isPlainObject(channel) || typeof channel.thread !== "string" || !channel.thread)
+    if (!isPlainObject2(channel) || typeof channel.thread !== "string" || !channel.thread)
       throw new Error("Invalid conversation channel");
     if (channel.namespace && channel.namespace !== runtime.home)
       throw new Error("Conversation belongs to a different runtime home");
