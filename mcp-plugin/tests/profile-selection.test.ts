@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { projectProfileSelector } from "../src/profile-selection.ts";
@@ -19,9 +19,27 @@ test("project selector: binding, local profile, absent; malformed declarations f
     expect(projectProfileSelector(cwd)?.selector).toBe(join(cwd, "private/bot.json"));
     writeFileSync(config, JSON.stringify({ profile: "Chosen", agent_id: "expected", api_url: "http://127.0.0.1:9876", ws_url: "ws://127.0.0.1:9876/ws" }));
     expect(projectProfileSelector(cwd)).toEqual({ selector: "Chosen", source: "project-config", agentId: "expected", apiUrl: "http://127.0.0.1:9876", wsUrl: "ws://127.0.0.1:9876/ws" });
-    for (const bad of ["broken", "[]", "null", '{"profile":""}', '{"profile":"Chosen","agent_id":1}', '{"profile":"Chosen","api_url":"http://example.com"}', '{"profile":"Chosen","api_url":"https://user:secret@example.com"}']) {
+    for (const bad of [
+      "broken",
+      "[]",
+      "null",
+      '{"profile":""}',
+      '{"profile":"Chosen","agent_id":1}',
+      '{"profile":"Chosen","api_url":"http://example.com"}',
+      '{"profile":"Chosen","api_url":"https://user:secret@example.com"}',
+      '{"profile":"../../outside.json"}',
+      '{"profile":"~/../../etc/passwd"}',
+      '{"profile":"Chosen\\u0000evil"}',
+      '{"profile":"Chosen","token":"ac_inline_secret"}',
+    ]) {
       writeFileSync(config, bad);
       expect(() => projectProfileSelector(cwd)).toThrow();
     }
+    rmSync(config);
+    rmSync(profile);
+    const outside = join(cwd, "outside.json");
+    writeFileSync(outside, '{"profile":"Chosen"}');
+    symlinkSync(outside, config);
+    expect(() => projectProfileSelector(cwd)).toThrow(/Invalid project \.agentschat\/config\.json|symlink/i);
   } finally { rmSync(cwd, { recursive: true, force: true }); }
 });

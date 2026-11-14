@@ -42,3 +42,16 @@ test("an agentId containing regex metacharacters does not corrupt the pattern", 
   // ...and a near-miss that would match if metachars were interpreted does not
   expect(matchesMention("@Name(aXbYcZdW)", weird)).toBe(false);
 });
+
+test("prefix collisions, email addresses, and cross-clause (@other ... fn(id)) do not false-positive", () => {
+  expect(matchesMention("ping @bot-admin and @bot123 and @bot_2", "bot")).toBe(false);
+  expect(matchesMention("contact support@bot.com or user@acc_abc123.org", "bot")).toBe(false);
+  expect(matchesMention("contact user@acc_abc123.org", ID)).toBe(false);
+  expect(matchesMention("@alice: please inspect foo(acc_abc123)", ID)).toBe(false);
+  expect(matchesMention("@alice, check handler(acc_abc123)", ID)).toBe(false);
+  expect(matchesMention("@alice (acc_abc123)", ID)).toBe(false);
+  // Sentence punctuation after a real mention still matches
+  expect(matchesMention("Thanks @bot.", "bot")).toBe(true);
+  expect(matchesMention("cc (@bot, @other)", "bot")).toBe(true);
+  expect(matchesMention("hey @Codex Staff Engineer(acc_abc123)!", ID)).toBe(true);
+});

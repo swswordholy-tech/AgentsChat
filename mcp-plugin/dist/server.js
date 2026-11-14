@@ -4,31 +4,57 @@ import { createRequire } from "node:module";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/onboarding-status.ts
+function isSafeOnboardingBase(base) {
+  try {
+    const parsed = new URL(base);
+    const host = parsed.hostname.toLowerCase();
+    const isLoopback = host === "127.0.0.1" || host === "localhost" || host === "[::1]" || host === "::1";
+    if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && isLoopback))
+      return false;
+    if (parsed.username || parsed.password || parsed.search || parsed.hash)
+      return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
 async function getOnboardingStatus(base, agentId, token, request = fetch) {
-  const chat = `${base.replace(/\/$/, "")}/chat/${encodeURIComponent(agentId)}`;
+  const cleanBase = typeof base === "string" ? base.trim().replace(/\/+$/, "") : "";
+  const safeAgentId = typeof agentId === "string" ? agentId.trim() : "";
+  const chat = `${cleanBase}/chat/${encodeURIComponent(safeAgentId)}`;
   const result = {
-    agent_id: agentId,
+    agent_id: safeAgentId,
     claimed: null,
     authentication: "unknown",
     chat_url: chat,
     claim_url: `${chat}?claim=1`,
     next_step: "check_identity"
   };
+  if (!cleanBase || !safeAgentId || /[\x00-\x1f\x7f]/.test(cleanBase) || /[\x00-\x1f\x7f]/.test(safeAgentId) || typeof token !== "string" || !token.trim() || /[\x00-\x1f\x7f]/.test(token) || !isSafeOnboardingBase(cleanBase)) {
+    return result;
+  }
   try {
-    const r = await request(`${base.replace(/\/$/, "")}/api/account/onboarding`, {
-      headers: { Authorization: `Bearer ${token}` },
+    const r = await request(`${cleanBase}/api/account/onboarding`, {
+      headers: { Authorization: `Bearer ${token.trim()}` },
       cache: "no-store",
       signal: AbortSignal.timeout(8000),
       redirect: "error"
     });
     if (r.status === 401 || r.status === 403) {
+      try {
+        await r.body?.cancel?.();
+      } catch {}
       result.authentication = "failed";
       return result;
     }
-    if (!r.ok)
+    if (!r.ok) {
+      try {
+        await r.body?.cancel?.();
+      } catch {}
       return result;
+    }
     const data = await r.json();
-    if (data.agent_id !== agentId || typeof data.claimed !== "boolean")
+    if (!data || typeof data !== "object" || data.agent_id !== safeAgentId || typeof data.claimed !== "boolean")
       return result;
     result.authentication = "ok";
     result.claimed = data.claimed;
@@ -89,12 +115,16 @@ function redactParticipantPii(rawId) {
 
 // src/mentions.ts
 function matchesMention(content, agentId) {
-  if (!content || !agentId)
+  if (typeof content !== "string" || typeof agentId !== "string")
     return false;
-  if (content.includes(`@${agentId}`))
+  const trimmedId = agentId.trim();
+  if (!content || !trimmedId || /[\x00-\x1f\x7f]/.test(trimmedId))
+    return false;
+  const idEsc = trimmedId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const bareMentionRe = new RegExp(`(?<![A-Za-z0-9_])@${idEsc}(?![A-Za-z0-9_-]|\\.[A-Za-z0-9])`);
+  if (bareMentionRe.test(content))
     return true;
-  const idEsc = agentId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const displayMentionRe = new RegExp(`@[^(\\n]+\\(${idEsc}\\)`);
+  const displayMentionRe = new RegExp(`(?<![A-Za-z0-9_])@[^\\s(@,:;<>"'\\x60\\n]+(?: [^\\s(@,:;<>"'\\x60\\n]+){0,4}\\(${idEsc}\\)`);
   return displayMentionRe.test(content);
 }
 
@@ -102,26 +132,37 @@ function matchesMention(content, agentId) {
 function messageDedupKey(data) {
   if (!data || typeof data.id !== "string" || typeof data.channel_id !== "string")
     return null;
-  return `${data.channel_id}:${data.id}`;
+  if (!data.id.trim() || !data.channel_id.trim())
+    return null;
+  const safeChannel = data.channel_id.replace(/\\/g, "\\\\").replace(/:/g, "\\:");
+  return `${safeChannel}:${data.id}`;
 }
 
 class MessageDedup {
+  seen = new Set;
   max;
   dropOnEvict;
-  seen = new Set;
   constructor(max = 5000, dropOnEvict = 1000) {
-    this.max = max;
-    this.dropOnEvict = dropOnEvict;
+    const safeMax = Number.isFinite(max) ? Math.max(1, Math.floor(max)) : 5000;
+    const safeDrop = Number.isFinite(dropOnEvict) ? Math.min(safeMax, Math.max(1, Math.floor(dropOnEvict))) : Math.min(safeMax, 1000);
+    this.max = safeMax;
+    this.dropOnEvict = safeDrop;
   }
   recordOrSkip(key) {
+    if (typeof key !== "string" || key.length === 0)
+      return false;
     if (this.seen.has(key))
       return true;
     this.seen.add(key);
     if (this.seen.size > this.max) {
-      const arr = [...this.seen];
-      this.seen.clear();
-      for (const item of arr.slice(this.dropOnEvict))
-        this.seen.add(item);
+      const toDrop = Math.max(this.dropOnEvict, this.seen.size - this.max);
+      let dropped = 0;
+      for (const oldest of this.seen) {
+        this.seen.delete(oldest);
+        dropped += 1;
+        if (dropped >= toDrop)
+          break;
+      }
     }
     return false;
   }
@@ -1686,48 +1727,106 @@ function shouldMigrateDevToken(i) {
 }
 
 // src/profile-selection.ts
-import { existsSync, readFileSync as readFileSync2 } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
+import { lstatSync, readFileSync as readFileSync2 } from "node:fs";
+import { homedir } from "node:os";
+import { isAbsolute, join, relative, resolve } from "node:path";
+var MAX_PROJECT_CONFIG_BYTES = 64 * 1024;
+var FORBIDDEN_CREDENTIAL_KEYS = new Set(["token", "key", "api_key", "secret", "password", "authorization"]);
+function safeLstat(target) {
+  try {
+    return lstatSync(target);
+  } catch (err) {
+    if (err && err.code === "ENOENT")
+      return;
+    throw err;
+  }
+}
+function isLoopbackHost(hostname) {
+  const lower = hostname.toLowerCase();
+  return lower === "127.0.0.1" || lower === "localhost" || lower === "[::1]" || lower === "::1";
+}
 function projectProfileSelector(cwd) {
-  const config = join(cwd, ".agentschat/config.json");
+  const resolvedCwd = resolve(cwd);
+  const projectDir = join(resolvedCwd, ".agentschat");
+  const dirStat = safeLstat(projectDir);
+  if (!dirStat)
+    return;
+  if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) {
+    throw new Error("Refusing symlinked or non-directory project .agentschat");
+  }
+  const config = join(projectDir, "config.json");
   let doc = {};
-  if (existsSync(config)) {
+  const configStat = safeLstat(config);
+  if (configStat) {
+    if (configStat.isSymbolicLink() || !configStat.isFile() || configStat.size > MAX_PROJECT_CONFIG_BYTES) {
+      throw new Error("Invalid project .agentschat/config.json; repair it before choosing an identity");
+    }
+    let raw;
     try {
-      doc = JSON.parse(readFileSync2(config, "utf8"));
+      raw = readFileSync2(config, "utf8");
+      doc = JSON.parse(raw);
     } catch {
       throw new Error("Invalid project .agentschat/config.json; repair it before choosing an identity");
     }
     if (!doc || typeof doc !== "object" || Array.isArray(doc))
       throw new Error("Invalid project identity configuration");
+    if (Object.prototype.hasOwnProperty.call(doc, "__proto__") || Object.keys(doc).some((k) => FORBIDDEN_CREDENTIAL_KEYS.has(k.toLowerCase()))) {
+      throw new Error("Credentials must not be stored in project .agentschat/config.json");
+    }
     for (const field of ["profile", "agent_id", "api_url", "ws_url"]) {
-      if (doc[field] !== undefined && (typeof doc[field] !== "string" || !doc[field].trim()))
+      if (doc[field] !== undefined && (typeof doc[field] !== "string" || !doc[field].trim() || /[\x00-\x1f\x7f]/.test(doc[field]))) {
         throw new Error(`Invalid project ${field}`);
+      }
     }
     for (const [field, protocols] of [["api_url", ["https:", "http:"]], ["ws_url", ["wss:", "ws:"]]]) {
       if (doc[field] === undefined)
         continue;
       let url;
       try {
-        url = new URL(doc[field]);
+        url = new URL(doc[field].trim());
       } catch {
         throw new Error(`Invalid project ${field}`);
       }
-      if (!protocols.includes(url.protocol) || url.username || url.password || url.search || url.hash || !url.protocol.endsWith("s:") && !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname))
+      if (!protocols.includes(url.protocol) || url.username || url.password || url.search || url.hash || !url.protocol.endsWith("s:") && !isLoopbackHost(url.hostname))
         throw new Error(`Invalid project ${field}: require TLS (except loopback) and no credentials/query`);
     }
   }
   const settings = {
-    ...doc.agent_id !== undefined ? { agentId: doc.agent_id } : {},
-    ...doc.api_url !== undefined ? { apiUrl: doc.api_url } : {},
-    ...doc.ws_url !== undefined ? { wsUrl: doc.ws_url } : {}
+    ...doc.agent_id !== undefined ? { agentId: doc.agent_id.trim() } : {},
+    ...doc.api_url !== undefined ? { apiUrl: doc.api_url.trim() } : {},
+    ...doc.ws_url !== undefined ? { wsUrl: doc.ws_url.trim() } : {}
   };
   if (doc.profile !== undefined) {
-    const value = doc.profile;
-    return { selector: !isAbsolute(value) && !value.startsWith("~/") && value.includes("/") ? resolve(cwd, value) : value, source: "project-config", ...settings };
+    const value = doc.profile.trim();
+    if (value === "." || value === "..")
+      throw new Error("Invalid project profile");
+    if (value.startsWith("~/") || value.startsWith("~\\")) {
+      const homeBase = resolve(homedir());
+      const resolvedHomeTarget = resolve(homeBase, value.slice(2));
+      const relHome = relative(homeBase, resolvedHomeTarget);
+      if (!relHome || relHome.startsWith("..") || isAbsolute(relHome)) {
+        throw new Error("Invalid project profile: home-relative path traversal");
+      }
+      return { selector: value, source: "project-config", ...settings };
+    }
+    if (!isAbsolute(value) && (value.includes("/") || value.includes("\\"))) {
+      const resolvedTarget = resolve(resolvedCwd, value);
+      const rel = relative(resolvedCwd, resolvedTarget);
+      if (!rel || rel.startsWith("..") || isAbsolute(rel)) {
+        throw new Error("Invalid project profile: relative path must stay within project directory");
+      }
+      return { selector: resolvedTarget, source: "project-config", ...settings };
+    }
+    return { selector: value, source: "project-config", ...settings };
   }
-  const profile = join(cwd, ".agentschat/profile.json");
-  if (existsSync(profile))
+  const profile = join(projectDir, "profile.json");
+  const profileStat = safeLstat(profile);
+  if (profileStat) {
+    if (profileStat.isSymbolicLink() || !profileStat.isFile()) {
+      throw new Error("Refusing symlinked or non-regular project .agentschat/profile.json");
+    }
     return { selector: profile, source: "project-profile", ...settings };
+  }
   if (Object.keys(settings).length)
     throw new Error("Project identity/server settings require a profile binding");
 }
@@ -1977,8 +2076,8 @@ function annotateTools(tools) {
 
 // src/wake.ts
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { existsSync as existsSync2, readFileSync as readFileSync3 } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, readFileSync as readFileSync3 } from "node:fs";
+import { homedir as homedir2 } from "node:os";
 import { join as join3, win32 as pathWin32 } from "node:path";
 
 // src/redact.ts
@@ -2149,7 +2248,7 @@ function grokPortFromGatewayConfig(cfg, fallback = 1340) {
   return typeof p === "number" && Number.isInteger(p) && p >= 1 && p <= 65535 ? p : fallback;
 }
 var GROK_GATEWAY_PATH_CANDIDATES = [
-  join3(process.env.HOME || process.env.USERPROFILE || homedir(), ".grok", "gateway.json"),
+  join3(process.env.HOME || process.env.USERPROFILE || homedir2(), ".grok", "gateway.json"),
   "/home/box/sand-data/gateway.json"
 ];
 function resolveGrokGatewayPath(explicit, exists) {
@@ -2323,7 +2422,7 @@ function resolveWindowsCliSpawn(cmd, args, opts) {
     return { cmd: trimmed, args };
   }
   const env = opts?.env ?? process.env;
-  const exists = opts?.existsImpl ?? existsSync2;
+  const exists = opts?.existsImpl ?? existsSync;
   const readText = opts?.readTextImpl ?? ((p) => readFileSync3(p, "utf8"));
   const hasSep = /[\\/]/.test(trimmed) || /^[A-Za-z]:/.test(trimmed);
   const hasWinExt = /\.(?:exe|cmd|bat)$/i.test(trimmed);
@@ -2384,7 +2483,7 @@ async function resolveZcodeCommand(explicitBin) {
   if (process.platform === "darwin") {
     const macAppBundleCjs = "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs";
     try {
-      if (existsSync2(macAppBundleCjs)) {
+      if (existsSync(macAppBundleCjs)) {
         return { cmd: process.execPath, prefixArgs: [macAppBundleCjs] };
       }
     } catch {}
@@ -2488,18 +2587,18 @@ function fireZcodeWake(msg, cfg) {
 
 // src/session-bind.ts
 import { createHash } from "node:crypto";
-import { closeSync, existsSync as existsSync4, mkdirSync, openSync, readFileSync as readFileSync5, readSync, readdirSync as readdirSync2, statSync as statSync2, unlinkSync as unlinkSync2 } from "node:fs";
-import { homedir as homedir2, tmpdir } from "node:os";
+import { closeSync, existsSync as existsSync3, mkdirSync, openSync, readFileSync as readFileSync5, readSync, readdirSync as readdirSync2, statSync as statSync2, unlinkSync as unlinkSync2 } from "node:fs";
+import { homedir as homedir3, tmpdir } from "node:os";
 import { join as join4 } from "node:path";
 import { spawnSync } from "node:child_process";
 
 // src/profile-store.ts
-import { existsSync as existsSync3, writeFileSync, renameSync, copyFileSync, chmodSync, unlinkSync, statSync, readdirSync, readFileSync as readFileSync4 } from "fs";
+import { existsSync as existsSync2, writeFileSync, renameSync, copyFileSync, chmodSync, unlinkSync, statSync, readdirSync, readFileSync as readFileSync4 } from "fs";
 var defaultWarn = (m) => process.stderr.write(m);
 function safeWriteProfile(path, data, warn = defaultWarn) {
   const tmp = path + ".tmp";
   try {
-    if (existsSync3(tmp))
+    if (existsSync2(tmp))
       unlinkSync(tmp);
   } catch (e) {
     warn(`[agentchat] WARNING: stale ${tmp} could not be removed: ${e}
@@ -2579,7 +2678,7 @@ function readAgentLock(lockDir, agentId) {
   if (!agentId)
     return null;
   const file = lockFilePath(lockDir, agentId);
-  if (!existsSync4(file))
+  if (!existsSync3(file))
     return null;
   try {
     const raw = JSON.parse(readFileSync5(file, "utf8"));
@@ -2599,7 +2698,7 @@ function checkAgentLock(opts) {
   const file = lockFilePath(lockDir, agentId);
   const record = readAgentLock(lockDir, agentId);
   if (!record) {
-    if (existsSync4(file)) {
+    if (existsSync3(file)) {
       try {
         const st = statSync2(file);
         if (Date.now() - st.mtimeMs > 1000)
@@ -2653,7 +2752,7 @@ function releaseAgentLock(opts) {
   const file = lockFilePath(opts.lockDir, opts.agentId);
   const existing = readAgentLock(opts.lockDir, opts.agentId);
   if (!existing) {
-    if (existsSync4(file)) {
+    if (existsSync3(file)) {
       try {
         const st = statSync2(file);
         if (Date.now() - st.mtimeMs > 1000) {
@@ -2700,7 +2799,7 @@ function loadSessionBinds(configDir) {
   const merged = {};
   for (const filename of [LEGACY_AGY_BINDS_FILENAME, DEFAULT_SESSION_BINDS_FILENAME]) {
     const path = join4(configDir, filename);
-    if (!existsSync4(path))
+    if (!existsSync3(path))
       continue;
     try {
       Object.assign(merged, parseSessionBinds(JSON.parse(readFileSync5(path, "utf8"))));
@@ -2713,7 +2812,7 @@ function resolveAgentIdForProfileName(configDir, name) {
     return null;
   const base = name.replace(/\.json$/, "").replace(/[^a-zA-Z0-9_-]/g, "_");
   for (const candidate of [join4(configDir, "profiles", `${base}.json`), join4(configDir, `${base}.json`)]) {
-    if (!existsSync4(candidate))
+    if (!existsSync3(candidate))
       continue;
     try {
       const parsed = JSON.parse(readFileSync5(candidate, "utf8"));
@@ -2739,7 +2838,7 @@ function saveSessionBind(configDir, sessionId, profileName) {
   };
   const path = join4(configDir, DEFAULT_SESSION_BINDS_FILENAME);
   let current = {};
-  if (existsSync4(path)) {
+  if (existsSync3(path)) {
     try {
       current = parseSessionBinds(JSON.parse(readFileSync5(path, "utf8")));
     } catch {}
@@ -2754,7 +2853,7 @@ function saveSessionBind(configDir, sessionId, profileName) {
   mkdirSync(configDir, { recursive: true });
   safeWriteProfile(path, current);
   const legacyPath = join4(configDir, LEGACY_AGY_BINDS_FILENAME);
-  if (existsSync4(legacyPath)) {
+  if (existsSync3(legacyPath)) {
     try {
       const legacy = parseSessionBinds(JSON.parse(readFileSync5(legacyPath, "utf8")));
       let changed = false;
@@ -2776,7 +2875,7 @@ function removeSessionBind(configDir, sessionId) {
   let removed = false;
   for (const filename of [DEFAULT_SESSION_BINDS_FILENAME, LEGACY_AGY_BINDS_FILENAME]) {
     const path = join4(configDir, filename);
-    if (!existsSync4(path))
+    if (!existsSync3(path))
       continue;
     try {
       const current = parseSessionBinds(JSON.parse(readFileSync5(path, "utf8")));
@@ -3100,9 +3199,9 @@ function discoverAntigravityHost(opts) {
   }
 }
 function detectAntigravityCallerSession(opts) {
-  const home = process.env.HOME || process.env.USERPROFILE || homedir2();
+  const home = process.env.HOME || process.env.USERPROFILE || homedir3();
   const brainDir = opts?.brainDir?.trim() || process.env.AGENTSCHAT_AGY_BRAIN_DIR?.trim() || join4(home, ".gemini", "antigravity", "brain");
-  if (!existsSync4(brainDir))
+  if (!existsSync3(brainDir))
     return null;
   const nowMs = opts?.nowMs ?? Date.now();
   const maxAgeMs = opts?.maxAgeMs ?? 30000;
@@ -3327,7 +3426,7 @@ async function detectDshCallerSession(opts) {
   if (!opts?.dshHome && !opts?.healthUrl && !isDshHostProcess({ env })) {
     return null;
   }
-  const dshHome = opts?.dshHome?.trim() || env.AGENTSCHAT_DSH_HOME?.trim() || env.DSH_HOME?.trim() || join4(homedir2(), ".dsh");
+  const dshHome = opts?.dshHome?.trim() || env.AGENTSCHAT_DSH_HOME?.trim() || env.DSH_HOME?.trim() || join4(homedir3(), ".dsh");
   const healthUrl = opts?.healthUrl?.trim() || env.AGENTSCHAT_DSH_HEALTH_URL?.trim() || "http://127.0.0.1:8799/health";
   const nowMs = opts?.nowMs ?? Date.now();
   try {
@@ -3366,12 +3465,12 @@ async function detectDshCallerSession(opts) {
 }
 
 // src/session-route.ts
-import { existsSync as existsSync6, readFileSync as readFileSync7 } from "node:fs";
-import { homedir as homedir3 } from "node:os";
+import { existsSync as existsSync5, readFileSync as readFileSync7 } from "node:fs";
+import { homedir as homedir4 } from "node:os";
 import { join as join6 } from "node:path";
 
 // src/session-bind.ts
-import { closeSync as closeSync2, existsSync as existsSync5, mkdirSync as mkdirSync2, openSync as openSync2, readFileSync as readFileSync6, readSync as readSync2, readdirSync as readdirSync3, statSync as statSync3, unlinkSync as unlinkSync3 } from "node:fs";
+import { closeSync as closeSync2, existsSync as existsSync4, mkdirSync as mkdirSync2, openSync as openSync2, readFileSync as readFileSync6, readSync as readSync2, readdirSync as readdirSync3, statSync as statSync3, unlinkSync as unlinkSync3 } from "node:fs";
 import { join as join5 } from "node:path";
 var DEFAULT_SESSION_BINDS_FILENAME2 = "session-binds.json";
 var LEGACY_AGY_BINDS_FILENAME2 = "agy-binds.json";
@@ -3399,7 +3498,7 @@ function loadSessionBinds2(configDir) {
   const merged = {};
   for (const filename of [LEGACY_AGY_BINDS_FILENAME2, DEFAULT_SESSION_BINDS_FILENAME2]) {
     const path = join5(configDir, filename);
-    if (!existsSync5(path))
+    if (!existsSync4(path))
       continue;
     try {
       Object.assign(merged, parseSessionBinds2(JSON.parse(readFileSync6(path, "utf8"))));
@@ -3410,7 +3509,7 @@ function loadSessionBinds2(configDir) {
 
 // src/session-route.ts
 function agentschatConfigDir(env = process.env) {
-  const home = env.HOME || env.USERPROFILE || homedir3();
+  const home = env.HOME || env.USERPROFILE || homedir4();
   return env.AGENTSCHAT_CONFIG_DIR ?? join6(home, ".agentschat");
 }
 function profilePathForName(configDir, name) {
@@ -3418,10 +3517,10 @@ function profilePathForName(configDir, name) {
     return;
   const base = name.replace(/\.json$/, "").replace(/[^a-zA-Z0-9_-]/g, "_");
   const nested = join6(configDir, "profiles", `${base}.json`);
-  if (existsSync6(nested))
+  if (existsSync5(nested))
     return nested;
   const flat = join6(configDir, `${base}.json`);
-  return existsSync6(flat) ? flat : undefined;
+  return existsSync5(flat) ? flat : undefined;
 }
 function readAgentId(path) {
   try {
@@ -3679,19 +3778,19 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema
 } from "@modelcontextprotocol/sdk/types.js";
-import { readFileSync as readFileSync12, existsSync as existsSync9, writeFileSync as writeFileSync6, mkdirSync as mkdirSync4, readdirSync as readdirSync5 } from "fs";
-import { homedir as homedir5 } from "os";
+import { readFileSync as readFileSync12, existsSync as existsSync8, writeFileSync as writeFileSync6, mkdirSync as mkdirSync4, readdirSync as readdirSync5 } from "fs";
+import { homedir as homedir6 } from "os";
 import { join as join12, dirname as dirname2 } from "path";
 import { fileURLToPath } from "url";
 
 // src/profile-store.ts
-import { existsSync as existsSync7, writeFileSync as writeFileSync2, renameSync as renameSync2, copyFileSync as copyFileSync2, chmodSync as chmodSync2, unlinkSync as unlinkSync4, statSync as statSync4, readdirSync as readdirSync4, readFileSync as readFileSync8 } from "fs";
+import { existsSync as existsSync6, writeFileSync as writeFileSync2, renameSync as renameSync2, copyFileSync as copyFileSync2, chmodSync as chmodSync2, unlinkSync as unlinkSync4, statSync as statSync4, readdirSync as readdirSync4, readFileSync as readFileSync8 } from "fs";
 import { join as join7, resolve as resolve2 } from "path";
 var defaultWarn2 = (m) => process.stderr.write(m);
 function safeWriteProfile2(path, data, warn = defaultWarn2) {
   const tmp = path + ".tmp";
   try {
-    if (existsSync7(tmp))
+    if (existsSync6(tmp))
       unlinkSync4(tmp);
   } catch (e) {
     warn(`[agentchat] WARNING: stale ${tmp} could not be removed: ${e}
@@ -3740,7 +3839,7 @@ var NON_PROFILE_JSON_FILES2 = new Set([
   "config.json"
 ]);
 function findDefaultProfileCollision(configDir, defaultProfilePath) {
-  if (!defaultProfilePath || !existsSync7(defaultProfilePath))
+  if (!defaultProfilePath || !existsSync6(defaultProfilePath))
     return null;
   let defParsed;
   try {
@@ -3756,7 +3855,7 @@ function findDefaultProfileCollision(configDir, defaultProfilePath) {
     return null;
   const resolvedDefault = resolve2(defaultProfilePath);
   for (const dir of [join7(configDir, "profiles"), configDir]) {
-    if (!existsSync7(dir))
+    if (!existsSync6(dir))
       continue;
     let files = [];
     try {
@@ -3955,17 +4054,21 @@ function flushCursor(state, persist) {
 }
 
 // src/rest-cli.ts
-import { existsSync as existsSync8, mkdirSync as mkdirSync3, readFileSync as readFileSync11, unlinkSync as unlinkSync7, writeFileSync as writeFileSync5 } from "node:fs";
+import { existsSync as existsSync7, mkdirSync as mkdirSync3, readFileSync as readFileSync11, unlinkSync as unlinkSync7, writeFileSync as writeFileSync5 } from "node:fs";
 import { dirname, join as join11 } from "node:path";
 
 // src/mentions.ts
 function matchesMention2(content, agentId) {
-  if (!content || !agentId)
+  if (typeof content !== "string" || typeof agentId !== "string")
     return false;
-  if (content.includes(`@${agentId}`))
+  const trimmedId = agentId.trim();
+  if (!content || !trimmedId || /[\x00-\x1f\x7f]/.test(trimmedId))
+    return false;
+  const idEsc = trimmedId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const bareMentionRe = new RegExp(`(?<![A-Za-z0-9_])@${idEsc}(?![A-Za-z0-9_-]|\\.[A-Za-z0-9])`);
+  if (bareMentionRe.test(content))
     return true;
-  const idEsc = agentId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const displayMentionRe = new RegExp(`@[^(\\n]+\\(${idEsc}\\)`);
+  const displayMentionRe = new RegExp(`(?<![A-Za-z0-9_])@[^\\s(@,:;<>"'\\x60\\n]+(?: [^\\s(@,:;<>"'\\x60\\n]+){0,4}\\(${idEsc}\\)`);
   return displayMentionRe.test(content);
 }
 
@@ -4048,7 +4151,7 @@ function normalizeTimestampForCursor2(ts, mode) {
 }
 
 // src/wake.ts
-import { homedir as homedir4 } from "node:os";
+import { homedir as homedir5 } from "node:os";
 import { join as join10, win32 as pathWin322 } from "node:path";
 var NATIVE_WAKE_CONTENT_MAX2 = 4000;
 function formatWakeAttachments2(attachments) {
@@ -4074,7 +4177,7 @@ function formatWakeAttachments2(attachments) {
   return lines.length > 0 ? ` [附件: ${lines.join("; ")}]` : "";
 }
 var GROK_GATEWAY_PATH_CANDIDATES2 = [
-  join10(process.env.HOME || process.env.USERPROFILE || homedir4(), ".grok", "gateway.json"),
+  join10(process.env.HOME || process.env.USERPROFILE || homedir5(), ".grok", "gateway.json"),
   "/home/box/sand-data/gateway.json"
 ];
 function buildWakePrompt2(msg, contextPrefix = "") {
@@ -4180,7 +4283,7 @@ function sleepAbortable(ms, signal) {
   });
 }
 function loadSeenIds(file) {
-  if (!existsSync8(file))
+  if (!existsSync7(file))
     return [];
   try {
     const parsed = JSON.parse(readFileSync11(file, "utf8"));
@@ -4197,7 +4300,7 @@ function saveSeenIds(file, ids) {
   } catch {}
 }
 function loadJsonMap(file) {
-  if (!existsSync8(file))
+  if (!existsSync7(file))
     return {};
   try {
     const raw = JSON.parse(readFileSync11(file, "utf8"));
@@ -4388,7 +4491,7 @@ async function wakeOnce(opts) {
   let wrotePidFile = false;
   if (!opts.fetchImpl) {
     try {
-      if (existsSync8(wakePidFile)) {
+      if (existsSync7(wakePidFile)) {
         const oldPid = parseInt(readFileSync11(wakePidFile, "utf-8").trim(), 10);
         if (Number.isFinite(oldPid) && oldPid > 1 && oldPid !== process.pid) {
           try {
@@ -4609,7 +4712,7 @@ ${context}
         clearTimeout(timeoutTimer);
       if (wrotePidFile) {
         try {
-          if (existsSync8(wakePidFile) && readFileSync11(wakePidFile, "utf-8").trim() === String(process.pid)) {
+          if (existsSync7(wakePidFile) && readFileSync11(wakePidFile, "utf-8").trim() === String(process.pid)) {
             unlinkSync7(wakePidFile);
           }
         } catch {}
@@ -4970,7 +5073,7 @@ if (codexIdentity) {
   delete process.env.AGENTCHAT_TOKEN;
   process.env.AGENTSCHAT_EXPECT_AGENT_ID = codexIdentity.agentId;
 }
-var homeDir = process.env.HOME || process.env.USERPROFILE || homedir5() || ".";
+var homeDir = process.env.HOME || process.env.USERPROFILE || homedir6() || ".";
 var configDir = join12(homeDir, ".agentschat");
 var legacyConfigDir = join12(homeDir, ".agentchat");
 var profileDirs = [configDir, legacyConfigDir];
@@ -4999,9 +5102,9 @@ function profileNameToPaths(name) {
 function nameToPath(name) {
   const candidates = profileNameToPaths(name);
   const nested = join12(configDir, "profiles", name.replace(/\.json$/, "") + ".json");
-  if (!name.includes("/") && !name.includes("\\") && existsSync9(nested))
+  if (!name.includes("/") && !name.includes("\\") && existsSync8(nested))
     return nested;
-  return candidates.find((path) => existsSync9(path)) || candidates[0];
+  return candidates.find((path) => existsSync8(path)) || candidates[0];
 }
 function listProfileFiles() {
   const seen = new Set;
@@ -5043,7 +5146,7 @@ function resolveProfile() {
   let binds = {};
   if (!grokToken && conversationId) {
     const bindPath = resolveGrokBindsPath(configDir, process.env.AGENTCHAT_GROK_BINDS);
-    if (existsSync9(bindPath)) {
+    if (existsSync8(bindPath)) {
       try {
         const parsed = parseGrokBindsText(readFileSync12(bindPath, "utf-8"));
         binds = parsed.binds;
@@ -5081,7 +5184,7 @@ function resolveProfile() {
     const boundProfile = sessionBinds[bootSession.sessionId];
     if (boundProfile) {
       const boundPath = nameToPath(boundProfile);
-      if (existsSync9(boundPath)) {
+      if (existsSync8(boundPath)) {
         process.stderr.write(`[agentchat] session-bind (${bootSession.runtime}): ${bootSession.sessionId} \u2192 profile "${boundProfile}"
 `);
         return { path: boundPath, source: "session-bind", declaredName: boundProfile };
@@ -5134,7 +5237,7 @@ if (hasToken && !explicitAgentId && profileSource === "default") {
   process.exit(1);
 }
 var identity = decideIdentity({
-  profileExists: existsSync9(profileFile),
+  profileExists: existsSync8(profileFile),
   source: profileSource,
   profileFile,
   cliName: cliArgs.name,
@@ -5360,7 +5463,7 @@ if (!anonymousMode && AGENT_ID && !isOneShotCli && !toolOnlyMode) {
       runtimeSession = { sessionId: resolvedSid, runtime: "antigravity" };
       if (profileSource === "default" && existingAgentRoute?.profileName && existingAgentRoute.profileName !== activeName) {
         const aliasPath = nameToPath(existingAgentRoute.profileName);
-        if (existsSync9(aliasPath)) {
+        if (existsSync8(aliasPath)) {
           activeProfileFile = aliasPath;
           activeName = existingAgentRoute.profileName;
         }
@@ -7784,7 +7887,7 @@ function mimeFromPath(p, kindHint) {
   return MEDIA_MIME_BY_EXT[ext] ?? "application/octet-stream";
 }
 async function uploadLocalFile(path, kindHint) {
-  if (!existsSync9(path))
+  if (!existsSync8(path))
     throw new Error(`file not found: ${path}`);
   const mime = mimeFromPath(path, kindHint);
   const buf = readFileSync12(path);
@@ -7984,7 +8087,7 @@ HANDLERS.set("transcribe", async (args) => {
 });
 function loadGrokBinds() {
   const bindPath = resolveGrokBindsPath(configDir, process.env.AGENTCHAT_GROK_BINDS);
-  if (!existsSync9(bindPath))
+  if (!existsSync8(bindPath))
     return {};
   try {
     return parseGrokBindsText(readFileSync12(bindPath, "utf-8")).binds;
@@ -8306,7 +8409,7 @@ async function registerAndConnectProfile(displayName, bindSessionId) {
     };
   }
   const existingTargetFile = nameToPath(cleanName);
-  if (existsSync9(existingTargetFile)) {
+  if (existsSync8(existingTargetFile)) {
     return {
       content: [{
         type: "text",
@@ -8316,7 +8419,7 @@ async function registerAndConnectProfile(displayName, bindSessionId) {
     };
   }
   const existingDefaultPath = nameToPath("profile");
-  if (existsSync9(existingDefaultPath)) {
+  if (existsSync8(existingDefaultPath)) {
     try {
       const defParsed = JSON.parse(readFileSync12(existingDefaultPath, "utf-8"));
       const defDisplay = typeof defParsed?.display_name === "string" ? defParsed.display_name.trim().toLowerCase() : "";
@@ -8416,7 +8519,7 @@ async function handleProfileSwitchOrConnect(args) {
     return { content: [{ type: "text", text: switchGate.message }], isError: true };
   }
   const targetFile = nameToPath(profile_name);
-  if (!existsSync9(targetFile)) {
+  if (!existsSync8(targetFile)) {
     if (register) {
       return await registerAndConnectProfile(profile_name, explicitSessionId);
     }
@@ -8492,7 +8595,7 @@ function ensureGrokBoundIdentity() {
   if (!boundName)
     return;
   const boundPath = nameToPath(boundName);
-  if (!existsSync9(boundPath))
+  if (!existsSync8(boundPath))
     return;
   let boundProfile;
   try {
@@ -8615,7 +8718,7 @@ var handleToolCall = async (request) => {
           }
         } else if (!isProfileControlTool || name === "disconnect_profile") {
           const boundPath = nameToPath(boundProfileName);
-          if (existsSync9(boundPath)) {
+          if (existsSync8(boundPath)) {
             try {
               const candidate = readIdentityProfile(boundPath);
               const aliasSlot = candidate?.agent_id ? findSlotByAgentId(candidate.agent_id) : undefined;
@@ -9094,7 +9197,7 @@ ${idx}` }] };
     }
     if (name === "sync_skill") {
       const a = args || {};
-      const home = process.env.HOME || process.env.USERPROFILE || homedir5() || ".";
+      const home = process.env.HOME || process.env.USERPROFILE || homedir6() || ".";
       const cacheDir = a.dir && String(a.dir).trim() || join12(home, ".agentchat", "skills");
       const safe = (s) => String(s).replace(/[^A-Za-z0-9_.-]/g, "_");
       if (a.name && !a.chat_id) {
@@ -11319,7 +11422,7 @@ function syncOpenBoundSessions() {
     if (!boundProf || profileSlots.has(boundProf))
       continue;
     const boundPath = nameToPath(boundProf);
-    if (!existsSync9(boundPath))
+    if (!existsSync8(boundPath))
       continue;
     try {
       const candidate = readIdentityProfile(boundPath);
@@ -11552,8 +11655,8 @@ ${context}
         if (process.env.AGENTCHAT_WAKE_MODE === "grok") {
           (async () => {
             try {
-              const { readFileSync: readFileSync13, existsSync: existsSync10 } = await import("fs");
-              const gwPath = resolveGrokGatewayPath(process.env.AGENTCHAT_GROK_GATEWAY, existsSync10);
+              const { readFileSync: readFileSync13, existsSync: existsSync9 } = await import("fs");
+              const gwPath = resolveGrokGatewayPath(process.env.AGENTCHAT_GROK_GATEWAY, existsSync9);
               let agentId = process.env.AGENTCHAT_GROK_AGENT_ID || "";
               if (!agentId) {
                 agentId = await resolveGrokAgentId({
@@ -11631,7 +11734,7 @@ ${context}
                   let soleMatchesAgent = false;
                   if (soleBoundProf) {
                     const p = nameToPath(soleBoundProf);
-                    if (existsSync9(p)) {
+                    if (existsSync8(p)) {
                       try {
                         soleMatchesAgent = readIdentityProfile(p)?.agent_id === slot.agentId;
                       } catch {}

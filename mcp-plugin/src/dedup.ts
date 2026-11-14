@@ -10,27 +10,43 @@
 /** Stable identity for a message frame, or null if it lacks string id/channel. */
 export function messageDedupKey(data: any): string | null {
   if (!data || typeof data.id !== "string" || typeof data.channel_id !== "string") return null;
-  return `${data.channel_id}:${data.id}`;
+  if (!data.id.trim() || !data.channel_id.trim()) return null;
+  const safeChannel = data.channel_id.replace(/\\/g, "\\\\").replace(/:/g, "\\:");
+  return `${safeChannel}:${data.id}`;
 }
 
 export class MessageDedup {
   private seen = new Set<string>();
+  private readonly max: number;
+  private readonly dropOnEvict: number;
 
   constructor(
     /** Evict once the set grows past this many keys. */
-    private readonly max: number = 5000,
+    max: number = 5000,
     /** How many oldest keys to drop on eviction (Set preserves insertion order). */
-    private readonly dropOnEvict: number = 1000,
-  ) {}
+    dropOnEvict: number = 1000,
+  ) {
+    const safeMax = Number.isFinite(max) ? Math.max(1, Math.floor(max)) : 5000;
+    const safeDrop = Number.isFinite(dropOnEvict)
+      ? Math.min(safeMax, Math.max(1, Math.floor(dropOnEvict)))
+      : Math.min(safeMax, 1000);
+    this.max = safeMax;
+    this.dropOnEvict = safeDrop;
+  }
 
   /** Returns true if `key` was already delivered (skip), false if newly recorded. */
   recordOrSkip(key: string): boolean {
+    if (typeof key !== "string" || key.length === 0) return false;
     if (this.seen.has(key)) return true;
     this.seen.add(key);
     if (this.seen.size > this.max) {
-      const arr = [...this.seen];
-      this.seen.clear();
-      for (const item of arr.slice(this.dropOnEvict)) this.seen.add(item);
+      const toDrop = Math.max(this.dropOnEvict, this.seen.size - this.max);
+      let dropped = 0;
+      for (const oldest of this.seen) {
+        this.seen.delete(oldest);
+        dropped += 1;
+        if (dropped >= toDrop) break;
+      }
     }
     return false;
   }

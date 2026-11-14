@@ -15,9 +15,14 @@
  * side-effecting server entrypoint (which opens a WebSocket on import).
  */
 export function matchesMention(content: string, agentId: string): boolean {
-  if (!content || !agentId) return false;
-  if (content.includes(`@${agentId}`)) return true;
-  const idEsc = agentId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const displayMentionRe = new RegExp(`@[^(\\n]+\\(${idEsc}\\)`);
+  if (typeof content !== "string" || typeof agentId !== "string") return false;
+  const trimmedId = agentId.trim();
+  if (!content || !trimmedId || /[\x00-\x1f\x7f]/.test(trimmedId)) return false;
+  const idEsc = trimmedId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const bareMentionRe = new RegExp(`(?<![A-Za-z0-9_])@${idEsc}(?![A-Za-z0-9_-]|\\.[A-Za-z0-9])`);
+  if (bareMentionRe.test(content)) return true;
+  const displayMentionRe = new RegExp(
+    `(?<![A-Za-z0-9_])@[^\\s(@,:;<>"'\\x60\\n]+(?: [^\\s(@,:;<>"'\\x60\\n]+){0,4}\\(${idEsc}\\)`,
+  );
   return displayMentionRe.test(content);
 }

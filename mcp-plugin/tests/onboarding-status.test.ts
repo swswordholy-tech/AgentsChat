@@ -18,8 +18,18 @@ test("claimed false, true, absent, mismatched and failed status stay distinct",a
   expect(calls[0].options.headers.Authorization).toBe("Bearer ac_private");expect(calls[0].options.cache).toBe("no-store");
  }
  for(const code of [401,403,404,503]){
-  const s=await getOnboardingStatus("https://example.com","bot","ac_private",(async()=>new Response("",{status:code})));
+  let cancelled=false;
+  const stream=new ReadableStream({start(c){c.enqueue(new Uint8Array([1]));},cancel(){cancelled=true;}});
+  const s=await getOnboardingStatus("https://example.com","bot","ac_private",(async()=>new Response(stream,{status:code})));
   expect(s.claimed).toBeNull();expect(claimSummary(s)).toContain("unknown");
+  expect(s.authentication).toBe(code===401||code===403?"failed":"unknown");
+  expect(cancelled).toBe(true);
+ }
+ // Plaintext non-loopback, credentialed URLs, and control-char tokens fail closed before sending Bearer headers
+ for(const [badBase,badToken] of [["http://example.com","ac_private"],["https://u:p@example.com","ac_private"],["file:///etc/passwd","ac_private"],["https://example.com","ac_bad\r\ntoken"]] as const){
+  let called=false;
+  const s=await getOnboardingStatus(badBase,"bot",badToken,(async()=>{called=true;return Response.json({agent_id:"bot",claimed:true});}));
+  expect(called).toBe(false);expect(s.claimed).toBeNull();expect(s.authentication).toBe("unknown");
  }
 });
 test("one-shot registration exits with private clickable claim link, without logging key or starting MCP",async()=>{

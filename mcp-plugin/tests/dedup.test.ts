@@ -34,3 +34,24 @@ test("eviction drops the oldest keys and keeps the newest", () => {
   // k4 survived → still deduped
   expect(d.recordOrSkip("k4")).toBe(true);
 });
+
+test("messageDedupKey escapes colon/backslash collisions and rejects blank strings", () => {
+  const k1 = messageDedupKey({ channel_id: "a:b", id: "c" });
+  const k2 = messageDedupKey({ channel_id: "a", id: "b:c" });
+  const k3 = messageDedupKey({ channel_id: "a\\", id: ":c" });
+  const k4 = messageDedupKey({ channel_id: "a", id: "\\:c" });
+  expect(k1).not.toBeNull();
+  expect(k2).not.toBeNull();
+  expect(new Set([k1, k2, k3, k4]).size).toBe(4);
+  expect(messageDedupKey({ channel_id: "   ", id: "m-1" })).toBeNull();
+  expect(messageDedupKey({ channel_id: "room-1", id: "" })).toBeNull();
+});
+
+test("MessageDedup clamps invalid constructor bounds so overflow always evicts", () => {
+  const d = new MessageDedup(2, 0);
+  expect(d.recordOrSkip("a")).toBe(false);
+  expect(d.recordOrSkip("b")).toBe(false);
+  expect(d.recordOrSkip("c")).toBe(false);
+  expect(d.size).toBe(2);
+  expect(d.recordOrSkip("a")).toBe(false);
+});
