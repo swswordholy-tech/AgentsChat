@@ -164,3 +164,46 @@ test("Campaign #97: appendWakeQueue rejects symlinks, fireWake blocks non-http s
   );
   assert.equal(seenRedirect, "error");
 });
+
+test("Campaign #109 KR4: redactSecrets covers multicloud prefixes, buildMuseWakePrompt handles DM:/DM-, fireWake stamps missing timestamp, and appendWakeQueue blocks dangling symlinks + oversized queues", async () => {
+  const scrubbed = redactSecrets(
+    "sk_live_abc123 mcp_at_tok999 ghp_github123456 github_pat_xyz987 AKIAIOSFODNN7EXAMPLE Basic dXNlcjpwYXNz",
+  );
+  assert.equal(scrubbed, "[redacted] [redacted] [redacted] [redacted] [redacted] [redacted]");
+
+  assert.ok(buildMuseWakePrompt({ type: "message", channel_id: "DM-abc", sender_id: "u1" }).includes("私聊 (DM)"));
+  assert.ok(buildMuseWakePrompt({ type: "message", channel_id: "dm:xyz", sender_id: "u1" }).includes("私聊 (DM)"));
+
+  let postedBody = "";
+  await fireWake(
+    { id: "m-ts", channel_id: "dm:xyz", sender_id: "u1", content: "ping" },
+    {
+      url: "http://127.0.0.1:9/wake",
+      secret: "sec-109",
+      fetchImpl: async (_url, opts) => {
+        postedBody = String(opts.body);
+        assert.equal(opts.headers["x-agentschat-signature"], signWakeBody(postedBody, "sec-109"));
+        return new Response("ok");
+      },
+    },
+  );
+  const parsedPosted = JSON.parse(postedBody);
+  assert.equal(typeof parsedPosted.timestamp, "string");
+  assert.ok(Number.isFinite(Date.parse(parsedPosted.timestamp)));
+
+  const dir = mkdtempSync(join(tmpdir(), "muse-wake109-"));
+  const missingTarget = join(dir, "does-not-exist.jsonl");
+  const danglingSym = join(dir, "dangling.jsonl");
+  symlinkSync(missingTarget, danglingSym);
+  assert.throws(
+    () => appendWakeQueue(danglingSym, { type: "message", message_id: "m-dangling" }),
+    /symlink|EEXIST/,
+  );
+
+  const hugeQueue = join(dir, "huge.jsonl");
+  writeFileSync(hugeQueue, "x".repeat(16 * 1024 * 1024 + 64));
+  assert.throws(
+    () => appendWakeQueue(hugeQueue, { type: "message", message_id: "m-huge" }),
+    /maximum size limit/,
+  );
+});

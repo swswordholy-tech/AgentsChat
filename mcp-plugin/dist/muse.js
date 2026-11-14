@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 // muse/src/cli.ts
-import { writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, renameSync as renameSync2, unlinkSync as unlinkSync2, existsSync as existsSync3, lstatSync as lstatSync3 } from "node:fs";
+import { randomBytes as randomBytes2 } from "node:crypto";
+import { writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, renameSync as renameSync2, unlinkSync as unlinkSync2, lstatSync as lstatSync3 } from "node:fs";
 import { dirname as dirname2 } from "node:path";
 import { homedir as homedir2 } from "node:os";
 import { join as join2 } from "node:path";
@@ -719,13 +720,13 @@ function loadConfig(env = process.env, profilePath) {
 }
 
 // muse/src/wake.ts
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { appendFileSync, chmodSync, lstatSync as lstatSync2, mkdirSync, readFileSync as readFileSync2, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 var WAKE_SIG_HEADER = "x-agentschat-signature";
 var WAKE_CONTENT_MAX = 500;
 function redactSecrets(text) {
-  return text.replace(/\bBearer\s+[^\s"'<>\\]+/gi, "[redacted]").replace(/(?:ac_|sk-)[A-Za-z0-9_-]+/g, "[redacted]").replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[redacted]");
+  return text.replace(/\b(?:Bearer|Basic)\s+[^\s"'<>\\]+/gi, "[redacted]").replace(/(?:ac_|agent_key_|mcp_(?:at|rt|code)_|sk-|sk_|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_)[A-Za-z0-9_-]+/g, "[redacted]").replace(/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, "[redacted]").replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[redacted]");
 }
 function buildWakePayload(msg, opts = {}) {
   const content = typeof msg.content === "string" ? redactSecrets(msg.content.slice(0, WAKE_CONTENT_MAX)) : undefined;
@@ -774,7 +775,10 @@ async function fireWake(msg, cfg) {
     return;
   }
   const timeoutMs = typeof cfg.timeoutMs === "number" && Number.isFinite(cfg.timeoutMs) && cfg.timeoutMs >= 1 ? Math.min(cfg.timeoutMs, 60000) : 5000;
-  const body = JSON.stringify(buildWakePayload(msg, { targetSessionId: cfg.targetSessionId }));
+  const payload = buildWakePayload(msg, { targetSessionId: cfg.targetSessionId });
+  if (!payload.timestamp)
+    payload.timestamp = new Date().toISOString();
+  const body = JSON.stringify(payload);
   const headers = { "Content-Type": "application/json" };
   if (cfg.secret)
     headers[WAKE_SIG_HEADER] = signWakeBody(body, cfg.secret);
@@ -805,6 +809,7 @@ async function fireWake(msg, cfg) {
   }
 }
 var MAX_WAKE_QUEUE_LINES = 500;
+var MAX_WAKE_QUEUE_BYTES = 16 * 1024 * 1024;
 var wakeTmpSeq = 0;
 function appendWakeQueue(queueFile, payload, maxLines = MAX_WAKE_QUEUE_LINES) {
   const dir = dirname(queueFile);
@@ -819,6 +824,9 @@ function appendWakeQueue(queueFile, payload, maxLines = MAX_WAKE_QUEUE_LINES) {
     const st = lstatSync2(queueFile);
     if (st.isSymbolicLink() || !st.isFile()) {
       throw new Error("Refusing to use symlink or non-regular file for Muse wake queue");
+    }
+    if (st.size > MAX_WAKE_QUEUE_BYTES) {
+      throw new Error("Muse wake queue exceeds maximum size limit");
     }
     existedBefore = true;
   } catch (err) {
@@ -842,11 +850,19 @@ function appendWakeQueue(queueFile, payload, maxLines = MAX_WAKE_QUEUE_LINES) {
   const cap = Number.isFinite(maxLines) ? Math.max(1, Math.floor(maxLines)) : MAX_WAKE_QUEUE_LINES;
   if (existingLines.length >= cap) {
     const kept = [...existingLines.slice(-(cap - 1)), line];
-    const tmp = `${queueFile}.${process.pid}.${Date.now()}.${++wakeTmpSeq}.tmp`;
+    const tmp = `${queueFile}.${process.pid}.${Date.now()}.${++wakeTmpSeq}.${randomBytes(6).toString("hex")}.tmp`;
     try {
       writeFileSync(tmp, `${kept.join(`
 `)}
-`, { mode: 384 });
+`, { mode: 384, flag: "wx" });
+      try {
+        if (lstatSync2(queueFile).isSymbolicLink()) {
+          throw new Error("Refusing to use symlink or non-regular file for Muse wake queue");
+        }
+      } catch (err) {
+        if (err?.code !== "ENOENT")
+          throw err;
+      }
       renameSync(tmp, queueFile);
     } catch (err) {
       try {
@@ -856,25 +872,46 @@ function appendWakeQueue(queueFile, payload, maxLines = MAX_WAKE_QUEUE_LINES) {
     }
     return true;
   }
+  if (!existedBefore) {
+    try {
+      writeFileSync(queueFile, `${line}
+`, { mode: 384, flag: "wx" });
+      if (process.platform !== "win32") {
+        try {
+          chmodSync(queueFile, 384);
+        } catch {}
+      }
+      return true;
+    } catch (err) {
+      if (err?.code !== "EEXIST")
+        throw err;
+      const st = lstatSync2(queueFile);
+      if (st.isSymbolicLink() || !st.isFile()) {
+        throw new Error("Refusing to use symlink or non-regular file for Muse wake queue");
+      }
+      if (st.size > MAX_WAKE_QUEUE_BYTES) {
+        throw new Error("Muse wake queue exceeds maximum size limit");
+      }
+    }
+  }
   appendFileSync(queueFile, `${line}
 `, { mode: 384 });
-  if (!existedBefore && process.platform !== "win32") {
-    try {
-      chmodSync(queueFile, 384);
-    } catch {}
-  }
   return true;
 }
 
 // muse/src/cli.ts
+var RESERVED_AGENT_IDS = new Set(["__proto__", "constructor", "prototype"]);
 function arg(name, argv) {
   const i = argv.indexOf(name);
-  return i >= 0 ? argv[i + 1] : undefined;
+  if (i < 0)
+    return;
+  const val = argv[i + 1];
+  return val !== undefined && !val.startsWith("--") ? val : undefined;
 }
 function has(name, argv) {
   return argv.includes(name);
 }
-async function registerOnly(name, restUrl) {
+async function registerOnly(name, restUrl, profilePath = PROFILE_PATH, fetchImpl = fetch) {
   const cleanName = name.trim();
   if (!cleanName || cleanName.length > 64 || /[\x00-\x1f\x7f]/.test(cleanName)) {
     throw new Error("Invalid --name value");
@@ -887,19 +924,22 @@ async function registerOnly(name, restUrl) {
   if (parsedRest.protocol !== "https:" && !(parsedRest.protocol === "http:" && isLocal)) {
     throw new Error("AGENTCHAT_REST_URL must use https:// (or http:// on loopback)");
   }
-  const profileDir = dirname2(PROFILE_PATH);
+  const profileDir = dirname2(profilePath);
   mkdirSync2(profileDir, { recursive: true, mode: 448 });
   if (lstatSync3(profileDir).isSymbolicLink()) {
     throw new Error("Refusing to write Muse profile inside symlinked directory");
   }
-  if (existsSync3(PROFILE_PATH)) {
-    const st = lstatSync3(PROFILE_PATH);
+  try {
+    const st = lstatSync3(profilePath);
     if (st.isSymbolicLink() || !st.isFile()) {
       throw new Error("Refusing to overwrite symlink or non-regular Muse profile");
     }
+  } catch (err) {
+    if (err?.code !== "ENOENT")
+      throw err;
   }
   console.log("Terms notice: https://agents-chat.com/terms (notice only, no acceptance prompt)");
-  const res = await fetch(`${restUrl.trim().replace(/\/$/, "")}/api/account/register`, {
+  const res = await fetchImpl(`${restUrl.trim().replace(/\/$/, "")}/api/account/register`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ name: cleanName, type: "agent", capabilities: ["chat"] }),
@@ -915,20 +955,30 @@ async function registerOnly(name, restUrl) {
   const token = String(data.agentKey ?? data.token ?? data.key ?? "").trim();
   if (!agentId || !token)
     throw new Error("Registration response did not include an agent id/token");
-  const tmp = `${PROFILE_PATH}.${process.pid}.${Date.now()}.tmp`;
+  if (/[\x00-\x1f\x7f]/.test(agentId) || /[\x00-\x1f\x7f]/.test(token) || RESERVED_AGENT_IDS.has(agentId.toLowerCase())) {
+    throw new Error("Registration response contained unsafe agent id or token");
+  }
+  const tmp = `${profilePath}.${process.pid}.${Date.now()}.${randomBytes2(6).toString("hex")}.tmp`;
   try {
-    writeFileSync2(tmp, JSON.stringify({ agentId, token }, null, 2), { mode: 384 });
-    renameSync2(tmp, PROFILE_PATH);
+    writeFileSync2(tmp, JSON.stringify({ agentId, token }, null, 2), { mode: 384, flag: "wx" });
+    try {
+      if (lstatSync3(profilePath).isSymbolicLink()) {
+        throw new Error("Refusing to overwrite symlink or non-regular Muse profile");
+      }
+    } catch (err) {
+      if (err?.code !== "ENOENT")
+        throw err;
+    }
+    renameSync2(tmp, profilePath);
   } catch (err) {
     try {
       unlinkSync2(tmp);
     } catch {}
     throw err;
   }
-  console.log(`Registered agent '${cleanName}' as ${agentId}. Identity saved to ${PROFILE_PATH} (token not printed).`);
+  console.log(`Registered agent '${cleanName}' as ${agentId}. Identity saved to ${profilePath} (token not printed).`);
 }
-async function main() {
-  const argv = process.argv.slice(2);
+async function main(argv = process.argv.slice(2)) {
   if (has("--help", argv) || has("-h", argv)) {
     console.log("Usage: agentschat-mcp --muse --register-only --name <name> | --wake [--channel <id>...] | --listen [--channel <id>...] [--auto-reply <text>] | --send <channel-id> --text <text>");
     return;
@@ -952,22 +1002,29 @@ async function main() {
   if (has("--wake", argv)) {
     const wakeChannels = [];
     for (let i = 0;i < argv.length; i++) {
-      if (argv[i] === "--channel" && argv[i + 1])
+      if (argv[i] === "--channel" && argv[i + 1] && !argv[i + 1].startsWith("--"))
         wakeChannels.push(argv[i + 1]);
     }
     if (config.defaultChannelId)
       wakeChannels.push(config.defaultChannelId);
+    const uniqueWakeChannels = [...new Set(wakeChannels)];
     const queueFile = process.env.MUSE_WAKE_QUEUE ?? join2(homedir2(), ".agentschat", "muse-wake-queue.jsonl");
     const wakeUrl = process.env.MUSE_WAKE_URL ?? process.env.AGENTCHAT_WAKE_URL;
     const wakeSecret = process.env.MUSE_WAKE_SECRET ?? process.env.AGENTCHAT_WAKE_SECRET;
     const typing = new TypingHeartbeat((channelId) => client.sendTyping(channelId));
-    process.on("SIGINT", () => typing.stopAll());
+    const shutdownWake = () => {
+      typing.stopAll();
+      client.disconnect();
+    };
+    process.once("SIGINT", shutdownWake);
+    process.once("SIGTERM", shutdownWake);
+    process.once("SIGHUP", shutdownWake);
     client.onMessage((m) => {
       if (m.sender_id === config.agentId) {
         typing.stop(m.channel_id);
         return;
       }
-      const kind = m.channel_id.startsWith("dm-") ? "direct" : "group";
+      const kind = /^dm[-:]/i.test(m.channel_id) ? "direct" : "group";
       if (!shouldDispatch(m, { agentId: config.agentId, displayName: config.displayName, channelKind: kind }))
         return;
       typing.start(m.channel_id);
@@ -977,14 +1034,20 @@ async function main() {
       console.log(`[wake] ${m.channel_id} ${m.sender_id} ${m.id} queued=${queued}`);
     });
     client.onReconnect = () => {
-      for (const c of wakeChannels)
+      for (const c of uniqueWakeChannels)
         client.joinChannel(c);
     };
-    await client.connect();
-    for (const c of wakeChannels)
-      client.joinChannel(c);
-    console.log(`Wake daemon listening on ${wakeChannels.join(", ") || "(no channels — pass --channel <id>)"}, queue=${queueFile}. Press Ctrl+C to stop.`);
-    await client.waitUntilClosed();
+    try {
+      await client.connect();
+      for (const c of uniqueWakeChannels)
+        client.joinChannel(c);
+      console.log(`Wake daemon listening on ${uniqueWakeChannels.join(", ") || "(no channels — pass --channel <id>)"}, queue=${queueFile}. Press Ctrl+C to stop.`);
+      await client.waitUntilClosed();
+    } finally {
+      process.removeListener("SIGINT", shutdownWake);
+      process.removeListener("SIGTERM", shutdownWake);
+      process.removeListener("SIGHUP", shutdownWake);
+    }
     return;
   }
   if (has("--send", argv)) {
@@ -995,33 +1058,54 @@ async function main() {
     await client.connect();
     client.joinChannel(channelId);
     client.sendMessage(channelId, text);
+    await new Promise((r) => setTimeout(r, 500));
     console.log(`Sent to ${channelId}`);
     client.disconnect();
     return;
   }
   const channels = [];
   for (let i = 0;i < argv.length; i++) {
-    if (argv[i] === "--channel" && argv[i + 1])
+    if (argv[i] === "--channel" && argv[i + 1] && !argv[i + 1].startsWith("--"))
       channels.push(argv[i + 1]);
   }
   if (config.defaultChannelId)
     channels.push(config.defaultChannelId);
+  const uniqueChannels = [...new Set(channels)];
   const autoReply = arg("--auto-reply", argv);
   const bridge = new MuseBridge(client, {
     agentId: config.agentId,
     displayName: config.displayName,
-    channels,
+    channels: uniqueChannels,
     responder: async (ctx) => {
       console.log(`[${ctx.message.channel_id}] ${ctx.message.sender_id}: ${ctx.message.content}`);
       return autoReply ?? null;
     }
   });
+  const shutdownListen = () => bridge.stop();
+  process.once("SIGINT", shutdownListen);
+  process.once("SIGTERM", shutdownListen);
+  process.once("SIGHUP", shutdownListen);
   client.onReconnect = () => bridge.rejoin();
-  await bridge.start();
-  console.log(`Listening on ${channels.join(", ") || "(no channels — pass --channel <id>)"}. Press Ctrl+C to stop.`);
-  await client.waitUntilClosed();
+  try {
+    await bridge.start();
+    console.log(`Listening on ${uniqueChannels.join(", ") || "(no channels — pass --channel <id>)"}. Press Ctrl+C to stop.`);
+    await client.waitUntilClosed();
+  } finally {
+    process.removeListener("SIGINT", shutdownListen);
+    process.removeListener("SIGTERM", shutdownListen);
+    process.removeListener("SIGHUP", shutdownListen);
+  }
 }
-main().catch((err) => {
-  console.error(err instanceof Error ? err.message : String(err));
-  process.exit(1);
-});
+var entryPath = (process.argv[1] ?? "").replace(/\\/g, "/");
+var invokedDirectly = entryPath.endsWith("muse/src/cli.ts") || entryPath.endsWith("dist/muse.js") || process.argv.includes("--muse");
+if (invokedDirectly) {
+  main().catch((err) => {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  });
+}
+export {
+  registerOnly,
+  main,
+  arg
+};

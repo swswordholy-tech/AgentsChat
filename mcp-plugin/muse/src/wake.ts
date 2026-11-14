@@ -1,5 +1,5 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
-import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { appendFileSync, chmodSync, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 /**
@@ -59,8 +59,12 @@ export interface WakePayload {
 
 export function redactSecrets(text: string): string {
   return text
-    .replace(/\bBearer\s+[^\s"'<>\\]+/gi, "[redacted]")
-    .replace(/(?:ac_|sk-)[A-Za-z0-9_-]+/g, "[redacted]")
+    .replace(/\b(?:Bearer|Basic)\s+[^\s"'<>\\]+/gi, "[redacted]")
+    .replace(
+      /(?:ac_|agent_key_|mcp_(?:at|rt|code)_|sk-|sk_|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_)[A-Za-z0-9_-]+/g,
+      "[redacted]",
+    )
+    .replace(/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, "[redacted]")
     .replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[redacted]");
 }
 
@@ -121,7 +125,7 @@ export function verifyWakeSignature(body: string, sigHex: string, secrets: reado
 
 /** Prompt text a Muse host can inject into a turn, mirroring buildGrokPrompt. */
 export function buildMuseWakePrompt(payload: WakePayload): string {
-  const where = payload.channel_id?.startsWith("dm-") ? "私聊 (DM)" : `频道 ${payload.channel_id ?? "?"}`;
+  const where = /^dm[-:]/i.test(payload.channel_id ?? "") ? "私聊 (DM)" : `频道 ${payload.channel_id ?? "?"}`;
   const content = payload.content ? `：“${payload.content}”` : "。";
   return (
     `[AgentsChat] ${payload.sender_id ?? "someone"} 在${where}提到了你${content}` +
@@ -160,7 +164,9 @@ export async function fireWake(msg: WakeMessage, cfg: WakeConfig): Promise<void>
     typeof cfg.timeoutMs === "number" && Number.isFinite(cfg.timeoutMs) && cfg.timeoutMs >= 1
       ? Math.min(cfg.timeoutMs, 60_000)
       : 5_000;
-  const body = JSON.stringify(buildWakePayload(msg, { targetSessionId: cfg.targetSessionId }));
+  const payload = buildWakePayload(msg, { targetSessionId: cfg.targetSessionId });
+  if (!payload.timestamp) payload.timestamp = new Date().toISOString();
+  const body = JSON.stringify(payload);
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (cfg.secret) headers[WAKE_SIG_HEADER] = signWakeBody(body, cfg.secret);
   const doPost = async (): Promise<void> => {
@@ -190,6 +196,7 @@ export async function fireWake(msg: WakeMessage, cfg: WakeConfig): Promise<void>
 }
 
 export const MAX_WAKE_QUEUE_LINES = 500;
+export const MAX_WAKE_QUEUE_BYTES = 16 * 1024 * 1024;
 let wakeTmpSeq = 0;
 
 /**
@@ -211,6 +218,9 @@ export function appendWakeQueue(queueFile: string, payload: WakePayload, maxLine
     const st = lstatSync(queueFile);
     if (st.isSymbolicLink() || !st.isFile()) {
       throw new Error("Refusing to use symlink or non-regular file for Muse wake queue");
+    }
+    if (st.size > MAX_WAKE_QUEUE_BYTES) {
+      throw new Error("Muse wake queue exceeds maximum size limit");
     }
     existedBefore = true;
   } catch (err) {
@@ -235,9 +245,16 @@ export function appendWakeQueue(queueFile: string, payload: WakePayload, maxLine
   const cap = Number.isFinite(maxLines) ? Math.max(1, Math.floor(maxLines)) : MAX_WAKE_QUEUE_LINES;
   if (existingLines.length >= cap) {
     const kept = [...existingLines.slice(-(cap - 1)), line];
-    const tmp = `${queueFile}.${process.pid}.${Date.now()}.${++wakeTmpSeq}.tmp`;
+    const tmp = `${queueFile}.${process.pid}.${Date.now()}.${++wakeTmpSeq}.${randomBytes(6).toString("hex")}.tmp`;
     try {
-      writeFileSync(tmp, `${kept.join("\n")}\n`, { mode: 0o600 });
+      writeFileSync(tmp, `${kept.join("\n")}\n`, { mode: 0o600, flag: "wx" });
+      try {
+        if (lstatSync(queueFile).isSymbolicLink()) {
+          throw new Error("Refusing to use symlink or non-regular file for Muse wake queue");
+        }
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err;
+      }
       renameSync(tmp, queueFile);
     } catch (err) {
       try { unlinkSync(tmp); } catch {}
@@ -245,9 +262,24 @@ export function appendWakeQueue(queueFile: string, payload: WakePayload, maxLine
     }
     return true;
   }
-  appendFileSync(queueFile, `${line}\n`, { mode: 0o600 });
-  if (!existedBefore && process.platform !== "win32") {
-    try { chmodSync(queueFile, 0o600); } catch {}
+  if (!existedBefore) {
+    try {
+      writeFileSync(queueFile, `${line}\n`, { mode: 0o600, flag: "wx" });
+      if (process.platform !== "win32") {
+        try { chmodSync(queueFile, 0o600); } catch {}
+      }
+      return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") throw err;
+      const st = lstatSync(queueFile);
+      if (st.isSymbolicLink() || !st.isFile()) {
+        throw new Error("Refusing to use symlink or non-regular file for Muse wake queue");
+      }
+      if (st.size > MAX_WAKE_QUEUE_BYTES) {
+        throw new Error("Muse wake queue exceeds maximum size limit");
+      }
+    }
   }
+  appendFileSync(queueFile, `${line}\n`, { mode: 0o600 });
   return true;
 }

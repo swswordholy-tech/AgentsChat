@@ -2,7 +2,7 @@
 
 // dsh/src/cli.ts
 import { chmodSync as chmodSync3, lstatSync as lstatSync6, mkdirSync as mkdirSync4, readFileSync as readFileSync6, renameSync as renameSync3, unlinkSync as unlinkSync4, writeFileSync as writeFileSync3 } from "node:fs";
-import { randomBytes as randomBytes2 } from "node:crypto";
+import { randomBytes as randomBytes3 } from "node:crypto";
 import { spawn } from "node:child_process";
 import { dirname as dirname3, join as join6, resolve as resolve2 } from "node:path";
 import { homedir as homedir5 } from "node:os";
@@ -642,13 +642,13 @@ function redact(value) {
 }
 
 // muse/src/wake.ts
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { appendFileSync, chmodSync, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 var WAKE_SIG_HEADER = "x-agentschat-signature";
 var WAKE_CONTENT_MAX = 500;
 function redactSecrets(text) {
-  return text.replace(/\bBearer\s+[^\s"'<>\\]+/gi, "[redacted]").replace(/(?:ac_|sk-)[A-Za-z0-9_-]+/g, "[redacted]").replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[redacted]");
+  return text.replace(/\b(?:Bearer|Basic)\s+[^\s"'<>\\]+/gi, "[redacted]").replace(/(?:ac_|agent_key_|mcp_(?:at|rt|code)_|sk-|sk_|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_)[A-Za-z0-9_-]+/g, "[redacted]").replace(/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, "[redacted]").replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[redacted]");
 }
 function buildWakePayload(msg, opts = {}) {
   const content = typeof msg.content === "string" ? redactSecrets(msg.content.slice(0, WAKE_CONTENT_MAX)) : undefined;
@@ -697,7 +697,10 @@ async function fireWake(msg, cfg) {
     return;
   }
   const timeoutMs = typeof cfg.timeoutMs === "number" && Number.isFinite(cfg.timeoutMs) && cfg.timeoutMs >= 1 ? Math.min(cfg.timeoutMs, 60000) : 5000;
-  const body = JSON.stringify(buildWakePayload(msg, { targetSessionId: cfg.targetSessionId }));
+  const payload = buildWakePayload(msg, { targetSessionId: cfg.targetSessionId });
+  if (!payload.timestamp)
+    payload.timestamp = new Date().toISOString();
+  const body = JSON.stringify(payload);
   const headers = { "Content-Type": "application/json" };
   if (cfg.secret)
     headers[WAKE_SIG_HEADER] = signWakeBody(body, cfg.secret);
@@ -728,6 +731,7 @@ async function fireWake(msg, cfg) {
   }
 }
 var MAX_WAKE_QUEUE_LINES = 500;
+var MAX_WAKE_QUEUE_BYTES = 16 * 1024 * 1024;
 var wakeTmpSeq = 0;
 function appendWakeQueue(queueFile, payload, maxLines = MAX_WAKE_QUEUE_LINES) {
   const dir = dirname(queueFile);
@@ -742,6 +746,9 @@ function appendWakeQueue(queueFile, payload, maxLines = MAX_WAKE_QUEUE_LINES) {
     const st = lstatSync(queueFile);
     if (st.isSymbolicLink() || !st.isFile()) {
       throw new Error("Refusing to use symlink or non-regular file for Muse wake queue");
+    }
+    if (st.size > MAX_WAKE_QUEUE_BYTES) {
+      throw new Error("Muse wake queue exceeds maximum size limit");
     }
     existedBefore = true;
   } catch (err) {
@@ -765,11 +772,19 @@ function appendWakeQueue(queueFile, payload, maxLines = MAX_WAKE_QUEUE_LINES) {
   const cap = Number.isFinite(maxLines) ? Math.max(1, Math.floor(maxLines)) : MAX_WAKE_QUEUE_LINES;
   if (existingLines.length >= cap) {
     const kept = [...existingLines.slice(-(cap - 1)), line];
-    const tmp = `${queueFile}.${process.pid}.${Date.now()}.${++wakeTmpSeq}.tmp`;
+    const tmp = `${queueFile}.${process.pid}.${Date.now()}.${++wakeTmpSeq}.${randomBytes(6).toString("hex")}.tmp`;
     try {
       writeFileSync(tmp, `${kept.join(`
 `)}
-`, { mode: 384 });
+`, { mode: 384, flag: "wx" });
+      try {
+        if (lstatSync(queueFile).isSymbolicLink()) {
+          throw new Error("Refusing to use symlink or non-regular file for Muse wake queue");
+        }
+      } catch (err) {
+        if (err?.code !== "ENOENT")
+          throw err;
+      }
       renameSync(tmp, queueFile);
     } catch (err) {
       try {
@@ -779,13 +794,30 @@ function appendWakeQueue(queueFile, payload, maxLines = MAX_WAKE_QUEUE_LINES) {
     }
     return true;
   }
+  if (!existedBefore) {
+    try {
+      writeFileSync(queueFile, `${line}
+`, { mode: 384, flag: "wx" });
+      if (process.platform !== "win32") {
+        try {
+          chmodSync(queueFile, 384);
+        } catch {}
+      }
+      return true;
+    } catch (err) {
+      if (err?.code !== "EEXIST")
+        throw err;
+      const st = lstatSync(queueFile);
+      if (st.isSymbolicLink() || !st.isFile()) {
+        throw new Error("Refusing to use symlink or non-regular file for Muse wake queue");
+      }
+      if (st.size > MAX_WAKE_QUEUE_BYTES) {
+        throw new Error("Muse wake queue exceeds maximum size limit");
+      }
+    }
+  }
   appendFileSync(queueFile, `${line}
 `, { mode: 384 });
-  if (!existedBefore && process.platform !== "win32") {
-    try {
-      chmodSync(queueFile, 384);
-    } catch {}
-  }
   return true;
 }
 
@@ -795,7 +827,7 @@ import { homedir as homedir2 } from "node:os";
 import { join as join3 } from "node:path";
 
 // src/session-bind.ts
-import { closeSync, existsSync as existsSync2, lstatSync as lstatSync2, mkdirSync as mkdirSync2, openSync, readFileSync as readFileSync2, readSync, readdirSync, statSync, unlinkSync as unlinkSync2 } from "node:fs";
+import { closeSync, existsSync, lstatSync as lstatSync2, mkdirSync as mkdirSync2, openSync, readFileSync as readFileSync2, readSync, readdirSync, statSync, unlinkSync as unlinkSync2 } from "node:fs";
 import { join as join2 } from "node:path";
 
 // src/profile-store.ts
@@ -929,7 +961,7 @@ function resolveSessionForAgent(agentId, opts = {}) {
 }
 
 // src/wake.ts
-import { existsSync as existsSync3, lstatSync as lstatSync4, readFileSync as readFileSync4 } from "node:fs";
+import { existsSync as existsSync2, lstatSync as lstatSync4, readFileSync as readFileSync4 } from "node:fs";
 import { homedir as homedir3 } from "node:os";
 import { join as join4, win32 as pathWin32 } from "node:path";
 var GROK_GATEWAY_PATH_CANDIDATES = [
@@ -950,7 +982,7 @@ function resolveWindowsCliSpawn(cmd, args, opts) {
     return { cmd: trimmed, args };
   }
   const env = opts?.env ?? process.env;
-  const exists = opts?.existsImpl ?? existsSync3;
+  const exists = opts?.existsImpl ?? existsSync2;
   const readText = opts?.readTextImpl ?? ((p) => readFileSync4(p, "utf8"));
   const hasSep = /[\\/]/.test(trimmed) || /^[A-Za-z]:/.test(trimmed);
   const hasWinExt = /\.(?:exe|cmd|bat)$/i.test(trimmed);
@@ -1002,7 +1034,7 @@ function resolveWindowsCliSpawn(cmd, args, opts) {
 }
 
 // dsh/src/patch.ts
-import { randomBytes } from "node:crypto";
+import { randomBytes as randomBytes2 } from "node:crypto";
 import { chmodSync as chmodSync2, lstatSync as lstatSync5, mkdirSync as mkdirSync3, readFileSync as readFileSync5, renameSync as renameSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2 } from "node:fs";
 import { dirname as dirname2, join as join5, resolve } from "node:path";
 import { homedir as homedir4 } from "node:os";
@@ -1066,7 +1098,9 @@ function buildMcpAgentsChatArgs(opts = {}) {
     } catch {
       throw new Error("Invalid AgentsChat API URL");
     }
-    if (parsed.username || parsed.password || parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    const host = parsed.hostname.toLowerCase().replace(/\.$/, "");
+    const isLoopback = host === "localhost" || host === "127.0.0.1" || host === "[::1]" || host === "::1";
+    if (parsed.username || parsed.password || parsed.protocol !== "https:" && !(parsed.protocol === "http:" && isLoopback)) {
       throw new Error("Invalid AgentsChat API URL");
     }
     args.push("--url", rawUrl);
@@ -1164,6 +1198,9 @@ function applyDshCordisPatchFile(opts = {}) {
     if (lst.isSymbolicLink() || !lst.isFile()) {
       throw new Error(`Refusing to modify non-regular or symlinked DSH patch file: ${patchPath}`);
     }
+    if (lst.size > 1048576) {
+      throw new Error(`Refusing to modify oversized DSH patch file (>1MiB): ${patchPath}`);
+    }
     existed = true;
     mode = lst.mode & 511;
   } catch (err) {
@@ -1175,11 +1212,19 @@ function applyDshCordisPatchFile(opts = {}) {
   if (changed) {
     mkdirSync3(dirname2(patchPath), { recursive: true });
     checkParentDirectory(patchPath);
-    const tmp = `${patchPath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+    const tmp = `${patchPath}.${process.pid}.${randomBytes2(4).toString("hex")}.tmp`;
     let created = false;
     try {
       writeFileSync2(tmp, content, { encoding: "utf8", mode, flag: "wx" });
       created = true;
+      try {
+        if (lstatSync5(patchPath).isSymbolicLink()) {
+          throw new Error(`Refusing to overwrite symlinked DSH patch file: ${patchPath}`);
+        }
+      } catch (err) {
+        if (err?.code !== "ENOENT")
+          throw err;
+      }
       renameSync2(tmp, patchPath);
       if (process.platform !== "win32") {
         try {
@@ -1231,6 +1276,10 @@ function checkParentDirectory2(path) {
     parent = next;
   }
 }
+function isLoopbackHost(hostname) {
+  const h = hostname.toLowerCase().replace(/\.$/, "");
+  return h === "localhost" || h === "127.0.0.1" || h === "[::1]" || h === "::1";
+}
 function validateHttpOrWsUrl(raw, allowedProtocols, label) {
   const trimmed = raw.trim();
   if (!trimmed || /[\x00-\x20\x7f]/.test(trimmed)) {
@@ -1246,6 +1295,9 @@ function validateHttpOrWsUrl(raw, allowedProtocols, label) {
     throw new Error(`Invalid ${label} URL`);
   if (!allowedProtocols.includes(parsed.protocol)) {
     throw new Error(`Unsupported ${label} protocol: ${parsed.protocol}`);
+  }
+  if ((parsed.protocol === "ws:" || parsed.protocol === "http:") && !isLoopbackHost(parsed.hostname)) {
+    throw new Error(`Remote ${label} URL must use TLS (${parsed.protocol === "ws:" ? "wss://" : "https://"})`);
   }
   return trimmed;
 }
@@ -1293,13 +1345,17 @@ function safeDshConfig(config) {
   };
 }
 async function registerOnly(name, restUrl, profilePath = DSH_PROFILE_PATH) {
+  const cleanName = typeof name === "string" ? name.trim() : "";
+  if (!cleanName || cleanName.length > 64 || /[\x00-\x1f\x7f]/.test(cleanName)) {
+    throw new Error("Invalid --name value");
+  }
   checkParentDirectory2(profilePath);
   const safeRestUrl = validateHttpOrWsUrl(restUrl, ["http:", "https:"], "AgentChat REST");
   console.log("Terms notice: https://agents-chat.com/terms (notice only, no acceptance prompt)");
   const res = await fetch(`${safeRestUrl.replace(/\/+$/, "")}/api/account/register`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ name, type: "agent", capabilities: ["chat"] }),
+    body: JSON.stringify({ name: cleanName, type: "agent", capabilities: ["chat"] }),
     redirect: "error",
     signal: AbortSignal.timeout(15000)
   });
@@ -1327,7 +1383,7 @@ async function registerOnly(name, restUrl, profilePath = DSH_PROFILE_PATH) {
   checkParentDirectory2(profilePath);
   mkdirSync4(dirname3(profilePath), { recursive: true, mode: 448 });
   checkParentDirectory2(profilePath);
-  const tmp = `${profilePath}.${process.pid}.${randomBytes2(4).toString("hex")}.tmp`;
+  const tmp = `${profilePath}.${process.pid}.${randomBytes3(4).toString("hex")}.tmp`;
   let created = false;
   try {
     writeFileSync3(tmp, JSON.stringify({ agentId, token }, null, 2), { mode: 384, flag: "wx" });
@@ -1394,12 +1450,16 @@ async function runDshHeadlessResponder(prompt, opts = {}) {
     }, timeoutMs);
     timer.unref?.();
     child.stdout.on("data", (chunk) => {
-      if (stdout.length < 2000000)
-        stdout += chunk.toString("utf8");
+      if (stdout.length < 2000000) {
+        const text = chunk.toString("utf8");
+        stdout += text.slice(0, 2000000 - stdout.length);
+      }
     });
     child.stderr.on("data", (chunk) => {
-      if (stderr.length < 65536)
-        stderr += chunk.toString("utf8");
+      if (stderr.length < 65536) {
+        const text = chunk.toString("utf8");
+        stderr += text.slice(0, 65536 - stderr.length);
+      }
     });
     child.on("error", (err) => {
       clearTimers();
@@ -1490,7 +1550,7 @@ DeepSeek Harness (dsh) integration for AgentsChat:
           typing.stop(m.channel_id);
           return;
         }
-        const kind = /^dm-/i.test(m.channel_id) ? "direct" : "group";
+        const kind = /^dm[-:]/i.test(m.channel_id) ? "direct" : "group";
         if (!shouldDispatch(m, { agentId: botIdentity.agentId, displayName: botIdentity.displayName, channelKind: kind }))
           return;
         typing.start(m.channel_id);
@@ -1556,7 +1616,14 @@ DeepSeek Harness (dsh) integration for AgentsChat:
             const rawToken = typeof raw.token === "string" ? raw.token : "";
             const botAgentId = rawAgentId.trim();
             const botToken = rawToken.trim();
-            const botWsUrl = typeof raw.server === "string" && /^wss?:\/\//i.test(raw.server.trim()) && !/[\x00-\x20\x7f]/.test(raw.server.trim()) ? raw.server.trim() : defaultWsUrl;
+            let botWsUrl = defaultWsUrl;
+            if (typeof raw.server === "string" && raw.server.trim()) {
+              try {
+                botWsUrl = validateHttpOrWsUrl(raw.server.trim(), ["ws:", "wss:"], "AgentChat WebSocket");
+              } catch {
+                botWsUrl = defaultWsUrl;
+              }
+            }
             if (!botAgentId || !botToken || botToken === "dev-token" || /[\x00-\x1f\x7f]/.test(botAgentId) || /[\x00-\x1f\x7f]/.test(botToken) || connectedAgentIds.has(botAgentId)) {
               continue;
             }
@@ -1604,6 +1671,7 @@ DeepSeek Harness (dsh) integration for AgentsChat:
       };
       process.once("SIGINT", shutdown);
       process.once("SIGTERM", shutdown);
+      process.once("SIGHUP", shutdown);
       if (primaryClient) {
         primaryClient.waitUntilClosed().then(resolve3);
       }
@@ -1645,7 +1713,7 @@ DeepSeek Harness (dsh) integration for AgentsChat:
     const dshProfile = arg("--dsh-profile", argv) ?? "headless";
     const channelKinds = {};
     for (const c of channels) {
-      channelKinds[c] = /^dm-/i.test(c) ? "direct" : "group";
+      channelKinds[c] = /^dm[-:]/i.test(c) ? "direct" : "group";
     }
     const bridge = new MuseBridge(client, {
       agentId: config.agentId,
@@ -1669,9 +1737,23 @@ ${ctx.context}`,
       }
     });
     client.onReconnect = () => bridge.rejoin();
-    await bridge.start();
-    console.log(`DSH bridge listening on ${channels.join(", ") || "(no channels — pass --channel <id>)"} (profile=${dshProfile}).`);
-    await client.waitUntilClosed();
+    const shutdownListen = () => {
+      try {
+        client.disconnect();
+      } catch {}
+    };
+    process.once("SIGINT", shutdownListen);
+    process.once("SIGTERM", shutdownListen);
+    process.once("SIGHUP", shutdownListen);
+    try {
+      await bridge.start();
+      console.log(`DSH bridge listening on ${channels.join(", ") || "(no channels — pass --channel <id>)"} (profile=${dshProfile}).`);
+      await client.waitUntilClosed();
+    } finally {
+      process.removeListener("SIGINT", shutdownListen);
+      process.removeListener("SIGTERM", shutdownListen);
+      process.removeListener("SIGHUP", shutdownListen);
+    }
     return;
   }
   throw new Error("Specify --setup, --register-only, --wake, --listen, or --send (see --dsh --help)");
