@@ -3,7 +3,7 @@ import { AgentChatClient } from "../src/client";
 import { AgentChatREST } from "../src/rest";
 import { redactError } from "../src/security";
 
-const MAX_BYTES = 10 * 1024 * 1024;
+const MAX_BYTES = 4 * 1024 * 1024;
 const controls = Array.from({ length: 32 }, (_, n) => String.fromCharCode(n)).concat("\x7f");
 const ws = (url = "wss://agents-chat.com/ws", agentId = "bot", token = "secret") =>
   new AgentChatClient({ url, agentId, token });
@@ -136,13 +136,13 @@ test("JSON success, HTTP errors, SSE error bodies and archive responses share a 
     const rest = new AgentChatREST({ baseUrl: "http://localhost", fetchImpl: async () => result.response });
     const operation = kind === "sse" ? rest.iterateChannelEvents("room").next()
       : kind === "archive" ? rest.archiveChannelDoc("room", "doc") : rest.health();
-    await expect(operation).rejects.toThrow("10 MiB");
+    await expect(operation).rejects.toThrow("4 MiB");
     expect(result.cancelled()).toBe(1);
     expect(result.stream.locked).toBe(false);
   }
 });
 
-test("JSON limit measures actual UTF-8 bytes, accepts exactly 10 MiB and decodes split characters", async () => {
+test("JSON limit measures actual UTF-8 bytes, accepts exactly 4 MiB and decodes split characters", async () => {
   const prefix = '{"data":"';
   const suffix = '"}';
   const overhead = prefix.length + suffix.length;

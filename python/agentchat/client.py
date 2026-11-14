@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import websockets
-from ._security import redact_error, validate_server_url, validate_token
+from ._security import redact_error, validate_server_url, validate_token, validate_path_segment
 
 if TYPE_CHECKING:
     from websockets.asyncio.client import ClientConnection
@@ -94,6 +94,7 @@ class AgentChatClient:
         validate_token(token)
         if not isinstance(agent_id, str) or not agent_id.strip():
             raise ValueError("agent_id must not be empty")
+        validate_path_segment(agent_id, "agent_id")
         self.url = url
         self.agent_id = agent_id
         self.token = token
@@ -782,6 +783,9 @@ class AgentChatClient:
                 raise ValueError(f"{name} must not be empty")
 
     async def _send(self, data: dict) -> None:
+        for key, value in data.items():
+            if key == "id" or key.endswith("_id"):
+                validate_path_segment(value, key)
         if self._ws is None:
             raise ConnectionError("Not connected. Call connect() first.")
         await self._ws.send(json.dumps(data))
