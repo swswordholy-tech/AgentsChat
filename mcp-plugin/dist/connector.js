@@ -605,10 +605,19 @@ function redactSecrets(text, opts) {
 }
 
 // src/read-cursor.ts
-import { readFileSync, renameSync, unlinkSync, writeFileSync } from "fs";
+import { randomBytes } from "crypto";
+import { chmodSync, lstatSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "fs";
+var MAX_CURSOR_BYTES = 4 * 1024 * 1024;
 var tmpCounter = 0;
 function loadCursor(file, warn) {
   try {
+    const st = lstatSync(file);
+    if (st.isSymbolicLink() || !st.isFile()) {
+      throw new Error("cursor path must be a regular file");
+    }
+    if (st.size > MAX_CURSOR_BYTES) {
+      throw new Error(`cursor file exceeds ${MAX_CURSOR_BYTES} byte limit`);
+    }
     const parsed = JSON.parse(readFileSync(file, "utf-8"));
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       throw new Error("cursor root must be a JSON object");
@@ -619,6 +628,9 @@ function loadCursor(file, warn) {
         continue;
       if (typeof v !== "string") {
         throw new Error(`cursor value for ${k} must be a string`);
+      }
+      if (!k || /[\x00-\x1f\x7f]/.test(k) || /[\x00-\x1f\x7f]/.test(v) || v.length > 256) {
+        throw new Error(`cursor entry for ${k} contains invalid characters or length`);
       }
       entries.push([k, v]);
     }
@@ -632,9 +644,26 @@ function loadCursor(file, warn) {
   }
 }
 function persistCursor(file, cursor, warn) {
-  const tmp = `${file}.${process.pid}.${Date.now()}.${++tmpCounter}.tmp`;
   try {
-    writeFileSync(tmp, JSON.stringify(Object.fromEntries(cursor)), { mode: 384 });
+    const existing = lstatSync(file);
+    if (existing.isSymbolicLink() || !existing.isFile()) {
+      warn(`[agentchat] WARNING: failed to persist read cursor to ${file}: target is not a regular file
+`);
+      return false;
+    }
+  } catch (e) {
+    if (e?.code !== "ENOENT") {
+      warn(`[agentchat] WARNING: failed to persist read cursor to ${file}: ${e}
+`);
+      return false;
+    }
+  }
+  const tmp = `${file}.${process.pid}.${Date.now()}.${++tmpCounter}.${randomBytes(4).toString("hex")}.tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify(Object.fromEntries(cursor)), { mode: 384, flag: "wx" });
+    if (process.platform !== "win32") {
+      chmodSync(tmp, 384);
+    }
     renameSync(tmp, file);
     return true;
   } catch (e) {

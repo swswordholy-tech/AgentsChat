@@ -124,7 +124,13 @@ function redactSecrets(text, opts) {
 // codex/owner.ts
 async function getBotOwner(base, agentId, token, request = fetch) {
   try {
-    const origin = base.replace(/\/+$/, "");
+    if (!base || base !== base.trim() || /[\x00-\x1f\x7f]/.test(base) || !agentId || agentId !== agentId.trim() || /[\x00-\x1f\x7f]/.test(agentId) || !token || token !== token.trim() || /[\x00-\x1f\x7f]/.test(token))
+      return null;
+    const parsed = new URL(base);
+    const loopback = ["127.0.0.1", "localhost", "[::1]", "::1"].includes(parsed.hostname);
+    if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && loopback) || parsed.username || parsed.password || parsed.search || parsed.hash)
+      return null;
+    const origin = parsed.href.replace(/\/+$/, "");
     const options = {
       method: "GET",
       headers: { Authorization: `Bearer ${token}` },
@@ -158,7 +164,7 @@ async function getBotOwner(base, agentId, token, request = fetch) {
     if (!entitlement || typeof entitlement !== "object" || Array.isArray(entitlement))
       return null;
     const owner = entitlement.owner_account_id;
-    return typeof owner === "string" && owner.trim().length > 0 && owner === owner.trim() && !/[\x00-\x1f\x7f]/.test(owner) && owner !== agentId ? owner : null;
+    return typeof owner === "string" && owner.trim().length > 0 && owner === owner.trim() && !/[\x00-\x1f\x7f]/.test(owner) && owner !== agentId && !["__proto__", "constructor", "prototype"].includes(owner.toLowerCase()) ? owner : null;
   } catch {
     return null;
   }
@@ -178,6 +184,38 @@ function isSafeOnboardingBase(base) {
   } catch {
     return false;
   }
+}
+var MAX_ONBOARDING_JSON_BYTES = 64 * 1024;
+async function readBoundedJson(r, maxBytes = MAX_ONBOARDING_JSON_BYTES) {
+  if (!r.body) {
+    const txt = await r.text();
+    if (Buffer.byteLength(txt, "utf8") > maxBytes)
+      throw new Error("onboarding response too large");
+    return JSON.parse(txt);
+  }
+  const reader = r.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done)
+        break;
+      if (value) {
+        total += value.byteLength;
+        if (total > maxBytes) {
+          await reader.cancel().catch(() => {});
+          throw new Error("onboarding response too large");
+        }
+        chunks.push(value);
+      }
+    }
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {}
+  }
+  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
 async function getOnboardingStatus(base, agentId, token, request = fetch) {
   const cleanBase = typeof base === "string" ? base.trim().replace(/\/+$/, "") : "";
@@ -214,7 +252,7 @@ async function getOnboardingStatus(base, agentId, token, request = fetch) {
       } catch {}
       return result;
     }
-    const data = await r.json();
+    const data = await readBoundedJson(r);
     if (!data || typeof data !== "object" || data.agent_id !== safeAgentId || typeof data.claimed !== "boolean")
       return result;
     result.authentication = "ok";

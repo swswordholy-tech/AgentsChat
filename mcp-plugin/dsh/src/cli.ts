@@ -51,16 +51,20 @@ function has(name: string, argv: string[]): boolean {
 
 const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
+const DARWIN_ROOT_LINKS = new Set(["/var", "/tmp", "/etc"]);
+
 function checkParentDirectory(path: string): void {
   let parent = dirname(resolve(path));
   for (;;) {
-    try {
-      const stat = lstatSync(parent);
-      if (stat.isSymbolicLink() || !stat.isDirectory()) {
-        throw new Error(`Refusing symlinked or non-directory parent: ${parent}`);
+    if (!(process.platform === "darwin" && DARWIN_ROOT_LINKS.has(parent))) {
+      try {
+        const stat = lstatSync(parent);
+        if (stat.isSymbolicLink() || !stat.isDirectory()) {
+          throw new Error(`Refusing symlinked or non-directory parent: ${parent}`);
+        }
+      } catch (err: any) {
+        if (err?.code !== "ENOENT") throw err;
       }
-    } catch (err: any) {
-      if (err?.code !== "ENOENT") throw err;
     }
     const next = dirname(parent);
     if (next === parent) break;

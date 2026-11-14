@@ -2,8 +2,9 @@
 
 // dsh/src/cli.ts
 import { chmodSync as chmodSync3, lstatSync as lstatSync4, mkdirSync as mkdirSync4, readFileSync as readFileSync6, renameSync as renameSync3, unlinkSync as unlinkSync4, writeFileSync as writeFileSync3 } from "node:fs";
+import { randomBytes as randomBytes2 } from "node:crypto";
 import { spawn } from "node:child_process";
-import { dirname as dirname3, join as join6 } from "node:path";
+import { dirname as dirname3, join as join6, resolve as resolve2 } from "node:path";
 import { homedir as homedir5 } from "node:os";
 
 // muse/src/policy.ts
@@ -921,10 +922,32 @@ function resolveWindowsCliSpawn(cmd, args, opts) {
 }
 
 // dsh/src/patch.ts
+import { randomBytes } from "node:crypto";
 import { chmodSync as chmodSync2, lstatSync as lstatSync3, mkdirSync as mkdirSync3, readFileSync as readFileSync5, renameSync as renameSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2 } from "node:fs";
-import { dirname as dirname2, join as join5 } from "node:path";
+import { dirname as dirname2, join as join5, resolve } from "node:path";
 import { homedir as homedir4 } from "node:os";
 var FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+var DARWIN_ROOT_LINKS = new Set(["/var", "/tmp", "/etc"]);
+function checkParentDirectory(path) {
+  let parent = dirname2(resolve(path));
+  for (;; ) {
+    if (!(process.platform === "darwin" && DARWIN_ROOT_LINKS.has(parent))) {
+      try {
+        const stat = lstatSync3(parent);
+        if (stat.isSymbolicLink() || !stat.isDirectory()) {
+          throw new Error(`Refusing symlinked or non-directory parent: ${parent}`);
+        }
+      } catch (err) {
+        if (err?.code !== "ENOENT")
+          throw err;
+      }
+    }
+    const next = dirname2(parent);
+    if (next === parent)
+      break;
+    parent = next;
+  }
+}
 function resolveDshPatchPath(opts = {}) {
   const home = opts.dshHome ?? process.env.DSH_HOME ?? join5(homedir4(), ".dsh");
   if (!home || /[\x00-\x1f\x7f]/.test(home)) {
@@ -963,7 +986,7 @@ function buildMcpAgentsChatArgs(opts = {}) {
     } catch {
       throw new Error("Invalid AgentsChat API URL");
     }
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    if (parsed.username || parsed.password || parsed.protocol !== "http:" && parsed.protocol !== "https:") {
       throw new Error("Invalid AgentsChat API URL");
     }
     args.push("--url", rawUrl);
@@ -1051,9 +1074,9 @@ ${renderMcpAgentsChatEntry("    ", opts)}
     changed: true
   };
 }
-var dshPatchTmpSeq = 0;
 function applyDshCordisPatchFile(opts = {}) {
   const patchPath = resolveDshPatchPath(opts);
+  checkParentDirectory(patchPath);
   let existed = false;
   let mode = 384;
   try {
@@ -1071,9 +1094,12 @@ function applyDshCordisPatchFile(opts = {}) {
   const { content, changed } = mergeDshCordisPatch(existing, opts);
   if (changed) {
     mkdirSync3(dirname2(patchPath), { recursive: true });
-    const tmp = `${patchPath}.${process.pid}.${Date.now()}.${++dshPatchTmpSeq}.tmp`;
+    checkParentDirectory(patchPath);
+    const tmp = `${patchPath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+    let created = false;
     try {
-      writeFileSync2(tmp, content, { encoding: "utf8", mode });
+      writeFileSync2(tmp, content, { encoding: "utf8", mode, flag: "wx" });
+      created = true;
       renameSync2(tmp, patchPath);
       if (process.platform !== "win32") {
         try {
@@ -1082,7 +1108,8 @@ function applyDshCordisPatchFile(opts = {}) {
       }
     } catch (err) {
       try {
-        unlinkSync3(tmp);
+        if (created)
+          unlinkSync3(tmp);
       } catch {}
       throw err;
     }
@@ -1096,12 +1123,34 @@ var DEFAULT_WS_URL = "wss://agents-chat.com/ws";
 var DEFAULT_REST_URL = "https://agents-chat.com";
 function arg(name, argv) {
   const i = argv.indexOf(name);
-  return i >= 0 ? argv[i + 1] : undefined;
+  const value = i >= 0 ? argv[i + 1] : undefined;
+  return value?.startsWith("--") ? undefined : value;
 }
 function has(name, argv) {
   return argv.includes(name);
 }
 var FORBIDDEN_KEYS2 = new Set(["__proto__", "constructor", "prototype"]);
+var DARWIN_ROOT_LINKS2 = new Set(["/var", "/tmp", "/etc"]);
+function checkParentDirectory2(path) {
+  let parent = dirname3(resolve2(path));
+  for (;; ) {
+    if (!(process.platform === "darwin" && DARWIN_ROOT_LINKS2.has(parent))) {
+      try {
+        const stat = lstatSync4(parent);
+        if (stat.isSymbolicLink() || !stat.isDirectory()) {
+          throw new Error(`Refusing symlinked or non-directory parent: ${parent}`);
+        }
+      } catch (err) {
+        if (err?.code !== "ENOENT")
+          throw err;
+      }
+    }
+    const next = dirname3(parent);
+    if (next === parent)
+      break;
+    parent = next;
+  }
+}
 function validateHttpOrWsUrl(raw, allowedProtocols, label) {
   const trimmed = raw.trim();
   if (!trimmed || /[\x00-\x20\x7f]/.test(trimmed)) {
@@ -1113,6 +1162,8 @@ function validateHttpOrWsUrl(raw, allowedProtocols, label) {
   } catch {
     throw new Error(`Invalid ${label} URL`);
   }
+  if (parsed.username || parsed.password)
+    throw new Error(`Invalid ${label} URL`);
   if (!allowedProtocols.includes(parsed.protocol)) {
     throw new Error(`Unsupported ${label} protocol: ${parsed.protocol}`);
   }
@@ -1162,6 +1213,7 @@ function safeDshConfig(config) {
   };
 }
 async function registerOnly(name, restUrl, profilePath = DSH_PROFILE_PATH) {
+  checkParentDirectory2(profilePath);
   const safeRestUrl = validateHttpOrWsUrl(restUrl, ["http:", "https:"], "AgentChat REST");
   console.log("Terms notice: https://agents-chat.com/terms (notice only, no acceptance prompt)");
   const res = await fetch(`${safeRestUrl.replace(/\/+$/, "")}/api/account/register`, {
@@ -1192,10 +1244,14 @@ async function registerOnly(name, restUrl, profilePath = DSH_PROFILE_PATH) {
     if (err?.code !== "ENOENT")
       throw err;
   }
+  checkParentDirectory2(profilePath);
   mkdirSync4(dirname3(profilePath), { recursive: true, mode: 448 });
-  const tmp = `${profilePath}.${process.pid}.${Date.now()}.tmp`;
+  checkParentDirectory2(profilePath);
+  const tmp = `${profilePath}.${process.pid}.${randomBytes2(4).toString("hex")}.tmp`;
+  let created = false;
   try {
-    writeFileSync3(tmp, JSON.stringify({ agentId, token }, null, 2), { mode: 384 });
+    writeFileSync3(tmp, JSON.stringify({ agentId, token }, null, 2), { mode: 384, flag: "wx" });
+    created = true;
     renameSync3(tmp, profilePath);
     if (process.platform !== "win32") {
       try {
@@ -1203,9 +1259,11 @@ async function registerOnly(name, restUrl, profilePath = DSH_PROFILE_PATH) {
       } catch {}
     }
   } catch (err) {
-    try {
-      unlinkSync4(tmp);
-    } catch {}
+    if (created) {
+      try {
+        unlinkSync4(tmp);
+      } catch {}
+    }
     throw err;
   }
   console.log(`Registered DSH agent '${name}' as ${agentId}. Identity saved to ${profilePath} (token not printed).`);
@@ -1221,8 +1279,9 @@ async function runDshHeadlessResponder(prompt, opts = {}) {
     console.error("[dsh] invalid dshProfile");
     return null;
   }
-  const timeoutMs = opts.timeoutMs ?? 120000;
-  return new Promise((resolve) => {
+  const t = opts.timeoutMs ?? 120000;
+  const timeoutMs = Number.isFinite(t) && t > 0 ? Math.min(Math.floor(t), 2147483647) : 120000;
+  return new Promise((resolve3) => {
     const resolved = resolveWindowsCliSpawn(dshBin, ["--profile", dshProfile, prompt], { env: process.env });
     const child = spawn(resolved.cmd, resolved.args, {
       stdio: ["ignore", "pipe", "pipe"],
@@ -1265,17 +1324,17 @@ async function runDshHeadlessResponder(prompt, opts = {}) {
     child.on("error", (err) => {
       clearTimers();
       console.error(`[dsh] failed to spawn ${dshBin}: ${redact(err.message)}`);
-      resolve(null);
+      resolve3(null);
     });
     child.on("close", (code) => {
       clearTimers();
       if (code !== 0) {
         console.error(`[dsh] exited with code ${code}: ${redact(stderr.trim().slice(0, 300))}`);
-        resolve(null);
+        resolve3(null);
         return;
       }
       const trimmed = stdout.trim();
-      resolve(trimmed.length > 0 ? trimmed : null);
+      resolve3(trimmed.length > 0 ? trimmed : null);
     });
   });
 }
@@ -1351,7 +1410,7 @@ DeepSeek Harness (dsh) integration for AgentsChat:
           typing.stop(m.channel_id);
           return;
         }
-        const kind = m.channel_id.startsWith("dm-") ? "direct" : "group";
+        const kind = /^dm-/i.test(m.channel_id) ? "direct" : "group";
         if (!shouldDispatch(m, { agentId: botIdentity.agentId, displayName: botIdentity.displayName, channelKind: kind }))
           return;
         typing.start(m.channel_id);
@@ -1452,7 +1511,7 @@ DeepSeek Harness (dsh) integration for AgentsChat:
     const bindTimer = setInterval(() => void syncBoundDshClients(), 3000);
     bindTimer.unref?.();
     console.log(`DSH wake daemon listening on ${wakeChannels.join(", ") || "(no channels — pass --channel <id>)"}, queue=${queueFile}.`);
-    await new Promise((resolve) => {
+    await new Promise((resolve3) => {
       const shutdown = () => {
         for (const t of activeTyping)
           t.stopAll();
@@ -1461,12 +1520,12 @@ DeepSeek Harness (dsh) integration for AgentsChat:
             c.disconnect();
           } catch {}
         }
-        resolve();
+        resolve3();
       };
       process.once("SIGINT", shutdown);
       process.once("SIGTERM", shutdown);
       if (primaryClient) {
-        primaryClient.waitUntilClosed().then(resolve);
+        primaryClient.waitUntilClosed().then(resolve3);
       }
     });
     clearInterval(bindTimer);
@@ -1506,7 +1565,7 @@ DeepSeek Harness (dsh) integration for AgentsChat:
     const dshProfile = arg("--dsh-profile", argv) ?? "headless";
     const channelKinds = {};
     for (const c of channels) {
-      channelKinds[c] = c.startsWith("dm-") ? "direct" : "group";
+      channelKinds[c] = /^dm-/i.test(c) ? "direct" : "group";
     }
     const bridge = new MuseBridge(client, {
       agentId: config.agentId,
@@ -1547,6 +1606,7 @@ if (invokedDirectly) {
 export {
   safeDshConfig,
   runDshHeadlessResponder,
+  registerOnly,
   main,
   loadDshConfig,
   DSH_PROFILE_PATH
