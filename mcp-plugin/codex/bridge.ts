@@ -24,9 +24,22 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" &&
     (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
 }
+function safeMessageId(value: unknown): value is string {
+  return typeof value === "string" && !!value.trim() && !/[\x00-\x1f\x7f]/.test(value) && !isPrototypeKey(value);
+}
+function validMentions(value: unknown): boolean {
+  return value === undefined || (Array.isArray(value) && value.length <= 128 && [...value].every(id => typeof id === "string"));
+}
+function checkStateDir(dir: string, allowMissing = false) {
+  try {
+    const stat = lstatSync(dir);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("Unsafe bridge state directory");
+  } catch (error: any) { if (!allowMissing || error.code !== "ENOENT") throw error; }
+}
+const entryStatuses = new Set<Entry["status"]>(["pending", "running", "ready", "sending", "sent", "failed", "uncertain", "blocked", "skipped"]);
 export function addressed(m: any, c: BridgeConfig): m is ChatMessage {
   if (!m || ["id", "channel_id", "sender_id", "content"].some(k => typeof m[k] !== "string" || !m[k].trim())) return false;
-  if (isPrototypeKey(m.channel_id)) return false;
+  if (![m.id, m.channel_id, m.sender_id].every(safeMessageId) || !validMentions(m.mentions) || !validMentions(m.mentioned_ids)) return false;
   if (m.content === "__typing__" || m.content.length > 32_000) return false;
   if (["slash_input", "loop_status", "slash_response"].includes(m.meta?.kind)) return false;
   if (m.meta?.kind === "loop_tick") return authorizedLoopTick(m, c) !== null;
@@ -49,7 +62,9 @@ export class Bridge {
     private activity: (channel: string, active: boolean) => void = () => {},
     private owner: () => Promise<string | null> = async () => null,
     private loops: () => Promise<unknown> = async () => null) {
+    checkStateDir(config.stateDir, true);
     mkdirSync(config.stateDir, { recursive: true, mode: 0o700 });
+    checkStateDir(config.stateDir);
     this.file = join(config.stateDir, "state.json"); this.lock = join(config.stateDir, "bridge.lock");
     try {
       const stat = lstatSync(this.lock);
@@ -74,6 +89,9 @@ export class Bridge {
       if (this.state?.version !== 1 || !isPlainObject(this.state.threads) || !Array.isArray(this.state.entries) ||
         (Object.prototype.hasOwnProperty.call(this.state, "channels") && !isPlainObject(this.state.channels))) throw new Error("Invalid bridge state");
       for (const e of this.state.entries) {
+        if (!isPlainObject(e) || !entryStatuses.has(e.status as Entry["status"]) || !isPlainObject(e.message) ||
+          ![e.message.id, e.message.channel_id, e.message.sender_id].every(safeMessageId) || typeof e.message.content !== "string" ||
+          !validMentions(e.message.mentions) || !validMentions(e.message.mentioned_ids)) throw new Error("Invalid bridge entry");
         if (e.status === "sending") e.status = "uncertain";
         if (e.status === "running") e.status = "failed";
       }
@@ -107,10 +125,13 @@ export class Bridge {
     }
     const tmp = `${this.file}.tmp.${process.pid}.${Date.now()}.${randomBytes(16).toString("hex")}`;
     try {
-      writeFileSync(tmp, JSON.stringify(this.state), { mode: 0o600, flag: "wx" });
+      const serialized = JSON.stringify(this.state);
+      checkStateDir(this.config.stateDir);
+      writeFileSync(tmp, serialized, { mode: 0o600, flag: "wx" });
       try {
         if (lstatSync(this.file).isSymbolicLink()) throw new Error("Bridge state must not be a symlink");
       } catch (error: any) { if (error.code !== "ENOENT") throw error; }
+      checkStateDir(this.config.stateDir);
       renameSync(tmp, this.file);
     } catch (err) {
       try { unlinkSync(tmp); } catch {}
@@ -230,7 +251,10 @@ export class Bridge {
         if (error instanceof ThreadBusyError) {
           e.status = "pending"; e.error = error.message; this.save();
           this.log("Conversation in use; queued message will resume in the same task");
-          if (!this.stopped) this.retry = setTimeout(() => { this.retry = undefined; void this.drain(); }, 5000);
+          if (!this.stopped) {
+            this.retry = setTimeout(() => { this.retry = undefined; void this.drain(); }, 5000);
+            this.retry.unref?.();
+          }
           return;
         }
         e.error = this.redact(error instanceof Error ? error.message : "Bridge operation failed").slice(0, 240);

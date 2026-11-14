@@ -79,6 +79,7 @@ export class AppServer {
     });
     this.rl = createInterface({ input: this.child.stdout });
     this.rl.on("line", line => {
+      if (line.length > 8 * 1024 * 1024) { this.fatal(new Error("Oversized app-server response")); return; }
       let parsed: any;
       try { parsed = JSON.parse(line); } catch { this.fatal(new Error("Invalid app-server response")); return; }
       this.receive(parsed);
@@ -145,12 +146,16 @@ export class AppServer {
     if (!a || p?.threadId !== a.thread) return;
     if (!a.turn) { if (a.early.length < 500) a.early.push(message); return; }
     if ((p.turnId ?? p.turn?.id) !== a.turn) return;
-    if (message.method === "item/completed" && p.item?.type === "agentMessage" &&
-      (!p.item.phase || p.item.phase === "final_answer")) a.items.set(p.item.id, p.item.text);
+    const recordItem = (item: any) => {
+      if (item?.type === "agentMessage" && (!item.phase || item.phase === "final_answer") &&
+        typeof item.id === "string" && item.id.length > 0 && typeof item.text === "string" &&
+        (a.items.has(item.id) || a.items.size < 512)) a.items.set(item.id, item.text);
+    };
+    if (message.method === "item/completed") recordItem(p.item);
     if (message.method === "turn/completed") {
       this.active = undefined;
       if (p.turn?.status !== "completed") { a.reject(new Error(`Codex turn ${p.turn?.status ?? "unknown"}`)); return; }
-      for (const item of p.turn.items ?? []) if (item.type === "agentMessage" && (!item.phase || item.phase === "final_answer")) a.items.set(item.id, item.text);
+      for (const item of Array.isArray(p.turn.items) ? p.turn.items : []) recordItem(item);
       const text = [...a.items.values()].join("\n").trim();
       text ? a.resolve(text) : a.reject(new Error("Codex completed without a final reply"));
     }
@@ -164,7 +169,9 @@ export class AppServer {
     }
     const result = await this.request("config/read", { includeLayers: false, cwd });
     this.disabledMcp = {};
-    for (const name of Object.keys(result.config?.mcp_servers ?? {})) this.disabledMcp[name] = { enabled: false };
+    for (const name of Object.keys(result.config?.mcp_servers ?? {})) {
+      if (!/^(?:__proto__|constructor|prototype)$/i.test(name)) this.disabledMcp[name] = { enabled: false };
+    }
     const r = await this.request(existing ? "thread/resume" : "thread/start", {
       ...(existing ? { threadId: existing } : { ephemeral }), cwd, ...(this.model ? { model: this.model } : {}),
       approvalPolicy: "never", sandbox: permissions === "full-access" ? "danger-full-access" : "read-only",
@@ -177,6 +184,7 @@ export class AppServer {
     });
     if (typeof r.thread?.id !== "string") throw new Error("App-server returned no thread ID");
     this.threadPermissions.set(r.thread.id, permissions);
+    if (this.threadPermissions.size > 1024) this.threadPermissions.delete(this.threadPermissions.keys().next().value!);
     return r.thread.id;
   }
   async readThread(thread: string): Promise<ThreadHistory> {
