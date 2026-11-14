@@ -63,8 +63,16 @@ describe("tool annotations — full coverage (OpenAI directory requirement)", ()
   });
 
   test("annotateTools attaches annotations and defaults unknown tools to write (fail safe)", () => {
-    const out = annotateTools([{ name: "whoami" }, { name: "brand_new_tool" }]);
+    const out = annotateTools([
+      { name: "whoami" },
+      { name: "brand_new_tool" },
+      { name: "constructor" },
+      { name: "toString" },
+    ]);
     expect(out[0].annotations.readOnlyHint).toBe(true);
     expect(out[1].annotations.readOnlyHint).toBe(false); // unknown ≠ read-only
+    expect(out[2].annotations.readOnlyHint).toBe(false);
+    expect(out[2].annotations.openWorldHint).toBe(true);
+    expect(out[3].annotations.readOnlyHint).toBe(false);
   });
 });

@@ -95,3 +95,16 @@ test("resolveSessionTarget: builds a conversation id from id + thread", () => {
     buildConversationId("room-1"),
   );
 });
+
+test("Campaign #101: messaging & conversation harden against control chars, blank IDs, and double-prefixing", () => {
+  assert.equal(agentChatMessaging.normalizeTarget("room\r\n1"), undefined);
+  assert.equal(agentChatMessaging.normalizeTarget(null), undefined);
+  assert.equal(agentChatMessaging.resolveInboundConversation({ from: "   " }), null);
+  assert.equal(agentChatMessaging.resolveInboundConversation({ from: "room\x001" }), null);
+  assert.equal(
+    agentChatMessaging.resolveInboundConversation({ conversationId: buildConversationId("room-9", "t9") })
+      .conversationId,
+    buildConversationId("room-9", "t9"),
+  );
+  assert.throws(() => buildConversationId("room:thread:injected"));
+});

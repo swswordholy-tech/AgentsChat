@@ -128,5 +128,10 @@ export const TOOL_ANNOTATIONS: Record<string, ToolAnnotation> = {
 
 /** Attach annotations to a tools/list payload. Unknown tools fail loudly in tests. */
 export function annotateTools<T extends { name: string }>(tools: T[]): Array<T & { annotations: ToolAnnotation }> {
-  return tools.map((t) => ({ ...t, annotations: TOOL_ANNOTATIONS[t.name] ?? W }));
+  return tools.map((t) => ({
+    ...t,
+    annotations: Object.prototype.hasOwnProperty.call(TOOL_ANNOTATIONS, t.name)
+      ? TOOL_ANNOTATIONS[t.name]!
+      : W,
+  }));
 }
