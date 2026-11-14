@@ -144,26 +144,37 @@ function matchesLiveLoop(msg, agentId, response) {
 function messageDedupKey(data) {
   if (!data || typeof data.id !== "string" || typeof data.channel_id !== "string")
     return null;
-  return `${data.channel_id}:${data.id}`;
+  if (!data.id.trim() || !data.channel_id.trim())
+    return null;
+  const safeChannel = data.channel_id.replace(/\\/g, "\\\\").replace(/:/g, "\\:");
+  return `${safeChannel}:${data.id}`;
 }
 
 class MessageDedup {
+  seen = new Set;
   max;
   dropOnEvict;
-  seen = new Set;
   constructor(max = 5000, dropOnEvict = 1000) {
-    this.max = max;
-    this.dropOnEvict = dropOnEvict;
+    const safeMax = Number.isFinite(max) ? Math.max(1, Math.floor(max)) : 5000;
+    const safeDrop = Number.isFinite(dropOnEvict) ? Math.min(safeMax, Math.max(1, Math.floor(dropOnEvict))) : Math.min(safeMax, 1000);
+    this.max = safeMax;
+    this.dropOnEvict = safeDrop;
   }
   recordOrSkip(key) {
+    if (typeof key !== "string" || key.length === 0)
+      return false;
     if (this.seen.has(key))
       return true;
     this.seen.add(key);
     if (this.seen.size > this.max) {
-      const arr = [...this.seen];
-      this.seen.clear();
-      for (const item of arr.slice(this.dropOnEvict))
-        this.seen.add(item);
+      const toDrop = Math.max(this.dropOnEvict, this.seen.size - this.max);
+      let dropped = 0;
+      for (const oldest of this.seen) {
+        this.seen.delete(oldest);
+        dropped += 1;
+        if (dropped >= toDrop)
+          break;
+      }
     }
     return false;
   }
