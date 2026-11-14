@@ -740,11 +740,13 @@ function safeCursorBotFile(cursorDir, botId) {
 
 // connector/ingest.ts
 function ingestAgentsChatFrame(id, frame, deps) {
+  if (!frame || typeof frame !== "object")
+    return false;
   if (frame.content !== "__typing__") {
     deps.advanceCursor(id, frame.channel_id, frame.timestamp);
   }
   const key = messageDedupKey(frame);
-  const isDm = frame.channel_id?.startsWith("dm-");
+  const isDm = typeof frame.channel_id === "string" && /^dm-/i.test(frame.channel_id);
   const scopedKey = key && (isDm ? JSON.stringify([id.botId, frame.channel_id, frame.id]) : key);
   if (scopedKey && deps.dedup.recordOrSkip(scopedKey))
     return false;

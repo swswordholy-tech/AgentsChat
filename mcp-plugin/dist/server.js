@@ -2094,7 +2094,10 @@ var TOOL_ANNOTATIONS = {
   list_channel_doc_revisions: R
 };
 function annotateTools(tools) {
-  return tools.map((t) => ({ ...t, annotations: TOOL_ANNOTATIONS[t.name] ?? W }));
+  return tools.map((t) => ({
+    ...t,
+    annotations: Object.prototype.hasOwnProperty.call(TOOL_ANNOTATIONS, t.name) ? TOOL_ANNOTATIONS[t.name] : W
+  }));
 }
 
 // src/wake.ts

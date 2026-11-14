@@ -11,23 +11,37 @@ var MAX_HISTORY_MESSAGES = 50;
 var MAX_CONTEXT_BYTES = 15000;
 var MAX_MESSAGE_BYTES = 2000;
 function isMentioned(content, agentId, displayName) {
+  if (typeof content !== "string")
+    return false;
   const haystack = content.toLowerCase();
-  const names = [`@${agentId.toLowerCase()}`];
-  if (displayName)
-    names.push(`@${displayName.toLowerCase()}`);
-  names.push("@muse");
-  return names.some((name) => haystack.includes(name));
+  const names = [agentId, displayName, "muse"].filter((name) => typeof name === "string" && name.trim().length > 0).map((name) => `@${name.trim().toLowerCase()}`);
+  return names.some((name) => {
+    let index = haystack.indexOf(name);
+    while (index !== -1) {
+      const before = haystack[index - 1];
+      const afterCodePoint = haystack.codePointAt(index + name.length);
+      const after = afterCodePoint === undefined ? "" : String.fromCodePoint(afterCodePoint);
+      if ((!before || !/[a-z0-9@]/i.test(before)) && (!after || !/[\p{L}\p{N}\p{M}_-]/u.test(after)))
+        return true;
+      index = haystack.indexOf(name, index + 1);
+    }
+    return false;
+  });
 }
 function shouldDispatch(message, opts) {
+  if (!message || typeof message !== "object" || typeof message.content !== "string")
+    return false;
   if (message.sender_id === opts.agentId)
     return false;
   if (opts.channelKind === "direct")
     return true;
-  if (!opts.channelKind)
-    return isMentioned(message.content, opts.agentId, opts.displayName);
+  if (!opts.channelKind && typeof message.channel_id === "string" && /^dm-/i.test(message.channel_id))
+    return true;
   return isMentioned(message.content, opts.agentId, opts.displayName);
 }
 function truncateToBytes(text, maxBytes) {
+  if (maxBytes <= 0)
+    return "";
   const encoder = new TextEncoder;
   if (encoder.encode(text).length <= maxBytes)
     return text;
@@ -40,6 +54,8 @@ function truncateToBytes(text, maxBytes) {
     else
       high = mid - 1;
   }
+  if (low > 0 && low < text.length && text.charCodeAt(low - 1) >= 55296 && text.charCodeAt(low - 1) <= 56319 && text.charCodeAt(low) >= 56320 && text.charCodeAt(low) <= 57343)
+    low -= 1;
   return text.slice(0, low);
 }
 function buildContext(messages, agentId) {
@@ -47,15 +63,16 @@ function buildContext(messages, agentId) {
   const lines = [];
   let bytes = 0;
   for (const m of [...recent].reverse()) {
-    const line = `${m.sender_id}: ${truncateToBytes(m.content, MAX_MESSAGE_BYTES)}
+    const sender = typeof m.sender_id === "string" ? m.sender_id.replace(/[\x00-\x1f\x7f]+/g, " ").slice(0, 128) : "unknown";
+    const line = `${sender}: ${truncateToBytes(m.content, MAX_MESSAGE_BYTES)}
 `;
     const lineBytes = new TextEncoder().encode(line).length;
     if (bytes + lineBytes > MAX_CONTEXT_BYTES)
       break;
     bytes += lineBytes;
-    lines.unshift(line);
+    lines.push(line);
   }
-  return lines.join("");
+  return lines.reverse().join("");
 }
 
 // muse/src/typing.ts
