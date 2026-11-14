@@ -66,9 +66,105 @@ const MAX_SEEN_IDS = 200;
 const DEFAULT_HTTP_TIMEOUT_MS = 15_000;
 export const MAX_TIMER_MS = 2_147_483_647;
 const MAX_STATE_FILE_BYTES = 1_048_576;
+const MAX_HTTP_JSON_BYTES = 4 * 1024 * 1024;
 const MAX_PID_FILE_BYTES = 64 * 1024;
 const DIRECT_CHANNEL_RE = /^dm[-:]/i;
 const PROTOTYPE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+function isLoopbackHost(hostname: string): boolean {
+  const h = hostname.toLowerCase();
+  return h === "127.0.0.1" || h === "localhost" || h === "[::1]" || h === "::1";
+}
+
+export function validateSafeRestBaseUrl(rawUrl: string): string {
+  if (typeof rawUrl !== "string") throw new Error("Invalid AgentsChat REST URL");
+  const trimmed = rawUrl.trim().replace(/\/+$/, "");
+  if (!trimmed || trimmed.length > 2048 || /[\x00-\x20\x7f"<>\\]/.test(trimmed) || /:0(?:\/|$)/.test(trimmed)) {
+    throw new Error("Invalid AgentsChat REST URL");
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    throw new Error("Invalid AgentsChat REST URL");
+  }
+  if (parsed.username || parsed.password || parsed.search || parsed.hash) {
+    throw new Error("Invalid AgentsChat REST URL");
+  }
+  if (parsed.protocol === "https:") return trimmed;
+  if (
+    parsed.protocol === "http:" &&
+    (isLoopbackHost(parsed.hostname) || process.env.AGENTSCHAT_ALLOW_INSECURE_HTTP === "1")
+  ) {
+    return trimmed;
+  }
+  throw new Error("Refusing insecure non-loopback HTTP AgentsChat REST URL");
+}
+
+export function isSafeCliChannelId(channelId: unknown): channelId is string {
+  if (typeof channelId !== "string") return false;
+  if (
+    channelId.length < 1 ||
+    channelId.length > 128 ||
+    channelId.trim() !== channelId ||
+    /[\x00-\x1f\x7f/\\\s]/.test(channelId) ||
+    channelId === "." ||
+    channelId.includes("..") ||
+    PROTOTYPE_KEYS.has(channelId.toLowerCase())
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function ensureRealDirectory(dir: string): void {
+  const pre = lstatSync(dir, { throwIfNoEntry: false });
+  if (pre && (pre.isSymbolicLink() || !pre.isDirectory())) {
+    throw new Error("Refusing symlink or non-directory state root");
+  }
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const post = lstatSync(dir);
+  if (post.isSymbolicLink() || !post.isDirectory()) {
+    throw new Error("Refusing symlink or non-directory state root");
+  }
+}
+
+async function readBoundedResponseJson(res: Response, maxBytes = MAX_HTTP_JSON_BYTES): Promise<any> {
+  const cl = Number(res.headers?.get("content-length") ?? "");
+  if (Number.isFinite(cl) && cl > maxBytes) {
+    await res.body?.cancel().catch(() => {});
+    throw new Error("HTTP JSON response exceeds byte limit");
+  }
+  if (!res.body) {
+    const text = await res.text();
+    if (Buffer.byteLength(text, "utf8") > maxBytes) {
+      throw new Error("HTTP JSON response exceeds byte limit");
+    }
+    return JSON.parse(text);
+  }
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        total += value.byteLength;
+        if (total > maxBytes) {
+          await reader.cancel().catch(() => {});
+          throw new Error("HTTP JSON response exceeds byte limit");
+        }
+        chunks.push(value);
+      }
+    }
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {}
+  }
+  return JSON.parse(Buffer.concat(chunks, total).toString("utf8"));
+}
 
 export function clampTimerMs(raw: unknown, fallback: number, minMs = 0): number {
   if (typeof raw !== "number" || !Number.isFinite(raw)) return fallback;
@@ -108,7 +204,7 @@ async function fetchWithDeadline(
       : null;
   timer?.unref?.();
   try {
-    return await f(url, { ...init, signal: ctrl.signal });
+    return await f(url, { redirect: "error", ...init, signal: ctrl.signal });
   } finally {
     if (timer) clearTimeout(timer);
     if (parentSignal) parentSignal.removeEventListener("abort", onParentAbort);
@@ -188,7 +284,7 @@ export function loadSeenIds(file: string): string[] {
 
 function saveSeenIds(file: string, ids: Iterable<string>): void {
   try {
-    mkdirSync(dirname(file), { recursive: true });
+    ensureRealDirectory(dirname(file));
     const list = [...ids].slice(-MAX_SEEN_IDS);
     safeWriteProfile(file, list);
   } catch {}
@@ -241,7 +337,20 @@ export function acquireWakePidFile(
     tmp = `${wakePidFile}.${pid}.${randomBytes(4).toString("hex")}.tmp`;
     writeFileSync(tmp, `${pid}\n`, { mode: 0o600, flag: "wx" });
     created = true;
+    const recheckDir = lstatSync(dirname(wakePidFile), { throwIfNoEntry: false });
+    const recheckTarget = lstatSync(wakePidFile, { throwIfNoEntry: false });
+    if (
+      !recheckDir ||
+      recheckDir.isSymbolicLink() ||
+      !recheckDir.isDirectory() ||
+      (recheckTarget && (recheckTarget.isSymbolicLink() || !recheckTarget.isFile()))
+    ) {
+      unlinkSync(tmp);
+      created = false;
+      return false;
+    }
     renameSync(tmp, wakePidFile);
+    created = false;
     return true;
   } catch {
     if (created && tmp) {
@@ -265,7 +374,7 @@ export function releaseWakePidFile(wakePidFile: string, pid = process.pid): void
 
 function saveJsonMap(file: string, data: Record<string, string>): void {
   try {
-    mkdirSync(dirname(file), { recursive: true });
+    ensureRealDirectory(dirname(file));
     safeWriteProfile(file, data);
   } catch {}
 }
@@ -280,9 +389,9 @@ export function advanceChannelReadCursor(opts: {
   warn?: Warn;
 }): void {
   const { configDir, agentId, channelId, timestamp } = opts;
-  if (!agentId || !channelId || !timestamp) return;
+  if (!agentId || !isSafeCliChannelId(channelId) || !timestamp) return;
   const warn = opts.warn ?? ((m: string) => process.stderr.write(m));
-  mkdirSync(configDir, { recursive: true });
+  ensureRealDirectory(configDir);
 
   const lastSeenFile = cursorFileForAgent(configDir, agentId);
   const cursor = loadCursor(lastSeenFile, warn);
@@ -320,9 +429,12 @@ export async function joinChannelRest(opts: {
   fetchImpl?: typeof fetch;
 }): Promise<JoinChannelResult> {
   const f = opts.fetchImpl ?? fetch;
-  const baseUrl = opts.restUrl.replace(/\/$/, "");
-  const url = `${baseUrl}/api/channels/${encodeURIComponent(opts.channelId)}/join`;
   try {
+    const baseUrl = validateSafeRestBaseUrl(opts.restUrl);
+    if (!isSafeCliChannelId(opts.channelId)) {
+      throw new Error("Invalid channel_id");
+    }
+    const url = `${baseUrl}/api/channels/${encodeURIComponent(opts.channelId)}/join`;
     const res = await fetchWithDeadline(
       f,
       url,
@@ -336,7 +448,7 @@ export async function joinChannelRest(opts: {
       },
       opts.timeoutMs ?? DEFAULT_HTTP_TIMEOUT_MS,
     );
-    const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+    const data = (await readBoundedResponseJson(res).catch(() => ({}))) as Record<string, unknown>;
     if (res.ok) {
       return {
         ok: true,
@@ -379,10 +491,13 @@ export async function sendRestMessage(opts: {
   warn?: Warn;
 }): Promise<SendMessageResult> {
   const f = opts.fetchImpl ?? fetch;
-  const baseUrl = opts.restUrl.replace(/\/$/, "");
   const cleanText = redactSecrets(opts.text);
-  const url = `${baseUrl}/api/channels/${encodeURIComponent(opts.channelId)}/messages`;
   try {
+    const baseUrl = validateSafeRestBaseUrl(opts.restUrl);
+    if (!isSafeCliChannelId(opts.channelId)) {
+      throw new Error("Invalid channel_id");
+    }
+    const url = `${baseUrl}/api/channels/${encodeURIComponent(opts.channelId)}/messages`;
     const res = await fetchWithDeadline(
       f,
       url,
@@ -402,7 +517,7 @@ export async function sendRestMessage(opts: {
       },
       opts.timeoutMs ?? DEFAULT_HTTP_TIMEOUT_MS,
     );
-    const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+    const data = (await readBoundedResponseJson(res).catch(() => ({}))) as Record<string, unknown>;
     if (res.ok) {
       const serverTs =
         typeof data.timestamp === "string" && data.timestamp.trim()
@@ -493,7 +608,7 @@ export async function wakeOnce(opts: {
   const f = opts.fetchImpl ?? fetch;
   const warn = opts.warn ?? ((m: string) => process.stderr.write(m));
   const nowIso = opts.nowIso ?? (() => new Date().toISOString());
-  const baseUrl = opts.restUrl.replace(/\/$/, "");
+  const baseUrl = validateSafeRestBaseUrl(opts.restUrl);
   const { configDir, agentId, displayName, token } = opts;
   const timeoutMs =
     opts.timeoutMs !== undefined && Number.isFinite(opts.timeoutMs)
@@ -505,7 +620,7 @@ export async function wakeOnce(opts: {
   const pollIntervalMs = clampTimerMs(opts.pollIntervalMs, 15_000, 10);
   const enableSse = opts.enableSse ?? true;
 
-  mkdirSync(configDir, { recursive: true });
+  ensureRealDirectory(configDir);
   const safeSlug = safeAgentCursorSlug(agentId);
   const lastSeenFile = cursorFileForAgent(configDir, agentId);
   const seenIdsFile = join(configDir, `wake-seen-ids-${safeSlug}.json`);
@@ -587,7 +702,7 @@ export async function wakeOnce(opts: {
         abortCtrl.signal,
       );
       if (res.ok) {
-        const data = (await res.json()) as { messages?: any[] };
+        const data = (await readBoundedResponseJson(res)) as { messages?: any[] };
         const msgs = (data.messages || []).filter(
           (m: any) => m && m.id !== triggerMsgId && m.content !== "__typing__",
         );
@@ -770,7 +885,7 @@ export async function wakeOnce(opts: {
     };
 
     function maybeStartSse(channelId: string) {
-      if (!enableSse || resolved) return;
+      if (!enableSse || resolved || !isSafeCliChannelId(channelId)) return;
       if (activeSseChannels.has(channelId) || activeSseChannels.size >= MAX_SSE_STREAMS) return;
       activeSseChannels.add(channelId);
       void (async () => {
@@ -779,6 +894,7 @@ export async function wakeOnce(opts: {
             const res = await f(
               `${baseUrl}/api/channels/${encodeURIComponent(channelId)}/stream`,
               {
+                redirect: "error",
                 headers: { Authorization: `Bearer ${token}` },
                 signal: abortCtrl.signal,
               },
@@ -873,9 +989,9 @@ export async function wakeOnce(opts: {
         const channelList: Array<{ id: string; last_message_at?: string }> = [];
         const seenCh = new Set<string>();
         if (mineRes.ok) {
-          const mineData = (await mineRes.json()) as { channels?: any[] };
+          const mineData = (await readBoundedResponseJson(mineRes)) as { channels?: any[] };
           for (const ch of mineData.channels || []) {
-            if (ch && typeof ch.id === "string" && !seenCh.has(ch.id)) {
+            if (ch && isSafeCliChannelId(ch.id) && !seenCh.has(ch.id)) {
               seenCh.add(ch.id);
               channelList.push({ id: ch.id, last_message_at: ch.last_message_at });
             }
@@ -884,9 +1000,10 @@ export async function wakeOnce(opts: {
           await mineRes.body?.cancel().catch(() => {});
         }
         for (const extra of opts.channels ?? []) {
-          if (extra && !seenCh.has(extra)) {
-            seenCh.add(extra);
-            channelList.push({ id: extra });
+          const trimmedExtra = typeof extra === "string" ? extra.trim() : "";
+          if (isSafeCliChannelId(trimmedExtra) && !seenCh.has(trimmedExtra)) {
+            seenCh.add(trimmedExtra);
+            channelList.push({ id: trimmedExtra });
           }
         }
 
@@ -928,7 +1045,7 @@ export async function wakeOnce(opts: {
             continue;
           }
           initialSyncedChannels.add(ch.id);
-          const msgData = (await msgRes.json()) as { messages?: any[] };
+          const msgData = (await readBoundedResponseJson(msgRes)) as { messages?: any[] };
           const wakeEv = await inspectChannelMessages(ch.id, msgData.messages || []);
           if (wakeEv) {
             finish(wakeEv);

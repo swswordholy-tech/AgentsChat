@@ -172,3 +172,26 @@ test("Campaign #113 KR3: ignores blank AGENTSCHAT_CONFIG_DIR, rejects symlinked 
     rmSync(extProfiles, { recursive: true, force: true });
   }
 });
+
+test("Campaign #117 KR3: agentschatConfigDir rejects relative, dash-prefixed, control-char, or oversized env overrides and own __proto__ profile JSON", () => {
+  expect(agentschatConfigDir({ AGENTSCHAT_CONFIG_DIR: "-rf", HOME: "/tmp/safe-home" })).toBe(
+    join("/tmp/safe-home", ".agentschat"),
+  );
+  expect(agentschatConfigDir({ AGENTSCHAT_CONFIG_DIR: "relative/dir", HOME: "/tmp/safe-home" })).toBe(
+    join("/tmp/safe-home", ".agentschat"),
+  );
+  expect(agentschatConfigDir({ AGENTSCHAT_CONFIG_DIR: "/tmp/evil\ndir", HOME: "/tmp/safe-home" })).toBe(
+    join("/tmp/safe-home", ".agentschat"),
+  );
+  expect(agentschatConfigDir({ AGENTSCHAT_CONFIG_DIR: "/" + "x".repeat(4100), HOME: "/tmp/safe-home" })).toBe(
+    join("/tmp/safe-home", ".agentschat"),
+  );
+
+  mkdirSync(join(dir, "profiles"), { recursive: true });
+  writeFileSync(
+    join(dir, "profiles", "proto.json"),
+    '{"__proto__":{"polluted":true},"agent_id":"proto-agent"}',
+  );
+  bind("session-proto", "proto");
+  expect(resolveSessionForAgent("proto-agent", { configDir: dir })).toBeUndefined();
+});

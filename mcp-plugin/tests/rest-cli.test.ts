@@ -11,11 +11,13 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
   acquireWakePidFile,
+  advanceChannelReadCursor,
   clampTimerMs,
   CURSOR_INIT_KEY,
   CURSOR_LAST_ACTIVE_KEY,
   CURSOR_MAX_IDLE_KEY,
   isMessageAddressedToAgent,
+  isSafeCliChannelId,
   joinChannelRest,
   loadJsonMap,
   loadSeenIds,
@@ -23,6 +25,7 @@ import {
   parseMaxIdleMs,
   releaseWakePidFile,
   sendRestMessage,
+  validateSafeRestBaseUrl,
   wakeOnce,
 } from "../src/rest-cli.ts";
 import { cursorFileForAgent, loadCursor, safeAgentCursorSlug } from "../src/read-cursor.ts";
@@ -805,6 +808,105 @@ describe("rest-cli (--join, --send, --wake-once) & unified per-channel cursor", 
       expect(wakeEv.channel_id).toBe("DM-UPPER-1");
       expect(wakeEv.message_id).toBe("dm-upper-msg-1");
       expect(cancelledStreams).toBe(2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("Campaign #117 KR3: redirect:error, URL & channelId guards, symlinked configDir refusal, and TOCTOU wakePidFile swap check", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "rest-cli-c117-"));
+    try {
+      // 1. validateSafeRestBaseUrl & isSafeCliChannelId
+      expect(validateSafeRestBaseUrl("https://agents-chat.com/")).toBe("https://agents-chat.com");
+      expect(validateSafeRestBaseUrl("http://127.0.0.1:8080/")).toBe("http://127.0.0.1:8080");
+      for (const badUrl of [
+        "http://evil.example.com",
+        "https://user:pass@agents-chat.com",
+        "https://agents-chat.com?x=1",
+        "https://agents-chat.com#frag",
+        "https://agents-chat.com:0",
+        "ftp://agents-chat.com",
+      ]) {
+        expect(() => validateSafeRestBaseUrl(badUrl)).toThrow();
+      }
+      for (const badCh of ["", ".", "..", "room..sub", "a/b", "a\\b", "a b", "a\nb", "__proto__", "CONSTRUCTOR"]) {
+        expect(isSafeCliChannelId(badCh)).toBe(false);
+      }
+      expect(isSafeCliChannelId("dm:colon-room")).toBe(true);
+      expect(isSafeCliChannelId("v1.release-room_42")).toBe(true);
+
+      // 2. joinChannelRest & sendRestMessage block unsafe URLs / channelIds without calling fetch, and pass redirect: "error"
+      let fetchCalls = 0;
+      const badJoin = await joinChannelRest({
+        restUrl: "http://evil.example.com",
+        agentId: "bot-1",
+        token: "ac_secret_c117",
+        channelId: "welcome",
+        fetchImpl: (async () => {
+          fetchCalls++;
+          return Response.json({ ok: true });
+        }) as any,
+      });
+      expect(badJoin.ok).toBe(false);
+      expect(fetchCalls).toBe(0);
+
+      const badSend = await sendRestMessage({
+        restUrl: "https://agents-chat.com",
+        configDir: dir,
+        agentId: "bot-1",
+        token: "ac_secret_c117",
+        channelId: "../traversal",
+        text: "hi",
+        fetchImpl: (async () => {
+          fetchCalls++;
+          return Response.json({ ok: true });
+        }) as any,
+      });
+      expect(badSend.ok).toBe(false);
+      expect(fetchCalls).toBe(0);
+
+      let seenRedirectMode: unknown;
+      const okJoin = await joinChannelRest({
+        restUrl: "https://agents-chat.com",
+        agentId: "bot-1",
+        token: "ac_secret_c117",
+        channelId: "welcome",
+        fetchImpl: (async (_url: any, init: any) => {
+          seenRedirectMode = init?.redirect;
+          return Response.json({ ok: true, channel_id: "welcome" });
+        }) as any,
+      });
+      expect(okJoin.ok).toBe(true);
+      expect(seenRedirectMode).toBe("error");
+
+      // 3. Symlinked configDir is refused before mkdirSync / file creation
+      const realTargetDir = join(dir, "real-target");
+      mkdirSync(realTargetDir, { recursive: true });
+      const symConfigDir = join(dir, "sym-config");
+      symlinkSync(realTargetDir, symConfigDir);
+      expect(() =>
+        advanceChannelReadCursor({
+          configDir: symConfigDir,
+          agentId: "bot-1",
+          channelId: "welcome",
+          timestamp: "2026-11-15T00:00:00.000Z",
+        }),
+      ).toThrow("Refusing symlink");
+
+      // 4. TOCTOU symlink swap during killFn in acquireWakePidFile fails closed without overwriting victim
+      const pidDir = join(dir, "pid-dir");
+      mkdirSync(pidDir, { recursive: true });
+      const pidPath = join(pidDir, "wake.pid");
+      const victimPath = join(dir, "victim-toctou.txt");
+      writeFileSync(victimPath, "untouched");
+      writeFileSync(pidPath, "4242\n");
+      const acquired = acquireWakePidFile(pidPath, 5555, () => {
+        // Simulate attacker swapping wake.pid into a symlink mid-acquire
+        rmSync(pidPath);
+        symlinkSync(victimPath, pidPath);
+      });
+      expect(acquired).toBe(false);
+      expect(readFileSync(victimPath, "utf8")).toBe("untouched");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

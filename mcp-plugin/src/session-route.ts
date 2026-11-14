@@ -15,10 +15,11 @@
  */
 import { lstatSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { loadSessionBinds } from "./session-bind.ts";
 
 const MAX_PROFILE_BYTES = 64 * 1024;
+const MAX_DIR_PATH_LENGTH = 4096;
 const RESERVED_PROFILE_KEY = /^(?:__proto__|constructor|prototype)$/i;
 
 export interface AgentSessionRoute {
@@ -30,11 +31,25 @@ export interface AgentSessionRoute {
   agentId: string;
 }
 
+function isSafeAbsoluteDirEnv(raw: unknown): raw is string {
+  if (typeof raw !== "string") return false;
+  const s = raw.trim();
+  return (
+    s.length > 0 &&
+    s.length <= MAX_DIR_PATH_LENGTH &&
+    !s.startsWith("-") &&
+    !/[\x00-\x1f\x7f]/.test(s) &&
+    isAbsolute(s)
+  );
+}
+
 /** Same config root the MCP server uses for profiles and `session-binds.json`. */
 export function agentschatConfigDir(env: Record<string, string | undefined> = process.env): string {
-  const custom = typeof env.AGENTSCHAT_CONFIG_DIR === "string" ? env.AGENTSCHAT_CONFIG_DIR.trim() : "";
-  if (custom) return custom;
-  const home = (env.HOME || env.USERPROFILE || homedir()).trim() || homedir();
+  if (isSafeAbsoluteDirEnv(env.AGENTSCHAT_CONFIG_DIR)) {
+    return env.AGENTSCHAT_CONFIG_DIR.trim();
+  }
+  const homeCandidate = env.HOME || env.USERPROFILE || "";
+  const home = isSafeAbsoluteDirEnv(homeCandidate) ? homeCandidate.trim() : homedir();
   return join(home, ".agentschat");
 }
 
@@ -104,7 +119,10 @@ function readAgentId(path: string): string | undefined {
   try {
     if (!isSafeRegularProfileFile(path)) return undefined;
     const parsed = JSON.parse(readFileSync(path, "utf8")) as { agent_id?: unknown };
-    const id = typeof parsed?.agent_id === "string" ? parsed.agent_id.trim() : "";
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || Object.prototype.hasOwnProperty.call(parsed, "__proto__")) {
+      return undefined;
+    }
+    const id = typeof parsed.agent_id === "string" ? parsed.agent_id.trim() : "";
     return isSafeAgentId(id) ? id : undefined;
   } catch {
     return undefined;
