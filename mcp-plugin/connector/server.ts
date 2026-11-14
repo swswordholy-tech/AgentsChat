@@ -136,7 +136,13 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
   const wss = new WebSocketServer({ noServer: true, maxPayload: 2 * 1024 * 1024 });
 
   http.on("upgrade", (req: IncomingMessage, socket, head) => {
-    const { pathname } = new URL(req.url ?? "/", "http://localhost");
+    let pathname: string;
+    try {
+      pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+    } catch {
+      socket.destroy();
+      return;
+    }
     if (pathname !== "/relay") {
       socket.destroy();
       return;
@@ -144,7 +150,8 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
     const auth = req.headers.authorization ?? "";
     const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
     const payload = peekPayload(token);
-    const secrets = payload ? config.secrets[payload] : undefined;
+    const secrets = payload && Object.prototype.hasOwnProperty.call(config.secrets, payload) &&
+      Array.isArray(config.secrets[payload]) ? config.secrets[payload] : undefined;
     const secret = secrets?.find((s) => verifyUpgradeToken(token, [s]) === payload);
     const gatewayId = secret ? payload : null;
     if (!gatewayId) {
@@ -293,6 +300,7 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
       http.close();
     },
     async injectAgentsChatMessage(msg: AgentsChatMessage) {
+      if (!msg || typeof msg !== "object") return;
       // Route to the identity this message is ADDRESSED to, then only to gateway
       // socket(s) fronting THAT identity — never broadcast across identities.
       //
@@ -305,7 +313,7 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
       //   unaddressed is dropped — injecting joined-channel chatter into the
       //   agent's session would burn its tokens on messages not meant for it.
       // Own server loop ticks bypass those gates only after live-record verification.
-      const isDm = typeof msg.channel_id === "string" && msg.channel_id.startsWith("dm-");
+      const isDm = typeof msg.channel_id === "string" && /^dm[-:]/i.test(msg.channel_id);
       const owner = (msg as any).__botId ?? (msg as any).dm_owner;
       const isTick = (msg.meta as any)?.kind === "loop_tick";
       const tick = serverLoopTick(msg);
@@ -428,7 +436,10 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
       // Rebuild upgrade-auth secrets in place so the upgrade handler sees them.
       for (const k of Object.keys(config.secrets)) delete config.secrets[k];
       for (const id of next) {
-        (config.secrets[id.gatewayId] ??= []).push(id.secret);
+        if (!Object.prototype.hasOwnProperty.call(config.secrets, id.gatewayId)) {
+          config.secrets[id.gatewayId] = [];
+        }
+        config.secrets[id.gatewayId].push(id.secret);
       }
       log(`[connector] identities reloaded: ${table.size}`);
     },
@@ -437,11 +448,13 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
 
 /** Peek the payload head of an upgrade token without verifying (to index secrets). */
 function peekPayload(token: string): string | null {
+  if (typeof token !== "string" || token.length === 0 || token.length > 4096) return null;
   try {
     const decoded = Buffer.from(token, "base64url").toString("utf8");
     const parts = decoded.split(":");
     if (parts.length < 3) return null;
-    return parts.slice(0, -2).join(":");
+    const payload = parts.slice(0, -2).join(":");
+    return ["__proto__", "constructor", "prototype"].includes(payload.toLowerCase()) ? null : payload;
   } catch {
     return null;
   }

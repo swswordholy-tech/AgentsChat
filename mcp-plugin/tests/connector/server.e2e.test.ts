@@ -13,7 +13,9 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import WebSocket from "ws";
-import { makeUpgradeToken, CLOSE_UNAUTHORIZED } from "../../connector/auth.ts";
+import { connect } from "node:net";
+import { IdentityTable, routeInbound, routeInboundTargets } from "../../connector/identities.ts";
+import { makeUpgradeToken, verifyToken, CLOSE_UNAUTHORIZED } from "../../connector/auth.ts";
 import { startConnector, type ConnectorConfig } from "../../connector/server.ts";
 
 const SECRET = "e2e-secret-abcdef0123456789";
@@ -285,5 +287,118 @@ describe("outbound: gateway action → agentschat", () => {
     const dShard = computePleaseReconnectDelay(1_500, () => 0.9);
     expect(dShard).toBeGreaterThanOrEqual(200);
     expect(dShard).toBeLessThanOrEqual(2_000);
+  });
+});
+
+
+describe("remote crash and routing regressions", () => {
+  test("prototype Bearer payloads reject and leave valid upgrades operational", async () => {
+    for (const payload of ["constructor", "__proto__", "prototype", "CONSTRUCTOR", "Prototype"]) {
+      expect(await dialExpectClose(Buffer.from(`${payload}:1:2`).toString("base64url"))).toBe(CLOSE_UNAUTHORIZED);
+    }
+    const ws = await dial(makeUpgradeToken(GATEWAY_ID, SECRET, 0));
+    expect(ws.readyState).toBe(WebSocket.OPEN);
+    ws.close();
+  });
+
+  test("inherited secrets and own non-array secrets cannot authorize or crash upgrades", async () => {
+    const config = cfg();
+    config.secrets = Object.assign(Object.create({ inherited: [SECRET] }), { [GATEWAY_ID]: SECRET });
+    const isolated = startConnector(config);
+    try {
+      await isolated.ready;
+      for (const payload of ["inherited", GATEWAY_ID]) {
+        const code = await new Promise<number>(resolve => {
+          const ws = new WebSocket(`ws://127.0.0.1:${isolated.port}/relay`, {
+            headers: { Authorization: `Bearer ${makeUpgradeToken(payload, SECRET, 0)}` },
+          });
+          ws.on("close", resolve);
+          ws.on("error", () => resolve(-1));
+        });
+        expect(code).toBe(CLOSE_UNAUTHORIZED);
+      }
+    } finally { isolated.stop(); }
+  });
+
+  test("malformed upgrade URLs close the socket and the server still accepts valid upgrades", async () => {
+    await server.ready;
+    for (const target of ["http://[::1", "http://%/relay"]) {
+      await new Promise<void>((resolve, reject) => {
+        const socket = connect(server.port, "127.0.0.1", () => {
+          socket.write(`GET ${target} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n`);
+        });
+        socket.setTimeout(1000, () => { socket.destroy(); reject(new Error("malformed upgrade did not close")); });
+        socket.on("data", () => {});
+        socket.on("error", reject);
+        socket.on("close", () => resolve());
+      });
+    }
+    const ws = await dial(makeUpgradeToken(GATEWAY_ID, SECRET, 0));
+    expect(ws.readyState).toBe(WebSocket.OPEN);
+    ws.close();
+  });
+
+  test("token verification rejects invalid types and caps encoded tokens at 4096 characters", async () => {
+    for (const token of [null, undefined, 123, {}, "", "A".repeat(4097)]) {
+      expect(verifyToken(token as any, [SECRET])).toBeNull();
+    }
+    let boundary = "";
+    for (let n = 2900; n < 3100; n++) {
+      const token = makeUpgradeToken("g".repeat(n), SECRET, 0);
+      if (token.length === 4096) { boundary = token; break; }
+    }
+    expect(boundary.length).toBe(4096);
+    expect(verifyToken(boundary, [SECRET])).toBeTruthy();
+    expect(verifyToken(makeUpgradeToken("g".repeat(3100), SECRET, 0), [SECRET])).toBeNull();
+    expect(await dialExpectClose("A".repeat(4097))).toBe(CLOSE_UNAUTHORIZED);
+  });
+
+  test("gateway prototype and control IDs fail validation and rejected reload preserves credentials", async () => {
+    const identity = cfg().identities![0];
+    for (const gatewayId of ["__proto__", "constructor", "prototype", "CONSTRUCTOR", "Prototype", "gw\u0000x", "gw\n", "gw\u007f"]) {
+      expect(() => new IdentityTable([{ ...identity, gatewayId }])).toThrow();
+      expect(() => server.reloadIdentities([{ ...identity, gatewayId }])).toThrow();
+    }
+    const ws = await dial(makeUpgradeToken(GATEWAY_ID, SECRET, 0));
+    expect(ws.readyState).toBe(WebSocket.OPEN);
+    ws.close();
+    const isolated = startConnector(cfg());
+    try {
+      // Ordinary inherited Object method names remain valid own gateway keys.
+      expect(() => isolated.reloadIdentities([{ ...identity, gatewayId: "toString" }])).not.toThrow();
+    } finally { isolated.stop(); }
+  });
+
+  test("DM aliases route only to their owner, including when another identity is mentioned", () => {
+    const first = cfg().identities![0];
+    const second = { ...first, botId: "other-bot", agentId: "other-bot" };
+    const table = new IdentityTable([first, second]);
+    for (const channel_id of ["dm-room", "DM-room", "dm:room", "DM:room"]) {
+      const ctx = { channel_id, dmOwnerBotId: first.botId, content: "@other-bot", mentioned_ids: [second.botId] };
+      expect(routeInbound(table, ctx)?.botId).toBe(first.botId);
+      expect(routeInboundTargets(table, ctx).map(id => id.botId)).toEqual([first.botId]);
+      expect(routeInbound(table, { ...ctx, dmOwnerBotId: "unknown" })).toBeNull();
+      expect(routeInboundTargets(table, { ...ctx, dmOwnerBotId: undefined })).toEqual([]);
+    }
+  });
+
+  test("null inbound values are ignored and DM aliases deliver without group context", async () => {
+    for (const msg of [null, undefined, 1, "text"]) await server.injectAgentsChatMessage(msg as any);
+    const ws = await dial(makeUpgradeToken(GATEWAY_ID, SECRET, 0));
+    try {
+      const hello = nextFrame(ws);
+      ws.send(JSON.stringify({ type: "hello", platform: "agentschat", botId: "ac-bot" }));
+      await hello;
+      const callsBefore = contextCalls.length;
+      for (const channel_id of ["DM-owner-ac-bot", "dm:owner-ac-bot", "DM:owner-ac-bot"]) {
+        const received = nextFrame(ws);
+        await server.injectAgentsChatMessage({ id: channel_id, channel_id, sender_id: "human-1", content: "private alias ping" });
+        const frame = await received;
+        expect(frame.type).toBe("inbound");
+        expect(frame.event.source.chat_type).toBe("dm");
+        expect(frame.event.source.chat_id).toBe(channel_id);
+      }
+      expect(contextCalls.length).toBe(callsBefore);
+    } finally { ws.close(); }
   });
 });
