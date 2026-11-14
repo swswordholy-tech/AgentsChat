@@ -32,8 +32,21 @@ export interface AgentSessionRoute {
 
 /** Same config root the MCP server uses for profiles and `session-binds.json`. */
 export function agentschatConfigDir(env: Record<string, string | undefined> = process.env): string {
-  const home = env.HOME || env.USERPROFILE || homedir();
-  return env.AGENTSCHAT_CONFIG_DIR ?? join(home, ".agentschat");
+  const custom = typeof env.AGENTSCHAT_CONFIG_DIR === "string" ? env.AGENTSCHAT_CONFIG_DIR.trim() : "";
+  if (custom) return custom;
+  const home = (env.HOME || env.USERPROFILE || homedir()).trim() || homedir();
+  return join(home, ".agentschat");
+}
+
+function isSafeAgentId(id: string): boolean {
+  return (
+    id.length > 0 &&
+    id.length <= 128 &&
+    id !== "." &&
+    id !== ".." &&
+    !RESERVED_PROFILE_KEY.test(id) &&
+    !/[/\\\s\x00-\x1f\x7f]/.test(id)
+  );
 }
 
 /**
@@ -53,12 +66,36 @@ function isSafeRegularProfileFile(path: string): boolean {
   }
 }
 
+function isSafeRealDir(path: string): boolean {
+  try {
+    const st = lstatSync(path);
+    return !st.isSymbolicLink() && st.isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 function profilePathForName(configDir: string, name: string): string | undefined {
-  if (!name || name === "." || name === ".." || name.includes("/") || name.includes("\\")) return undefined;
-  const base = name.replace(/\.json$/, "").replace(/[^a-zA-Z0-9_-]/g, "_");
-  if (!base || RESERVED_PROFILE_KEY.test(base)) return undefined;
-  const nested = join(configDir, "profiles", `${base}.json`);
-  if (isSafeRegularProfileFile(nested)) return nested;
+  if (
+    typeof name !== "string" ||
+    !name ||
+    name.length > 133 ||
+    name === "." ||
+    name === ".." ||
+    name.includes("/") ||
+    name.includes("\\") ||
+    /[\x00-\x1f\x7f]/.test(name) ||
+    !isSafeRealDir(configDir)
+  ) {
+    return undefined;
+  }
+  const base = name.replace(/\.json$/i, "").replace(/[^a-zA-Z0-9_-]/g, "_");
+  if (!base || base.length > 128 || RESERVED_PROFILE_KEY.test(base)) return undefined;
+  const profilesDir = join(configDir, "profiles");
+  if (isSafeRealDir(profilesDir)) {
+    const nested = join(profilesDir, `${base}.json`);
+    if (isSafeRegularProfileFile(nested)) return nested;
+  }
   const flat = join(configDir, `${base}.json`);
   return isSafeRegularProfileFile(flat) ? flat : undefined;
 }
@@ -68,7 +105,7 @@ function readAgentId(path: string): string | undefined {
     if (!isSafeRegularProfileFile(path)) return undefined;
     const parsed = JSON.parse(readFileSync(path, "utf8")) as { agent_id?: unknown };
     const id = typeof parsed?.agent_id === "string" ? parsed.agent_id.trim() : "";
-    return id && !RESERVED_PROFILE_KEY.test(id) ? id : undefined;
+    return isSafeAgentId(id) ? id : undefined;
   } catch {
     return undefined;
   }
@@ -90,7 +127,7 @@ export function resolveSessionForAgent(
   } = {},
 ): AgentSessionRoute | undefined {
   const targetAgentId = typeof agentId === "string" ? agentId.trim() : "";
-  if (!targetAgentId || RESERVED_PROFILE_KEY.test(targetAgentId)) return undefined;
+  if (!isSafeAgentId(targetAgentId)) return undefined;
   const configDir = opts.configDir ?? agentschatConfigDir(opts.env);
   let binds: Record<string, string>;
   try {

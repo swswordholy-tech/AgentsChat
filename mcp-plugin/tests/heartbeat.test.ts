@@ -139,3 +139,32 @@ test("Campaign #102: CONNECTING at clock=0 still expires, sendPing throw trigger
   throwingMonitor.tick();
   expect(reconnects).toBe(1);
 });
+
+test("Campaign #113 KR3: synchronous reconnect() throw does not permanently wedge reconnecting=true, and fractional/overflow intervals clamp cleanly", () => {
+  let attempts = 0;
+  let shouldThrow = true;
+  const m = new HeartbeatMonitor(
+    {
+      sendPing: () => {},
+      reconnect: () => {
+        attempts++;
+        if (shouldThrow) throw new Error("transient network error");
+      },
+      getReadyState: () => WS_CLOSED,
+    },
+    0.25,
+    5_000_000_000,
+    5_000_000_000,
+  );
+  expect(m.pingInterval).toBe(1);
+  expect(m.pongTimeout).toBe(2_147_483_647);
+  expect(m.connectTimeout).toBe(2_147_483_647);
+
+  expect(() => m.tick()).not.toThrow();
+  expect(attempts).toBe(1);
+
+  // Next tick retries because reconnecting was reset on throw
+  shouldThrow = false;
+  m.tick();
+  expect(attempts).toBe(2);
+});

@@ -41,9 +41,9 @@ export class HeartbeatMonitor {
     /** Max time to stay in CONNECTING before forcing retry (ms) */
     connectTimeout: number = 30_000,
   ) {
-    this.pingInterval = Number.isFinite(pingInterval) && pingInterval > 0 ? Math.min(pingInterval, 2_147_483_647) : 30_000;
-    this.pongTimeout = Number.isFinite(pongTimeout) && pongTimeout > 0 ? pongTimeout : 90_000;
-    this.connectTimeout = Number.isFinite(connectTimeout) && connectTimeout > 0 ? connectTimeout : 30_000;
+    this.pingInterval = Number.isFinite(pingInterval) && pingInterval > 0 ? Math.max(1, Math.min(Math.floor(pingInterval), 2_147_483_647)) : 30_000;
+    this.pongTimeout = Number.isFinite(pongTimeout) && pongTimeout > 0 ? Math.max(1, Math.min(Math.floor(pongTimeout), 2_147_483_647)) : 90_000;
+    this.connectTimeout = Number.isFinite(connectTimeout) && connectTimeout > 0 ? Math.max(1, Math.min(Math.floor(connectTimeout), 2_147_483_647)) : 30_000;
     this.lastPong = Date.now();
   }
 
@@ -116,6 +116,11 @@ export class HeartbeatMonitor {
   private safeReconnect(reason: string) {
     if (this.reconnecting) return; // already in progress
     this.reconnecting = true;
-    this.deps.reconnect();
+    try {
+      this.deps.reconnect();
+    } catch {
+      // Never permanently wedge `reconnecting = true` or crash the interval loop if reconnect throws.
+      this.reconnecting = false;
+    }
   }
 }

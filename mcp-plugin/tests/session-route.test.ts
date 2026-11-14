@@ -5,7 +5,7 @@ import { test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { resolveSessionForAgent } from "../src/session-route.ts";
+import { agentschatConfigDir, resolveSessionForAgent } from "../src/session-route.ts";
 
 let dir: string;
 
@@ -140,4 +140,35 @@ test("Campaign #102: rejects symlinked or oversized profile files and trims whit
     profileName: "padded",
     agentId: "trimmed-agent",
   });
+});
+
+test("Campaign #113 KR3: ignores blank AGENTSCHAT_CONFIG_DIR, rejects symlinked profiles dir & control-char profile names, and handles .JSON suffix", () => {
+  expect(agentschatConfigDir({ AGENTSCHAT_CONFIG_DIR: "   ", HOME: "/tmp/home-x" })).toBe(join("/tmp/home-x", ".agentschat"));
+
+  profile("upper-ext", "agent-upper");
+  bind("session-upper", "upper-ext.JSON");
+  expect(resolveSessionForAgent("agent-upper", { configDir: dir })?.sessionId).toBe("session-upper");
+
+  profile("ctrl_target", "agent-ctrl");
+  bind("session-ctrl", "ctrl\ntarget");
+  expect(resolveSessionForAgent("agent-ctrl", { configDir: dir })).toBeUndefined();
+
+  for (const unsafeId of [".", "..", "a/b", "a\\b", "has space", "x".repeat(129)]) {
+    expect(resolveSessionForAgent(unsafeId, { configDir: dir })).toBeUndefined();
+  }
+
+  const extProfiles = mkdtempSync(join(tmpdir(), "ext-profiles-"));
+  try {
+    writeFileSync(join(extProfiles, "sneaky.json"), JSON.stringify({ agent_id: "sneaky-agent" }));
+    const dirWithSymProfiles = mkdtempSync(join(tmpdir(), "sym-profiles-"));
+    try {
+      symlinkSync(extProfiles, join(dirWithSymProfiles, "profiles"));
+      writeFileSync(join(dirWithSymProfiles, "session-binds.json"), JSON.stringify({ s1: "sneaky" }));
+      expect(resolveSessionForAgent("sneaky-agent", { configDir: dirWithSymProfiles })).toBeUndefined();
+    } finally {
+      rmSync(dirWithSymProfiles, { recursive: true, force: true });
+    }
+  } finally {
+    rmSync(extProfiles, { recursive: true, force: true });
+  }
 });

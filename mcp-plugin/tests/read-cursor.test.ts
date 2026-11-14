@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { flushCursor, loadCursor, persistCursor } from "../src/read-cursor.ts";
-import { mkdtempSync, readdirSync, rmSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { flushCursor, loadCursor, persistCursor, safeAgentCursorSlug } from "../src/read-cursor.ts";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -124,5 +124,25 @@ describe("persistCursor reports failures instead of swallowing them", () => {
     expect(persistCursor(link, new Map([["chan", "2026-07-10T00:00:00Z"]]), (m) => persistWarnings.push(m))).toBe(false);
     expect(persistWarnings.join("")).toMatch(/failed to persist read cursor/);
     expect(JSON.parse(readFileSync(victim, "utf-8"))).toEqual({ secret: "untouched" });
+  });
+
+  test("Campaign #113 KR3: rejects symlinked parent directory, filters case-insensitive prototype keys, and scrubs control chars in warnings", () => {
+    expect(safeAgentCursorSlug("__PROTO__")).toBe("_");
+    expect(safeAgentCursorSlug("Constructor")).toBe("_");
+
+    const realSub = join(dir, "real-sub");
+    mkdirSync(realSub);
+    const symSub = join(dir, "sym-sub");
+    symlinkSync(realSub, symSub);
+
+    const warnings: string[] = [];
+    expect(persistCursor(join(symSub, "c.json"), new Map([["chan", "ts"]]), (m) => warnings.push(m))).toBe(false);
+    expect(warnings.join("")).toMatch(/parent is not a real directory/);
+
+    const protoFile = join(dir, "proto.json");
+    writeFileSync(protoFile, '{"__PROTO__":"bad","Constructor":"bad","good":"2026-07-10T00:00:00Z"}');
+    const loadWarns: string[] = [];
+    expect(loadCursor(protoFile, (m) => loadWarns.push(m))).toEqual(new Map([["good", "2026-07-10T00:00:00Z"]]));
+    expect(loadWarns).toEqual([]);
   });
 });
