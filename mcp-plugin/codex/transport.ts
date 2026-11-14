@@ -18,6 +18,8 @@ export class AgentsChatTransport {
   private syncTimer?: ReturnType<typeof setInterval>;
   constructor(private config: BridgeConfig, private receive: (m: unknown) => void, private log: (s: string) => void = console.error,
     recover?: (m: unknown) => boolean, private syncIntervalMs = 60_000) {
+    this.syncIntervalMs = Number.isFinite(syncIntervalMs) && syncIntervalMs > 0
+      ? Math.min(Math.floor(syncIntervalMs), 2_147_483_647) : 60_000;
     if (recover) this.inboxSync = new InboxSync(config.stateDir, path => this.api(path), recover,
       () => !this.closed && this.authenticated, log);
   }
@@ -28,15 +30,38 @@ export class AgentsChatTransport {
         headers: { Authorization: `Bearer ${this.config.token}`, "Content-Type": "application/json" },
         ...(body ? { body: JSON.stringify(body) } : {}), signal: AbortSignal.timeout(15_000) });
     } catch { throw new Error("AgentsChat request failed or timed out"); }
-    if (!response.ok) throw new Error(`AgentsChat HTTP ${response.status}`);
-    try { return await response.json(); } catch { throw new Error("Invalid AgentsChat response"); }
+    if (!response.ok) {
+      try { await response.body?.cancel?.(); } catch { /* Preserve the HTTP error. */ }
+      throw new Error(`AgentsChat HTTP ${response.status}`);
+    }
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    try {
+      reader = response.body?.getReader();
+      if (!reader) throw new Error("Missing response body");
+      const decoder = new TextDecoder();
+      let bytes = 0, text = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        bytes += value.byteLength;
+        if (bytes > 4 * 1024 * 1024) {
+          try { await reader.cancel(); } catch { /* Preserve the invalid-response error. */ }
+          throw new Error("Response too large");
+        }
+        text += decoder.decode(value, { stream: true });
+      }
+      return JSON.parse(text + decoder.decode());
+    } catch { throw new Error("Invalid AgentsChat response"); }
+    finally { reader?.releaseLock(); }
   }
   setTyping(channel: string, active: boolean) {
     clearInterval(this.typing.get(channel)); this.typing.delete(channel);
     if (!active || this.closed) return;
     const pulse = () => {
-      if (this.authenticated && this.socket?.readyState === WebSocket.OPEN)
-        this.socket.send(JSON.stringify({ type: "typing", channel_id: channel, sender_id: this.config.agentId, cross_pod: true }));
+      if (this.authenticated && this.socket?.readyState === WebSocket.OPEN) {
+        try { this.socket.send(JSON.stringify({ type: "typing", channel_id: channel, sender_id: this.config.agentId, cross_pod: true })); }
+        catch { /* The socket may close between the state check and send. */ }
+      }
     };
     pulse();
     const typingTimer = setInterval(pulse, 2000);
@@ -73,10 +98,20 @@ export class AgentsChatTransport {
   }
   start() {
     if (this.closed) return;
+    clearTimeout(this.retry); this.retry = undefined;
+    clearInterval(this.syncTimer); this.syncTimer = undefined;
+    this.heartbeat?.stop(); this.heartbeat = undefined;
+    this.authenticated = false; this.clearTyping(); this.rejectPending();
+    const previous = this.socket; this.socket = undefined;
+    previous?.terminate();
     const socket = new WebSocket(this.config.wsUrl, { maxPayload: 1_048_576, handshakeTimeout: 15_000 });
     this.socket = socket;
     const current = () => !this.closed && this.socket === socket;
-    const send = (value: unknown) => { if (current() && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(value)); };
+    const send = (value: unknown) => {
+      if (current() && socket.readyState === WebSocket.OPEN) {
+        try { socket.send(JSON.stringify(value)); } catch { /* A concurrent close is handled below. */ }
+      }
+    };
     const join = (channel: string) => {
       if (!this.config.channels.length || this.config.channels.includes(channel)) {
         this.inboxSync?.watch(channel);
@@ -124,11 +159,19 @@ export class AgentsChatTransport {
     socket.on("error", () => this.log("AgentsChat socket error"));
     socket.on("close", () => {
       if (!current()) return;
+      clearInterval(this.syncTimer); this.syncTimer = undefined;
       this.authenticated = false; this.clearTyping(); this.rejectPending(); this.heartbeat?.stop(); this.log("AgentsChat disconnected; reconnecting with history reconciliation");
       this.retry = setTimeout(() => this.start(), this.delay);
       this.retry.unref?.();
       this.delay = Math.min(this.delay * 2, 30_000);
     });
   }
-  stop() { this.clearTyping(); this.closed = true; this.authenticated = false; this.rejectPending(); clearTimeout(this.retry); clearInterval(this.syncTimer); this.heartbeat?.stop(); this.socket?.terminate(); }
+  stop() {
+    this.closed = true; this.authenticated = false; this.clearTyping(); this.rejectPending();
+    clearTimeout(this.retry); this.retry = undefined;
+    clearInterval(this.syncTimer); this.syncTimer = undefined;
+    this.heartbeat?.stop(); this.heartbeat = undefined;
+    const socket = this.socket; this.socket = undefined;
+    socket?.terminate();
+  }
 }

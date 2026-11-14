@@ -144,3 +144,15 @@ require('readline').createInterface({input:process.stdin}).on('line',l=>{const m
   expect(entry.url).toBeUndefined();
  } finally { app.close(); }
 });
+
+
+test("linked mode rejects a runtime home symlink before writing into an unrelated directory",()=>{
+ const {root,source}=fixture();writeFileSync(join(source,"auth.json"),"synthetic-login");
+ const target=join(root,"unrelated"),state=join(root,"bot");mkdirSync(target);mkdirSync(state);
+ symlinkSync(target,join(state,"codex-home"));
+ expect(()=>prepareRuntimeHome(state,source,"linked")).toThrow("Bot runtime home must not be a symlink");
+ expect(existsSync(join(target,"auth.json"))).toBe(false);
+ rmSync(join(state,"codex-home"));
+ const runtime=prepareRuntimeHome(state,source,"linked");
+ expect(readlinkSync(join(runtime.home,"auth.json"))).toBe(join(realpathSync(source),"auth.json"));
+});

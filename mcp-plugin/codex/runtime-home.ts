@@ -80,6 +80,7 @@ export function prepareRuntimeHome(stateDir: string, source = process.env.CODEX_
   const home = join(stateDir, "codex-home");
   mkdirSync(home, {recursive:true, mode:0o700});
   if (realpathSync(home) === legacyHome) throw new Error("Bot runtime home must differ from desktop Codex home");
+  if (lstatSync(home).isSymbolicLink()) throw new Error("Bot runtime home must not be a symlink");
   for (const name of ["config.toml", "auth.json", "AGENTS.md", "skills", "rules", "plugins", "hooks.json", "models_cache.json"]) {
     const origin = join(legacyHome, name), target = join(home, name);
     if (!existsSync(origin)) continue;
