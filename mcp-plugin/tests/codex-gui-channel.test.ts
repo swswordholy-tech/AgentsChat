@@ -129,3 +129,36 @@ test("ambiguous GUI send survives restart without duplicate; allowlist rechecked
   await expect(new GuiChannel(dir,[]).dispatch(e.id,call)).rejects.toThrow("no longer allowed");
  } finally {rmSync(dir,{recursive:true,force:true});}
 });
+
+test("GUI bounds receipt files and tool JSON before parsing", async () => {
+ const dir=mkdtempSync(join(tmpdir(),"gui-bounds-"));
+ try {
+  const q=new GuiChannel(dir,["target"]), e=q.enqueue("target","hello"), path=join(dir,`${e.id}.json`);
+  const raw=JSON.stringify(e);
+  writeFileSync(path,raw+' '.repeat(1_048_576-raw.length));
+  expect(q.get(e.id)).toEqual(e);
+  writeFileSync(path,raw+' '.repeat(1_048_577-raw.length));
+  expect(()=>q.get(e.id)).toThrow("size limit");
+  expect(q.list()).toEqual([]);
+  for(const length of [1_048_576,1_048_577]) {
+   const entry=q.enqueue("target","hello");
+   const history=JSON.stringify({thread:{id:"target"},turns:[{id:"turn",items:[{type:"userMessage",content:[{type:"text",text:entry.prompt}]}]}]});
+   const result=await q.dispatch(entry.id,async name=>name==="send_message_to_thread"?{}:{content:[{type:"text",text:history+' '.repeat(length-history.length)}]});
+   expect(result.status).toBe(length===1_048_576?"delivered":"submitted");
+  }
+ } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
+test("GUI rechecks destination after serialization and preserves planted links", () => {
+ const dir=mkdtempSync(join(tmpdir(),"gui-race-"));
+ try {
+  const q=new GuiChannel(dir,["target"]), e=q.enqueue("target","hello"), path=join(dir,`${e.id}.json`), outside=join(dir,"outside");
+  writeFileSync(outside,"untouched");
+  expect(()=>(q as any).save({...e,toJSON(){rmSync(path);symlinkSync(outside,path);return e;}})).toThrow("symlink");
+  expect(lstatSync(path).isSymbolicLink()).toBe(true);
+  expect(readFileSync(outside,"utf8")).toBe("untouched");
+  expect(readdirSync(dir).filter(f=>f.endsWith(".tmp"))).toEqual([]);
+  const regular=join(dir,"regular");writeFileSync(regular,"");
+  expect(()=>new GuiChannel(regular,[])).toThrow("real directory");
+ } finally {rmSync(dir,{recursive:true,force:true});}
+});

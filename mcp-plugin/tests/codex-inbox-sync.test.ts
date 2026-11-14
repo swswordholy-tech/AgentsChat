@@ -152,3 +152,47 @@ test('failed atomic replacement removes its private temporary file', () => {
   expect(lstatSync(f.file).isDirectory()).toBe(true);
   expect(readdirSync(f.dir)).toEqual(['inbound-cursors.json']);
 });
+
+test('inbound channels reject traversal, case-insensitive prototype keys and excessive length', () => {
+  const f=fixture(), channels=Object.create(null);
+  const invalid=['__PROTO__','Constructor','PROTOTYPE','a..b','a/b','a\\b','x'.repeat(129)];
+  for(const key of invalid) channels[key]='1';
+  channels.group=f.seed;
+  writeFileSync(f.file,JSON.stringify({version:1,channels}));
+  const sync=idle(f.dir);
+  for(const key of invalid) {
+    expect(()=>sync.watch(key)).toThrow('Invalid inbound channel');
+    expect(()=>sync.memberships([key])).toThrow('Invalid inbound channel');
+  }
+  sync.watch('x'.repeat(128));
+  expect(Object.keys(f.state().channels)).toEqual(['group','x'.repeat(128)]);
+});
+
+test('non-ISO finite dates reject checkpoints and full history pages before delivery', async () => {
+  for(const timestamp of ['1','2026-09-27','09/27/2026','2026-09-27T00:00:00','2026-99-99T00:00:00Z']) {
+    const f=fixture();
+    writeFileSync(f.file,JSON.stringify({version:1,channels:{group:timestamp}}));
+    expect(()=>idle(f.dir)).toThrow('Invalid history timestamp');
+    writeFileSync(f.file,JSON.stringify({version:1,channels:{group:f.seed}}));
+    let delivered=0;
+    const sync=new InboxSync(f.dir,async()=>[f.row('good',1),{...f.row('bad',2),timestamp}],()=>{delivered++;return true;},()=>true,()=>{});
+    sync.watch('group');await sync.sync();
+    expect(delivered).toBe(0);expect(f.state().channels.group).toBe(f.seed);
+  }
+});
+
+test('inbound checkpoint size boundary and serialization-time link replacement fail closed', () => {
+  const f=fixture(), raw=readFileSync(f.file,'utf8');
+  writeFileSync(f.file,raw+' '.repeat(1_048_576-raw.length));
+  const sync=idle(f.dir);
+  writeFileSync(f.file,raw+' '.repeat(1_048_577-raw.length));
+  expect(()=>idle(f.dir)).toThrow('size limit');
+  const state=(sync as any).state, outside=join(f.dir,'outside');writeFileSync(outside,'untouched');
+  (sync as any).state={...state,toJSON(){rmSync(f.file);symlinkSync(outside,f.file);return state;}};
+  expect(()=>sync.watch('new')).toThrow('Invalid inbound cursors file');
+  expect(lstatSync(f.file).isSymbolicLink()).toBe(true);
+  expect(readFileSync(outside,'utf8')).toBe('untouched');
+  expect(readdirSync(f.dir).filter(f=>f.endsWith('.tmp'))).toEqual([]);
+  const regular=join(f.dir,'regular');writeFileSync(regular,'');
+  expect(()=>idle(regular)).toThrow('Invalid inbound state directory');
+});
