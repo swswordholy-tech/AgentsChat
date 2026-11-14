@@ -83,7 +83,7 @@ class HTTPHardeningTests(unittest.TestCase):
     def test_error_response_is_closed_and_traceback_scrubbed(self):
         body = io.BytesIO(json.dumps({"message": "private-token ac_other_key Bearer another-secret"}).encode())
         error = urllib.error.HTTPError("http://localhost", 403, "Forbidden", {}, body)
-        with patch('urllib.request.urlopen', side_effect=error):
+        with patch('urllib.request.OpenerDirector.open', side_effect=error):
             with self.assertRaises(AgentChatRESTError) as ctx:
                 AgentChatREST("http://localhost", token="private-token").health()
         self.assertTrue(body.closed)
@@ -98,14 +98,14 @@ class HTTPHardeningTests(unittest.TestCase):
                 raise TimeoutError("private-token")
         body = StalledBody()
         error = urllib.error.HTTPError("http://localhost", 503, "Unavailable", {}, body)
-        with patch('urllib.request.urlopen', side_effect=error):
+        with patch('urllib.request.OpenerDirector.open', side_effect=error):
             with self.assertRaisesRegex(AgentChatRESTError, "Request timed out"):
                 AgentChatREST("http://localhost", token="private-token").health()
         self.assertTrue(body.closed)
 
     def test_transport_reason_is_redacted_without_raw_exception_chain(self):
         error = urllib.error.URLError("Bearer another-secret ac_other_key private-token")
-        with patch('urllib.request.urlopen', side_effect=error):
+        with patch('urllib.request.OpenerDirector.open', side_effect=error):
             with self.assertRaises(AgentChatRESTError) as ctx:
                 AgentChatREST("http://localhost", token="private-token").health()
         rendered = ''.join(traceback.format_exception(ctx.exception))

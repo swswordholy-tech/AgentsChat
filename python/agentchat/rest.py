@@ -7,7 +7,7 @@ from typing import Any, Optional
 
 import json
 import math
-from ._security import redact_error
+from ._security import redact_error, validate_server_url, validate_token
 import socket
 import urllib.error
 import urllib.parse
@@ -29,6 +29,23 @@ class AgentChatRESTError(Exception):
         self.status = status
         self.message = message
         super().__init__(f"HTTP {status}: {message}")
+
+
+class _RejectRedirects(urllib.request.HTTPRedirectHandler):
+    def http_error_302(self, req, fp, code, msg, headers):
+        fp.close()
+        raise AgentChatRESTError(code, "Unexpected HTTP redirect")
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
+
+
+def _collection(data: Any, key: str, *, default_empty: bool = False) -> list[dict[str, Any]]:
+    if not isinstance(data, dict):
+        raise AgentChatRESTError(0, "Expected a JSON object")
+    value = data.get(key, [] if default_empty else None)
+    if not isinstance(value, list):
+        raise AgentChatRESTError(0, "Expected a JSON list")
+    return value
 
 
 @dataclass
@@ -58,6 +75,9 @@ class AgentChatREST:
         """
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("timeout must be > 0")
+        validate_server_url(base_url, ("http", "https"), loopback_http=True)
+        validate_token(token)
+        self._opener = urllib.request.build_opener(_RejectRedirects())
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.timeout = float(timeout)
@@ -84,7 +104,7 @@ class AgentChatREST:
             List of agent dicts with id, display_name, capabilities, etc.
         """
         data = self._get("/api/agents")
-        return data["agents"]
+        return _collection(data, "agents")
 
     def get_agent(self, agent_id: str) -> dict[str, Any]:
         """Get details for a specific agent."""
@@ -96,7 +116,7 @@ class AgentChatREST:
         if capabilities:
             query["capabilities"] = ",".join(capabilities)
         data = self._get(f"/api/discover?{urllib.parse.urlencode(query)}")
-        return data["agents"]
+        return _collection(data, "agents")
 
     # MARK: - Channels
 
@@ -104,7 +124,7 @@ class AgentChatREST:
         """Get channels that an agent belongs to."""
         query = urllib.parse.urlencode({"agent_id": agent_id})
         data = self._get(f"/api/channels?{query}")
-        return data["channels"]
+        return _collection(data, "channels")
 
     # MARK: - Messages
 
@@ -116,7 +136,7 @@ class AgentChatREST:
         if after:
             query["after"] = after
         data = self._get(f"/api/channels/{_quote_segment(channel_id)}/messages?{urllib.parse.urlencode(query)}")
-        return data["messages"]
+        return _collection(data, "messages")
 
     def send_message(self, channel_id: str, sender_id: str, content: str, sender_type: str = "agent", content_type: str = "text") -> dict[str, Any]:
         """Send a message via REST API (no WebSocket needed)."""
@@ -135,7 +155,7 @@ class AgentChatREST:
         if channel_id:
             params["channel_id"] = channel_id
         data = self._get(f"/api/search?{urllib.parse.urlencode(params)}")
-        return data["messages"]
+        return _collection(data, "messages")
 
     # MARK: - Stats
 
@@ -173,8 +193,9 @@ class AgentChatREST:
         Returns:
             List of unclaimed agent dicts.
         """
-        data = self._get(f"/api/agents/unclaimed?limit={limit}")
-        return data["agents"]
+        query = urllib.parse.urlencode({"limit": int(limit)})
+        data = self._get(f"/api/agents/unclaimed?{query}")
+        return _collection(data, "agents")
 
     # MARK: - Unified Account API
 
@@ -220,12 +241,12 @@ class AgentChatREST:
         if query:
             params["q"] = query
         data = self._get(f"/api/channels/discover?{urllib.parse.urlencode(params)}")
-        return data.get("channels", [])
+        return _collection(data, "channels", default_empty=True)
 
     def my_channels(self, agent_id: str) -> list[dict[str, Any]]:
         """Get channels the agent has joined."""
         data = self._get(f"/api/channels/mine?{urllib.parse.urlencode({'agent_id': agent_id})}")
-        return data.get("channels", [])
+        return _collection(data, "channels", default_empty=True)
 
     # MARK: - Internal
 
@@ -240,13 +261,18 @@ class AgentChatREST:
             payload = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(url, data=payload, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as response:
+            with self._opener.open(req, timeout=self.timeout) as response:
                 raw_bytes = response.read(MAX_RESPONSE_BYTES + 1)
                 if len(raw_bytes) > MAX_RESPONSE_BYTES:
                     raise AgentChatRESTError(0, "Response exceeded maximum allowed size")
                 if not raw_bytes:
                     return {}
-                return json.loads(raw_bytes.decode("utf-8"))
+                data = json.loads(raw_bytes.decode("utf-8"))
+                if not isinstance(data, dict):
+                    raise AgentChatRESTError(0, "Expected a JSON object")
+                return data
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise AgentChatRESTError(0, "Invalid JSON response") from None
         except urllib.error.HTTPError as e:
             try:
                 err_body = e.read(65536).decode("utf-8", errors="replace")

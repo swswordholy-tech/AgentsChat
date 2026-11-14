@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import websockets
-from ._security import redact_error
+from ._security import redact_error, validate_server_url, validate_token
 
 if TYPE_CHECKING:
     from websockets.asyncio.client import ClientConnection
@@ -90,6 +90,10 @@ class AgentChatClient:
         """
         if not math.isfinite(connect_timeout) or connect_timeout <= 0:
             raise ValueError("connect_timeout must be > 0")
+        validate_server_url(url, ("ws", "wss"), allow_query=True)
+        validate_token(token)
+        if not isinstance(agent_id, str) or not agent_id.strip():
+            raise ValueError("agent_id must not be empty")
         self.url = url
         self.agent_id = agent_id
         self.token = token
@@ -105,7 +109,7 @@ class AgentChatClient:
         self._thread_handlers: list[Callable] = []
         self._edit_handlers: list[Callable] = []
         self._delete_handlers: list[Callable] = []
-        self._message_queue: asyncio.Queue[ChatMessage] = asyncio.Queue()
+        self._message_queue: asyncio.Queue[ChatMessage] = asyncio.Queue(maxsize=1000)
         self._running = False
 
     # MARK: - Connection
@@ -117,6 +121,8 @@ class AgentChatClient:
         Raises ConnectionError if connection, timeout, or authentication fails,
         always closing any partially opened socket.
         """
+        if self._ws is not None:
+            await self._close_ws_quietly()
         try:
             self._ws = await self._ws_factory(
                 self.url,
