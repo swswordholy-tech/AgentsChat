@@ -23,7 +23,7 @@ test("reuse login/config but never desktop session storage, repeatably",()=>{
 });
 test("refuse unexpected configuration or desktop home reuse",()=>{
  const {root,source}=fixture();writeFileSync(join(source,"auth.json"),"test");const state=join(root,"bot");mkdirSync(state);
- symlinkSync(source,join(state,"codex-home"));expect(()=>prepareRuntimeHome(state,source)).toThrow("must differ");
+ symlinkSync(source,join(state,"codex-home"));expect(()=>prepareRuntimeHome(state,source)).toThrow("must not be a symlink");
  rmSync(join(state,"codex-home"));mkdirSync(join(state,"codex-home"));writeFileSync(join(state,"codex-home/auth.json"),"different");
  expect(()=>prepareRuntimeHome(state,source)).toThrow("Unexpected");
 });
@@ -155,4 +155,33 @@ test("linked mode rejects a runtime home symlink before writing into an unrelate
  rmSync(join(state,"codex-home"));
  const runtime=prepareRuntimeHome(state,source,"linked");
  expect(readlinkSync(join(runtime.home,"auth.json"))).toBe(join(realpathSync(source),"auth.json"));
+});
+
+test("all modes reject unsafe state/home leaves before creating directories",()=>{
+ for(const mode of ["isolated","auth-only","linked"] as const) for(const leaf of ["state","home"]) for(const kind of ["link","dangling","file"]) {
+  const {root,source}=fixture();writeFileSync(join(source,"auth.json"),"{}");
+  const state=join(root,"bot"),outside=join(root,"outside");mkdirSync(outside);
+  const home=join(state,mode==="linked"?"codex-home":`codex-home-${mode}`);
+  if(leaf==="home")mkdirSync(state);
+  const target=leaf==="state"?state:home;
+  if(kind==="file")writeFileSync(target,"keep");else symlinkSync(kind==="link"?outside:join(root,"absent"),target);
+  expect(()=>prepareRuntimeHome(state,source,mode)).toThrow();
+  expect(existsSync(join(outside,"auth.json"))).toBe(false);
+  expect(existsSync(join(outside,"codex-home"))).toBe(false);
+  expect(existsSync(join(outside,"codex-home-isolated"))).toBe(false);
+  expect(existsSync(join(outside,"codex-home-auth-only"))).toBe(false);
+ }
+});
+
+test("independent homes bound directory traversal and auth-only rejects dangling skills",()=>{
+ for(const mode of ["isolated","auth-only"] as const) {
+  const {root,source}=fixture();writeFileSync(join(source,"auth.json"),"{}");const state=join(root,"bot");
+  const {home}=prepareRuntimeHome(state,source,mode);let deep=home;
+  for(let i=0;i<32;i++){deep=join(deep,"d");mkdirSync(deep);}
+  expect(()=>prepareRuntimeHome(state,source,mode)).not.toThrow();
+  mkdirSync(join(deep,"d"));expect(()=>prepareRuntimeHome(state,source,mode)).toThrow("depth");
+ }
+ const {root,source}=fixture();writeFileSync(join(source,"auth.json"),"{}");const state=join(root,"bot");
+ const {home}=prepareRuntimeHome(state,source,"auth-only");symlinkSync(join(root,"absent"),join(home,"skills"));
+ expect(()=>prepareRuntimeHome(state,source,"auth-only")).toThrow("custom skills");
 });
