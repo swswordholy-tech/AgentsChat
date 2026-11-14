@@ -41,6 +41,8 @@ function verifySignature(payload, sigHex, secrets) {
   return false;
 }
 function verifyToken(token, secrets) {
+  if (typeof token !== "string" || token.length === 0 || token.length > 4096)
+    return null;
   let decoded;
   try {
     decoded = Buffer.from(token, "base64url").toString("utf8");
@@ -204,6 +206,9 @@ function validateIdentities(identities, allowEmptyCredentials = false) {
     if ([id.token, id.gatewayId, id.secret].some((value) => typeof value !== "string" || !value.trim() && !(allowEmptyCredentials && value === ""))) {
       throw new Error("missing identity credentials");
     }
+    if (!allowEmptyCredentials && (/[\x00-\x1f\x7f]/.test(id.gatewayId) || ["__proto__", "constructor", "prototype"].includes(id.gatewayId.toLowerCase()))) {
+      throw new Error("invalid identity gatewayId");
+    }
     if (bots.has(id.botId.trim()) || agents.has(id.agentId.trim())) {
       throw new Error("duplicate identity botId or agentId — ambiguous routing");
     }
@@ -261,7 +266,7 @@ function matchesExactMention(content, id) {
   return new RegExp(`(?:^|[^\\p{L}\\p{N}_@-])@(?:${escaped}(?![\\p{L}\\p{N}_(-])|[^\\s@()]+\\(${escaped}\\))`, "u").test(content);
 }
 function routeInboundTargets(table, ctx) {
-  if (ctx.channel_id?.startsWith("dm-")) {
+  if (/^dm[-:]/i.test(ctx.channel_id ?? "")) {
     const owner = ctx.dmOwnerBotId ? table.forBot(ctx.dmOwnerBotId) : null;
     return owner ? [owner] : [];
   }
@@ -320,7 +325,13 @@ function startConnector(config) {
   });
   const wss = new WebSocketServer({ noServer: true, maxPayload: 2 * 1024 * 1024 });
   http.on("upgrade", (req, socket, head) => {
-    const { pathname } = new URL(req.url ?? "/", "http://localhost");
+    let pathname;
+    try {
+      pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+    } catch {
+      socket.destroy();
+      return;
+    }
     if (pathname !== "/relay") {
       socket.destroy();
       return;
@@ -328,7 +339,7 @@ function startConnector(config) {
     const auth = req.headers.authorization ?? "";
     const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
     const payload = peekPayload(token);
-    const secrets = payload ? config.secrets[payload] : undefined;
+    const secrets = payload && Object.prototype.hasOwnProperty.call(config.secrets, payload) && Array.isArray(config.secrets[payload]) ? config.secrets[payload] : undefined;
     const secret = secrets?.find((s) => verifyUpgradeToken(token, [s]) === payload);
     const gatewayId = secret ? payload : null;
     if (!gatewayId) {
@@ -463,7 +474,9 @@ function startConnector(config) {
       http.close();
     },
     async injectAgentsChatMessage(msg) {
-      const isDm = typeof msg.channel_id === "string" && msg.channel_id.startsWith("dm-");
+      if (!msg || typeof msg !== "object")
+        return;
+      const isDm = typeof msg.channel_id === "string" && /^dm[-:]/i.test(msg.channel_id);
       const owner = msg.__botId ?? msg.dm_owner;
       const isTick = msg.meta?.kind === "loop_tick";
       const tick = serverLoopTick(msg);
@@ -585,19 +598,25 @@ function startConnector(config) {
       for (const k of Object.keys(config.secrets))
         delete config.secrets[k];
       for (const id of next) {
-        (config.secrets[id.gatewayId] ??= []).push(id.secret);
+        if (!Object.prototype.hasOwnProperty.call(config.secrets, id.gatewayId)) {
+          config.secrets[id.gatewayId] = [];
+        }
+        config.secrets[id.gatewayId].push(id.secret);
       }
       log(`[connector] identities reloaded: ${table.size}`);
     }
   };
 }
 function peekPayload(token) {
+  if (typeof token !== "string" || token.length === 0 || token.length > 4096)
+    return null;
   try {
     const decoded = Buffer.from(token, "base64url").toString("utf8");
     const parts = decoded.split(":");
     if (parts.length < 3)
       return null;
-    return parts.slice(0, -2).join(":");
+    const payload = parts.slice(0, -2).join(":");
+    return ["__proto__", "constructor", "prototype"].includes(payload.toLowerCase()) ? null : payload;
   } catch {
     return null;
   }
