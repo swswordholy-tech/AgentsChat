@@ -370,3 +370,136 @@ test("Campaign #97: MuseAgentChatClient ignores non-object/array frames, caps jo
     await server.close();
   }
 });
+
+test("constructor requires credential-free wss or loopback ws URLs", () => {
+  const options = { agentId: "muse-bot", token: "t" };
+  for (const url of ["wss://agents-chat.com/ws", "ws://127.0.0.1:1", "ws://localhost/ws", "ws://LOCALHOST:99", "ws://[::1]:80/ws"]) {
+    assert.doesNotThrow(() => new MuseAgentChatClient({ ...options, url }));
+  }
+  for (const url of ["bad-url", "https://agents-chat.com", "file:///tmp/ws", "ws://agents-chat.com", "ws://localhost.evil", "ws://192.168.1.1", "wss://user:secret@agents-chat.com", "ws://user@localhost", "wss://:secret@localhost"]) {
+    assert.throws(() => new MuseAgentChatClient({ ...options, url }), /Muse.*URL|credentials/);
+  }
+});
+
+function fakeSockets(t) {
+  const sockets = [];
+  class FakeSocket {
+    static OPEN = 1;
+    readyState = 0;
+    sent = [];
+    closeCalls = 0;
+    constructor() { sockets.push(this); }
+    send(raw) {
+      if (this.sendError) throw new Error(this.sendError);
+      this.sent.push(JSON.parse(raw));
+    }
+    close() { this.closeCalls += 1; this.readyState = 3; this.onclose?.(); }
+    open() { this.readyState = 1; this.onopen?.(); }
+    frame(payload) { this.onmessage?.({ data: JSON.stringify(payload) }); }
+  }
+  const original = Object.getOwnPropertyDescriptor(globalThis, "WebSocket");
+  Object.defineProperty(globalThis, "WebSocket", { configurable: true, writable: true, value: FakeSocket });
+  t.after(() => Object.defineProperty(globalThis, "WebSocket", original));
+  const client = new MuseAgentChatClient({ url: "ws://localhost:1", agentId: "muse-bot", token: "t", connectTimeoutMs: 0 });
+  t.after(() => client.disconnect());
+  return { sockets, client };
+}
+
+test("repeated connect ignores every stale socket callback and heartbeat", async (t) => {
+  const { sockets, client } = fakeSockets(t);
+  const heartbeats = [];
+  t.mock.method(globalThis, "setInterval", (callback) => { heartbeats.push(callback); return { unref() {} }; });
+  t.mock.method(globalThis, "clearInterval", () => {});
+  const errors = [];
+  const inbound = [];
+  client.onError((err) => errors.push(err.message));
+  client.onMessage((m) => inbound.push(m));
+  const first = client.connect();
+  const old = sockets[0];
+  old.open(); old.frame({ type: "auth_ok", session_id: "old" });
+  await first;
+  const second = client.connect();
+  const current = sockets[1];
+  const before = old.sent.length;
+  old.onopen();
+  old.frame({ type: "auth_ok", session_id: "stale" });
+  old.frame({ type: "message", content: "stale" });
+  old.frame({ type: "auth_error", error: "stale error" });
+  old.onerror(); old.onclose(); heartbeats[0]();
+  assert.equal(old.sent.length, before);
+  assert.equal(client.session, null);
+  assert.equal(client.heartbeatTimer, null);
+  assert.equal(client.reconnectTimer, null);
+  assert.deepEqual(errors, []);
+  assert.deepEqual(inbound, []);
+  current.open(); current.frame({ type: "auth_ok", session_id: "current" });
+  await second;
+  const timer = client.heartbeatTimer;
+  old.onclose(); old.onerror(); old.frame({ type: "auth_ok", session_id: "stale-again" });
+  assert.equal(client.session, "current");
+  assert.equal(client.heartbeatTimer, timer);
+  heartbeats[1]();
+  assert.equal(current.sent.at(-1).type, "ping");
+  current.frame({ type: "message", content: "fresh" });
+  assert.equal(inbound[0].content, "fresh");
+});
+
+test("disconnect detaches socket before synchronous close and settles pending lifecycle", async (t) => {
+  const { sockets, client } = fakeSockets(t);
+  const errors = [];
+  client.onError((err) => errors.push(err.message));
+  const connecting = assert.rejects(client.connect(), /Disconnected before authentication/);
+  const closed = client.waitUntilClosed();
+  const old = sockets[0];
+  let detached = false;
+  old.close = () => {
+    detached = client.ws === null;
+    old.onclose();
+    old.onerror();
+    old.frame({ type: "auth_ok", session_id: "late" });
+    throw new Error("close failed");
+  };
+  assert.doesNotThrow(() => client.disconnect());
+  await connecting;
+  await closed;
+  assert.equal(detached, true);
+  assert.equal(client.ws, null);
+  assert.equal(client.session, null);
+  assert.equal(client.reconnectTimer, null);
+  assert.equal(client.lifecycleResolve, null);
+  assert.deepEqual(errors, []);
+});
+
+test("synchronous auth send failure rejects connect and reports through onError", async (t) => {
+  const { sockets, client } = fakeSockets(t);
+  const errors = [];
+  client.onError((err) => errors.push(err.message));
+  const rejected = assert.rejects(client.connect(), /auth send failed/);
+  sockets[0].sendError = "auth send failed";
+  assert.doesNotThrow(() => sockets[0].open());
+  await rejected;
+  assert.deepEqual(errors, ["auth send failed"]);
+  assert.equal(sockets[0].closeCalls, 1);
+  assert.equal(client.heartbeatTimer, null);
+});
+
+test("heartbeat catches synchronous send failure and closes for reconnect", async (t) => {
+  const { sockets, client } = fakeSockets(t);
+  let heartbeat;
+  t.mock.method(globalThis, "setInterval", (callback) => { heartbeat = callback; return { unref() {} }; });
+  t.mock.method(globalThis, "clearInterval", () => {});
+  const errors = [];
+  client.onError((err) => errors.push(err.message));
+  const connected = client.connect();
+  sockets[0].open(); sockets[0].frame({ type: "auth_ok", session_id: "s" });
+  await connected;
+  sockets[0].sendError = "ping send failed";
+  assert.doesNotThrow(() => heartbeat());
+  assert.deepEqual(errors, ["ping send failed"]);
+  assert.equal(sockets[0].closeCalls, 1);
+  assert.equal(client.session, null);
+  assert.notEqual(client.reconnectTimer, null);
+  client.disconnect();
+  assert.doesNotThrow(() => heartbeat());
+  assert.deepEqual(errors, ["ping send failed"]);
+});

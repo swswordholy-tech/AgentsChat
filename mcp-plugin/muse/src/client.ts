@@ -57,6 +57,21 @@ export class MuseAgentChatClient {
   onReconnect?: MuseAgentChatOptions["onReconnect"];
 
   constructor(options: MuseAgentChatOptions) {
+    let url: URL;
+    try {
+      url = new URL(options.url);
+    } catch {
+      throw new Error("Invalid Muse ws URL");
+    }
+    if (url.protocol !== "ws:" && url.protocol !== "wss:") {
+      throw new Error("Invalid Muse ws URL protocol");
+    }
+    if (url.username || url.password) {
+      throw new Error("Embedded credentials are not allowed in Muse ws URL");
+    }
+    if (url.protocol === "ws:" && !["127.0.0.1", "localhost", "[::1]", "::1"].includes(url.hostname.toLowerCase())) {
+      throw new Error("Remote Muse ws URL must use wss://");
+    }
     this.url = options.url;
     this.agentId = options.agentId;
     this.token = options.token;
@@ -141,12 +156,15 @@ export class MuseAgentChatClient {
       this.connectSettled = true;
       this.connectReject?.(new Error("Disconnected before authentication completed"));
     }
-    try {
-      this.ws?.close();
-    } catch {}
+    this.connectResolve = null;
+    this.connectReject = null;
+    this.lifecycleResolve?.();
+    this.lifecycleResolve = null;
+    const prev = this.ws;
     this.ws = null;
     this.sessionId = null;
-    this.lifecycleResolve?.();
+    this.sessionJoined.clear();
+    try { prev?.close(); } catch {}
   }
 
   get isConnected(): boolean {
@@ -237,22 +255,44 @@ export class MuseAgentChatClient {
       this.connectTimer.unref?.();
     }
     ws.onopen = () => {
-      this.send({
-        type: "auth",
-        agent_id: this.agentId,
-        token: this.token,
-        capabilities: this.capabilities,
-      });
+      if (this.ws !== ws) return;
+      try {
+        this.send({
+          type: "auth",
+          agent_id: this.agentId,
+          token: this.token,
+          capabilities: this.capabilities,
+        });
+      } catch (err) {
+        this.clearConnectTimer();
+        if (!this.connectSettled) {
+          this.connectSettled = true;
+          this.connectReject?.(err instanceof Error ? err : new Error(String(err)));
+        }
+        this.emitError(err instanceof Error ? err : new Error(String(err)));
+        try { ws.close(); } catch {}
+        return;
+      }
       if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = setInterval(() => {
-        if (this.ws?.readyState === WebSocket.OPEN) {
-          this.send({ type: "ping", timestamp: new Date().toISOString() });
+        if (this.ws !== ws) return;
+        if (ws.readyState === WebSocket.OPEN) {
+          try {
+            this.send({ type: "ping", timestamp: new Date().toISOString() });
+          } catch (err) {
+            this.emitError(err instanceof Error ? err : new Error(String(err)));
+            try { ws.close(); } catch {}
+          }
         }
       }, this.heartbeatIntervalMs);
       this.heartbeatTimer.unref?.();
     };
-    ws.onmessage = (event) => this.handleMessage(String(event.data));
+    ws.onmessage = (event) => {
+      if (this.ws !== ws) return;
+      this.handleMessage(String(event.data));
+    };
     ws.onerror = () => {
+      if (this.ws !== ws) return;
       const err = new Error("WebSocket error");
       if (!this.connectSettled) {
         this.clearConnectTimer();
@@ -262,7 +302,7 @@ export class MuseAgentChatClient {
       this.emitError(err);
     };
     ws.onclose = () => {
-      if (this.ws && this.ws !== ws) return;
+      if (this.ws !== ws) return;
       this.clearConnectTimer();
       if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
