@@ -824,7 +824,7 @@ function appendWakeQueue(queueFile, payload, maxLines = MAX_WAKE_QUEUE_LINES) {
 // src/session-route.ts
 import { lstatSync as lstatSync3, readFileSync as readFileSync3 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
-import { join as join3 } from "node:path";
+import { isAbsolute, join as join3 } from "node:path";
 
 // src/session-bind.ts
 import { closeSync, lstatSync as lstatSync2, mkdirSync as mkdirSync2, openSync, readFileSync as readFileSync2, readSync, readdirSync, unlinkSync as unlinkSync2 } from "node:fs";
@@ -919,12 +919,20 @@ var DSH_HEALTH_MAX_BYTES = 256 * 1024;
 
 // src/session-route.ts
 var MAX_PROFILE_BYTES2 = 64 * 1024;
+var MAX_DIR_PATH_LENGTH = 4096;
 var RESERVED_PROFILE_KEY = /^(?:__proto__|constructor|prototype)$/i;
+function isSafeAbsoluteDirEnv(raw) {
+  if (typeof raw !== "string")
+    return false;
+  const s = raw.trim();
+  return s.length > 0 && s.length <= MAX_DIR_PATH_LENGTH && !s.startsWith("-") && !/[\x00-\x1f\x7f]/.test(s) && isAbsolute(s);
+}
 function agentschatConfigDir(env = process.env) {
-  const custom = typeof env.AGENTSCHAT_CONFIG_DIR === "string" ? env.AGENTSCHAT_CONFIG_DIR.trim() : "";
-  if (custom)
-    return custom;
-  const home = (env.HOME || env.USERPROFILE || homedir2()).trim() || homedir2();
+  if (isSafeAbsoluteDirEnv(env.AGENTSCHAT_CONFIG_DIR)) {
+    return env.AGENTSCHAT_CONFIG_DIR.trim();
+  }
+  const homeCandidate = env.HOME || env.USERPROFILE || "";
+  const home = isSafeAbsoluteDirEnv(homeCandidate) ? homeCandidate.trim() : homedir2();
   return join3(home, ".agentschat");
 }
 function isSafeAgentId(id) {
@@ -967,7 +975,10 @@ function readAgentId(path) {
     if (!isSafeRegularProfileFile(path))
       return;
     const parsed = JSON.parse(readFileSync3(path, "utf8"));
-    const id = typeof parsed?.agent_id === "string" ? parsed.agent_id.trim() : "";
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || Object.prototype.hasOwnProperty.call(parsed, "__proto__")) {
+      return;
+    }
+    const id = typeof parsed.agent_id === "string" ? parsed.agent_id.trim() : "";
     return isSafeAgentId(id) ? id : undefined;
   } catch {
     return;

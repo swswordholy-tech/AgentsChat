@@ -3985,7 +3985,7 @@ async function detectDshCallerSession(opts) {
 // src/session-route.ts
 import { lstatSync as lstatSync6, readFileSync as readFileSync7 } from "node:fs";
 import { homedir as homedir4 } from "node:os";
-import { join as join7 } from "node:path";
+import { isAbsolute as isAbsolute2, join as join7 } from "node:path";
 
 // src/session-bind.ts
 import { closeSync as closeSync2, lstatSync as lstatSync5, mkdirSync as mkdirSync2, openSync as openSync2, readFileSync as readFileSync6, readSync as readSync2, readdirSync as readdirSync3, unlinkSync as unlinkSync3 } from "node:fs";
@@ -4065,12 +4065,20 @@ var DSH_HEALTH_MAX_BYTES2 = 256 * 1024;
 
 // src/session-route.ts
 var MAX_PROFILE_BYTES = 64 * 1024;
+var MAX_DIR_PATH_LENGTH = 4096;
 var RESERVED_PROFILE_KEY = /^(?:__proto__|constructor|prototype)$/i;
+function isSafeAbsoluteDirEnv(raw) {
+  if (typeof raw !== "string")
+    return false;
+  const s = raw.trim();
+  return s.length > 0 && s.length <= MAX_DIR_PATH_LENGTH && !s.startsWith("-") && !/[\x00-\x1f\x7f]/.test(s) && isAbsolute2(s);
+}
 function agentschatConfigDir(env = process.env) {
-  const custom = typeof env.AGENTSCHAT_CONFIG_DIR === "string" ? env.AGENTSCHAT_CONFIG_DIR.trim() : "";
-  if (custom)
-    return custom;
-  const home = (env.HOME || env.USERPROFILE || homedir4()).trim() || homedir4();
+  if (isSafeAbsoluteDirEnv(env.AGENTSCHAT_CONFIG_DIR)) {
+    return env.AGENTSCHAT_CONFIG_DIR.trim();
+  }
+  const homeCandidate = env.HOME || env.USERPROFILE || "";
+  const home = isSafeAbsoluteDirEnv(homeCandidate) ? homeCandidate.trim() : homedir4();
   return join7(home, ".agentschat");
 }
 function isSafeAgentId(id) {
@@ -4113,7 +4121,10 @@ function readAgentId(path) {
     if (!isSafeRegularProfileFile(path))
       return;
     const parsed = JSON.parse(readFileSync7(path, "utf8"));
-    const id = typeof parsed?.agent_id === "string" ? parsed.agent_id.trim() : "";
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || Object.prototype.hasOwnProperty.call(parsed, "__proto__")) {
+      return;
+    }
+    const id = typeof parsed.agent_id === "string" ? parsed.agent_id.trim() : "";
     return isSafeAgentId(id) ? id : undefined;
   } catch {
     return;
@@ -5101,9 +5112,93 @@ var MAX_SEEN_IDS = 200;
 var DEFAULT_HTTP_TIMEOUT_MS = 15000;
 var MAX_TIMER_MS = 2147483647;
 var MAX_STATE_FILE_BYTES = 1048576;
+var MAX_HTTP_JSON_BYTES = 4 * 1024 * 1024;
 var MAX_PID_FILE_BYTES = 64 * 1024;
 var DIRECT_CHANNEL_RE3 = /^dm[-:]/i;
 var PROTOTYPE_KEYS2 = new Set(["__proto__", "constructor", "prototype"]);
+function isLoopbackHost2(hostname) {
+  const h = hostname.toLowerCase();
+  return h === "127.0.0.1" || h === "localhost" || h === "[::1]" || h === "::1";
+}
+function validateSafeRestBaseUrl(rawUrl) {
+  if (typeof rawUrl !== "string")
+    throw new Error("Invalid AgentsChat REST URL");
+  const trimmed = rawUrl.trim().replace(/\/+$/, "");
+  if (!trimmed || trimmed.length > 2048 || /[\x00-\x20\x7f"<>\\]/.test(trimmed) || /:0(?:\/|$)/.test(trimmed)) {
+    throw new Error("Invalid AgentsChat REST URL");
+  }
+  let parsed;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    throw new Error("Invalid AgentsChat REST URL");
+  }
+  if (parsed.username || parsed.password || parsed.search || parsed.hash) {
+    throw new Error("Invalid AgentsChat REST URL");
+  }
+  if (parsed.protocol === "https:")
+    return trimmed;
+  if (parsed.protocol === "http:" && (isLoopbackHost2(parsed.hostname) || process.env.AGENTSCHAT_ALLOW_INSECURE_HTTP === "1")) {
+    return trimmed;
+  }
+  throw new Error("Refusing insecure non-loopback HTTP AgentsChat REST URL");
+}
+function isSafeCliChannelId(channelId) {
+  if (typeof channelId !== "string")
+    return false;
+  if (channelId.length < 1 || channelId.length > 128 || channelId.trim() !== channelId || /[\x00-\x1f\x7f/\\\s]/.test(channelId) || channelId === "." || channelId.includes("..") || PROTOTYPE_KEYS2.has(channelId.toLowerCase())) {
+    return false;
+  }
+  return true;
+}
+function ensureRealDirectory(dir) {
+  const pre = lstatSync10(dir, { throwIfNoEntry: false });
+  if (pre && (pre.isSymbolicLink() || !pre.isDirectory())) {
+    throw new Error("Refusing symlink or non-directory state root");
+  }
+  mkdirSync3(dir, { recursive: true, mode: 448 });
+  const post = lstatSync10(dir);
+  if (post.isSymbolicLink() || !post.isDirectory()) {
+    throw new Error("Refusing symlink or non-directory state root");
+  }
+}
+async function readBoundedResponseJson(res, maxBytes = MAX_HTTP_JSON_BYTES) {
+  const cl = Number(res.headers?.get("content-length") ?? "");
+  if (Number.isFinite(cl) && cl > maxBytes) {
+    await res.body?.cancel().catch(() => {});
+    throw new Error("HTTP JSON response exceeds byte limit");
+  }
+  if (!res.body) {
+    const text = await res.text();
+    if (Buffer.byteLength(text, "utf8") > maxBytes) {
+      throw new Error("HTTP JSON response exceeds byte limit");
+    }
+    return JSON.parse(text);
+  }
+  const reader = res.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done)
+        break;
+      if (value) {
+        total += value.byteLength;
+        if (total > maxBytes) {
+          await reader.cancel().catch(() => {});
+          throw new Error("HTTP JSON response exceeds byte limit");
+        }
+        chunks.push(value);
+      }
+    }
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {}
+  }
+  return JSON.parse(Buffer.concat(chunks, total).toString("utf8"));
+}
 function clampTimerMs(raw, fallback, minMs = 0) {
   if (typeof raw !== "number" || !Number.isFinite(raw))
     return fallback;
@@ -5131,7 +5226,7 @@ async function fetchWithDeadline(f, url, init, timeoutMs, parentSignal) {
   }, safeTimeoutMs) : null;
   timer?.unref?.();
   try {
-    return await f(url, { ...init, signal: ctrl.signal });
+    return await f(url, { redirect: "error", ...init, signal: ctrl.signal });
   } finally {
     if (timer)
       clearTimeout(timer);
@@ -5168,7 +5263,7 @@ function loadSeenIds(file) {
 }
 function saveSeenIds(file, ids) {
   try {
-    mkdirSync3(dirname5(file), { recursive: true });
+    ensureRealDirectory(dirname5(file));
     const list = [...ids].slice(-MAX_SEEN_IDS);
     safeWriteProfile(file, list);
   } catch {}
@@ -5222,7 +5317,15 @@ function acquireWakePidFile(wakePidFile, pid = process.pid, killFn = process.kil
     writeFileSync5(tmp, `${pid}
 `, { mode: 384, flag: "wx" });
     created = true;
+    const recheckDir = lstatSync10(dirname5(wakePidFile), { throwIfNoEntry: false });
+    const recheckTarget = lstatSync10(wakePidFile, { throwIfNoEntry: false });
+    if (!recheckDir || recheckDir.isSymbolicLink() || !recheckDir.isDirectory() || recheckTarget && (recheckTarget.isSymbolicLink() || !recheckTarget.isFile())) {
+      unlinkSync7(tmp);
+      created = false;
+      return false;
+    }
     renameSync5(tmp, wakePidFile);
+    created = false;
     return true;
   } catch {
     if (created && tmp) {
@@ -5245,16 +5348,16 @@ function releaseWakePidFile(wakePidFile, pid = process.pid) {
 }
 function saveJsonMap(file, data) {
   try {
-    mkdirSync3(dirname5(file), { recursive: true });
+    ensureRealDirectory(dirname5(file));
     safeWriteProfile(file, data);
   } catch {}
 }
 function advanceChannelReadCursor(opts) {
   const { configDir, agentId, channelId, timestamp } = opts;
-  if (!agentId || !channelId || !timestamp)
+  if (!agentId || !isSafeCliChannelId(channelId) || !timestamp)
     return;
   const warn = opts.warn ?? ((m) => process.stderr.write(m));
-  mkdirSync3(configDir, { recursive: true });
+  ensureRealDirectory(configDir);
   const lastSeenFile = cursorFileForAgent2(configDir, agentId);
   const cursor = loadCursor2(lastSeenFile, warn);
   const prev = cursor.get(channelId) || "";
@@ -5281,9 +5384,12 @@ function advanceChannelReadCursor(opts) {
 }
 async function joinChannelRest(opts) {
   const f = opts.fetchImpl ?? fetch;
-  const baseUrl = opts.restUrl.replace(/\/$/, "");
-  const url = `${baseUrl}/api/channels/${encodeURIComponent(opts.channelId)}/join`;
   try {
+    const baseUrl = validateSafeRestBaseUrl(opts.restUrl);
+    if (!isSafeCliChannelId(opts.channelId)) {
+      throw new Error("Invalid channel_id");
+    }
+    const url = `${baseUrl}/api/channels/${encodeURIComponent(opts.channelId)}/join`;
     const res = await fetchWithDeadline(f, url, {
       method: "POST",
       headers: {
@@ -5292,7 +5398,7 @@ async function joinChannelRest(opts) {
       },
       body: JSON.stringify({ sender_id: opts.agentId })
     }, opts.timeoutMs ?? DEFAULT_HTTP_TIMEOUT_MS);
-    const data = await res.json().catch(() => ({}));
+    const data = await readBoundedResponseJson(res).catch(() => ({}));
     if (res.ok) {
       return {
         ok: true,
@@ -5321,10 +5427,13 @@ async function joinChannelRest(opts) {
 }
 async function sendRestMessage(opts) {
   const f = opts.fetchImpl ?? fetch;
-  const baseUrl = opts.restUrl.replace(/\/$/, "");
   const cleanText = redactSecrets2(opts.text);
-  const url = `${baseUrl}/api/channels/${encodeURIComponent(opts.channelId)}/messages`;
   try {
+    const baseUrl = validateSafeRestBaseUrl(opts.restUrl);
+    if (!isSafeCliChannelId(opts.channelId)) {
+      throw new Error("Invalid channel_id");
+    }
+    const url = `${baseUrl}/api/channels/${encodeURIComponent(opts.channelId)}/messages`;
     const res = await fetchWithDeadline(f, url, {
       method: "POST",
       headers: {
@@ -5339,7 +5448,7 @@ async function sendRestMessage(opts) {
         ...opts.replyTo ? { in_reply_to: opts.replyTo } : {}
       })
     }, opts.timeoutMs ?? DEFAULT_HTTP_TIMEOUT_MS);
-    const data = await res.json().catch(() => ({}));
+    const data = await readBoundedResponseJson(res).catch(() => ({}));
     if (res.ok) {
       const serverTs = typeof data.timestamp === "string" && data.timestamp.trim() ? data.timestamp.trim() : undefined;
       const cursorTs = serverTs ?? new Date().toISOString();
@@ -5408,13 +5517,13 @@ async function wakeOnce(opts) {
   const f = opts.fetchImpl ?? fetch;
   const warn = opts.warn ?? ((m) => process.stderr.write(m));
   const nowIso = opts.nowIso ?? (() => new Date().toISOString());
-  const baseUrl = opts.restUrl.replace(/\/$/, "");
+  const baseUrl = validateSafeRestBaseUrl(opts.restUrl);
   const { configDir, agentId, displayName, token } = opts;
   const timeoutMs = opts.timeoutMs !== undefined && Number.isFinite(opts.timeoutMs) ? opts.timeoutMs > 0 ? Math.min(MAX_TIMER_MS, Math.floor(opts.timeoutMs)) : 0 : 240000;
   const requestTimeoutMs = clampTimerMs(opts.requestTimeoutMs, DEFAULT_HTTP_TIMEOUT_MS, 0);
   const pollIntervalMs = clampTimerMs(opts.pollIntervalMs, 15000, 10);
   const enableSse = opts.enableSse ?? true;
-  mkdirSync3(configDir, { recursive: true });
+  ensureRealDirectory(configDir);
   const safeSlug = safeAgentCursorSlug2(agentId);
   const lastSeenFile = cursorFileForAgent2(configDir, agentId);
   const seenIdsFile = join12(configDir, `wake-seen-ids-${safeSlug}.json`);
@@ -5479,7 +5588,7 @@ async function wakeOnce(opts) {
     try {
       const res = await fetchWithDeadline(f, `${baseUrl}/api/channels/${encodeURIComponent(channelId)}/messages?${params}`, { headers }, requestTimeoutMs, abortCtrl.signal);
       if (res.ok) {
-        const data = await res.json();
+        const data = await readBoundedResponseJson(res);
         const msgs = (data.messages || []).filter((m) => m && m.id !== triggerMsgId && m.content !== "__typing__");
         const trimmed = msgs.slice(-20);
         if (trimmed.length > 0) {
@@ -5641,7 +5750,7 @@ ${context}
       resolvePromise(ev);
     };
     function maybeStartSse(channelId) {
-      if (!enableSse || resolved)
+      if (!enableSse || resolved || !isSafeCliChannelId(channelId))
         return;
       if (activeSseChannels.has(channelId) || activeSseChannels.size >= MAX_SSE_STREAMS)
         return;
@@ -5650,6 +5759,7 @@ ${context}
         while (!resolved) {
           try {
             const res = await f(`${baseUrl}/api/channels/${encodeURIComponent(channelId)}/stream`, {
+              redirect: "error",
               headers: { Authorization: `Bearer ${token}` },
               signal: abortCtrl.signal
             });
@@ -5744,9 +5854,9 @@ ${context}
         const channelList = [];
         const seenCh = new Set;
         if (mineRes.ok) {
-          const mineData = await mineRes.json();
+          const mineData = await readBoundedResponseJson(mineRes);
           for (const ch of mineData.channels || []) {
-            if (ch && typeof ch.id === "string" && !seenCh.has(ch.id)) {
+            if (ch && isSafeCliChannelId(ch.id) && !seenCh.has(ch.id)) {
               seenCh.add(ch.id);
               channelList.push({ id: ch.id, last_message_at: ch.last_message_at });
             }
@@ -5755,9 +5865,10 @@ ${context}
           await mineRes.body?.cancel().catch(() => {});
         }
         for (const extra of opts.channels ?? []) {
-          if (extra && !seenCh.has(extra)) {
-            seenCh.add(extra);
-            channelList.push({ id: extra });
+          const trimmedExtra = typeof extra === "string" ? extra.trim() : "";
+          if (isSafeCliChannelId(trimmedExtra) && !seenCh.has(trimmedExtra)) {
+            seenCh.add(trimmedExtra);
+            channelList.push({ id: trimmedExtra });
           }
         }
         const sortedForSse = [...channelList].sort((a, b) => {
@@ -5788,7 +5899,7 @@ ${context}
             continue;
           }
           initialSyncedChannels.add(ch.id);
-          const msgData = await msgRes.json();
+          const msgData = await readBoundedResponseJson(msgRes);
           const wakeEv = await inspectChannelMessages(ch.id, msgData.messages || []);
           if (wakeEv) {
             finish(wakeEv);

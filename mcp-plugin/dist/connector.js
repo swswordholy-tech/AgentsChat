@@ -342,7 +342,7 @@ function startConnector(config) {
       return;
     }
     const auth = req.headers.authorization ?? "";
-    const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+    const token = auth.length <= 8192 && auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
     const payload = peekPayload(token);
     const secrets = payload && Object.prototype.hasOwnProperty.call(config.secrets, payload) && Array.isArray(config.secrets[payload]) ? config.secrets[payload] : undefined;
     const secret = secrets?.find((s) => verifyUpgradeToken(token, [s]) === payload);
@@ -363,11 +363,19 @@ function startConnector(config) {
     sockets.add(conn);
     log(`[connector] gateway connected: ${safeLabel(gatewayId)} (${sockets.size} total)`);
     ws.on("message", async (data) => {
+      const bytes = Array.isArray(data) ? data.reduce((n, chunk) => n + chunk.byteLength, 0) : data.byteLength;
+      if (bytes > 2 * 1024 * 1024) {
+        ws.close(1009, "message too large");
+        return;
+      }
       const text = data.toString();
-      for (const line of text.split(`
-`)) {
-        if (!line.trim())
-          continue;
+      const lines = text.split(`
+`).filter((line) => line.trim());
+      if (lines.length > 128) {
+        ws.close(1009, "batch too large");
+        return;
+      }
+      for (const line of lines) {
         let frame;
         try {
           frame = JSON.parse(line);
@@ -431,6 +439,9 @@ function startConnector(config) {
     if (!identity) {
       log(`[connector] outbound failed: no usable identity for botId=${requested ?? "?"}`);
       return { success: false, error: `no usable identity for outbound (botId=${requested ?? "?"})` };
+    }
+    if (typeof chatId !== "string" || chatId !== chatId.trim() || chatId.length < 1 || chatId.length > 128 || /[\x00-\x1f\x7f/\\]/.test(chatId) || chatId === "." || chatId.includes("..") || ["__proto__", "constructor", "prototype"].includes(chatId.toLowerCase())) {
+      return { success: false, error: "invalid chat_id" };
     }
     switch (op) {
       case "send": {
@@ -849,7 +860,7 @@ function selectChannelContextMessages(msgs, sinceTs, excludeId) {
 }
 function safeCursorBotFile(cursorDir, botId) {
   const cleaned = String(botId || "default").replace(/[^A-Za-z0-9._-]/g, "_").replace(/\.{2,}/g, "_");
-  const safeId = cleaned && cleaned !== "." ? cleaned.slice(0, 128) : "default";
+  const safeId = cleaned && cleaned !== "." && !["__proto__", "constructor", "prototype"].includes(cleaned.toLowerCase()) ? cleaned.slice(0, 128) : "default";
   return join2(cursorDir, `last-seen-msg-ts-${safeId}.json`);
 }
 
@@ -861,7 +872,7 @@ function ingestAgentsChatFrame(id, frame, deps) {
     deps.advanceCursor(id, frame.channel_id, frame.timestamp);
   }
   const key = messageDedupKey(frame);
-  const isDm = typeof frame.channel_id === "string" && /^dm-/i.test(frame.channel_id);
+  const isDm = typeof frame.channel_id === "string" && /^dm[-:]/i.test(frame.channel_id);
   const scopedKey = key && (isDm ? JSON.stringify([id.botId, frame.channel_id, frame.id]) : key);
   if (scopedKey && deps.dedup.recordOrSkip(scopedKey))
     return false;
@@ -1022,10 +1033,56 @@ function need(name) {
   }
   return v;
 }
-var API = (process.env.AGENTCHAT_API_URL || "https://agents-chat.com").replace(/\/$/, "");
-var WS_URL = process.env.AGENTCHAT_WS_URL || API.replace(/^http/, "ws") + "/ws";
-var PORT = Number(process.env.RELAY_PORT || 8765);
-var HOST = process.env.RELAY_HOST || "127.0.0.1";
+function readConnectorConfig(env = process.env) {
+  const API = (env.AGENTCHAT_API_URL || "https://agents-chat.com").replace(/\/$/, "");
+  const WS_URL = env.AGENTCHAT_WS_URL || API.replace(/^http/, "ws") + "/ws";
+  const PORT = Number(env.RELAY_PORT || 8765);
+  if (!Number.isInteger(PORT) || PORT < 0 || PORT > 65535)
+    throw new Error("invalid RELAY_PORT");
+  for (const [name, raw, protocols] of [
+    ["AGENTCHAT_API_URL", API, ["http:", "https:"]],
+    ["AGENTCHAT_WS_URL", WS_URL, ["ws:", "wss:"]]
+  ]) {
+    let url;
+    try {
+      url = new URL(raw);
+    } catch {
+      throw new Error(`invalid ${name}`);
+    }
+    const loopback = ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname);
+    if (!protocols.includes(url.protocol) || url.username || url.password || url.port === "0" || name === "AGENTCHAT_API_URL" && (url.search || url.hash || raw.includes("?") || raw.includes("#")) || (url.protocol === "http:" || url.protocol === "ws:") && !loopback && env.AGENTSCHAT_ALLOW_INSECURE_HTTP !== "1") {
+      throw new Error(`invalid ${name}`);
+    }
+  }
+  return { API, WS_URL, PORT, HOST: env.RELAY_HOST || "127.0.0.1" };
+}
+async function readBoundedJson(response) {
+  const limit = 4 * 1024 * 1024;
+  const reader = response.body?.getReader();
+  if (!reader)
+    throw new Error("invalid JSON response");
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let bytes = 0;
+  let text = "";
+  try {
+    for (;; ) {
+      const { done, value } = await reader.read();
+      if (done)
+        break;
+      bytes += value.byteLength;
+      if (bytes > limit)
+        throw new Error("JSON response too large");
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+    return JSON.parse(text);
+  } catch (error) {
+    reader.cancel().catch(() => {});
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+}
 function parseIdentitiesJson(raw, source) {
   let parsed;
   try {
@@ -1033,14 +1090,21 @@ function parseIdentitiesJson(raw, source) {
   } catch {
     throw new Error(`${source} is not valid JSON`);
   }
-  if (!Array.isArray(parsed) || parsed.length === 0) {
-    throw new Error(`${source} must be a non-empty JSON array`);
+  if (!Array.isArray(parsed) || parsed.length === 0 || parsed.length > 256) {
+    throw new Error(`${source} must be a JSON array of 1..256 identities`);
   }
   const seen = new Set;
   for (const [index, it] of parsed.entries()) {
+    if (!it || typeof it !== "object" || Object.getPrototypeOf(it) !== Object.prototype || Object.prototype.hasOwnProperty.call(it, "__proto__")) {
+      throw new Error(`${source} entry ${index}: invalid identity object`);
+    }
     const invalid = ["botId", "token", "gatewayId", "secret"].filter((k) => typeof it?.[k] !== "string" || !it[k].trim());
     for (const k of ["agentId", "profile"]) {
       if (it?.[k] !== undefined && (typeof it[k] !== "string" || !it[k].trim()))
+        invalid.push(k);
+    }
+    for (const k of ["botId", "agentId", "token", "gatewayId", "secret", "profile"]) {
+      if (typeof it[k] === "string" && /[\x00-\x1f\x7f]/.test(it[k]))
         invalid.push(k);
     }
     if (invalid.length)
@@ -1099,6 +1163,7 @@ function isConnectorEntrypoint(entry, moduleUrl, isMain = false) {
   return isMain || Boolean(entry && resolve(entry) === fileURLToPath(moduleUrl));
 }
 async function main() {
+  const { API, WS_URL, PORT, HOST } = readConnectorConfig();
   let identities = resolveIdentitiesAtStartup();
   const secrets = {};
   for (const id of identities) {
@@ -1195,6 +1260,7 @@ async function main() {
   async function joinMemberships(ws, id) {
     try {
       const r = await fetch(`${API}/api/channels/mine`, {
+        redirect: "error",
         headers: { Authorization: `Bearer ${id.token}` },
         signal: AbortSignal.timeout(HTTP_TIMEOUT_MS)
       });
@@ -1203,7 +1269,7 @@ async function main() {
         log(`list mine failed: ${r.status}`);
         return;
       }
-      const body = await r.json();
+      const body = await readBoundedJson(r);
       if (!currentIdentity(id) || socketsByBot.get(id.botId) !== ws)
         return;
       const channels = Array.isArray(body) ? body : body.channels || [];
@@ -1239,6 +1305,7 @@ async function main() {
         const after = s.map.get(channelId);
         const params = after ? `?after=${encodeURIComponent(after)}&limit=50` : `?limit=1`;
         const r = await fetch(`${API}/api/channels/${encodeURIComponent(channelId)}/messages${params}`, {
+          redirect: "error",
           headers: { Authorization: `Bearer ${id.token}` },
           signal: AbortSignal.timeout(HTTP_TIMEOUT_MS)
         });
@@ -1246,7 +1313,7 @@ async function main() {
           await r.body?.cancel().catch(() => {});
           continue;
         }
-        const msgs = (await r.json())?.messages ?? [];
+        const msgs = (await readBoundedJson(r))?.messages ?? [];
         if (!currentIdentity(id))
           return;
         const plan = planBackfill(after, msgs, id.agentId);
@@ -1403,6 +1470,7 @@ async function main() {
       async sendMessage(botId, chatId, content, replyTo) {
         const id = requireIdentity(identities, botId);
         const res = await fetch(`${API}/api/channels/${encodeURIComponent(chatId)}/messages`, {
+          redirect: "error",
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${id.token}` },
           body: JSON.stringify({ sender_id: id.agentId, content_type: "text", content, ...replyTo ? { parent_id: replyTo } : {} }),
@@ -1414,12 +1482,13 @@ async function main() {
           await res.body?.cancel().catch(() => {});
           throw new PlatformHttpError(res.status);
         }
-        const data = await res.json();
+        const data = await readBoundedJson(res);
         return { id: data?.id };
       },
       async getLoops(botId) {
         const id = requireIdentity(identities, botId);
         const res = await fetch(`${API}/api/loops/mine`, {
+          redirect: "error",
           headers: { Authorization: `Bearer ${id.token}` },
           signal: AbortSignal.timeout(5000)
         });
@@ -1427,11 +1496,12 @@ async function main() {
           await res.body?.cancel().catch(() => {});
           throw new PlatformHttpError(res.status);
         }
-        return await res.json();
+        return await readBoundedJson(res);
       },
       async getChatInfo(botId, chatId) {
         const id = requireIdentity(identities, botId);
         const res = await fetch(`${API}/api/channels/${encodeURIComponent(chatId)}`, {
+          redirect: "error",
           headers: { Authorization: `Bearer ${id.token}` },
           signal: AbortSignal.timeout(HTTP_TIMEOUT_MS)
         });
@@ -1439,7 +1509,7 @@ async function main() {
           await res.body?.cancel().catch(() => {});
           return { name: chatId, type: /^dm[-:]/i.test(chatId) ? "dm" : "group" };
         }
-        const data = await res.json();
+        const data = await readBoundedJson(res);
         return { name: data?.name ?? chatId, type: /^dm[-:]/i.test(chatId) ? "dm" : "group" };
       },
       async sendTyping(botId, chatId) {
@@ -1457,6 +1527,7 @@ async function main() {
         let res;
         try {
           res = await fetch(`${API}/api/channels/${encodeURIComponent(chatId)}/messages?limit=50`, {
+            redirect: "error",
             signal: boundedSignal,
             headers: { Authorization: `Bearer ${id.token}` }
           });
@@ -1464,7 +1535,7 @@ async function main() {
             await res.body?.cancel().catch(() => {});
             return null;
           }
-          const rawMsgs = (await res.json())?.messages ?? [];
+          const rawMsgs = (await readBoundedJson(res))?.messages ?? [];
           const tail = selectChannelContextMessages(rawMsgs, sinceTs, excludeId);
           if (!tail.length)
             return null;
@@ -1566,6 +1637,9 @@ if (isConnectorEntrypoint(process.argv[1], import.meta.url, __require.main == __
   await main();
 }
 export {
+  readConnectorConfig,
+  readBoundedJson,
+  parseIdentitiesJson,
   loadIdentities,
   isConnectorEntrypoint,
   clampTimerMs
