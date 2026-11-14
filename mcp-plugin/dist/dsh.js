@@ -1084,7 +1084,7 @@ function resolveWindowsCliSpawn(cmd, args, opts) {
 // dsh/src/patch.ts
 import { randomBytes as randomBytes2 } from "node:crypto";
 import { chmodSync as chmodSync2, lstatSync as lstatSync5, mkdirSync as mkdirSync3, readFileSync as readFileSync5, renameSync as renameSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2 } from "node:fs";
-import { dirname as dirname2, join as join5, resolve } from "node:path";
+import { dirname as dirname2, isAbsolute as isAbsolute2, join as join5, resolve } from "node:path";
 import { homedir as homedir4 } from "node:os";
 var FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 var DARWIN_ROOT_LINKS = new Set(["/var", "/tmp", "/etc"]);
@@ -1110,12 +1110,12 @@ function checkParentDirectory(path) {
 }
 function resolveDshPatchPath(opts = {}) {
   const home = opts.dshHome ?? process.env.DSH_HOME ?? join5(homedir4(), ".dsh");
-  if (!home || /[\x00-\x1f\x7f]/.test(home)) {
+  if (!home || home.length > 4096 || home.startsWith("-") || !isAbsolute2(home) || /[\x00-\x1f\x7f]/.test(home)) {
     throw new Error("Invalid DSH home path");
   }
   if (opts.dshProfile !== undefined) {
     const profile = opts.dshProfile.trim();
-    if (!profile || profile.length > 64 || !/^[A-Za-z0-9._-]+$/.test(profile) || profile === "." || profile.includes("..") || FORBIDDEN_KEYS.has(profile)) {
+    if (!profile || profile.length > 64 || !/^[A-Za-z0-9._-]+$/.test(profile) || profile === "." || profile.includes("..") || FORBIDDEN_KEYS.has(profile.toLowerCase())) {
       throw new Error("Invalid DSH profile name");
     }
     return join5(home, "profiles", profile, "cordis.patch.yml");
@@ -1130,7 +1130,7 @@ function buildMcpAgentsChatArgs(opts = {}) {
   const args = ["-y", pkg];
   if (opts.agentsChatProfile !== undefined && opts.agentsChatProfile !== "") {
     const profile = opts.agentsChatProfile.trim();
-    if (!profile || profile.length > 64 || profile.startsWith("-") || profile.includes("..") || profile.includes("/") || profile.includes("\\") || FORBIDDEN_KEYS.has(profile) || /[\x00-\x1f\x7f]/.test(profile)) {
+    if (!profile || profile.length > 64 || profile.startsWith("-") || profile.includes("..") || profile.includes("/") || profile.includes("\\") || FORBIDDEN_KEYS.has(profile.toLowerCase()) || /[\x00-\x1f\x7f]/.test(profile)) {
       throw new Error("Invalid AgentsChat profile name");
     }
     args.push("--profile", profile);
@@ -1148,7 +1148,7 @@ function buildMcpAgentsChatArgs(opts = {}) {
     }
     const host = parsed.hostname.toLowerCase().replace(/\.$/, "");
     const isLoopback = host === "localhost" || host === "127.0.0.1" || host === "[::1]" || host === "::1";
-    if (parsed.username || parsed.password || parsed.protocol !== "https:" && !(parsed.protocol === "http:" && isLoopback)) {
+    if (parsed.username || parsed.password || parsed.port === "0" || parsed.search || parsed.hash || parsed.protocol !== "https:" && !(parsed.protocol === "http:" && isLoopback)) {
       throw new Error("Invalid AgentsChat API URL");
     }
     args.push("--url", rawUrl);
@@ -1324,13 +1324,41 @@ function checkParentDirectory2(path) {
     parent = next;
   }
 }
+async function readRegistrationText(res) {
+  if (!res.body)
+    throw new Error("Empty registration response");
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let bytes = 0;
+  let text = "";
+  try {
+    for (;; ) {
+      const { done, value } = await reader.read();
+      if (done)
+        break;
+      bytes += value.byteLength;
+      if (bytes > 1024 * 1024)
+        throw new Error("Registration response exceeds 1MiB");
+      text += decoder.decode(value, { stream: true });
+    }
+    return text + decoder.decode();
+  } catch (error) {
+    reader.cancel().catch(() => {});
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+}
+function isSafeAgentId2(value) {
+  return typeof value === "string" && !!value && value !== "." && value !== ".." && !FORBIDDEN_KEYS2.has(value.toLowerCase()) && !/[\s\x00-\x1f\x7f/\\]/.test(value);
+}
 function isLoopbackHost(hostname) {
   const h = hostname.toLowerCase().replace(/\.$/, "");
   return h === "localhost" || h === "127.0.0.1" || h === "[::1]" || h === "::1";
 }
 function validateHttpOrWsUrl(raw, allowedProtocols, label) {
   const trimmed = raw.trim();
-  if (!trimmed || /[\x00-\x20\x7f]/.test(trimmed)) {
+  if (!trimmed || raw !== trimmed || /[\x00-\x20\x7f"<>\\]/.test(raw)) {
     throw new Error(`Invalid ${label} URL`);
   }
   let parsed;
@@ -1339,7 +1367,7 @@ function validateHttpOrWsUrl(raw, allowedProtocols, label) {
   } catch {
     throw new Error(`Invalid ${label} URL`);
   }
-  if (parsed.username || parsed.password)
+  if (parsed.username || parsed.password || parsed.port === "0" || (parsed.protocol === "http:" || parsed.protocol === "https:") && (parsed.search || parsed.hash))
     throw new Error(`Invalid ${label} URL`);
   if (!allowedProtocols.includes(parsed.protocol)) {
     throw new Error(`Unsupported ${label} protocol: ${parsed.protocol}`);
@@ -1355,7 +1383,7 @@ function loadDshConfig(env = process.env, profilePath = DSH_PROFILE_PATH) {
     const lst = lstatSync6(profilePath);
     if (!lst.isSymbolicLink() && lst.isFile() && lst.size <= 256 * 1024) {
       const parsed = JSON.parse(readFileSync6(profilePath, "utf8"));
-      if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+      if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) && !Object.prototype.hasOwnProperty.call(parsed, "__proto__")) {
         profile = parsed;
       }
     }
@@ -1366,7 +1394,7 @@ function loadDshConfig(env = process.env, profilePath = DSH_PROFILE_PATH) {
   const rawToken = env.AGENTCHAT_TOKEN ?? (typeof profile.token === "string" ? profile.token : undefined);
   const agentId = typeof rawAgentId === "string" ? rawAgentId.trim() : "";
   const token = typeof rawToken === "string" ? rawToken.trim() : "";
-  if (!agentId || !token || /[\x00-\x1f\x7f]/.test(agentId) || /[\x00-\x1f\x7f]/.test(token)) {
+  if (!isSafeAgentId2(agentId) || !token || /[\x00-\x1f\x7f]/.test(agentId) || /[\x00-\x1f\x7f]/.test(token)) {
     throw new Error("Missing AgentsChat identity for DSH: set AGENTCHAT_AGENT_ID and AGENTCHAT_TOKEN, " + `or create ${profilePath} via 'agentschat-mcp --dsh --register-only --name <name>'.`);
   }
   const wsUrl = validateHttpOrWsUrl(env.AGENTCHAT_WS_URL ?? (typeof profile.wsUrl === "string" ? profile.wsUrl : DEFAULT_WS_URL), ["ws:", "wss:"], "AgentChat WebSocket");
@@ -1408,15 +1436,15 @@ async function registerOnly(name, restUrl, profilePath = DSH_PROFILE_PATH) {
     signal: AbortSignal.timeout(15000)
   });
   if (!res.ok) {
-    const errText = redact((await res.text().catch(() => "")).slice(0, 300));
+    const errText = redact((await readRegistrationText(res)).slice(0, 300));
     throw new Error(`Registration failed: ${res.status} ${errText}`);
   }
-  const data = await res.json();
+  const data = JSON.parse(await readRegistrationText(res));
   const rawAgentId = data.agentId ?? data.agent_id ?? data.id;
   const rawToken = data.agentKey ?? data.token ?? data.key;
   const agentId = typeof rawAgentId === "string" ? rawAgentId.trim() : "";
   const token = typeof rawToken === "string" ? rawToken.trim() : "";
-  if (!agentId || !token || /[\x00-\x1f\x7f]/.test(agentId) || /[\x00-\x1f\x7f]/.test(token)) {
+  if (!isSafeAgentId2(rawAgentId) || !token || /[\x00-\x1f\x7f]/.test(agentId) || /[\x00-\x1f\x7f]/.test(token)) {
     throw new Error("Registration response did not include a valid agent id/token");
   }
   try {
@@ -1436,6 +1464,15 @@ async function registerOnly(name, restUrl, profilePath = DSH_PROFILE_PATH) {
   try {
     writeFileSync3(tmp, JSON.stringify({ agentId, token }, null, 2), { mode: 384, flag: "wx" });
     created = true;
+    checkParentDirectory2(profilePath);
+    try {
+      const lst = lstatSync6(profilePath);
+      if (lst.isSymbolicLink() || !lst.isFile())
+        throw new Error(`Refusing to overwrite non-regular file ${profilePath}`);
+    } catch (err) {
+      if (err?.code !== "ENOENT")
+        throw err;
+    }
     renameSync3(tmp, profilePath);
     if (process.platform !== "win32") {
       try {
@@ -1639,10 +1676,10 @@ DeepSeek Harness (dsh) integration for AgentsChat:
         const cfgDir = agentschatConfigDir();
         const binds = loadSessionBinds(cfgDir);
         for (const [sid, profName] of Object.entries(binds)) {
-          if (!sid.startsWith("session-") || FORBIDDEN_KEYS2.has(sid) || !profName || typeof profName !== "string")
+          if (!sid.startsWith("session-") || FORBIDDEN_KEYS2.has(sid.toLowerCase()) || !profName || typeof profName !== "string")
             continue;
-          const base = profName.replace(/\.json$/, "").replace(/[^a-zA-Z0-9_-]/g, "_");
-          if (!base || FORBIDDEN_KEYS2.has(base))
+          const base = profName.replace(/\.json$/i, "").replace(/[^a-zA-Z0-9_-]/g, "_");
+          if (!base || FORBIDDEN_KEYS2.has(base.toLowerCase()))
             continue;
           let extraClient = null;
           try {
@@ -1658,7 +1695,7 @@ DeepSeek Harness (dsh) integration for AgentsChat:
             if (!profPath)
               continue;
             const raw = JSON.parse(readFileSync6(profPath, "utf8"));
-            if (raw === null || typeof raw !== "object" || Array.isArray(raw))
+            if (raw === null || typeof raw !== "object" || Array.isArray(raw) || Object.prototype.hasOwnProperty.call(raw, "__proto__"))
               continue;
             const rawAgentId = typeof raw.agent_id === "string" ? raw.agent_id : typeof raw.agentId === "string" ? raw.agentId : "";
             const rawToken = typeof raw.token === "string" ? raw.token : "";
@@ -1672,7 +1709,7 @@ DeepSeek Harness (dsh) integration for AgentsChat:
                 botWsUrl = defaultWsUrl;
               }
             }
-            if (!botAgentId || !botToken || botToken === "dev-token" || /[\x00-\x1f\x7f]/.test(botAgentId) || /[\x00-\x1f\x7f]/.test(botToken) || connectedAgentIds.has(botAgentId)) {
+            if (!isSafeAgentId2(rawAgentId) || !botToken || botToken === "dev-token" || /[\x00-\x1f\x7f]/.test(botAgentId) || /[\x00-\x1f\x7f]/.test(botToken) || connectedAgentIds.has(botAgentId)) {
               continue;
             }
             extraClient = new MuseAgentChatClient({

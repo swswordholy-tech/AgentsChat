@@ -355,9 +355,18 @@ function normalizeTimestampForCursor(ts, mode) {
 }
 
 // src/argcheck.ts
+var FORBIDDEN_ARG_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+function hasOwnProto(v) {
+  return Boolean(v && typeof v === "object" && Object.prototype.hasOwnProperty.call(v, "__proto__"));
+}
+function isReservedIdKey(id) {
+  return id === "." || id.includes("..") || FORBIDDEN_ARG_KEYS.has(id.toLowerCase());
+}
 function validateToolArgs(schema, args) {
   if (!schema || schema.type !== "object" || !schema.properties)
     return null;
+  if (hasOwnProto(args))
+    return 'disallowed argument "__proto__"';
   const a = args && typeof args === "object" && !Array.isArray(args) ? args : {};
   const required = Array.isArray(schema.required) ? schema.required : [];
   for (const key of required) {
@@ -400,7 +409,7 @@ function matchesJsonType(val, expected) {
       case "array":
         return Array.isArray(val);
       case "object":
-        return val !== null && typeof val === "object" && !Array.isArray(val);
+        return val !== null && typeof val === "object" && !Array.isArray(val) && !hasOwnProto(val);
       case "null":
         return val === null;
       default:
@@ -420,7 +429,7 @@ var TASK_EVIDENCE_CAP = 10;
 var TASK_EVIDENCE_REF_MAX = 160;
 var TASK_EVIDENCE_NOTE_MAX = 200;
 var EVIDENCE_CTRL_RE = /[\u0000-\u001f\u007f]/;
-var EVIDENCE_SECRET_RE = /(?:(?:ac|agent_key)_[A-Za-z0-9_-]{8,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|(?:sk|rk)-(?:live-|test-|proj-|ant-)?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|AIza[0-9A-Za-z_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [^-]*PRIVATE KEY-----)/;
+var EVIDENCE_SECRET_RE = /(?:(?:ac|agent_key|mcp_at|mcp_rt|mcp_code|whsec)_[A-Za-z0-9_-]{8,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|(?:sk|rk)-(?:live-|test-|proj-|ant-)?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|AIza[0-9A-Za-z_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [^-]*PRIVATE KEY-----)/;
 function isTaskEvidenceKind(v) {
   return typeof v === "string" && TASK_EVIDENCE_KINDS.includes(v);
 }
@@ -610,9 +619,12 @@ function parseLoopIntervalShorthandMs(raw) {
   return ms;
 }
 function validateCreateLoopInput(args) {
+  if (hasOwnProto(args)) {
+    return { ok: false, error: 'create_loop arguments cannot define own "__proto__".' };
+  }
   const a = args && typeof args === "object" && !Array.isArray(args) ? args : {};
   const channelId = typeof a.channel_id === "string" ? a.channel_id.trim() : "";
-  if (!SAFE_CHANNEL_OR_LOOP_ID_RE.test(channelId) || channelId.includes("..")) {
+  if (!SAFE_CHANNEL_OR_LOOP_ID_RE.test(channelId) || isReservedIdKey(channelId) || EVIDENCE_CTRL_RE.test(channelId) || EVIDENCE_SECRET_RE.test(channelId)) {
     return { ok: false, error: "create_loop needs a valid channel_id." };
   }
   const rawMode = typeof a.mode === "string" ? a.mode.trim() : "";
@@ -661,7 +673,7 @@ function validateCreateLoopInput(args) {
       const handle = entry.trim().replace(/^@+/, "");
       if (!handle)
         continue;
-      if (!SAFE_AGENT_HANDLE_RE.test(handle)) {
+      if (!SAFE_AGENT_HANDLE_RE.test(handle) || isReservedIdKey(handle) || EVIDENCE_SECRET_RE.test(handle)) {
         return { ok: false, error: `create_loop invalid target agent handle "${handle}".` };
       }
       if (!seenTargets.has(handle)) {
@@ -688,7 +700,7 @@ function validateCreateLoopInput(args) {
   }
   if (mode === "okr_wake" || mode === "okr_watch") {
     const objectiveId = typeof a.objective_id === "string" ? a.objective_id.trim() : "";
-    if (!SAFE_OBJECTIVE_ID_RE.test(objectiveId)) {
+    if (!SAFE_OBJECTIVE_ID_RE.test(objectiveId) || isReservedIdKey(objectiveId) || EVIDENCE_SECRET_RE.test(objectiveId)) {
       return { ok: false, error: `create_loop mode="${mode}" requires a valid objective_id.` };
     }
     out.objective_id = objectiveId;
@@ -721,9 +733,12 @@ function validateCreateLoopInput(args) {
 var OKR_KR_METRIC_TYPES = ["count", "bool", "percent"];
 var OKR_KR_RISK_LEVELS = ["green", "yellow", "red"];
 function validateOkrAddKrInput(args) {
+  if (hasOwnProto(args)) {
+    return { ok: false, error: 'okr_add_kr arguments cannot define own "__proto__".' };
+  }
   const a = args && typeof args === "object" && !Array.isArray(args) ? args : {};
   const objectiveId = typeof a.objective_id === "string" ? a.objective_id.trim() : "";
-  if (!objectiveId || !SAFE_CHANNEL_OR_LOOP_ID_RE.test(objectiveId) || objectiveId.includes("..")) {
+  if (!objectiveId || !SAFE_CHANNEL_OR_LOOP_ID_RE.test(objectiveId) || isReservedIdKey(objectiveId) || EVIDENCE_CTRL_RE.test(objectiveId) || EVIDENCE_SECRET_RE.test(objectiveId)) {
     return { ok: false, error: "okr_add_kr requires a valid objective_id." };
   }
   const rawTitle = typeof a.title === "string" ? a.title : "";
@@ -783,9 +798,12 @@ function validateOkrAddKrInput(args) {
   };
 }
 function validateOkrKrMutationInput(args, toolLabel, forceMetadataEndpoint) {
+  if (hasOwnProto(args)) {
+    return { ok: false, error: `${toolLabel} arguments cannot define own "__proto__".` };
+  }
   const a = args && typeof args === "object" && !Array.isArray(args) ? args : {};
   const krId = typeof a.kr_id === "string" ? a.kr_id.trim() : "";
-  if (!krId || !SAFE_CHANNEL_OR_LOOP_ID_RE.test(krId) || krId.includes("..") || EVIDENCE_CTRL_RE.test(krId) || EVIDENCE_SECRET_RE.test(krId)) {
+  if (!krId || !SAFE_CHANNEL_OR_LOOP_ID_RE.test(krId) || isReservedIdKey(krId) || EVIDENCE_CTRL_RE.test(krId) || EVIDENCE_SECRET_RE.test(krId)) {
     return { ok: false, error: `${toolLabel} requires a valid kr_id.` };
   }
   const body = {};
@@ -929,7 +947,7 @@ function validateOkrTaskAssigneeInput(raw) {
   if (EVIDENCE_SECRET_RE.test(trimmed)) {
     return { ok: false, error: "assignee rejected: appears to contain a secret or token" };
   }
-  if (!SAFE_CHANNEL_OR_LOOP_ID_RE.test(trimmed) || trimmed.includes("..")) {
+  if (!SAFE_CHANNEL_OR_LOOP_ID_RE.test(trimmed) || isReservedIdKey(trimmed)) {
     return { ok: false, error: `assignee "${trimmed}" contains invalid characters` };
   }
   return { ok: true, value: trimmed };
@@ -962,7 +980,7 @@ function validateOkrTaskContributesToInput(raw) {
     if (EVIDENCE_SECRET_RE.test(id)) {
       return { ok: false, error: `contributes_to[${i}] rejected: appears to contain a secret or token` };
     }
-    if (!SAFE_CHANNEL_OR_LOOP_ID_RE.test(id) || id.includes("..")) {
+    if (!SAFE_CHANNEL_OR_LOOP_ID_RE.test(id) || isReservedIdKey(id)) {
       return { ok: false, error: `contributes_to[${i}] contains invalid KR ID characters` };
     }
     if (!seen.has(id)) {
@@ -1006,7 +1024,7 @@ function validateOkrTaskDependsOnInput(raw, selfTaskId) {
     if (EVIDENCE_SECRET_RE.test(id)) {
       return { ok: false, error: `depends_on[${i}] rejected: appears to contain a secret or token` };
     }
-    if (!SAFE_CHANNEL_OR_LOOP_ID_RE.test(id) || id.includes("..")) {
+    if (!SAFE_CHANNEL_OR_LOOP_ID_RE.test(id) || isReservedIdKey(id)) {
       return { ok: false, error: `depends_on[${i}] contains invalid task ID characters` };
     }
     if (normalizedSelf && id === normalizedSelf) {
@@ -1038,7 +1056,7 @@ function validateOkrLinkedChannelDocsInput(raw, expectedChannelId) {
   const seen = new Set;
   for (let i = 0;i < raw.length; i++) {
     const item = raw[i];
-    if (!item || typeof item !== "object" || Array.isArray(item)) {
+    if (!item || typeof item !== "object" || Array.isArray(item) || hasOwnProto(item)) {
       return { ok: false, error: `linked_channel_docs[${i}] must be an object with channel_id and doc_id` };
     }
     const rawChannelId = item.channel_id;
@@ -1048,7 +1066,7 @@ function validateOkrLinkedChannelDocsInput(raw, expectedChannelId) {
     }
     const channelId = rawChannelId.trim();
     const docId = rawDocId.trim();
-    if (!channelId || !OKR_DOC_CHANNEL_ID_RE.test(channelId) || /^dm-/i.test(channelId)) {
+    if (!channelId || !OKR_DOC_CHANNEL_ID_RE.test(channelId) || /^dm[-:]/i.test(channelId) || channelId === "direct" || isReservedIdKey(channelId)) {
       return {
         ok: false,
         error: `linked_channel_docs[${i}].channel_id must be a valid non-DM room ID (1..80 chars)`
@@ -1057,7 +1075,7 @@ function validateOkrLinkedChannelDocsInput(raw, expectedChannelId) {
     if (EVIDENCE_SECRET_RE.test(channelId) || EVIDENCE_SECRET_RE.test(docId)) {
       return { ok: false, error: `linked_channel_docs[${i}] rejected: appears to contain a secret or token` };
     }
-    if (!docId || !OKR_DOC_ID_RE.test(docId)) {
+    if (!docId || !OKR_DOC_ID_RE.test(docId) || isReservedIdKey(docId)) {
       return { ok: false, error: `linked_channel_docs[${i}].doc_id must match ^[A-Za-z0-9_-]{1,120}$` };
     }
     if (requiredChannel && channelId !== requiredChannel) {
@@ -1111,9 +1129,12 @@ function validateOkrCompletionSummaryInput(raw) {
   return { ok: true, value: trimmed };
 }
 function validateOkrUpdateObjectiveInput(args) {
+  if (hasOwnProto(args)) {
+    return { ok: false, error: 'okr_update_objective arguments cannot define own "__proto__"' };
+  }
   const a = args && typeof args === "object" && !Array.isArray(args) ? args : {};
   const objectiveId = typeof a.objective_id === "string" ? a.objective_id.trim() : "";
-  if (!objectiveId || !SAFE_CHANNEL_OR_LOOP_ID_RE.test(objectiveId) || objectiveId.includes("..") || EVIDENCE_CTRL_RE.test(objectiveId) || EVIDENCE_SECRET_RE.test(objectiveId)) {
+  if (!objectiveId || !SAFE_CHANNEL_OR_LOOP_ID_RE.test(objectiveId) || isReservedIdKey(objectiveId) || EVIDENCE_CTRL_RE.test(objectiveId) || EVIDENCE_SECRET_RE.test(objectiveId)) {
     return { ok: false, error: "objective_id must be a valid non-empty identifier" };
   }
   const body = {};
@@ -1207,9 +1228,12 @@ function validateOkrUpdateObjectiveInput(args) {
   return { ok: true, value: { objective_id: objectiveId, body } };
 }
 function validateOkrArchiveObjectiveInput(args) {
+  if (hasOwnProto(args)) {
+    return { ok: false, error: 'archive_objective arguments cannot define own "__proto__"' };
+  }
   const a = args && typeof args === "object" && !Array.isArray(args) ? args : {};
   const objectiveId = typeof a.objective_id === "string" ? a.objective_id.trim() : "";
-  if (!objectiveId || !SAFE_CHANNEL_OR_LOOP_ID_RE.test(objectiveId) || objectiveId.includes("..") || EVIDENCE_CTRL_RE.test(objectiveId) || EVIDENCE_SECRET_RE.test(objectiveId)) {
+  if (!objectiveId || !SAFE_CHANNEL_OR_LOOP_ID_RE.test(objectiveId) || isReservedIdKey(objectiveId) || EVIDENCE_CTRL_RE.test(objectiveId) || EVIDENCE_SECRET_RE.test(objectiveId)) {
     return { ok: false, error: "objective_id must be a valid non-empty identifier" };
   }
   const body = {};
@@ -1224,11 +1248,14 @@ function validateOkrArchiveObjectiveInput(args) {
   return { ok: true, value: { objective_id: objectiveId, body } };
 }
 function validateListLoopsInput(args) {
+  if (hasOwnProto(args)) {
+    return { ok: false, error: 'list_loops arguments cannot define own "__proto__".' };
+  }
   const a = args && typeof args === "object" && !Array.isArray(args) ? args : {};
   const out = {};
   if (a.channel_id !== undefined && a.channel_id !== null) {
     const cid = typeof a.channel_id === "string" ? a.channel_id.trim() : "";
-    if (!SAFE_CHANNEL_OR_LOOP_ID_RE.test(cid) || cid.includes("..") || EVIDENCE_SECRET_RE.test(cid)) {
+    if (!SAFE_CHANNEL_OR_LOOP_ID_RE.test(cid) || isReservedIdKey(cid) || EVIDENCE_CTRL_RE.test(cid) || EVIDENCE_SECRET_RE.test(cid)) {
       return { ok: false, error: "list_loops channel_id must be a valid channel identifier." };
     }
     out.channel_id = cid;
@@ -1247,7 +1274,7 @@ function validateListLoopsInput(args) {
   }
   if (a.objective_id !== undefined && a.objective_id !== null) {
     const oid = typeof a.objective_id === "string" ? a.objective_id.trim() : "";
-    if (!SAFE_OBJECTIVE_ID_RE.test(oid) || EVIDENCE_SECRET_RE.test(oid)) {
+    if (!SAFE_OBJECTIVE_ID_RE.test(oid) || isReservedIdKey(oid) || EVIDENCE_SECRET_RE.test(oid)) {
       return { ok: false, error: "list_loops objective_id must be a valid objective identifier." };
     }
     out.objective_id = oid;
@@ -1256,6 +1283,9 @@ function validateListLoopsInput(args) {
 }
 var SAFE_MEMORY_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
 function validateLoadMemoryInput(args) {
+  if (hasOwnProto(args)) {
+    return { ok: false, error: 'load_memory arguments cannot define own "__proto__".' };
+  }
   const a = args && typeof args === "object" && !Array.isArray(args) ? args : {};
   const out = {};
   if (a.name !== undefined && a.name !== null) {
@@ -1264,7 +1294,7 @@ function validateLoadMemoryInput(args) {
     }
     const trimmed = a.name.trim();
     if (trimmed) {
-      if (!SAFE_MEMORY_NAME_RE.test(trimmed) || trimmed.includes("..") || EVIDENCE_CTRL_RE.test(trimmed) || EVIDENCE_SECRET_RE.test(trimmed)) {
+      if (!SAFE_MEMORY_NAME_RE.test(trimmed) || isReservedIdKey(trimmed) || EVIDENCE_CTRL_RE.test(trimmed) || EVIDENCE_SECRET_RE.test(trimmed)) {
         return {
           ok: false,
           error: "load_memory name must be 1..64 alphanumeric/._- chars starting with alphanumeric."
@@ -1285,9 +1315,12 @@ function validateLoadMemoryInput(args) {
   return { ok: true, value: out };
 }
 function validateDeleteMemoryInput(args) {
+  if (hasOwnProto(args)) {
+    return { ok: false, error: 'delete_memory arguments cannot define own "__proto__".' };
+  }
   const a = args && typeof args === "object" && !Array.isArray(args) ? args : {};
   const name = typeof a.name === "string" ? a.name.trim() : "";
-  if (!name || !SAFE_MEMORY_NAME_RE.test(name) || name.includes("..") || EVIDENCE_CTRL_RE.test(name) || EVIDENCE_SECRET_RE.test(name)) {
+  if (!name || !SAFE_MEMORY_NAME_RE.test(name) || isReservedIdKey(name) || EVIDENCE_CTRL_RE.test(name) || EVIDENCE_SECRET_RE.test(name)) {
     return {
       ok: false,
       error: "delete_memory requires a valid memory name (1..64 alphanumeric/._- chars starting with alphanumeric)."
@@ -1322,18 +1355,18 @@ function validateOkrParentIdOptionalInput(parentId) {
   if (EVIDENCE_SECRET_RE.test(trimmed)) {
     return { ok: false, error: "parent_id rejected: appears to contain a secret or token" };
   }
-  if (!SAFE_CHANNEL_OR_LOOP_ID_RE.test(trimmed) || trimmed.includes("..") || EVIDENCE_CTRL_RE.test(trimmed)) {
+  if (!SAFE_CHANNEL_OR_LOOP_ID_RE.test(trimmed) || isReservedIdKey(trimmed) || EVIDENCE_CTRL_RE.test(trimmed)) {
     return { ok: false, error: "parent_id must be a valid objective identifier" };
   }
   return { ok: true, value: trimmed };
 }
 function validateOkrReparentObjectiveInput(args) {
-  if (!args || typeof args !== "object" || Array.isArray(args)) {
+  if (!args || typeof args !== "object" || Array.isArray(args) || hasOwnProto(args)) {
     return { ok: false, error: "okr_reparent_objective requires objective_id and parent_id." };
   }
   const a = args;
   const objectiveId = typeof a.objective_id === "string" ? a.objective_id.trim() : "";
-  if (!objectiveId || !SAFE_CHANNEL_OR_LOOP_ID_RE.test(objectiveId) || objectiveId.includes("..") || EVIDENCE_CTRL_RE.test(objectiveId) || EVIDENCE_SECRET_RE.test(objectiveId)) {
+  if (!objectiveId || !SAFE_CHANNEL_OR_LOOP_ID_RE.test(objectiveId) || isReservedIdKey(objectiveId) || EVIDENCE_CTRL_RE.test(objectiveId) || EVIDENCE_SECRET_RE.test(objectiveId)) {
     return { ok: false, error: "objective_id must be a valid non-empty identifier." };
   }
   if (!("parent_id" in a) || a.parent_id === undefined) {
@@ -1350,7 +1383,7 @@ function validateOkrReparentObjectiveInput(args) {
     if (EVIDENCE_SECRET_RE.test(trimmedParent)) {
       return { ok: false, error: "parent_id rejected: appears to contain a secret or token" };
     }
-    if (!SAFE_CHANNEL_OR_LOOP_ID_RE.test(trimmedParent) || trimmedParent.includes("..") || EVIDENCE_CTRL_RE.test(trimmedParent)) {
+    if (!SAFE_CHANNEL_OR_LOOP_ID_RE.test(trimmedParent) || isReservedIdKey(trimmedParent) || EVIDENCE_CTRL_RE.test(trimmedParent)) {
       return { ok: false, error: "parent_id must be a valid objective identifier or null to detach" };
     }
     if (trimmedParent === objectiveId) {
@@ -1393,7 +1426,7 @@ function normalizeDocLevelValue(level) {
 }
 function validateChannelDocRoomId(raw, toolName) {
   const chatId = typeof raw === "string" ? raw.trim() : "";
-  if (!chatId || !OKR_DOC_CHANNEL_ID_RE.test(chatId) || /^dm-/i.test(chatId) || chatId === "direct" || chatId.includes("..") || EVIDENCE_CTRL_RE.test(chatId)) {
+  if (!chatId || !OKR_DOC_CHANNEL_ID_RE.test(chatId) || /^dm[-:]/i.test(chatId) || chatId === "direct" || isReservedIdKey(chatId) || EVIDENCE_CTRL_RE.test(chatId)) {
     return { ok: false, error: `${toolName} requires a valid non-DM room chat_id (1..80 chars).` };
   }
   if (EVIDENCE_SECRET_RE.test(chatId)) {
@@ -1403,7 +1436,7 @@ function validateChannelDocRoomId(raw, toolName) {
 }
 function validateChannelDocIdInput(raw, toolName = "channel_doc") {
   const docId = typeof raw === "string" ? raw.trim() : "";
-  if (!docId || !SAFE_CHANNEL_DOC_ID_RE.test(docId) || EVIDENCE_CTRL_RE.test(docId)) {
+  if (!docId || !SAFE_CHANNEL_DOC_ID_RE.test(docId) || isReservedIdKey(docId) || EVIDENCE_CTRL_RE.test(docId)) {
     return { ok: false, error: `${toolName} doc_id must match ^[A-Za-z0-9_-]{1,64}$.` };
   }
   if (EVIDENCE_SECRET_RE.test(docId)) {
@@ -1412,6 +1445,9 @@ function validateChannelDocIdInput(raw, toolName = "channel_doc") {
   return { ok: true, value: docId };
 }
 function validateListChannelDocsInput(args) {
+  if (hasOwnProto(args)) {
+    return { ok: false, error: 'list_channel_docs arguments cannot define own "__proto__".' };
+  }
   const a = args && typeof args === "object" && !Array.isArray(args) ? args : {};
   const roomCheck = validateChannelDocRoomId(a.chat_id, "list_channel_docs");
   if (!roomCheck.ok)
@@ -1433,6 +1469,9 @@ function validateListChannelDocsInput(args) {
   return { ok: true, value: out };
 }
 function validateArchiveChannelDocInput(args, toolName = "archive_channel_doc") {
+  if (hasOwnProto(args)) {
+    return { ok: false, error: `${toolName} arguments cannot define own "__proto__".` };
+  }
   const a = args && typeof args === "object" && !Array.isArray(args) ? args : {};
   const roomCheck = validateChannelDocRoomId(a.chat_id, toolName);
   if (!roomCheck.ok)
@@ -1499,6 +1538,9 @@ function hasValidSkillFrontmatter(markdown) {
   return hasName && hasDesc;
 }
 function validateUpsertChannelDocInput(args) {
+  if (hasOwnProto(args)) {
+    return { ok: false, error: 'upsert_channel_doc arguments cannot define own "__proto__".' };
+  }
   const a = args && typeof args === "object" && !Array.isArray(args) ? args : {};
   if (a.archived !== undefined && typeof a.archived !== "boolean") {
     return { ok: false, error: "upsert_channel_doc archived must be a boolean when provided." };
@@ -1582,15 +1624,16 @@ var PERSONAL_SKILL_BODY_MAX_CHARS = 1e5;
 function derivePersonalSkillSlug(rawDocId, rawName) {
   if (typeof rawDocId === "string" && rawDocId.trim()) {
     const trimmed = rawDocId.trim();
-    if (SAFE_PERSONAL_SKILL_SLUG_RE.test(trimmed) && !trimmed.includes("..")) {
+    if (SAFE_PERSONAL_SKILL_SLUG_RE.test(trimmed) && !isReservedIdKey(trimmed)) {
       return trimmed;
     }
   }
-  return String(rawDocId || rawName).toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^[^a-z0-9]+/, "").replace(/[^a-z0-9]+$/, "").replace(/\.{2,}/g, "-").slice(0, 64) || "skill";
+  const fallback = String(rawDocId || rawName).toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^[^a-z0-9]+/, "").replace(/[^a-z0-9]+$/, "").replace(/\.{2,}/g, "-").slice(0, 64) || "skill";
+  return isReservedIdKey(fallback) ? "skill" : fallback;
 }
 function validatePersonalSkillSlugInput(raw, toolName) {
   const slug = typeof raw === "string" ? raw.trim() : "";
-  if (!slug || !SAFE_PERSONAL_SKILL_SLUG_RE.test(slug) || slug.includes("..") || EVIDENCE_CTRL_RE.test(slug) || EVIDENCE_SECRET_RE.test(slug)) {
+  if (!slug || !SAFE_PERSONAL_SKILL_SLUG_RE.test(slug) || isReservedIdKey(slug) || EVIDENCE_CTRL_RE.test(slug) || EVIDENCE_SECRET_RE.test(slug)) {
     return {
       ok: false,
       error: `${toolName} requires a valid personal skill slug (1..64 alphanumeric/._- chars starting with alphanumeric).`
@@ -1599,6 +1642,9 @@ function validatePersonalSkillSlugInput(raw, toolName) {
   return { ok: true, value: slug };
 }
 function validateLoadSkillInput(args) {
+  if (hasOwnProto(args)) {
+    return { ok: false, error: 'load_skill arguments cannot define own "__proto__".' };
+  }
   const a = args && typeof args === "object" && !Array.isArray(args) ? args : {};
   const includeRevisions = a.include_revisions === true;
   if (a.include_revisions !== undefined && typeof a.include_revisions !== "boolean") {
@@ -1650,10 +1696,19 @@ function validateLoadSkillInput(args) {
       error: "load_skill include_revisions is supported for personal skills (name) or channel skills (chat_id + doc_id), not built-in global skills."
     };
   }
+  if (a.skill_id !== undefined && a.skill_id !== null && typeof a.skill_id !== "string") {
+    return { ok: false, error: "load_skill skill_id must be a string when provided." };
+  }
   const skillId = hasSkillId ? a.skill_id.trim() : undefined;
+  if (skillId !== undefined && (!SAFE_CHANNEL_DOC_ID_RE.test(skillId) || isReservedIdKey(skillId) || (skillId in Object.prototype) || EVIDENCE_CTRL_RE.test(skillId) || EVIDENCE_SECRET_RE.test(skillId))) {
+    return { ok: false, error: "load_skill skill_id must be a valid global skill identifier." };
+  }
   return { ok: true, value: { scope: "global", ...skillId ? { skill_id: skillId } : {} } };
 }
 function validateSaveSkillInput(args) {
+  if (hasOwnProto(args)) {
+    return { ok: false, error: 'save_skill arguments cannot define own "__proto__".' };
+  }
   const a = args && typeof args === "object" && !Array.isArray(args) ? args : {};
   const rawName = typeof a.name === "string" ? a.name.trim() : "";
   if (!rawName || rawName.length > 120 || EVIDENCE_CTRL_RE.test(rawName)) {
