@@ -63,10 +63,6 @@ test("round-trip: parse(build(channel, thread)) recovers inputs", () => {
   }
 });
 
-test("parseConversationId: first ':thread:' wins for an embedded separator", () => {
-  // Documents current behavior: a channel id that itself contains the
-  // separator is split at the first occurrence.
-  const parsed = parseConversationId(`${PREFIX}weird:thread:inner:thread:t1`);
-  assert.equal(parsed.channelId, "weird");
-  assert.equal(parsed.threadId, "inner:thread:t1");
+test("parseConversationId: rejects repeated thread separators", () => {
+  assert.equal(parseConversationId(`${PREFIX}weird:thread:inner:thread:t1`), null);
 });

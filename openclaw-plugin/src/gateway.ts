@@ -1,4 +1,5 @@
-import { closeSync, constants, fchmodSync, fstatSync, ftruncateSync, lstatSync, openSync, writeSync } from "node:fs";
+import { closeSync, constants, fchmodSync, fstatSync, ftruncateSync, lstatSync, openSync, realpathSync, writeSync } from "node:fs";
+import { dirname, isAbsolute, sep } from "node:path";
 import type { ChannelAccountSnapshot, ChannelPlugin, PluginRuntime } from "openclaw/plugin-sdk/core";
 import type { ChannelGatewayContext } from "openclaw/plugin-sdk/channel-contract";
 
@@ -14,7 +15,34 @@ type PendingStart = { promise?: Promise<AgentChatGatewayState>; cancel?: () => v
 const MAX_TRACE_BYTES = 1024 * 1024;
 
 function redact(value: string) {
-  return value.replace(/\bBearer\s+[^\s"'<>\\]+|(?:ac_|sk-)[A-Za-z0-9_-]+/gi, "[REDACTED]");
+  return value.replace(/\b(?:Bearer|Basic)\s+[^\s"'<>\\]+|(?:ac_|sk-|mcp_(?:at|rt|code)_|agent_key_|whsec_|gh[pousr]_|github_pat_|AIza|AKIA)[A-Za-z0-9_-]+/gi, "[REDACTED]");
+}
+
+function serializeLogMeta(meta: unknown): string {
+  try {
+    return redact(JSON.stringify(meta) ?? '"[unserializable metadata]"');
+  } catch {
+    return '"[unserializable metadata]"';
+  }
+}
+
+function assertSafeTraceParents(file: string) {
+  // Keep lexical .. components so a symlink before /../ is still inspected.
+  let dir = dirname(isAbsolute(file) ? file : `${process.cwd()}${sep}${file}`);
+  while (true) {
+    const stat = lstatSync(dir);
+    const systemLink = process.platform === "darwin" &&
+      ["/var", "/tmp", "/etc"].includes(dir) && stat.isSymbolicLink() &&
+      realpathSync(dir) === `/private${dir}` &&
+      !lstatSync("/private").isSymbolicLink() && lstatSync("/private").isDirectory() &&
+      !lstatSync(`/private${dir}`).isSymbolicLink() && lstatSync(`/private${dir}`).isDirectory();
+    if ((!systemLink && stat.isSymbolicLink()) || (!systemLink && !stat.isDirectory())) {
+      throw new Error("Unsafe AgentChat trace parent directory");
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
 }
 
 function trace(line: string) {
@@ -22,6 +50,7 @@ function trace(line: string) {
   if (!debugLogPath) return;
   let fd: number | undefined;
   try {
+    assertSafeTraceParents(debugLogPath);
     try {
       const stat = lstatSync(debugLogPath);
       if (!stat.isFile() || stat.isSymbolicLink()) return;
@@ -45,12 +74,14 @@ function trace(line: string) {
 const pendingStarts = new Map<string, PendingStart>();
 
 function log(ctx: unknown, level: "info" | "warn" | "error" | "debug", message: string, meta?: Record<string, unknown>) {
-  const sink = (ctx as { log?: Record<string, (...args: unknown[]) => void> }).log;
-  const fn = sink?.[level];
-  if (typeof fn === "function") {
-    if (meta) fn(redact(message), JSON.parse(redact(JSON.stringify(meta))));
-    else fn(redact(message));
-  }
+  try {
+    const sink = (ctx as { log?: Record<string, (...args: unknown[]) => void> }).log;
+    const fn = sink?.[level];
+    if (typeof fn === "function") {
+      if (meta !== undefined) fn.call(sink, redact(message), JSON.parse(serializeLogMeta(meta)));
+      else fn.call(sink, redact(message));
+    }
+  } catch {} // Logging must not interrupt connection cleanup or error handlers.
 }
 
 function logWithLevel(
@@ -255,7 +286,7 @@ export const agentChatGateway: AgentChatGatewayAdapter = {
       client = createGatewayClient(
         ctx.account,
         (event, meta) => {
-          trace(`client ${event} ${JSON.stringify({ accountId: ctx.accountId, ...meta })}`);
+          trace(`client ${event} ${serializeLogMeta({ accountId: ctx.accountId, ...meta })}`);
           log(ctx, "info", `AgentChat client ${event}`, {
             accountId: ctx.accountId,
             ...meta,

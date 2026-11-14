@@ -321,7 +321,8 @@ export class AgentChatClient {
     let data: Record<string, unknown>;
     try {
       const parsed = JSON.parse(raw);
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) ||
+          Object.prototype.hasOwnProperty.call(parsed, "__proto__")) {
         this.debug("recv:invalid_json");
         return;
       }
@@ -391,6 +392,8 @@ export class AgentChatClient {
       case "message":
       case "thread_reply": {
         if (data.content === "__typing__") break;
+        if (typeof data.channel_id !== "string" || !data.channel_id.trim() ||
+            /[\x00-\x1f\x7f]/.test(data.channel_id) || data.channel_id.includes(":thread:")) break;
         const rawThreadId = data.thread_id ?? data.parent_id ?? data.reply_to ?? data.in_reply_to;
         const threadId =
           (typeof rawThreadId === "string" && rawThreadId.length > 0) || typeof rawThreadId === "number"
