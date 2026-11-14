@@ -30,7 +30,7 @@ export function planBackfill(
     let newestRaw = "";
     let newestNorm = "";
     for (const m of list) {
-      if (!m || m.content === "__typing__") continue;
+      if (!m || typeof m !== "object" || typeof m.content !== "string" || m.content === "__typing__") continue;
       const raw = String(m.timestamp || "");
       if (!raw) continue;
       const norm = normalizeTimestampForCursor(raw, "after") || raw;
@@ -43,7 +43,7 @@ export function planBackfill(
   }
   const afterTs = normalizeTimestampForCursor(after, "after") || after;
   const replay = list.filter((m) => {
-    if (!m || m.content === "__typing__") return false;
+    if (!m || typeof m !== "object" || typeof m.content !== "string" || m.content === "__typing__") return false;
     if (m.sender_id === agentId && !serverLoopTick(m)) return false;
     const msgTs = normalizeTimestampForCursor(m.timestamp, "after");
     return typeof msgTs === "string" && msgTs > afterTs;
@@ -64,7 +64,7 @@ export function selectChannelContextMessages(
 ): BackfillMsg[] {
   const list = Array.isArray(msgs) ? msgs : [];
   const filtered = list
-    .filter((m) => m?.content && m.content !== "__typing__" && (!excludeId || m?.id !== excludeId))
+    .filter((m) => typeof m?.content === "string" && m.content.length > 0 && m.content !== "__typing__" && (!excludeId || m?.id !== excludeId))
     .sort((a, b) => compareNormalizedTimestamps(a.timestamp, b.timestamp));
   if (!sinceTs) return filtered.slice(-10);
   const normSince = normalizeTimestampForCursor(sinceTs, "after") || sinceTs;
