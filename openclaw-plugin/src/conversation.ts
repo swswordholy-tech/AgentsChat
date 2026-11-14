@@ -43,6 +43,7 @@ export function parseConversationId(conversationId: string) {
   if (!channelId) return null;
 
   const rest = raw.slice(separatorIndex + THREAD_SEPARATOR.length);
+  if (rest.includes(THREAD_SEPARATOR)) return null;
   const threadTrimmed = rest.trim();
   return {
     channelId,

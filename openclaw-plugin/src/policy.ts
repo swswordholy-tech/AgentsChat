@@ -14,7 +14,7 @@ function escapeRegExp(value: string) {
 }
 
 function isDirectChannel(channelId: string) {
-  return /^dm-/i.test(channelId);
+  return /^dm[-:]/i.test(channelId);
 }
 
 function getThreadId(message: ChatMessage): string | number | undefined {
@@ -24,9 +24,19 @@ function getThreadId(message: ChatMessage): string | number | undefined {
 }
 
 function deriveRestBaseUrl(wsUrl: string) {
+  if (wsUrl !== wsUrl.trim() || /["<>\\\x00-\x20\x7f]/.test(wsUrl)) {
+    throw new Error("Invalid AgentChat history WebSocket URL");
+  }
   const url = new URL(wsUrl);
-  if (!["ws:", "wss:"].includes(url.protocol) || url.username || url.password) {
+  if (!["ws:", "wss:"].includes(url.protocol) || url.username || url.password || url.port === "0") {
     throw new Error("AgentChat history requires a WebSocket URL without credentials");
+  }
+  // URL canonicalizes numeric IPv4 and IPv4-in-IPv6 spellings before this check.
+  const host = url.hostname.toLowerCase().replace(/\.$/, "");
+  if (["metadata.google.internal", "metadata.goog"].includes(host) ||
+      /^169\.254\./.test(host) || /^\[fe[89ab][0-9a-f]:/i.test(host) ||
+      /^\[::(?:ffff:(?:0:)?)?a9fe:[0-9a-f]+\]$/i.test(host)) {
+    throw new Error("AgentChat history cannot use metadata or link-local hosts");
   }
   if (url.protocol !== "wss:" && !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname)) {
     throw new Error("AgentChat history requires wss for remote hosts");
@@ -71,7 +81,8 @@ const MAX_HISTORY_BYTES = 512 * 1024;
 function scrubHistoryError(error: unknown) {
   return (error instanceof Error ? error.message : String(error))
     .replace(/\bBearer\s+[^\s"'<>]+/gi, "Bearer [redacted]")
-    .replace(/ac_[A-Za-z0-9_-]+/gi, "[redacted]");
+    .replace(/(?:ac_|mcp_(?:at|rt|code)_|agent_key_|sk-|whsec_|gh[pousr]_|github_pat_|AIza|AKIA)[A-Za-z0-9_-]+/gi, "[redacted]")
+    .replace(/[\x00-\x1f\x7f]/g, "");
 }
 
 async function readHistoryJson(response: Response) {
@@ -89,7 +100,11 @@ async function readHistoryJson(response: Response) {
       text += decoder.decode(value, { stream: true });
     }
     text += decoder.decode();
-    return JSON.parse(text);
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === "object" && Object.prototype.hasOwnProperty.call(parsed, "__proto__")) {
+      throw new Error("Invalid AgentChat history JSON object");
+    }
+    return parsed;
   } catch (error) {
     // Do not let a stalled producer delay the single-message fallback.
     void reader.cancel().catch(() => {});
