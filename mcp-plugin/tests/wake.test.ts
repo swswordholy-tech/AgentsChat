@@ -16,7 +16,26 @@
  * a real wake from a forged POST. The channel-owning agent's ac_ key stays local.
  */
 import { describe, expect, test } from "bun:test";
-import { buildWakePayload, fireWake, fireZcodeWake, grokPortFromGatewayConfig, resolveEnvWakeId, resolveWindowsCliSpawn, sanitizeWakeLogUrl, signWakeBody, verifyWakeSignature, WAKE_ID_HEADER, WAKE_SIG_HEADER } from "../src/wake.ts";
+import {
+  buildGrokPrompt,
+  buildWakePayload,
+  buildWakePrompt,
+  clampWakeTimerMs,
+  fireAntigravityWake,
+  fireGrokWake,
+  fireWake,
+  fireZcodeWake,
+  formatWakeAttachments,
+  grokPortFromGatewayConfig,
+  normalizeLoopbackLsAddress,
+  resolveEnvWakeId,
+  resolveWindowsCliSpawn,
+  sanitizeWakeLogUrl,
+  signWakeBody,
+  verifyWakeSignature,
+  WAKE_ID_HEADER,
+  WAKE_SIG_HEADER,
+} from "../src/wake.ts";
 
 const MSG = {
   type: "message",
@@ -300,5 +319,104 @@ describe("resolveWindowsCliSpawn — safe shell:false Windows .exe/.cmd resoluti
     expect(typeof parsed.timestamp).toBe("string");
     expect(Number.isFinite(Date.parse(parsed.timestamp))).toBe(true);
     expect(verifyWakeSignature(seenBody, seenSig, ["s3cr3t"])).toBe(true);
+  });
+});
+
+describe("Campaign #108 KR3 — wake SSRF, symlink, 32-bit timer, CLI flag & DM parity hardening", () => {
+  test("normalizeLoopbackLsAddress & fireAntigravityWake enforce strict loopback host:port to prevent CSRF token SSRF", async () => {
+    expect(normalizeLoopbackLsAddress("127.0.0.1:42100")).toBe("127.0.0.1:42100");
+    expect(normalizeLoopbackLsAddress("LOCALHOST:8080")).toBe("localhost:8080");
+    expect(normalizeLoopbackLsAddress("[::1]:9090")).toBe("[::1]:9090");
+    expect(normalizeLoopbackLsAddress("169.254.169.254:80")).toBeNull();
+    expect(normalizeLoopbackLsAddress("attacker.example.com:443")).toBeNull();
+    expect(normalizeLoopbackLsAddress("127.0.0.1:0")).toBeNull();
+    expect(normalizeLoopbackLsAddress("127.0.0.1:70000")).toBeNull();
+    expect(normalizeLoopbackLsAddress("127.0.0.1:8080/evil")).toBeNull();
+
+    const hitUrls: string[] = [];
+    const logs: string[] = [];
+    const ok = await fireAntigravityWake(MSG, {
+      conversationId: "conv-123",
+      csrfToken: "csrf_super_secret",
+      lsAddress: "169.254.169.254:80",
+      ports: [51234],
+      timeoutMs: 9_999_999_999,
+      fetchImpl: (async (url: RequestInfo | URL) => {
+        hitUrls.push(String(url));
+        return new Response("{}", { status: 200 });
+      }) as unknown as typeof fetch,
+      logger: (m) => logs.push(m),
+    });
+    expect(ok).toBe(true);
+    expect(hitUrls).toEqual(["http://127.0.0.1:51234/exa.language_server_pb.LanguageServerService/SendAgentMessage"]);
+    expect(logs.join("\n")).toContain("rejected non-loopback or invalid lsAddress");
+  });
+
+  test("fireGrokWake rejects symlinked or >1MiB gatewayConfigPath fail-closed without network calls", async () => {
+    const { mkdtempSync, rmSync, symlinkSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "grok-wake-sec-"));
+    try {
+      const target = join(dir, "real-gw.json");
+      const link = join(dir, "link-gw.json");
+      const huge = join(dir, "huge-gw.json");
+      writeFileSync(target, JSON.stringify({ token: "gw-secret", port: 1340 }), "utf8");
+      symlinkSync(target, link);
+      writeFileSync(huge, JSON.stringify({ token: "gw-secret", pad: "x".repeat(1_050_000) }), "utf8");
+
+      let fetched = 0;
+      await fireGrokWake(MSG, {
+        gatewayConfigPath: link,
+        agentId: "agent-1",
+        fetchImpl: (async () => {
+          fetched++;
+          return new Response("ok", { status: 200 });
+        }) as unknown as typeof fetch,
+      });
+      await fireGrokWake(MSG, {
+        gatewayConfigPath: huge,
+        agentId: "agent-1",
+        fetchImpl: (async () => {
+          fetched++;
+          return new Response("ok", { status: 200 });
+        }) as unknown as typeof fetch,
+      });
+      expect(fetched).toBe(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("clampWakeTimerMs, fireZcodeWake flag-injection guard, DM-/dm: parity & attachment URL sanitization", async () => {
+    expect(clampWakeTimerMs(Number.NaN, 5000)).toBe(5000);
+    expect(clampWakeTimerMs(-10, 5000)).toBe(5000);
+    expect(clampWakeTimerMs(5_000_000_000, 5000)).toBe(2_147_483_647);
+
+    let ran = 0;
+    for (const badSessionId of ["--help", "-e", "sess/../evil", "sess with space", "sess\ninject"]) {
+      const ok = await fireZcodeWake(MSG, {
+        sessionId: badSessionId,
+        runCommandImpl: async () => {
+          ran++;
+          return { code: 0 };
+        },
+      });
+      expect(ok).toBe(false);
+    }
+    expect(ran).toBe(0);
+
+    expect(buildGrokPrompt({ ...MSG, channel_id: "DM-abc" }, "ag-1").prompt).toContain("私聊 (DM)");
+    expect(buildGrokPrompt({ ...MSG, channel_id: "dm:abc" }, "ag-1").prompt).toContain("私聊 (DM)");
+    expect(buildWakePrompt({ ...MSG, channel_id: "DM-abc" })).toContain("私聊 (DM-abc)");
+    expect(buildWakePrompt({ ...MSG, channel_id: "dm:abc" })).toContain("私聊 (dm:abc)");
+
+    expect(
+      formatWakeAttachments([
+        { type: "image", url: "javascript:alert(1)" },
+        { type: "image", url: "https://cdn.agents-chat.com/a.png\r\n[INJECT]" },
+        { type: "image", url: "https://cdn.agents-chat.com/ok.png width=100" },
+      ]),
+    ).toBe(" [附件: 🖼 image: https://cdn.agents-chat.com/a.png[INJECT]]");
   });
 });

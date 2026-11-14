@@ -23,7 +23,7 @@
  * timeout, then drop with a stderr note.
  */
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, win32 as pathWin32 } from "node:path";
 import { redactSecrets } from "./redact.ts";
@@ -34,6 +34,34 @@ export const WAKE_SIG_HEADER = "x-agentschat-signature";
 export const WAKE_ID_HEADER = "X-AgentsChat-Wake-Id";
 const SAFE_WAKE_ID_RE = /^[a-zA-Z0-9_-]{1,128}$/;
 const CREDENTIAL_PREFIX_RE = /^(ac_|sk-|sk_|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_)/i;
+const MAX_WAKE_TIMER_MS = 2_147_483_647;
+const GROK_GATEWAY_MAX_BYTES = 1_048_576;
+const DIRECT_CHANNEL_RE = /^dm[-:]/i;
+const SAFE_ZCODE_SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
+/** Clamp timeout/grace durations to safe positive 32-bit signed integers so setTimeout never overflows to 1ms. */
+export function clampWakeTimerMs(raw: unknown, fallback: number, minMs = 1): number {
+  return typeof raw === "number" && Number.isFinite(raw) && raw > 0
+    ? Math.min(MAX_WAKE_TIMER_MS, Math.max(minMs, Math.floor(raw)))
+    : fallback;
+}
+
+/** Validate explicit Antigravity language_server address strictly as loopback host:port (1..65535). */
+export function normalizeLoopbackLsAddress(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const m = /^(127\.0\.0\.1|localhost|\[::1\]):(\d{1,5})$/i.exec(raw.trim());
+  if (!m) return null;
+  const port = Number(m[2]);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+  return `${m[1]!.toLowerCase()}:${port}`;
+}
+
+function sanitizeWakeAttachmentUrl(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const cleaned = raw.trim().replace(/[\x00-\x1f\x7f\r\n]+/g, "");
+  if (!cleaned || cleaned.length > 2048 || /\s/.test(cleaned) || !/^https?:\/\//i.test(cleaned)) return null;
+  return cleaned;
+}
 
 /**
  * Validate `AGENTSCHAT_WAKE_ID` injected by Cloud Sandbox per wake turn so
@@ -101,12 +129,13 @@ export function formatWakeAttachments(attachments: unknown): string {
   for (const raw of attachments) {
     if (!raw || typeof raw !== "object") continue;
     const a = raw as WakeAttachment;
-    if (typeof a.url !== "string" || !a.url) continue;
-    const t = typeof a.type === "string" ? a.type : "file";
+    const safeUrl = sanitizeWakeAttachmentUrl(a.url);
+    if (!safeUrl) continue;
+    const t = typeof a.type === "string" ? a.type.replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 32) : "file";
     const dim = typeof a.width === "number" && typeof a.height === "number" ? ` ${a.width}×${a.height}` : "";
-    const dur = typeof a.duration_ms === "number" ? ` ${(a.duration_ms / 1000).toFixed(1)}s` : "";
+    const dur = typeof a.duration_ms === "number" && Number.isFinite(a.duration_ms) ? ` ${(a.duration_ms / 1000).toFixed(1)}s` : "";
     const icon = t === "image" ? "🖼" : t === "video" ? "🎬" : t === "audio" ? "🔊" : "📎";
-    let desc = `${icon} ${t}${dim}${dur}: ${a.url}`;
+    let desc = `${icon} ${t}${dim}${dur}: ${safeUrl}`;
     if (typeof a.transcript === "string" && a.transcript.trim()) {
       desc += ` (transcript: "${redactSecrets(a.transcript.trim().slice(0, 300))}")`;
     }
@@ -218,10 +247,11 @@ export async function fireWake(msg: WakeMessage, cfg: WakeConfig): Promise<void>
   if (cfg.secret) headers[WAKE_SIG_HEADER] = signWakeBody(body, cfg.secret);
 
   const safeLogUrl = sanitizeWakeLogUrl(url);
+  const timeoutMs = clampWakeTimerMs(cfg.timeoutMs, 5000);
   const doPost = async (): Promise<void> => {
     const f = cfg.fetchImpl ?? fetch;
     const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), cfg.timeoutMs ?? 5000);
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
     t.unref?.();
     try {
       const res = await f(url, { method: "POST", headers, body, signal: ctrl.signal });
@@ -272,7 +302,7 @@ export function buildGrokPrompt(msg: WakeMessage, agentId: string, contextPrefix
   const channel = msg.channel_id ?? "?";
   const sender = msg.sender_id ?? "someone";
   const msgId = (msg.id ?? (msg as any).message_id ?? "") as string;
-  const isDm = channel.startsWith("dm-");
+  const isDm = DIRECT_CHANNEL_RE.test(channel);
   const where = isDm ? "私聊 (DM)" : `频道 ${channel}`;
   const actionHint = isTruncated
     ? `——消息已截断，可调 get_history 查看全文，再用 reply 回复`
@@ -391,7 +421,11 @@ export async function fireGrokWake(msg: WakeMessage, cfg: GrokWakeConfig): Promi
   }
   let gwcfg: any;
   try {
-    const { readFileSync } = await import("node:fs");
+    const stat = lstatSync(cfg.gatewayConfigPath);
+    if (stat.isSymbolicLink() || !stat.isFile() || stat.size > GROK_GATEWAY_MAX_BYTES) {
+      log(`[agentchat] grok wake: rejected unsafe or oversized gateway config ${cfg.gatewayConfigPath}`);
+      return;
+    }
     gwcfg = JSON.parse(readFileSync(cfg.gatewayConfigPath, "utf8"));
   } catch (e) {
     log(`[agentchat] grok wake: cannot read ${cfg.gatewayConfigPath}: ${e}`);
@@ -405,11 +439,12 @@ export async function fireGrokWake(msg: WakeMessage, cfg: GrokWakeConfig): Promi
   const port = grokPortFromGatewayConfig(gwcfg);
   const url = `http://127.0.0.1:${port}/api/sendPrompt`;
   const body = JSON.stringify(buildGrokPrompt(msg, cfg.agentId, cfg.contextPrefix));
+  const timeoutMs = clampWakeTimerMs(cfg.timeoutMs, 5000);
 
   const doPost = async (): Promise<void> => {
     const f = cfg.fetchImpl ?? fetch;
     const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), cfg.timeoutMs ?? 5000);
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
     t.unref?.();
     try {
       const res = await f(url, {
@@ -453,7 +488,7 @@ export function buildWakePrompt(msg: WakeMessage, contextPrefix = ""): string {
   const channel = msg.channel_id ?? "?";
   const sender = msg.sender_id ?? "someone";
   const msgId = (msg.id ?? (msg as any).message_id ?? "") as string;
-  const isDm = channel.startsWith("dm-");
+  const isDm = DIRECT_CHANNEL_RE.test(channel);
   const where = isDm ? `私聊 (${channel})` : `频道 ${channel}`;
   const actionHint = isTruncated
     ? ` —— 消息过长已截断，可调用 get_history(chat_id, message_id) 查看全文，再用 reply 回复并 mark_read 标记已读`
@@ -503,7 +538,12 @@ export async function fireAntigravityWake(msg: WakeMessage, cfg: AntigravityWake
 
   const addresses: string[] = [];
   if (cfg.lsAddress && cfg.lsAddress.trim()) {
-    addresses.push(cfg.lsAddress.trim());
+    const safeAddr = normalizeLoopbackLsAddress(cfg.lsAddress);
+    if (safeAddr) {
+      addresses.push(safeAddr);
+    } else {
+      log(`[agentchat] antigravity wake: rejected non-loopback or invalid lsAddress`);
+    }
   }
   for (const p of cfg.ports ?? []) {
     if (typeof p === "number" && Number.isInteger(p) && p >= 1 && p <= 65535) {
@@ -527,10 +567,11 @@ export async function fireAntigravityWake(msg: WakeMessage, cfg: AntigravityWake
   });
 
   const f = cfg.fetchImpl ?? fetch;
+  const timeoutMs = clampWakeTimerMs(cfg.timeoutMs, 5000);
   for (const addr of addresses) {
     const url = `http://${addr}/exa.language_server_pb.LanguageServerService/SendAgentMessage`;
     const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), cfg.timeoutMs ?? 5000);
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
     t.unref?.();
     try {
       const res = await f(url, {
@@ -703,8 +744,8 @@ export async function resolveZcodeCommand(explicitBin?: string): Promise<{ cmd: 
 export function fireZcodeWake(msg: WakeMessage, cfg: ZcodeWakeConfig): Promise<boolean> {
   const log = cfg.logger ?? (() => {});
   const sessionId = (cfg.sessionId ?? "").trim();
-  if (!sessionId) {
-    log(`[agentchat] zcode wake: missing sessionId, skipping`);
+  if (!sessionId || !SAFE_ZCODE_SESSION_ID_RE.test(sessionId)) {
+    log(`[agentchat] zcode wake: missing or unsafe sessionId, skipping`);
     return Promise.resolve(false);
   }
 
@@ -727,7 +768,8 @@ export function fireZcodeWake(msg: WakeMessage, cfg: ZcodeWakeConfig): Promise<b
         ...(cfg.profileName ? { AGENTSCHAT_PROFILE: cfg.profileName } : {}),
       };
       const resolved = resolveWindowsCliSpawn(cmd, rawArgs, { env });
-      const timeoutMs = cfg.timeoutMs ?? 180_000;
+      const timeoutMs = clampWakeTimerMs(cfg.timeoutMs, 180_000);
+      const killGraceMs = clampWakeTimerMs(cfg.killGraceMs, 2000);
 
       if (cfg.runCommandImpl) {
         const res = await cfg.runCommandImpl(resolved.cmd, resolved.args, { cwd: cfg.workspacePath, env, timeoutMs });
@@ -748,7 +790,7 @@ export function fireZcodeWake(msg: WakeMessage, cfg: ZcodeWakeConfig): Promise<b
         });
         let stderr = "";
         child.stderr?.on("data", (chunk) => {
-          if (stderr.length < 500) stderr += String(chunk);
+          if (stderr.length < 500) stderr += String(chunk).slice(0, 500 - stderr.length);
         });
         let killGraceTimer: ReturnType<typeof setTimeout> | null = null;
         const clearTimers = () => {
@@ -766,7 +808,7 @@ export function fireZcodeWake(msg: WakeMessage, cfg: ZcodeWakeConfig): Promise<b
             try {
               child.kill("SIGKILL");
             } catch {}
-          }, cfg.killGraceMs ?? 2000);
+          }, killGraceMs);
           killGraceTimer.unref?.();
         }, timeoutMs);
         timer.unref?.();
