@@ -131,3 +131,93 @@ test("typing and control sends tolerate synchronous socket state races", async (
     } finally { stub.mockRestore(); }
   });
 });
+
+test("API rejects unsafe paths before credential-bearing requests", async () => {
+  const stub = spyOn(globalThis, 'fetch').mockImplementation(Object.assign(async () => new Response('{}'), { preconnect: globalThis.fetch.preconnect }));
+  const t = new AgentsChatTransport(config, () => {}, () => {});
+  try {
+    for (const path of [null, 1, {}, '', 'https://evil.test/x', '//evil.test/x', '/\\evil.test', '/x\n', '/x\x7f', '/..', '/../secret', '/a/../b', '/a/%2e%2E/b', '/%2e%2e%2fsecret', '/a%2f..%2fb', '/%5c%5cevil.test', '/%00', '/%zz']) {
+      await expect(t.api(path as any)).rejects.toThrow('Invalid AgentsChat API path');
+    }
+    expect(stub).not.toHaveBeenCalled();
+    for (const path of ['/api/channels/mine', '/api/channels/room/messages?before=a%2Fb', '/ok?value=../x', '/..ordinary']) await expect(t.api(path)).resolves.toEqual({});
+    for (const call of stub.mock.calls) {
+      expect(new URL(String(call[0])).origin).toBe(config.apiUrl);
+      expect((call[1] as RequestInit).headers).toHaveProperty('Authorization', 'Bearer synthetic');
+    }
+  } finally { t.stop(); stub.mockRestore(); }
+});
+
+const unsafeChannels: any[] = [null, 1, {}, '', '   ', '.', '..', 'room.name', 'a/b', 'a\\b', 'room\n', 'room\x7f', '__PrOtO__', 'Constructor', 'PROTOTYPE', 'a'.repeat(129)];
+test("send and typing reject unsafe channels before HTTP or timer allocation", async () => {
+  const t = new AgentsChatTransport(config, () => {}, () => {});
+  const api = spyOn(t, 'api').mockResolvedValue({});
+  try {
+    for (const channel of unsafeChannels) {
+      await expect(t.send(channel, 'text')).rejects.toThrow('Invalid AgentsChat channel');
+      expect(() => t.setTyping(channel, true)).toThrow('Invalid AgentsChat channel');
+      expect(() => t.setTyping(channel, false)).toThrow('Invalid AgentsChat channel');
+    }
+    expect(api).not.toHaveBeenCalled(); expect((t as any).typing.size).toBe(0);
+    await t.send('a'.repeat(128), 'valid'); await t.send('dm-room_1:bot', 'valid'); expect(api).toHaveBeenCalledTimes(2);
+  } finally { t.stop(); api.mockRestore(); }
+});
+
+test("non-object WS frames and unsafe joins are ignored", async () => {
+  await socketTest(async (t, state) => {
+    const send = spyOn(state.socket, 'send'), pong = spyOn(state.heartbeat, 'receivedPong');
+    try {
+      for (const raw of ['null', '[]', '[{"type":"auth_ok"}]', 'true', '0', '"message"', '{']) expect(() => state.socket.emit('message', Buffer.from(raw))).not.toThrow();
+      expect(pong).not.toHaveBeenCalled();
+      for (const channel of unsafeChannels) state.socket.emit('message', Buffer.from(JSON.stringify({ type:'channel_created', channel_id:channel })));
+      expect(send).not.toHaveBeenCalled();
+      state.socket.emit('message', Buffer.from(JSON.stringify({type:'channel_created', channel_id:'a'.repeat(128)})));
+      expect(send).toHaveBeenCalledTimes(1); expect(state.authenticated).toBe(true);
+    } finally { send.mockRestore(); pong.mockRestore(); }
+  });
+});
+
+test("membership sync filters unsafe and non-object entries before joining", async () => {
+  await socketTest(async (t, state) => {
+    (t.api as any).mockResolvedValueOnce({channels:[null, ...unsafeChannels.map(id => ({id})), {id:'room'}, {channel_id:'dm-room_1:bot'}]});
+    const send = spyOn(state.socket, 'send');
+    try {
+      state.socket.emit('message', Buffer.from('{"type":"auth_ok"}')); await wait(() => send.mock.calls.length >= 2);
+      expect(send.mock.calls.map(call => JSON.parse(String(call[0])).channel_id)).toEqual(['room','dm-room_1:bot']);
+    } finally { send.mockRestore(); }
+  });
+});
+
+test("typing capacity allows refresh and removal but rejects a 65th channel", async () => {
+  await socketTest(async (t, state) => {
+    for (let i=0; i<64; i++) t.setTyping(`room-${i}`, true);
+    const old = state.typing.get('room-0');
+    expect(() => t.setTyping('overflow', true)).toThrow('typing limit'); expect(state.typing.size).toBe(64);
+    t.setTyping('room-0', true); expect(state.typing.get('room-0')).not.toBe(old);
+    t.setTyping('room-1', false); t.setTyping('overflow', true); expect(state.typing.size).toBe(64);
+    t.stop(); expect(state.typing.size).toBe(0);
+  });
+});
+
+test("pending ACK capacity rejects before sending and releases slots after ACK and stop", async () => {
+  await socketTest(async (t, state) => {
+    const sends = spyOn(state.socket, 'send'), pending: Promise<unknown>[] = [];
+    try {
+      for (let i=0; i<256; i++) pending.push(t.send('room','text').catch(error => error));
+      expect(state.pending.size).toBe(256);
+      await expect(t.send('room','overflow')).rejects.toThrow('pending message limit'); expect(sends).toHaveBeenCalledTimes(256);
+      state.socket.emit('message', Buffer.from(JSON.stringify({type:'message_ack', message_id:state.pending.keys().next().value})));
+      await pending[0]; expect(state.pending.size).toBe(255);
+      pending.push(t.send('room','after ACK').catch(error => error)); expect(state.pending.size).toBe(256);
+      t.stop(); await Promise.all(pending); expect(state.pending.size).toBe(0);
+    } finally { t.stop(); await Promise.all(pending); sends.mockRestore(); }
+  });
+});
+
+test("synchronous message send failure releases pending resources", async () => {
+  await socketTest(async (t, state) => {
+    const send = spyOn(state.socket, 'send').mockImplementation(() => { throw Error('private socket failure'); });
+    try { await expect(t.send('room','text')).rejects.toThrow('AgentsChat socket send failed'); expect(state.pending.size).toBe(0); }
+    finally { send.mockRestore(); }
+  });
+});

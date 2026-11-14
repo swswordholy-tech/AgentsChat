@@ -32,3 +32,21 @@ test('valid manager excludes all descendants regardless of row order and tolerat
   expect(externalCodexPresent(rows,10)).toBe(false);
   expect(externalCodexPresent([...rows,{pid:40,ppid:1,command:'codex --model gpt-5'}],10)).toBe(true);
 });
+
+test('parser skips control-bearing rows and caps inspected input at 65536 lines', () => {
+  for (const control of ['\x00','\x01','\x08','\x09','\x0b','\x0c','\x1f','\x7f']) expect(parseProcesses(`1 0 code${control}x\n2 0 worker`)).toEqual([{pid:2,ppid:0,command:'worker'}]);
+  const lines = Array.from({length:65_536}, (_,i) => `${i+1} 0 worker`);
+  expect(parseProcesses([...lines,'70000 0 codex'].join('\n'))).toHaveLength(65_536);
+  expect(parseProcesses([...Array(65_536).fill('invalid'),'70000 0 codex'].join('\n'))).toEqual([]);
+});
+
+test('deep reversed trees and connected cycles traverse each parent once', () => {
+  let reads=0;
+  const rows=Array.from({length:20_000}, (_,i) => {
+    const pid=20_001-i;
+    return {pid, get ppid() { reads++; return pid-1; }, command:'codex'};
+  });
+  rows.push({pid:1,ppid:20_001,command:'worker'});
+  expect(externalCodexPresent(rows,1)).toBe(false); expect(reads).toBeLessThanOrEqual(rows.length*2);
+  expect(externalCodexPresent([...rows,{pid:30_000,ppid:30_001,command:'codex'},{pid:30_001,ppid:30_000,command:'worker'}],1)).toBe(true);
+});
