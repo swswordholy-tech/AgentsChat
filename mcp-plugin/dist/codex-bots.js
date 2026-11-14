@@ -8,7 +8,7 @@ import { createHash as createHash2 } from "node:crypto";
 import { parseArgs } from "node:util";
 
 // codex/bots-config.ts
-import { readFileSync as readFileSync2, realpathSync as realpathSync2, mkdirSync } from "node:fs";
+import { readFileSync as readFileSync2, realpathSync as realpathSync2, mkdirSync, lstatSync } from "node:fs";
 import { homedir as homedir2 } from "node:os";
 import { dirname, isAbsolute as isAbsolute2, join as join2, resolve as resolve2 } from "node:path";
 
@@ -1068,6 +1068,9 @@ function defaultRegistry(home = homedir2()) {
 function loadBots(file = defaultRegistry(), home = homedir2()) {
   let doc;
   try {
+    const info = lstatSync(file);
+    if (info.isSymbolicLink() || !info.isFile() || info.size > 1048576)
+      throw new Error("Invalid registry file");
     doc = JSON.parse(readFileSync2(file, "utf8"));
   } catch {
     throw new Error("Cannot read bot registry JSON");
@@ -1085,7 +1088,7 @@ function loadBots(file = defaultRegistry(), home = homedir2()) {
   for (const k of ["default_workdir", "codex_bin"])
     if (doc[k] !== undefined && !text(doc[k]))
       throw new Error(`Invalid ${k}`);
-  const path = (value) => value.startsWith("~/") ? join2(home, value.slice(2)) : isAbsolute2(value) ? value : resolve2(dirname(file), value);
+  const path = (value) => /^~[\\/]/.test(value) ? join2(home, value.slice(2)) : isAbsolute2(value) ? value : resolve2(dirname(file), value);
   const defaultDir = doc.default_workdir ? path(doc.default_workdir) : join2(home, ".agentschat/workspace");
   const names = new Set, identities = new Set;
   const bots = [];

@@ -1,6 +1,7 @@
 /** Transport resource ownership: bounded HTTP bodies and one live connection per instance. */
 import { test, expect, spyOn } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WebSocketServer } from "ws";
@@ -74,15 +75,16 @@ test("sync intervals reject invalid values, preserve fast intervals and clamp fi
 
 async function socketTest(run: (t: AgentsChatTransport, state: any, ws: WebSocketServer) => Promise<void>) {
   const root = mkdtempSync(join(tmpdir(), "transport-"));
-  const ws = new WebSocketServer({ port: 0 });
-  await new Promise<void>(r => ws.once("listening", r));
+  const http = createServer();
+  await new Promise<void>(r => http.listen(0, "127.0.0.1", r));
+  const ws = new WebSocketServer({ server: http });
   ws.on("connection", socket => socket.on("message", raw => {
     if (JSON.parse(String(raw)).type === "auth") socket.send('{"type":"auth_ok"}');
   }));
-  const t = new AgentsChatTransport({ ...config, stateDir: root, wsUrl: `ws://127.0.0.1:${(ws.address() as any).port}` }, () => {}, () => {}, () => true, 1000);
+  const t = new AgentsChatTransport({ ...config, stateDir: root, wsUrl: `ws://127.0.0.1:${(http.address() as any).port}` }, () => {}, () => {}, () => true, 1000);
   const api = spyOn(t, "api").mockResolvedValue({ channels: [] });
   try { t.start(); await wait(() => (t as any).authenticated); await run(t, t as any, ws); }
-  finally { t.stop(); api.mockRestore(); for (const c of ws.clients) c.terminate(); await new Promise<void>(r => ws.close(() => r())); rmSync(root, { recursive: true, force: true }); }
+  finally { t.stop(); api.mockRestore(); for (const c of ws.clients) c.terminate(); ws.close(); http.closeAllConnections(); await new Promise<void>(r => http.close(() => r())); rmSync(root, { recursive: true, force: true }); }
 }
 
 test("repeated start stops old socket, heartbeat, sync, typing and pending ACK resources", async () => {

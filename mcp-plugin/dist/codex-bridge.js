@@ -93,6 +93,8 @@ function prepareRuntimeHome(stateDir, source = process.env.CODEX_HOME || join(ho
   mkdirSync(home, { recursive: true, mode: 448 });
   if (realpathSync(home) === legacyHome)
     throw new Error("Bot runtime home must differ from desktop Codex home");
+  if (lstatSync(home).isSymbolicLink())
+    throw new Error("Bot runtime home must not be a symlink");
   for (const name of ["config.toml", "auth.json", "AGENTS.md", "skills", "rules", "plugins", "hooks.json", "models_cache.json"]) {
     const origin = join(legacyHome, name), target = join(home, name);
     if (!existsSync(origin))
@@ -419,12 +421,12 @@ ${text}`,
 }
 
 // codex/run.ts
-import { readFileSync as readFileSync11, lstatSync as lstatSync7 } from "node:fs";
+import { readFileSync as readFileSync11, lstatSync as lstatSync8 } from "node:fs";
 import { homedir as homedir6 } from "node:os";
 import { join as join11 } from "node:path";
 
 // codex/bots-config.ts
-import { readFileSync as readFileSync3, realpathSync as realpathSync3, mkdirSync as mkdirSync3 } from "node:fs";
+import { readFileSync as readFileSync3, realpathSync as realpathSync3, mkdirSync as mkdirSync3, lstatSync as lstatSync3 } from "node:fs";
 import { homedir as homedir3 } from "node:os";
 import { dirname, isAbsolute as isAbsolute3, join as join4, resolve as resolve3 } from "node:path";
 
@@ -1484,6 +1486,9 @@ function defaultRegistry(home = homedir3()) {
 function loadBots(file = defaultRegistry(), home = homedir3()) {
   let doc;
   try {
+    const info = lstatSync3(file);
+    if (info.isSymbolicLink() || !info.isFile() || info.size > 1048576)
+      throw new Error("Invalid registry file");
     doc = JSON.parse(readFileSync3(file, "utf8"));
   } catch {
     throw new Error("Cannot read bot registry JSON");
@@ -1501,7 +1506,7 @@ function loadBots(file = defaultRegistry(), home = homedir3()) {
   for (const k of ["default_workdir", "codex_bin"])
     if (doc[k] !== undefined && !text(doc[k]))
       throw new Error(`Invalid ${k}`);
-  const path = (value) => value.startsWith("~/") ? join4(home, value.slice(2)) : isAbsolute3(value) ? value : resolve3(dirname(file), value);
+  const path = (value) => /^~[\\/]/.test(value) ? join4(home, value.slice(2)) : isAbsolute3(value) ? value : resolve3(dirname(file), value);
   const defaultDir = doc.default_workdir ? path(doc.default_workdir) : join4(home, ".agentschat/workspace");
   const names = new Set, identities = new Set;
   const bots = [];
@@ -1954,7 +1959,7 @@ import { join as join9 } from "node:path";
 
 // codex/thread-history.ts
 import { createHash as createHash2, randomBytes } from "node:crypto";
-import { chmodSync, lstatSync as lstatSync3, mkdirSync as mkdirSync4, renameSync as renameSync2, unlinkSync, writeFileSync as writeFileSync2 } from "node:fs";
+import { chmodSync, lstatSync as lstatSync4, mkdirSync as mkdirSync4, renameSync as renameSync2, unlinkSync, writeFileSync as writeFileSync2 } from "node:fs";
 import { join as join6 } from "node:path";
 function priorChannelThreads(threads, channel) {
   if (!threads || typeof threads !== "object" || typeof channel !== "string" || !channel)
@@ -1977,13 +1982,13 @@ function priorChannelThreads(threads, channel) {
 function preserveChannelHistory(directory, channel, histories, redact) {
   const root = join6(directory, "history");
   mkdirSync4(root, { recursive: true, mode: 448 });
-  if (lstatSync3(root).isSymbolicLink())
+  if (lstatSync4(root).isSymbolicLink())
     throw new Error("History directory must not be a symlink");
   if (process.platform !== "win32")
     chmodSync(root, 448);
   const file = join6(root, createHash2("sha256").update(channel).digest("hex").slice(0, 24) + ".json");
   try {
-    if (lstatSync3(file).isSymbolicLink())
+    if (lstatSync4(file).isSymbolicLink())
       throw new Error("History archive must not be a symlink");
   } catch (e) {
     if (e.code !== "ENOENT")
@@ -2075,13 +2080,13 @@ End of historical context.
 }
 
 // codex/loop-grants.ts
-import { lstatSync as lstatSync4, readFileSync as readFileSync6 } from "node:fs";
+import { lstatSync as lstatSync5, readFileSync as readFileSync6 } from "node:fs";
 import { join as join7 } from "node:path";
 function grants(config, opts) {
   try {
     const platform = opts?.platform ?? process.platform;
     const getuid = opts && "getuid" in opts ? opts.getuid : process.getuid;
-    const file = join7(config.stateDir, "loop-grants.json"), stat = lstatSync4(file);
+    const file = join7(config.stateDir, "loop-grants.json"), stat = lstatSync5(file);
     if (!stat.isFile())
       return [];
     if (platform !== "win32") {
@@ -2136,7 +2141,7 @@ import { join as join8 } from "node:path";
 
 // src/profile-store.ts
 import {
-  lstatSync as lstatSync5,
+  lstatSync as lstatSync6,
   writeFileSync as writeFileSync3,
   renameSync as renameSync3,
   copyFileSync,
@@ -2150,7 +2155,7 @@ var defaultWarn = (m) => process.stderr.write(m);
 var MAX_PROFILE_JSON_BYTES = 64 * 1024;
 function safeLstat(target) {
   try {
-    return lstatSync5(target);
+    return lstatSync6(target);
   } catch (err) {
     if (err && err.code === "ENOENT")
       return;
@@ -2712,7 +2717,7 @@ function resolveDrainReconnectDelay(frame, rand = Math.random) {
 }
 
 // codex/inbox-sync.ts
-import { chmodSync as chmodSync3, lstatSync as lstatSync6, mkdirSync as mkdirSync7, readFileSync as readFileSync10, renameSync as renameSync5, unlinkSync as unlinkSync5, writeFileSync as writeFileSync5 } from "node:fs";
+import { chmodSync as chmodSync3, lstatSync as lstatSync7, mkdirSync as mkdirSync7, readFileSync as readFileSync10, renameSync as renameSync5, unlinkSync as unlinkSync5, writeFileSync as writeFileSync5 } from "node:fs";
 import { randomBytes as randomBytes2 } from "node:crypto";
 import { join as join10 } from "node:path";
 
@@ -2770,7 +2775,7 @@ class InboxSync {
     this.active = active;
     this.log = log;
     mkdirSync7(stateDir, { recursive: true, mode: 448 });
-    const dirStat = lstatSync6(stateDir);
+    const dirStat = lstatSync7(stateDir);
     if (dirStat.isSymbolicLink() || !dirStat.isDirectory())
       throw new Error("Invalid inbound state directory");
     if (process.platform !== "win32")
@@ -2778,7 +2783,7 @@ class InboxSync {
     this.file = join10(stateDir, "inbound-cursors.json");
     let fileStat;
     try {
-      fileStat = lstatSync6(this.file);
+      fileStat = lstatSync7(this.file);
     } catch (err) {
       if (err.code !== "ENOENT")
         throw err;
@@ -2917,6 +2922,7 @@ class AgentsChatTransport {
     this.receive = receive;
     this.log = log;
     this.syncIntervalMs = syncIntervalMs;
+    this.syncIntervalMs = Number.isFinite(syncIntervalMs) && syncIntervalMs > 0 ? Math.min(Math.floor(syncIntervalMs), 2147483647) : 60000;
     if (recover)
       this.inboxSync = new InboxSync(config.stateDir, (path) => this.api(path), recover, () => !this.closed && this.authenticated, log);
   }
@@ -2933,12 +2939,37 @@ class AgentsChatTransport {
     } catch {
       throw new Error("AgentsChat request failed or timed out");
     }
-    if (!response.ok)
+    if (!response.ok) {
+      try {
+        await response.body?.cancel?.();
+      } catch {}
       throw new Error(`AgentsChat HTTP ${response.status}`);
+    }
+    let reader;
     try {
-      return await response.json();
+      reader = response.body?.getReader();
+      if (!reader)
+        throw new Error("Missing response body");
+      const decoder = new TextDecoder;
+      let bytes = 0, text = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done)
+          break;
+        bytes += value.byteLength;
+        if (bytes > 4 * 1024 * 1024) {
+          try {
+            await reader.cancel();
+          } catch {}
+          throw new Error("Response too large");
+        }
+        text += decoder.decode(value, { stream: true });
+      }
+      return JSON.parse(text + decoder.decode());
     } catch {
       throw new Error("Invalid AgentsChat response");
+    } finally {
+      reader?.releaseLock();
     }
   }
   setTyping(channel, active) {
@@ -2947,8 +2978,11 @@ class AgentsChatTransport {
     if (!active || this.closed)
       return;
     const pulse = () => {
-      if (this.authenticated && this.socket?.readyState === WebSocket.OPEN)
-        this.socket.send(JSON.stringify({ type: "typing", channel_id: channel, sender_id: this.config.agentId, cross_pod: true }));
+      if (this.authenticated && this.socket?.readyState === WebSocket.OPEN) {
+        try {
+          this.socket.send(JSON.stringify({ type: "typing", channel_id: channel, sender_id: this.config.agentId, cross_pod: true }));
+        } catch {}
+      }
     };
     pulse();
     const typingTimer = setInterval(pulse, 2000);
@@ -3004,12 +3038,27 @@ class AgentsChatTransport {
   start() {
     if (this.closed)
       return;
+    clearTimeout(this.retry);
+    this.retry = undefined;
+    clearInterval(this.syncTimer);
+    this.syncTimer = undefined;
+    this.heartbeat?.stop();
+    this.heartbeat = undefined;
+    this.authenticated = false;
+    this.clearTyping();
+    this.rejectPending();
+    const previous = this.socket;
+    this.socket = undefined;
+    previous?.terminate();
     const socket = new WebSocket(this.config.wsUrl, { maxPayload: 1048576, handshakeTimeout: 15000 });
     this.socket = socket;
     const current = () => !this.closed && this.socket === socket;
     const send = (value) => {
-      if (current() && socket.readyState === WebSocket.OPEN)
-        socket.send(JSON.stringify(value));
+      if (current() && socket.readyState === WebSocket.OPEN) {
+        try {
+          socket.send(JSON.stringify(value));
+        } catch {}
+      }
     };
     const join11 = (channel) => {
       if (!this.config.channels.length || this.config.channels.includes(channel)) {
@@ -3087,6 +3136,8 @@ class AgentsChatTransport {
     socket.on("close", () => {
       if (!current())
         return;
+      clearInterval(this.syncTimer);
+      this.syncTimer = undefined;
       this.authenticated = false;
       this.clearTyping();
       this.rejectPending();
@@ -3098,14 +3149,19 @@ class AgentsChatTransport {
     });
   }
   stop() {
-    this.clearTyping();
     this.closed = true;
     this.authenticated = false;
+    this.clearTyping();
     this.rejectPending();
     clearTimeout(this.retry);
+    this.retry = undefined;
     clearInterval(this.syncTimer);
+    this.syncTimer = undefined;
     this.heartbeat?.stop();
-    this.socket?.terminate();
+    this.heartbeat = undefined;
+    const socket = this.socket;
+    this.socket = undefined;
+    socket?.terminate();
   }
 }
 
@@ -3174,7 +3230,7 @@ async function main() {
     }
     if (!values["gui-thread"] || !values["gui-message-file"])
       throw new Error("GUI submission requires --gui-thread and --gui-message-file");
-    const stat = lstatSync7(values["gui-message-file"]);
+    const stat = lstatSync8(values["gui-message-file"]);
     if (stat.isSymbolicLink() || !stat.isFile())
       throw new Error("GUI message must be a regular file, not a symlink");
     if (stat.size > 256 * 1024)
