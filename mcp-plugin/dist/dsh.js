@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // dsh/src/cli.ts
-import { chmodSync as chmodSync3, existsSync as existsSync6, mkdirSync as mkdirSync4, readFileSync as readFileSync6, renameSync as renameSync3, unlinkSync as unlinkSync4, writeFileSync as writeFileSync3 } from "node:fs";
+import { chmodSync as chmodSync3, lstatSync as lstatSync2, mkdirSync as mkdirSync4, readFileSync as readFileSync6, renameSync as renameSync3, unlinkSync as unlinkSync4, writeFileSync as writeFileSync3 } from "node:fs";
 import { spawn } from "node:child_process";
 import { dirname as dirname3, join as join6 } from "node:path";
 import { homedir as homedir5 } from "node:os";
@@ -824,14 +824,18 @@ function resolveWindowsCliSpawn(cmd, args, opts) {
 }
 
 // dsh/src/patch.ts
-import { chmodSync as chmodSync2, existsSync as existsSync5, mkdirSync as mkdirSync3, readFileSync as readFileSync5, renameSync as renameSync2, statSync as statSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2 } from "node:fs";
+import { chmodSync as chmodSync2, lstatSync, mkdirSync as mkdirSync3, readFileSync as readFileSync5, renameSync as renameSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2 } from "node:fs";
 import { dirname as dirname2, join as join5 } from "node:path";
 import { homedir as homedir4 } from "node:os";
+var FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 function resolveDshPatchPath(opts = {}) {
   const home = opts.dshHome ?? process.env.DSH_HOME ?? join5(homedir4(), ".dsh");
+  if (!home || /[\x00-\x1f\x7f]/.test(home)) {
+    throw new Error("Invalid DSH home path");
+  }
   if (opts.dshProfile !== undefined) {
     const profile = opts.dshProfile.trim();
-    if (!profile || !/^[A-Za-z0-9._-]+$/.test(profile) || profile === "." || profile === "..") {
+    if (!profile || profile.length > 64 || !/^[A-Za-z0-9._-]+$/.test(profile) || profile === "." || profile.includes("..") || FORBIDDEN_KEYS.has(profile)) {
       throw new Error("Invalid DSH profile name");
     }
     return join5(home, "profiles", profile, "cordis.patch.yml");
@@ -839,13 +843,33 @@ function resolveDshPatchPath(opts = {}) {
   return join5(home, "cordis.patch.yml");
 }
 function buildMcpAgentsChatArgs(opts = {}) {
-  const pkg = opts.packageSpec ?? "agentschat-mcp@latest";
-  const args = ["-y", pkg];
-  if (opts.agentsChatProfile) {
-    args.push("--profile", opts.agentsChatProfile);
+  const pkg = (opts.packageSpec ?? "agentschat-mcp@latest").trim();
+  if (!pkg || pkg.startsWith("-") || /[\x00-\x20\x7f]/.test(pkg)) {
+    throw new Error("Invalid packageSpec");
   }
-  if (opts.apiUrl) {
-    args.push("--url", opts.apiUrl);
+  const args = ["-y", pkg];
+  if (opts.agentsChatProfile !== undefined && opts.agentsChatProfile !== "") {
+    const profile = opts.agentsChatProfile.trim();
+    if (!profile || profile.length > 64 || profile.startsWith("-") || profile.includes("..") || profile.includes("/") || profile.includes("\\") || FORBIDDEN_KEYS.has(profile) || /[\x00-\x1f\x7f]/.test(profile)) {
+      throw new Error("Invalid AgentsChat profile name");
+    }
+    args.push("--profile", profile);
+  }
+  if (opts.apiUrl !== undefined && opts.apiUrl !== "") {
+    const rawUrl = opts.apiUrl.trim();
+    if (!rawUrl || rawUrl.startsWith("-") || /[\x00-\x20\x7f]/.test(rawUrl)) {
+      throw new Error("Invalid AgentsChat API URL");
+    }
+    let parsed;
+    try {
+      parsed = new URL(rawUrl);
+    } catch {
+      throw new Error("Invalid AgentsChat API URL");
+    }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      throw new Error("Invalid AgentsChat API URL");
+    }
+    args.push("--url", rawUrl);
   }
   return args;
 }
@@ -933,17 +957,23 @@ ${renderMcpAgentsChatEntry("    ", opts)}
 var dshPatchTmpSeq = 0;
 function applyDshCordisPatchFile(opts = {}) {
   const patchPath = resolveDshPatchPath(opts);
-  const existed = existsSync5(patchPath);
+  let existed = false;
+  let mode = 384;
+  try {
+    const lst = lstatSync(patchPath);
+    if (lst.isSymbolicLink() || !lst.isFile()) {
+      throw new Error(`Refusing to modify non-regular or symlinked DSH patch file: ${patchPath}`);
+    }
+    existed = true;
+    mode = lst.mode & 511;
+  } catch (err) {
+    if (err?.code !== "ENOENT")
+      throw err;
+  }
   const existing = existed ? readFileSync5(patchPath, "utf8") : "";
   const { content, changed } = mergeDshCordisPatch(existing, opts);
   if (changed) {
     mkdirSync3(dirname2(patchPath), { recursive: true });
-    let mode = 384;
-    if (existed) {
-      try {
-        mode = statSync2(patchPath).mode & 511;
-      } catch {}
-    }
     const tmp = `${patchPath}.${process.pid}.${Date.now()}.${++dshPatchTmpSeq}.tmp`;
     try {
       writeFileSync2(tmp, content, { encoding: "utf8", mode });
@@ -974,27 +1004,54 @@ function arg(name, argv) {
 function has(name, argv) {
   return argv.includes(name);
 }
+var FORBIDDEN_KEYS2 = new Set(["__proto__", "constructor", "prototype"]);
+function validateHttpOrWsUrl(raw, allowedProtocols, label) {
+  const trimmed = raw.trim();
+  if (!trimmed || /[\x00-\x20\x7f]/.test(trimmed)) {
+    throw new Error(`Invalid ${label} URL`);
+  }
+  let parsed;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    throw new Error(`Invalid ${label} URL`);
+  }
+  if (!allowedProtocols.includes(parsed.protocol)) {
+    throw new Error(`Unsupported ${label} protocol: ${parsed.protocol}`);
+  }
+  return trimmed;
+}
 function loadDshConfig(env = process.env, profilePath = DSH_PROFILE_PATH) {
   let profile = {};
   try {
-    if (existsSync6(profilePath)) {
-      profile = JSON.parse(readFileSync6(profilePath, "utf8"));
+    const lst = lstatSync2(profilePath);
+    if (!lst.isSymbolicLink() && lst.isFile() && lst.size <= 256 * 1024) {
+      const parsed = JSON.parse(readFileSync6(profilePath, "utf8"));
+      if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+        profile = parsed;
+      }
     }
   } catch {
     profile = {};
   }
-  const agentId = env.AGENTCHAT_AGENT_ID ?? profile.agentId;
-  const token = env.AGENTCHAT_TOKEN ?? profile.token;
-  if (!agentId || !token) {
+  const rawAgentId = env.AGENTCHAT_AGENT_ID ?? (typeof profile.agentId === "string" ? profile.agentId : undefined);
+  const rawToken = env.AGENTCHAT_TOKEN ?? (typeof profile.token === "string" ? profile.token : undefined);
+  const agentId = typeof rawAgentId === "string" ? rawAgentId.trim() : "";
+  const token = typeof rawToken === "string" ? rawToken.trim() : "";
+  if (!agentId || !token || /[\x00-\x1f\x7f]/.test(agentId) || /[\x00-\x1f\x7f]/.test(token)) {
     throw new Error("Missing AgentsChat identity for DSH: set AGENTCHAT_AGENT_ID and AGENTCHAT_TOKEN, " + `or create ${profilePath} via 'agentschat-mcp --dsh --register-only --name <name>'.`);
   }
+  const wsUrl = validateHttpOrWsUrl(env.AGENTCHAT_WS_URL ?? (typeof profile.wsUrl === "string" ? profile.wsUrl : DEFAULT_WS_URL), ["ws:", "wss:"], "AgentChat WebSocket");
+  const restUrl = validateHttpOrWsUrl(env.AGENTCHAT_REST_URL ?? (typeof profile.restUrl === "string" ? profile.restUrl : DEFAULT_REST_URL), ["http:", "https:"], "AgentChat REST");
+  const rawDisplay = env.AGENTCHAT_DISPLAY_NAME ?? (typeof profile.displayName === "string" ? profile.displayName : undefined);
+  const rawChan = env.AGENTCHAT_CHANNEL_ID ?? (typeof profile.defaultChannelId === "string" ? profile.defaultChannelId : undefined);
   return {
     agentId,
     token,
-    wsUrl: env.AGENTCHAT_WS_URL ?? profile.wsUrl ?? DEFAULT_WS_URL,
-    restUrl: env.AGENTCHAT_REST_URL ?? profile.restUrl ?? DEFAULT_REST_URL,
-    displayName: env.AGENTCHAT_DISPLAY_NAME ?? profile.displayName,
-    defaultChannelId: env.AGENTCHAT_CHANNEL_ID ?? profile.defaultChannelId
+    wsUrl,
+    restUrl,
+    displayName: rawDisplay?.trim() || undefined,
+    defaultChannelId: rawChan?.trim() || undefined
   };
 }
 function safeDshConfig(config) {
@@ -1008,11 +1065,13 @@ function safeDshConfig(config) {
   };
 }
 async function registerOnly(name, restUrl, profilePath = DSH_PROFILE_PATH) {
+  const safeRestUrl = validateHttpOrWsUrl(restUrl, ["http:", "https:"], "AgentChat REST");
   console.log("Terms notice: https://agents-chat.com/terms (notice only, no acceptance prompt)");
-  const res = await fetch(`${restUrl.replace(/\/$/, "")}/api/account/register`, {
+  const res = await fetch(`${safeRestUrl.replace(/\/+$/, "")}/api/account/register`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ name, type: "agent", capabilities: ["chat"] }),
+    redirect: "error",
     signal: AbortSignal.timeout(15000)
   });
   if (!res.ok) {
@@ -1020,10 +1079,22 @@ async function registerOnly(name, restUrl, profilePath = DSH_PROFILE_PATH) {
     throw new Error(`Registration failed: ${res.status} ${errText}`);
   }
   const data = await res.json();
-  const agentId = data.agentId ?? data.agent_id ?? data.id;
-  const token = data.agentKey ?? data.token ?? data.key;
-  if (!agentId || !token)
-    throw new Error("Registration response did not include an agent id/token");
+  const rawAgentId = data.agentId ?? data.agent_id ?? data.id;
+  const rawToken = data.agentKey ?? data.token ?? data.key;
+  const agentId = typeof rawAgentId === "string" ? rawAgentId.trim() : "";
+  const token = typeof rawToken === "string" ? rawToken.trim() : "";
+  if (!agentId || !token || /[\x00-\x1f\x7f]/.test(agentId) || /[\x00-\x1f\x7f]/.test(token)) {
+    throw new Error("Registration response did not include a valid agent id/token");
+  }
+  try {
+    const lst = lstatSync2(profilePath);
+    if (lst.isSymbolicLink() || !lst.isFile()) {
+      throw new Error(`Refusing to overwrite non-regular file ${profilePath}`);
+    }
+  } catch (err) {
+    if (err?.code !== "ENOENT")
+      throw err;
+  }
   mkdirSync4(dirname3(profilePath), { recursive: true, mode: 448 });
   const tmp = `${profilePath}.${process.pid}.${Date.now()}.tmp`;
   try {
@@ -1043,8 +1114,16 @@ async function registerOnly(name, restUrl, profilePath = DSH_PROFILE_PATH) {
   console.log(`Registered DSH agent '${name}' as ${agentId}. Identity saved to ${profilePath} (token not printed).`);
 }
 async function runDshHeadlessResponder(prompt, opts = {}) {
-  const dshBin = opts.dshBin ?? process.env.DSH_BIN ?? "dsh";
-  const dshProfile = opts.dshProfile ?? process.env.DSH_PROFILE ?? "headless";
+  const dshBin = (opts.dshBin ?? process.env.DSH_BIN ?? "dsh").trim();
+  const dshProfile = (opts.dshProfile ?? process.env.DSH_PROFILE ?? "headless").trim();
+  if (!dshBin || /[\x00-\x1f\x7f]/.test(dshBin)) {
+    console.error("[dsh] invalid dshBin");
+    return null;
+  }
+  if (!dshProfile || dshProfile.startsWith("-") || /[\x00-\x1f\x7f]/.test(dshProfile)) {
+    console.error("[dsh] invalid dshProfile");
+    return null;
+  }
   const timeoutMs = opts.timeoutMs ?? 120000;
   return new Promise((resolve) => {
     const resolved = resolveWindowsCliSpawn(dshBin, ["--profile", dshProfile, prompt], { env: process.env });
@@ -1216,34 +1295,57 @@ DeepSeek Harness (dsh) integration for AgentsChat:
         const cfgDir = agentschatConfigDir();
         const binds = loadSessionBinds(cfgDir);
         for (const [sid, profName] of Object.entries(binds)) {
-          if (!sid.startsWith("session-") || !profName)
+          if (!sid.startsWith("session-") || FORBIDDEN_KEYS2.has(sid) || !profName || typeof profName !== "string")
             continue;
           const base = profName.replace(/\.json$/, "").replace(/[^a-zA-Z0-9_-]/g, "_");
-          const candidates = [join6(cfgDir, "profiles", `${base}.json`), join6(cfgDir, `${base}.json`)];
-          const profPath = candidates.find((p) => existsSync6(p));
-          if (!profPath)
+          if (!base || FORBIDDEN_KEYS2.has(base))
             continue;
-          const raw = JSON.parse(readFileSync6(profPath, "utf8"));
-          const botAgentId = typeof raw.agent_id === "string" ? raw.agent_id : typeof raw.agentId === "string" ? raw.agentId : "";
-          const botToken = typeof raw.token === "string" ? raw.token : "";
-          const botWsUrl = typeof raw.server === "string" && /^wss?:\/\//i.test(raw.server) ? raw.server : defaultWsUrl;
-          if (!botAgentId || !botToken || botToken === "dev-token" || connectedAgentIds.has(botAgentId))
-            continue;
-          connectedAgentIds.add(botAgentId);
-          const extraClient = new MuseAgentChatClient({
-            url: botWsUrl,
-            agentId: botAgentId,
-            token: botToken,
-            capabilities: ["chat"]
-          });
-          attachWakeForClient(extraClient, {
-            agentId: botAgentId,
-            displayName: typeof raw.display_name === "string" ? raw.display_name : undefined
-          });
-          await extraClient.connect();
-          for (const c of wakeChannels)
-            extraClient.joinChannel(c);
-          console.log(`[dsh-wake] Connected bound session ${sid} -> ${profName} (${botAgentId})`);
+          let extraClient = null;
+          try {
+            const candidates = [join6(cfgDir, "profiles", `${base}.json`), join6(cfgDir, `${base}.json`)];
+            const profPath = candidates.find((p) => {
+              try {
+                const lst = lstatSync2(p);
+                return !lst.isSymbolicLink() && lst.isFile() && lst.size <= 256 * 1024;
+              } catch {
+                return false;
+              }
+            });
+            if (!profPath)
+              continue;
+            const raw = JSON.parse(readFileSync6(profPath, "utf8"));
+            if (raw === null || typeof raw !== "object" || Array.isArray(raw))
+              continue;
+            const rawAgentId = typeof raw.agent_id === "string" ? raw.agent_id : typeof raw.agentId === "string" ? raw.agentId : "";
+            const rawToken = typeof raw.token === "string" ? raw.token : "";
+            const botAgentId = rawAgentId.trim();
+            const botToken = rawToken.trim();
+            const botWsUrl = typeof raw.server === "string" && /^wss?:\/\//i.test(raw.server.trim()) && !/[\x00-\x20\x7f]/.test(raw.server.trim()) ? raw.server.trim() : defaultWsUrl;
+            if (!botAgentId || !botToken || botToken === "dev-token" || /[\x00-\x1f\x7f]/.test(botAgentId) || /[\x00-\x1f\x7f]/.test(botToken) || connectedAgentIds.has(botAgentId)) {
+              continue;
+            }
+            extraClient = new MuseAgentChatClient({
+              url: botWsUrl,
+              agentId: botAgentId,
+              token: botToken,
+              capabilities: ["chat"]
+            });
+            await extraClient.connect();
+            connectedAgentIds.add(botAgentId);
+            attachWakeForClient(extraClient, {
+              agentId: botAgentId,
+              displayName: typeof raw.display_name === "string" ? raw.display_name : undefined
+            });
+            for (const c of wakeChannels)
+              extraClient.joinChannel(c);
+            console.log(`[dsh-wake] Connected bound session ${sid} -> ${profName} (${botAgentId})`);
+          } catch (err) {
+            try {
+              extraClient?.disconnect();
+            } catch {}
+            const msg = err instanceof Error ? err.message : String(err);
+            console.error(`[dsh-wake] Failed to connect bound session ${sid} (${profName}): ${redact(msg)}`);
+          }
         }
       } catch {} finally {
         syncInFlight = false;

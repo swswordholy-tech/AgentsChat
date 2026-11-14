@@ -10,7 +10,7 @@
  *   npx -y agentschat-mcp@latest --dsh --listen [--channel <id> ...] [--dsh-profile <headless>] [--auto-reply <text>]
  *   npx -y agentschat-mcp@latest --dsh --send <channel-id> --text <text>
  */
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
@@ -47,33 +47,70 @@ function has(name: string, argv: string[]): boolean {
   return argv.includes(name);
 }
 
+const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+function validateHttpOrWsUrl(raw: string, allowedProtocols: string[], label: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed || /[\x00-\x20\x7f]/.test(trimmed)) {
+    throw new Error(`Invalid ${label} URL`);
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    throw new Error(`Invalid ${label} URL`);
+  }
+  if (!allowedProtocols.includes(parsed.protocol)) {
+    throw new Error(`Unsupported ${label} protocol: ${parsed.protocol}`);
+  }
+  return trimmed;
+}
+
 export function loadDshConfig(
   env: NodeJS.ProcessEnv = process.env,
   profilePath: string = DSH_PROFILE_PATH,
 ): DshBridgeConfig {
-  let profile: Record<string, string | undefined> = {};
+  let profile: Record<string, unknown> = {};
   try {
-    if (existsSync(profilePath)) {
-      profile = JSON.parse(readFileSync(profilePath, "utf8")) as Record<string, string | undefined>;
+    const lst = lstatSync(profilePath);
+    if (!lst.isSymbolicLink() && lst.isFile() && lst.size <= 256 * 1024) {
+      const parsed = JSON.parse(readFileSync(profilePath, "utf8"));
+      if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+        profile = parsed as Record<string, unknown>;
+      }
     }
   } catch {
     profile = {};
   }
-  const agentId = env.AGENTCHAT_AGENT_ID ?? profile.agentId;
-  const token = env.AGENTCHAT_TOKEN ?? profile.token;
-  if (!agentId || !token) {
+  const rawAgentId = env.AGENTCHAT_AGENT_ID ?? (typeof profile.agentId === "string" ? profile.agentId : undefined);
+  const rawToken = env.AGENTCHAT_TOKEN ?? (typeof profile.token === "string" ? profile.token : undefined);
+  const agentId = typeof rawAgentId === "string" ? rawAgentId.trim() : "";
+  const token = typeof rawToken === "string" ? rawToken.trim() : "";
+  if (!agentId || !token || /[\x00-\x1f\x7f]/.test(agentId) || /[\x00-\x1f\x7f]/.test(token)) {
     throw new Error(
       "Missing AgentsChat identity for DSH: set AGENTCHAT_AGENT_ID and AGENTCHAT_TOKEN, " +
         `or create ${profilePath} via 'agentschat-mcp --dsh --register-only --name <name>'.`,
     );
   }
+  const wsUrl = validateHttpOrWsUrl(
+    env.AGENTCHAT_WS_URL ?? (typeof profile.wsUrl === "string" ? profile.wsUrl : DEFAULT_WS_URL),
+    ["ws:", "wss:"],
+    "AgentChat WebSocket",
+  );
+  const restUrl = validateHttpOrWsUrl(
+    env.AGENTCHAT_REST_URL ?? (typeof profile.restUrl === "string" ? profile.restUrl : DEFAULT_REST_URL),
+    ["http:", "https:"],
+    "AgentChat REST",
+  );
+  const rawDisplay = env.AGENTCHAT_DISPLAY_NAME ?? (typeof profile.displayName === "string" ? profile.displayName : undefined);
+  const rawChan = env.AGENTCHAT_CHANNEL_ID ?? (typeof profile.defaultChannelId === "string" ? profile.defaultChannelId : undefined);
   return {
     agentId,
     token,
-    wsUrl: env.AGENTCHAT_WS_URL ?? profile.wsUrl ?? DEFAULT_WS_URL,
-    restUrl: env.AGENTCHAT_REST_URL ?? profile.restUrl ?? DEFAULT_REST_URL,
-    displayName: env.AGENTCHAT_DISPLAY_NAME ?? profile.displayName,
-    defaultChannelId: env.AGENTCHAT_CHANNEL_ID ?? profile.defaultChannelId,
+    wsUrl,
+    restUrl,
+    displayName: rawDisplay?.trim() || undefined,
+    defaultChannelId: rawChan?.trim() || undefined,
   };
 }
 
@@ -89,11 +126,13 @@ export function safeDshConfig(config: DshBridgeConfig): Record<string, unknown> 
 }
 
 async function registerOnly(name: string, restUrl: string, profilePath = DSH_PROFILE_PATH): Promise<void> {
+  const safeRestUrl = validateHttpOrWsUrl(restUrl, ["http:", "https:"], "AgentChat REST");
   console.log("Terms notice: https://agents-chat.com/terms (notice only, no acceptance prompt)");
-  const res = await fetch(`${restUrl.replace(/\/$/, "")}/api/account/register`, {
+  const res = await fetch(`${safeRestUrl.replace(/\/+$/, "")}/api/account/register`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ name, type: "agent", capabilities: ["chat"] }),
+    redirect: "error",
     signal: AbortSignal.timeout(15_000),
   });
   if (!res.ok) {
@@ -101,9 +140,21 @@ async function registerOnly(name: string, restUrl: string, profilePath = DSH_PRO
     throw new Error(`Registration failed: ${res.status} ${errText}`);
   }
   const data = (await res.json()) as Record<string, unknown>;
-  const agentId = (data.agentId ?? data.agent_id ?? data.id) as string | undefined;
-  const token = (data.agentKey ?? data.token ?? data.key) as string | undefined;
-  if (!agentId || !token) throw new Error("Registration response did not include an agent id/token");
+  const rawAgentId = (data.agentId ?? data.agent_id ?? data.id) as string | undefined;
+  const rawToken = (data.agentKey ?? data.token ?? data.key) as string | undefined;
+  const agentId = typeof rawAgentId === "string" ? rawAgentId.trim() : "";
+  const token = typeof rawToken === "string" ? rawToken.trim() : "";
+  if (!agentId || !token || /[\x00-\x1f\x7f]/.test(agentId) || /[\x00-\x1f\x7f]/.test(token)) {
+    throw new Error("Registration response did not include a valid agent id/token");
+  }
+  try {
+    const lst = lstatSync(profilePath);
+    if (lst.isSymbolicLink() || !lst.isFile()) {
+      throw new Error(`Refusing to overwrite non-regular file ${profilePath}`);
+    }
+  } catch (err: any) {
+    if (err?.code !== "ENOENT") throw err;
+  }
   mkdirSync(dirname(profilePath), { recursive: true, mode: 0o700 });
   const tmp = `${profilePath}.${process.pid}.${Date.now()}.tmp`;
   try {
@@ -127,8 +178,16 @@ export async function runDshHeadlessResponder(
   prompt: string,
   opts: { dshBin?: string; dshProfile?: string; timeoutMs?: number } = {},
 ): Promise<string | null> {
-  const dshBin = opts.dshBin ?? process.env.DSH_BIN ?? "dsh";
-  const dshProfile = opts.dshProfile ?? process.env.DSH_PROFILE ?? "headless";
+  const dshBin = (opts.dshBin ?? process.env.DSH_BIN ?? "dsh").trim();
+  const dshProfile = (opts.dshProfile ?? process.env.DSH_PROFILE ?? "headless").trim();
+  if (!dshBin || /[\x00-\x1f\x7f]/.test(dshBin)) {
+    console.error("[dsh] invalid dshBin");
+    return null;
+  }
+  if (!dshProfile || dshProfile.startsWith("-") || /[\x00-\x1f\x7f]/.test(dshProfile)) {
+    console.error("[dsh] invalid dshProfile");
+    return null;
+  }
   const timeoutMs = opts.timeoutMs ?? 120_000;
 
   return new Promise((resolve) => {
@@ -320,30 +379,62 @@ DeepSeek Harness (dsh) integration for AgentsChat:
         const cfgDir = agentschatConfigDir();
         const binds = loadSessionBinds(cfgDir);
         for (const [sid, profName] of Object.entries(binds)) {
-          if (!sid.startsWith("session-") || !profName) continue;
+          if (!sid.startsWith("session-") || FORBIDDEN_KEYS.has(sid) || !profName || typeof profName !== "string") continue;
           const base = profName.replace(/\.json$/, "").replace(/[^a-zA-Z0-9_-]/g, "_");
-          const candidates = [join(cfgDir, "profiles", `${base}.json`), join(cfgDir, `${base}.json`)];
-          const profPath = candidates.find((p) => existsSync(p));
-          if (!profPath) continue;
-          const raw = JSON.parse(readFileSync(profPath, "utf8")) as Record<string, any>;
-          const botAgentId = typeof raw.agent_id === "string" ? raw.agent_id : typeof raw.agentId === "string" ? raw.agentId : "";
-          const botToken = typeof raw.token === "string" ? raw.token : "";
-          const botWsUrl = typeof raw.server === "string" && /^wss?:\/\//i.test(raw.server) ? raw.server : defaultWsUrl;
-          if (!botAgentId || !botToken || botToken === "dev-token" || connectedAgentIds.has(botAgentId)) continue;
-          connectedAgentIds.add(botAgentId);
-          const extraClient = new MuseAgentChatClient({
-            url: botWsUrl,
-            agentId: botAgentId,
-            token: botToken,
-            capabilities: ["chat"],
-          });
-          attachWakeForClient(extraClient, {
-            agentId: botAgentId,
-            displayName: typeof raw.display_name === "string" ? raw.display_name : undefined,
-          });
-          await extraClient.connect();
-          for (const c of wakeChannels) extraClient.joinChannel(c);
-          console.log(`[dsh-wake] Connected bound session ${sid} -> ${profName} (${botAgentId})`);
+          if (!base || FORBIDDEN_KEYS.has(base)) continue;
+          let extraClient: MuseAgentChatClient | null = null;
+          try {
+            const candidates = [join(cfgDir, "profiles", `${base}.json`), join(cfgDir, `${base}.json`)];
+            const profPath = candidates.find((p) => {
+              try {
+                const lst = lstatSync(p);
+                return !lst.isSymbolicLink() && lst.isFile() && lst.size <= 256 * 1024;
+              } catch {
+                return false;
+              }
+            });
+            if (!profPath) continue;
+            const raw = JSON.parse(readFileSync(profPath, "utf8")) as Record<string, any>;
+            if (raw === null || typeof raw !== "object" || Array.isArray(raw)) continue;
+            const rawAgentId = typeof raw.agent_id === "string" ? raw.agent_id : typeof raw.agentId === "string" ? raw.agentId : "";
+            const rawToken = typeof raw.token === "string" ? raw.token : "";
+            const botAgentId = rawAgentId.trim();
+            const botToken = rawToken.trim();
+            const botWsUrl =
+              typeof raw.server === "string" && /^wss?:\/\//i.test(raw.server.trim()) && !/[\x00-\x20\x7f]/.test(raw.server.trim())
+                ? raw.server.trim()
+                : defaultWsUrl;
+            if (
+              !botAgentId ||
+              !botToken ||
+              botToken === "dev-token" ||
+              /[\x00-\x1f\x7f]/.test(botAgentId) ||
+              /[\x00-\x1f\x7f]/.test(botToken) ||
+              connectedAgentIds.has(botAgentId)
+            ) {
+              continue;
+            }
+            extraClient = new MuseAgentChatClient({
+              url: botWsUrl,
+              agentId: botAgentId,
+              token: botToken,
+              capabilities: ["chat"],
+            });
+            await extraClient.connect();
+            connectedAgentIds.add(botAgentId);
+            attachWakeForClient(extraClient, {
+              agentId: botAgentId,
+              displayName: typeof raw.display_name === "string" ? raw.display_name : undefined,
+            });
+            for (const c of wakeChannels) extraClient.joinChannel(c);
+            console.log(`[dsh-wake] Connected bound session ${sid} -> ${profName} (${botAgentId})`);
+          } catch (err) {
+            try {
+              extraClient?.disconnect();
+            } catch {}
+            const msg = err instanceof Error ? err.message : String(err);
+            console.error(`[dsh-wake] Failed to connect bound session ${sid} (${profName}): ${redact(msg)}`);
+          }
         }
       } catch {} finally {
         syncInFlight = false;

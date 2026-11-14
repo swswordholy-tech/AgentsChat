@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 
@@ -10,11 +10,23 @@ export interface DshPatchOptions {
   packageSpec?: string;
 }
 
+const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
 export function resolveDshPatchPath(opts: DshPatchOptions = {}): string {
   const home = opts.dshHome ?? process.env.DSH_HOME ?? join(homedir(), ".dsh");
+  if (!home || /[\x00-\x1f\x7f]/.test(home)) {
+    throw new Error("Invalid DSH home path");
+  }
   if (opts.dshProfile !== undefined) {
     const profile = opts.dshProfile.trim();
-    if (!profile || !/^[A-Za-z0-9._-]+$/.test(profile) || profile === "." || profile === "..") {
+    if (
+      !profile ||
+      profile.length > 64 ||
+      !/^[A-Za-z0-9._-]+$/.test(profile) ||
+      profile === "." ||
+      profile.includes("..") ||
+      FORBIDDEN_KEYS.has(profile)
+    ) {
       throw new Error("Invalid DSH profile name");
     }
     return join(home, "profiles", profile, "cordis.patch.yml");
@@ -23,13 +35,42 @@ export function resolveDshPatchPath(opts: DshPatchOptions = {}): string {
 }
 
 export function buildMcpAgentsChatArgs(opts: DshPatchOptions = {}): string[] {
-  const pkg = opts.packageSpec ?? "agentschat-mcp@latest";
-  const args = ["-y", pkg];
-  if (opts.agentsChatProfile) {
-    args.push("--profile", opts.agentsChatProfile);
+  const pkg = (opts.packageSpec ?? "agentschat-mcp@latest").trim();
+  if (!pkg || pkg.startsWith("-") || /[\x00-\x20\x7f]/.test(pkg)) {
+    throw new Error("Invalid packageSpec");
   }
-  if (opts.apiUrl) {
-    args.push("--url", opts.apiUrl);
+  const args = ["-y", pkg];
+  if (opts.agentsChatProfile !== undefined && opts.agentsChatProfile !== "") {
+    const profile = opts.agentsChatProfile.trim();
+    if (
+      !profile ||
+      profile.length > 64 ||
+      profile.startsWith("-") ||
+      profile.includes("..") ||
+      profile.includes("/") ||
+      profile.includes("\\") ||
+      FORBIDDEN_KEYS.has(profile) ||
+      /[\x00-\x1f\x7f]/.test(profile)
+    ) {
+      throw new Error("Invalid AgentsChat profile name");
+    }
+    args.push("--profile", profile);
+  }
+  if (opts.apiUrl !== undefined && opts.apiUrl !== "") {
+    const rawUrl = opts.apiUrl.trim();
+    if (!rawUrl || rawUrl.startsWith("-") || /[\x00-\x20\x7f]/.test(rawUrl)) {
+      throw new Error("Invalid AgentsChat API URL");
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(rawUrl);
+    } catch {
+      throw new Error("Invalid AgentsChat API URL");
+    }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      throw new Error("Invalid AgentsChat API URL");
+    }
+    args.push("--url", rawUrl);
   }
   return args;
 }
@@ -131,17 +172,22 @@ export function applyDshCordisPatchFile(opts: DshPatchOptions = {}): {
   changed: boolean;
 } {
   const patchPath = resolveDshPatchPath(opts);
-  const existed = existsSync(patchPath);
+  let existed = false;
+  let mode = 0o600;
+  try {
+    const lst = lstatSync(patchPath);
+    if (lst.isSymbolicLink() || !lst.isFile()) {
+      throw new Error(`Refusing to modify non-regular or symlinked DSH patch file: ${patchPath}`);
+    }
+    existed = true;
+    mode = lst.mode & 0o777;
+  } catch (err: any) {
+    if (err?.code !== "ENOENT") throw err;
+  }
   const existing = existed ? readFileSync(patchPath, "utf8") : "";
   const { content, changed } = mergeDshCordisPatch(existing, opts);
   if (changed) {
     mkdirSync(dirname(patchPath), { recursive: true });
-    let mode = 0o600;
-    if (existed) {
-      try {
-        mode = statSync(patchPath).mode & 0o777;
-      } catch {}
-    }
     const tmp = `${patchPath}.${process.pid}.${Date.now()}.${++dshPatchTmpSeq}.tmp`;
     try {
       writeFileSync(tmp, content, { encoding: "utf8", mode });

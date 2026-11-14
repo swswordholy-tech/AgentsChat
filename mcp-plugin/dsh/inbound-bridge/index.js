@@ -46,11 +46,13 @@ import {
   appendFileSync,
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   readdirSync,
   renameSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -76,7 +78,57 @@ const MAX_SEEN_IDS = 200;
  * message_id, which bypass dedupe entirely — must not grow the queue forever.
  */
 const MAX_PENDING = 100;
+export const MAX_HTTP_BODY_BYTES = 64 * 1024;
 const WAKE_PATH = '/agentschat/wake';
+const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+const LOCAL_HTTP_ORIGIN_RE = /^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::(\d{1,5}))?$/i;
+const LOCAL_SCHEME_ORIGIN_RE = /^(?:app|tauri|dsh):\/\/[a-z0-9._-]+(?::(\d{1,5}))?$/i;
+let inboundTmpSeq = 0;
+
+/**
+ * Only local DSH UI origins (loopback HTTP/HTTPS or desktop webview schemes)
+ * may call this loopback bridge from a browser. External websites and
+ * sandboxed `Origin: null` frames are rejected to prevent drive-by CSRF.
+ */
+export function isAllowedLocalOrigin(origin) {
+  if (typeof origin !== 'string' || origin.length === 0 || origin.length > 128) return false;
+  if (origin === 'file://') return true;
+  const httpMatch = LOCAL_HTTP_ORIGIN_RE.exec(origin);
+  if (httpMatch) {
+    if (httpMatch[1] !== undefined) {
+      const p = Number(httpMatch[1]);
+      if (!Number.isInteger(p) || p < 1 || p > 65535) return false;
+    }
+    return true;
+  }
+  const schemeMatch = LOCAL_SCHEME_ORIGIN_RE.exec(origin);
+  if (schemeMatch) {
+    if (schemeMatch[1] !== undefined) {
+      const p = Number(schemeMatch[1]);
+      if (!Number.isInteger(p) || p < 1 || p > 65535) return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+function isSafeKey(value) {
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= 128 &&
+    !FORBIDDEN_KEYS.has(value) &&
+    !/[\x00-\x1f\x7f]/.test(value)
+  );
+}
+
+function scrubSecrets(text) {
+  if (typeof text !== 'string' || text.length === 0) return '';
+  return text
+    .replace(/Bearer\s+[^\s"',;]+/gi, 'Bearer [REDACTED]')
+    .replace(/\bac_[A-Za-z0-9_-]{8,}/g, 'ac_[REDACTED]')
+    .replace(/\bsk-[A-Za-z0-9_-]{8,}/g, 'sk-[REDACTED]');
+}
 /**
  * Identifies the code the *running* instance actually has in memory.
  *
@@ -109,45 +161,62 @@ function settleWithin(promise, ms) {
   ]).finally(() => clearTimeout(timer));
 }
 
-function log(line) {
+function writeLog(logPath, line) {
   try {
     try {
-      if (statSync(LOG_PATH).size > LOG_MAX_BYTES) writeFileSync(LOG_PATH, '');
+      const lst = lstatSync(logPath);
+      if (lst.isSymbolicLink()) return;
+      if (lst.size > LOG_MAX_BYTES) writeFileSync(logPath, '', { mode: 0o600 });
     } catch {}
-    appendFileSync(LOG_PATH, `${new Date().toISOString()} ${line}\n`);
+    mkdirSync(dirname(logPath), { recursive: true });
+    appendFileSync(logPath, `${new Date().toISOString()} ${line}\n`, { mode: 0o600 });
   } catch {}
 }
 
-/** Read the shared wake secret, creating it (0600) when absent. */
-function loadSecret() {
+/** Read the shared wake secret, creating it (0600) atomically when absent. */
+function loadSecret(secretPath, logFn) {
   try {
-    if (existsSync(SECRET_PATH)) {
-      const existing = readFileSync(SECRET_PATH, 'utf8').trim();
-      if (existing) return existing;
-    }
-    mkdirSync(dirname(SECRET_PATH), { recursive: true });
-    const secret = randomBytes(32).toString('hex');
-    writeFileSync(SECRET_PATH, `${secret}\n`, { mode: 0o600 });
     try {
-      chmodSync(SECRET_PATH, 0o600);
-    } catch (error) {
-      log(`WARNING: could not chmod ${SECRET_PATH}: ${error?.message ?? error}`);
+      const lst = lstatSync(secretPath);
+      if (lst.isSymbolicLink() || !lst.isFile()) {
+        logFn(`refusing non-regular wake secret path: ${secretPath}`);
+        return undefined;
+      }
+      const existing = readFileSync(secretPath, 'utf8').trim();
+      if (existing) return existing;
+    } catch (err) {
+      if (err?.code !== 'ENOENT') throw err;
+    }
+    mkdirSync(dirname(secretPath), { recursive: true, mode: 0o700 });
+    const secret = randomBytes(32).toString('hex');
+    const tmp = `${secretPath}.${process.pid}.${Date.now()}.${++inboundTmpSeq}.tmp`;
+    try {
+      writeFileSync(tmp, `${secret}\n`, { mode: 0o600 });
+      renameSync(tmp, secretPath);
+      try {
+        chmodSync(secretPath, 0o600);
+      } catch (error) {
+        logFn(`WARNING: could not chmod ${secretPath}: ${error?.message ?? error}`);
+      }
+    } catch (err) {
+      try {
+        unlinkSync(tmp);
+      } catch {}
+      throw err;
     }
     return secret;
   } catch (error) {
-    log(`cannot load wake secret: ${error?.message ?? error}`);
+    logFn(`cannot load wake secret: ${error?.message ?? error}`);
     return undefined;
   }
 }
 
-function verifySignature(body, sigHex, secret) {
+export function verifySignature(body, sigHex, secret) {
+  if (typeof body !== 'string' || typeof secret !== 'string' || secret.length === 0) return false;
   if (typeof sigHex !== 'string' || sigHex.length === 0) return false;
-  let received;
-  try {
-    received = Buffer.from(sigHex, 'hex');
-  } catch {
-    return false;
-  }
+  const normalized = sigHex.startsWith('sha256=') ? sigHex.slice(7) : sigHex;
+  if (!/^[0-9a-f]{64}$/i.test(normalized)) return false;
+  const received = Buffer.from(normalized, 'hex');
   const expected = createHmac('sha256', secret).update(body, 'utf8').digest();
   return received.length === expected.length && timingSafeEqual(received, expected);
 }
@@ -172,40 +241,45 @@ function renderInbound(payload) {
     .join('\n');
 }
 
-const seen = [];
-const seenSet = new Set();
-
-/** Deduplicate wake retries by message_id; bounded memory. */
-function firstDelivery(payload) {
-  const id = typeof payload.message_id === 'string' ? payload.message_id : undefined;
-  if (!id) return true;
-  if (seenSet.has(id)) return false;
-  seenSet.add(id);
-  seen.push(id);
-  if (seen.length > MAX_SEEN_IDS) {
-    const evicted = seen.shift();
-    if (evicted !== undefined) seenSet.delete(evicted);
-  }
-  return true;
-}
-
-/**
- * Release a claim taken by firstDelivery() after a delivery that never landed.
- *
- * The claim happens *before* the attempt (so a retry storm cannot double-queue),
- * which means a wake that fails to splice has to be un-claimed here — otherwise
- * the daemon's next attempt is swallowed as a duplicate and the message is lost
- * for good.
- */
-function forgetDelivery(payload) {
-  const id = typeof payload.message_id === 'string' ? payload.message_id : undefined;
-  if (!id || !seenSet.delete(id)) return;
-  const index = seen.indexOf(id);
-  if (index >= 0) seen.splice(index, 1);
-}
-
 export function apply(ctx, config = {}) {
-  const port = Number(config.port ?? 8799);
+  const rawPort = Number(config.port ?? 8799);
+  const requestedPort = Number.isInteger(rawPort) && rawPort >= 0 && rawPort <= 65535 ? rawPort : 8799;
+  let boundPort = requestedPort;
+  const agentschatDir = config.agentschatDir ?? AGENTSCHAT_DIR;
+  const profilesDir = join(agentschatDir, 'profiles');
+  const bindsPath = join(agentschatDir, 'session-binds.json');
+  const secretPath = config.secretPath ?? (config.agentschatDir ? join(agentschatDir, 'dsh-inbound.secret') : SECRET_PATH);
+  const queuePath = config.queuePath ?? (config.agentschatDir ? join(agentschatDir, 'dsh-wake-queue.jsonl') : QUEUE_PATH);
+  const logPath = config.logPath ?? LOG_PATH;
+  const log = (line) => writeLog(logPath, line);
+
+  const seen = [];
+  const seenSet = new Set();
+
+  /** Deduplicate wake retries by message_id; bounded memory per plugin instance. */
+  function firstDelivery(payload) {
+    const id = typeof payload.message_id === 'string' ? payload.message_id : undefined;
+    if (!id) return true;
+    if (seenSet.has(id)) return false;
+    seenSet.add(id);
+    seen.push(id);
+    if (seen.length > MAX_SEEN_IDS) {
+      const evicted = seen.shift();
+      if (evicted !== undefined) seenSet.delete(evicted);
+    }
+    return true;
+  }
+
+  /**
+   * Release a claim taken by firstDelivery() after a delivery that never landed.
+   */
+  function forgetDelivery(payload) {
+    const id = typeof payload.message_id === 'string' ? payload.message_id : undefined;
+    if (!id || !seenSet.delete(id)) return;
+    const index = seen.indexOf(id);
+    if (index >= 0) seen.splice(index, 1);
+  }
+
   // When installed as the published `agentschat-mcp` DSH bundle, `../../dist/dsh.js`
   // sits right inside the package so the wake daemon starts zero-config. Machine-local
   // copies (`~/.dsh/plugins/...`) lack `../../dist/dsh.js` and fall back to config/env.
@@ -223,7 +297,7 @@ export function apply(ctx, config = {}) {
   const retryMs = Number(config.retryMs ?? DEFAULT_RETRY_MS);
   const flushTimeoutMs = Number(config.flushTimeoutMs ?? DEFAULT_FLUSH_TIMEOUT_MS);
 
-  const secret = loadSecret();
+  const secret = loadSecret(secretPath, log);
   if (secret === undefined) {
     log('not starting: no wake secret');
     return;
@@ -416,7 +490,7 @@ export function apply(ctx, config = {}) {
    */
   function listProfiles() {
     const out = [];
-    const seen = new Set();
+    const seenNames = new Set();
     const scan = (dir) => {
       let files;
       try {
@@ -426,32 +500,45 @@ export function apply(ctx, config = {}) {
       }
       for (const file of files) {
         const name = file.replace(/\.json$/, '');
-        if (seen.has(name)) continue;
+        if (!isSafeKey(name) || seenNames.has(name)) continue;
         const path = join(dir, file);
         try {
+          const lst = lstatSync(path);
+          if (lst.isSymbolicLink() || !lst.isFile() || lst.size > 256 * 1024) continue;
           const parsed = JSON.parse(readFileSync(path, 'utf8'));
-          const agentId = typeof parsed.agent_id === 'string' ? parsed.agent_id : '';
-          if (!agentId) continue;
-          seen.add(name);
+          if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
+          const agentId = typeof parsed.agent_id === 'string' ? parsed.agent_id.trim() : '';
+          if (!agentId || /[\x00-\x1f\x7f]/.test(agentId)) continue;
+          seenNames.add(name);
           out.push({
             name,
             agentId,
             displayName: typeof parsed.display_name === 'string' ? parsed.display_name : undefined,
-            mtime: statSync(path).mtimeMs,
+            mtime: lst.mtimeMs,
           });
         } catch {}
       }
     };
-    scan(PROFILES_DIR);
-    scan(AGENTSCHAT_DIR);
+    scan(profilesDir);
+    scan(agentschatDir);
     out.sort((a, b) => b.mtime - a.mtime);
     return out;
   }
 
   function readBinds() {
     try {
-      const parsed = JSON.parse(readFileSync(BINDS_PATH, 'utf8'));
-      return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+      const lst = lstatSync(bindsPath);
+      if (lst.isSymbolicLink() || !lst.isFile() || lst.size > 256 * 1024) return {};
+      const parsed = JSON.parse(readFileSync(bindsPath, 'utf8'));
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+      const clean = {};
+      for (const [k, v] of Object.entries(parsed)) {
+        if (!isSafeKey(k) || typeof v !== 'string') continue;
+        const trimmed = v.trim();
+        if (!isSafeKey(trimmed)) continue;
+        clean[k] = trimmed;
+      }
+      return clean;
     } catch {
       return {};
     }
@@ -459,40 +546,85 @@ export function apply(ctx, config = {}) {
 
   /** Same shape the MCP server reads: `{ [sessionId]: profileName }`. */
   function writeBinds(binds) {
-    mkdirSync(AGENTSCHAT_DIR, { recursive: true });
-    const tmp = `${BINDS_PATH}.${process.pid}.tmp`;
-    writeFileSync(tmp, JSON.stringify(binds, null, 2));
-    renameSync(tmp, BINDS_PATH);
+    try {
+      const lst = lstatSync(bindsPath);
+      if (lst.isSymbolicLink() || !lst.isFile()) {
+        throw new Error(`Refusing to overwrite non-regular session-binds path: ${bindsPath}`);
+      }
+    } catch (err) {
+      if (err?.code !== 'ENOENT') throw err;
+    }
+    mkdirSync(agentschatDir, { recursive: true, mode: 0o700 });
+    const tmp = `${bindsPath}.${process.pid}.${Date.now()}.${++inboundTmpSeq}.tmp`;
+    try {
+      writeFileSync(tmp, `${JSON.stringify(binds, null, 2)}\n`, { mode: 0o600 });
+      renameSync(tmp, bindsPath);
+      try {
+        chmodSync(bindsPath, 0o600);
+      } catch {}
+    } catch (err) {
+      try {
+        unlinkSync(tmp);
+      } catch {}
+      throw err;
+    }
   }
 
-  function sendJson(res, status, value) {
-    res.writeHead(status, {
-      'content-type': 'application/json',
-      'access-control-allow-origin': '*',
+  function buildCorsHeaders(origin) {
+    if (typeof origin !== 'string' || !isAllowedLocalOrigin(origin)) return {};
+    return {
+      'access-control-allow-origin': origin,
       'access-control-allow-methods': 'GET, POST, OPTIONS',
       'access-control-allow-headers': 'content-type',
+      vary: 'Origin',
+    };
+  }
+
+  function sendJson(res, status, value, corsHeaders = {}) {
+    res.writeHead(status, {
+      'content-type': 'application/json',
+      ...corsHeaders,
     });
     res.end(JSON.stringify(value));
   }
 
-  /** Read a bounded JSON body; the endpoint is loopback-only and unauthenticated. */
-  function readJsonBody(req, res, onBody) {
+  /** Read a bounded UTF-8 request body; rejects payloads above `MAX_HTTP_BODY_BYTES` with 413. */
+  function readBoundedBody(req, res, corsHeaders, onText) {
     const chunks = [];
     let size = 0;
+    let settled = false;
     req.on('data', (chunk) => {
+      if (settled) return;
       size += chunk.length;
-      if (size > 64 * 1024) {
+      if (size > MAX_HTTP_BODY_BYTES) {
+        settled = true;
+        if (!res.headersSent) {
+          res.writeHead(413, { 'content-type': 'application/json', ...corsHeaders });
+          res.end(JSON.stringify({ ok: false, error: 'payload too large' }));
+        }
         req.destroy();
         return;
       }
       chunks.push(chunk);
     });
+    req.on('error', () => {
+      settled = true;
+    });
     req.on('end', () => {
+      if (settled) return;
+      settled = true;
+      onText(Buffer.concat(chunks).toString('utf8'));
+    });
+  }
+
+  /** Read a bounded JSON body; the endpoint is loopback-only and unauthenticated. */
+  function readJsonBody(req, res, corsHeaders, onBody) {
+    readBoundedBody(req, res, corsHeaders, (rawText) => {
       let parsed;
       try {
-        parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        parsed = JSON.parse(rawText);
       } catch {
-        sendJson(res, 400, { ok: false, error: 'invalid JSON' });
+        sendJson(res, 400, { ok: false, error: 'invalid JSON' }, corsHeaders);
         return;
       }
       onBody(parsed);
@@ -500,12 +632,21 @@ export function apply(ctx, config = {}) {
   }
 
   const server = createServer((req, res) => {
+    const originHeader = req.headers.origin;
+    if (originHeader !== undefined && (typeof originHeader !== 'string' || !isAllowedLocalOrigin(originHeader))) {
+      log(`rejected cross-origin request from origin=${String(originHeader).slice(0, 120)}`);
+      res.writeHead(403, { 'content-type': 'text/plain' });
+      res.end('forbidden');
+      return;
+    }
+    const corsHeaders = buildCorsHeaders(originHeader);
+
     if (req.method === 'OPTIONS') {
-      res.writeHead(204, {
-        'access-control-allow-origin': '*',
-        'access-control-allow-methods': 'GET, POST, OPTIONS',
-        'access-control-allow-headers': 'content-type',
-      });
+      const preflightHeaders = { ...corsHeaders };
+      if (req.headers['access-control-request-private-network'] === 'true' && typeof originHeader === 'string') {
+        preflightHeaders['access-control-allow-private-network'] = 'true';
+      }
+      res.writeHead(204, preflightHeaders);
       res.end();
       return;
     }
@@ -515,15 +656,15 @@ export function apply(ctx, config = {}) {
     // no separate storage — and the next tool call from this session picks the
     // identity up without a restart.
     if (req.method === 'GET' && req.url === '/identity') {
-      sendJson(res, 200, { ok: true, build: BUILD, profiles: listProfiles(), binds: readBinds() });
+      sendJson(res, 200, { ok: true, build: BUILD, profiles: listProfiles(), binds: readBinds() }, corsHeaders);
       return;
     }
     if (req.method === 'POST' && req.url === '/identity/bind') {
-      readJsonBody(req, res, (body) => {
+      readJsonBody(req, res, corsHeaders, (body) => {
         const sessionId = typeof body?.sessionId === 'string' ? body.sessionId.trim() : '';
         const profileName = typeof body?.profileName === 'string' ? body.profileName.trim() : '';
-        if (!sessionId || !listProfiles().some((entry) => entry.name === profileName)) {
-          sendJson(res, 400, { ok: false, error: 'sessionId and a known profileName are required' });
+        if (!isSafeKey(sessionId) || !isSafeKey(profileName) || !listProfiles().some((entry) => entry.name === profileName)) {
+          sendJson(res, 400, { ok: false, error: 'sessionId and a known profileName are required' }, corsHeaders);
           return;
         }
         const binds = readBinds();
@@ -531,11 +672,11 @@ export function apply(ctx, config = {}) {
         try {
           writeBinds(binds);
         } catch (error) {
-          sendJson(res, 500, { ok: false, error: String(error?.message ?? error) });
+          sendJson(res, 500, { ok: false, error: scrubSecrets(String(error?.message ?? error)) }, corsHeaders);
           return;
         }
         log(`identity bound: ${sessionId} -> ${profileName}`);
-        sendJson(res, 200, { ok: true, binds });
+        sendJson(res, 200, { ok: true, binds }, corsHeaders);
       });
       return;
     }
@@ -543,31 +684,50 @@ export function apply(ctx, config = {}) {
     // carries whatever failed. Without it a blank UI is indistinguishable from a
     // module that never loaded.
     if (req.method === 'POST' && req.url === '/identity/alive') {
-      readJsonBody(req, res, (body) => {
-        log(`client-alive ${JSON.stringify(body)}`);
-        sendJson(res, 200, { ok: true, build: BUILD });
+      readJsonBody(req, res, corsHeaders, (body) => {
+        log(`client-alive ${scrubSecrets(JSON.stringify(body).slice(0, 512))}`);
+        sendJson(res, 200, { ok: true, build: BUILD }, corsHeaders);
       });
       return;
     }
     if (req.method === 'POST' && req.url === '/identity/create') {
-      readJsonBody(req, res, async (body) => {
-        const sessionId = typeof body?.sessionId === 'string' ? body.sessionId.trim() : '';
+      readJsonBody(req, res, corsHeaders, async (body) => {
+        const rawSessionId = typeof body?.sessionId === 'string' ? body.sessionId.trim() : '';
+        if (rawSessionId && !isSafeKey(rawSessionId)) {
+          sendJson(res, 400, { ok: false, error: 'invalid sessionId' }, corsHeaders);
+          return;
+        }
+        const sessionId = rawSessionId;
         const rawName = typeof body?.name === 'string' && body.name.trim()
-          ? body.name.trim().slice(0, 48)
+          ? body.name.trim().replace(/[\x00-\x1f\x7f]/g, '').slice(0, 48)
           : `DSH_${sessionId ? sessionId.replace(/^session-/, '').slice(0, 6) : randomBytes(3).toString('hex')}`;
-        const baseName = rawName.replace(/[^a-zA-Z0-9_-]/g, '_').replace(/^_+|_+$/g, '') || `DSH_${randomBytes(3).toString('hex')}`;
+        const sanitizedBase = rawName.replace(/[^a-zA-Z0-9_-]/g, '_').replace(/^_+|_+$/g, '');
+        const baseName = isSafeKey(sanitizedBase) ? sanitizedBase : `DSH_${randomBytes(3).toString('hex')}`;
         let profileName = baseName;
         let suffix = 2;
-        mkdirSync(PROFILES_DIR, { recursive: true });
-        while (existsSync(join(PROFILES_DIR, `${profileName}.json`)) || existsSync(join(AGENTSCHAT_DIR, `${profileName}.json`))) {
+        mkdirSync(profilesDir, { recursive: true, mode: 0o700 });
+        while (existsSync(join(profilesDir, `${profileName}.json`)) || existsSync(join(agentschatDir, `${profileName}.json`))) {
           profileName = `${baseName}_${suffix++}`;
         }
-        const restBase = (
+        const restBase = String(
           config.apiUrl ??
           process.env.AGENTCHAT_REST_URL ??
           process.env.AGENTSCHAT_API_URL ??
-          'https://agents-chat.com'
-        ).replace(/\/+$/, '');
+          'https://agents-chat.com',
+        )
+          .trim()
+          .replace(/\/+$/, '');
+        let parsedRest;
+        try {
+          parsedRest = new URL(restBase);
+        } catch {
+          sendJson(res, 400, { ok: false, error: 'invalid API URL' }, corsHeaders);
+          return;
+        }
+        if (parsedRest.protocol !== 'http:' && parsedRest.protocol !== 'https:') {
+          sendJson(res, 400, { ok: false, error: 'unsupported API URL protocol' }, corsHeaders);
+          return;
+        }
         const wsUrl =
           process.env.AGENTCHAT_WS_URL ??
           `${restBase.replace(/^https:\/\//i, 'wss://').replace(/^http:\/\//i, 'ws://')}/ws`;
@@ -580,20 +740,33 @@ export function apply(ctx, config = {}) {
               type: 'agent',
               capabilities: ['dsh', 'coding', 'chat'],
             }),
+            redirect: 'error',
+            signal: AbortSignal.timeout(15_000),
           });
           if (!regRes.ok) {
-            const errText = (await regRes.text()).slice(0, 200);
-            sendJson(res, 502, { ok: false, error: `register HTTP ${regRes.status}: ${errText}` });
+            const errText = scrubSecrets((await regRes.text().catch(() => '')).slice(0, 200));
+            sendJson(res, 502, { ok: false, error: `register HTTP ${regRes.status}: ${errText}` }, corsHeaders);
             return;
           }
           const data = await regRes.json();
-          const agentId = data.agentId ?? data.agent_id ?? data.id;
-          const token = data.agentKey ?? data.token ?? data.key;
-          if (typeof agentId !== 'string' || !agentId || typeof token !== 'string' || !token) {
-            sendJson(res, 502, { ok: false, error: 'register response missing agent_id/token' });
+          const rawAgentId = data?.agentId ?? data?.agent_id ?? data?.id;
+          const rawToken = data?.agentKey ?? data?.token ?? data?.key;
+          const agentId = typeof rawAgentId === 'string' ? rawAgentId.trim() : '';
+          const token = typeof rawToken === 'string' ? rawToken.trim() : '';
+          if (!agentId || !token || /[\x00-\x1f\x7f]/.test(agentId) || /[\x00-\x1f\x7f]/.test(token)) {
+            sendJson(res, 502, { ok: false, error: 'register response missing agent_id/token' }, corsHeaders);
             return;
           }
-          const profilePath = join(PROFILES_DIR, `${profileName}.json`);
+          const profilePath = join(profilesDir, `${profileName}.json`);
+          try {
+            const lst = lstatSync(profilePath);
+            if (lst.isSymbolicLink() || !lst.isFile()) {
+              sendJson(res, 500, { ok: false, error: 'refusing non-regular profile path' }, corsHeaders);
+              return;
+            }
+          } catch (err) {
+            if (err?.code !== 'ENOENT') throw err;
+          }
           const record = {
             name: profileName,
             display_name: rawName,
@@ -603,33 +776,47 @@ export function apply(ctx, config = {}) {
             api_url: restBase,
             created_at: new Date().toISOString(),
           };
-          writeFileSync(profilePath, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+          const tmp = `${profilePath}.${process.pid}.${Date.now()}.${++inboundTmpSeq}.tmp`;
           try {
-            chmodSync(profilePath, 0o600);
-          } catch {}
+            writeFileSync(tmp, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+            renameSync(tmp, profilePath);
+            try {
+              chmodSync(profilePath, 0o600);
+            } catch {}
+          } catch (err) {
+            try {
+              unlinkSync(tmp);
+            } catch {}
+            throw err;
+          }
           const binds = readBinds();
           if (sessionId) {
             binds[sessionId] = profileName;
             writeBinds(binds);
           }
           log(`identity created: ${profileName} (${agentId})${sessionId ? ` bound to ${sessionId}` : ''}`);
-          sendJson(res, 200, {
-            ok: true,
-            profile: { name: profileName, agentId, displayName: rawName },
-            profiles: listProfiles(),
-            binds,
-          });
+          sendJson(
+            res,
+            200,
+            {
+              ok: true,
+              profile: { name: profileName, agentId, displayName: rawName },
+              profiles: listProfiles(),
+              binds,
+            },
+            corsHeaders,
+          );
         } catch (error) {
-          sendJson(res, 500, { ok: false, error: String(error?.message ?? error) });
+          sendJson(res, 500, { ok: false, error: scrubSecrets(String(error?.message ?? error)) }, corsHeaders);
         }
       });
       return;
     }
     if (req.method === 'POST' && req.url === '/identity/unbind') {
-      readJsonBody(req, res, (body) => {
+      readJsonBody(req, res, corsHeaders, (body) => {
         const sessionId = typeof body?.sessionId === 'string' ? body.sessionId.trim() : '';
-        if (!sessionId) {
-          sendJson(res, 400, { ok: false, error: 'sessionId required' });
+        if (!isSafeKey(sessionId)) {
+          sendJson(res, 400, { ok: false, error: 'sessionId required' }, corsHeaders);
           return;
         }
         const binds = readBinds();
@@ -637,17 +824,17 @@ export function apply(ctx, config = {}) {
         try {
           writeBinds(binds);
         } catch (error) {
-          sendJson(res, 500, { ok: false, error: String(error?.message ?? error) });
+          sendJson(res, 500, { ok: false, error: scrubSecrets(String(error?.message ?? error)) }, corsHeaders);
           return;
         }
         log(`identity unbound: ${sessionId}`);
-        sendJson(res, 200, { ok: true, binds });
+        sendJson(res, 200, { ok: true, binds }, corsHeaders);
       });
       return;
     }
     if (req.method === 'GET' && (req.url === '/health' || req.url === '/selftest')) {
       const roots = rootStatuses();
-      res.writeHead(200, { 'content-type': 'application/json' });
+      res.writeHead(200, { 'content-type': 'application/json', ...corsHeaders });
       if (req.url === '/health') {
         // `build` is the only way to tell which file:// version is actually in
         // memory; `agents` is kept for scripts that predate `roots`.
@@ -656,7 +843,7 @@ export function apply(ctx, config = {}) {
             ok: true,
             plugin: name,
             build: BUILD,
-            port,
+            port: boundPort,
             agents: roots.map((root) => root.id),
             roots,
             daemon: daemon !== undefined,
@@ -701,18 +888,15 @@ export function apply(ctx, config = {}) {
       return;
     }
     if (req.method !== 'POST' || req.url !== WAKE_PATH) {
-      res.writeHead(404, { 'content-type': 'text/plain' });
+      res.writeHead(404, { 'content-type': 'text/plain', ...corsHeaders });
       res.end('not found');
       return;
     }
-    const chunks = [];
-    req.on('data', (chunk) => chunks.push(chunk));
-    req.on('end', () => {
-      const body = Buffer.concat(chunks).toString('utf8');
+    readBoundedBody(req, res, corsHeaders, (body) => {
       const signature = req.headers['x-agentschat-signature'];
       if (!verifySignature(body, typeof signature === 'string' ? signature : '', secret)) {
         log('rejected wake: bad or missing signature');
-        res.writeHead(403, { 'content-type': 'text/plain' });
+        res.writeHead(403, { 'content-type': 'text/plain', ...corsHeaders });
         res.end('forbidden');
         return;
       }
@@ -721,11 +905,11 @@ export function apply(ctx, config = {}) {
         payload = JSON.parse(body);
       } catch (error) {
         log(`rejected wake: invalid JSON (${error?.message ?? error})`);
-        res.writeHead(400, { 'content-type': 'text/plain' });
+        res.writeHead(400, { 'content-type': 'text/plain', ...corsHeaders });
         res.end('bad request');
         return;
       }
-      res.writeHead(200, { 'content-type': 'application/json' });
+      res.writeHead(200, { 'content-type': 'application/json', ...corsHeaders });
       res.end('{"ok":true}');
       inject(payload).catch((error) => log(`inject failed: ${error?.message ?? error}`));
     });
@@ -736,8 +920,17 @@ export function apply(ctx, config = {}) {
     // to whatever else happens to own the port.
     log('not starting the wake daemon: the endpoint is not ours');
   });
-  server.listen(port, '127.0.0.1', () => {
-    log(`listening on http://127.0.0.1:${port}${WAKE_PATH} (health: /health, selftest: /selftest, build: ${BUILD})`);
+  server.listen(requestedPort, '127.0.0.1', () => {
+    const addr = server.address();
+    if (addr && typeof addr === 'object' && typeof addr.port === 'number') {
+      boundPort = addr.port;
+    }
+    log(`listening on http://127.0.0.1:${boundPort}${WAKE_PATH} (health: /health, selftest: /selftest, build: ${BUILD})`);
+    if (typeof config.onListening === 'function') {
+      try {
+        config.onListening({ port: boundPort });
+      } catch {}
+    }
     startDaemon();
   });
 
@@ -751,9 +944,9 @@ export function apply(ctx, config = {}) {
     for (const channel of channels) args.push('--channel', channel);
     const env = {
       ...process.env,
-      DSH_WAKE_URL: `http://127.0.0.1:${port}${WAKE_PATH}`,
+      DSH_WAKE_URL: `http://127.0.0.1:${boundPort}${WAKE_PATH}`,
       DSH_WAKE_SECRET: secret,
-      DSH_WAKE_QUEUE: QUEUE_PATH,
+      DSH_WAKE_QUEUE: queuePath,
     };
     log(`starting wake daemon: ${nodeBin} ${args.join(' ')}`);
     daemon = spawn(nodeBin, args, { env, stdio: ['ignore', 'pipe', 'pipe'] });
