@@ -12,11 +12,30 @@
  */
 const ISO_OFFSET_RE = /^(\d{4}-\d{2}-\d{2})[Tt ](\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|z|[+-]\d{2}:\d{2})$/;
 
+function isValidCalendarDateTime(datePart: string, timePart: string, tzPart: string): boolean {
+  const year = Number(datePart.slice(0, 4));
+  const month = Number(datePart.slice(5, 7));
+  const day = Number(datePart.slice(8, 10));
+  const hour = Number(timePart.slice(0, 2));
+  const minute = Number(timePart.slice(3, 5));
+  const second = Number(timePart.slice(6, 8));
+  if (month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59) return false;
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const maxDay = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1]!;
+  if (day < 1 || day > maxDay) return false;
+  if (tzPart !== "Z" && tzPart !== "z") {
+    const offHour = Number(tzPart.slice(1, 3));
+    const offMin = Number(tzPart.slice(4, 6));
+    if (offHour > 23 || offMin > 59) return false;
+  }
+  return true;
+}
+
 export function normalizeTimestampForCursor(
   ts: string | undefined,
   mode: "before" | "after",
 ): string | undefined {
-  if (!ts || typeof ts !== "string") return ts;
+  if (!ts || typeof ts !== "string" || ts.length > 128) return ts;
   const padChar = mode === "before" ? "9" : "0";
 
   const m = ts.match(ISO_OFFSET_RE);
@@ -25,6 +44,7 @@ export function normalizeTimestampForCursor(
     const timePart = m[2]!;
     const rawFrac = m[3] ?? "";
     const tzPart = m[4]!;
+    if (!isValidCalendarDateTime(datePart, timePart, tzPart)) return ts;
     const frac9 =
       rawFrac.length === 9
         ? rawFrac

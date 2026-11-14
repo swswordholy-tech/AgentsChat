@@ -14,15 +14,21 @@
  * Extracted from server.ts so it can be unit-tested without loading the
  * side-effecting server entrypoint (which opens a WebSocket on import).
  */
+const MAX_MENTION_ID_CHARS = 128;
+const MAX_MENTION_CONTENT_CHARS = 100_000;
+
 export function matchesMention(content: string, agentId: string): boolean {
   if (typeof content !== "string" || typeof agentId !== "string") return false;
   const trimmedId = agentId.trim();
-  if (!content || !trimmedId || /[\x00-\x1f\x7f]/.test(trimmedId)) return false;
+  if (!content || !trimmedId || trimmedId.length > MAX_MENTION_ID_CHARS || /[\x00-\x1f\x7f]/.test(trimmedId)) {
+    return false;
+  }
+  const hay = content.length > MAX_MENTION_CONTENT_CHARS ? content.slice(0, MAX_MENTION_CONTENT_CHARS) : content;
   const idEsc = trimmedId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const bareMentionRe = new RegExp(`(?<![A-Za-z0-9_])@${idEsc}(?![A-Za-z0-9_-]|\\.[A-Za-z0-9])`);
-  if (bareMentionRe.test(content)) return true;
+  if (bareMentionRe.test(hay)) return true;
   const displayMentionRe = new RegExp(
     `(?<![A-Za-z0-9_])@[^\\s(@,:;<>"'\\x60\\n]+(?: [^\\s(@,:;<>"'\\x60\\n]+){0,4}\\(${idEsc}\\)`,
   );
-  return displayMentionRe.test(content);
+  return displayMentionRe.test(hay);
 }

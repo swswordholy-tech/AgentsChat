@@ -53,3 +53,17 @@ test("normalizes numeric timezone offsets, lowercase z, and >9 fractional digits
     "2026-04-15T10:00:00.123456789Z",
   );
 });
+
+test("Campaign #112 KR3: rejects impossible calendar dates, rollover dates, and >23:59 offsets without fabricating UTC cursors", () => {
+  for (const bad of [
+    "2026-99-99T99:99:99Z",
+    "2026-02-30T10:00:00Z",
+    "2025-02-29T10:00:00Z",
+    "2026-02-31T10:00:00+08:00",
+    "2026-04-15T24:00:00Z",
+    "2026-04-15T10:00:00+25:00",
+  ]) {
+    expect(normalizeTimestampForCursor(bad, "after")).toBe(bad);
+  }
+  expect(normalizeTimestampForCursor("2024-02-29T12:00:00Z", "after")).toBe("2024-02-29T12:00:00.000000000Z");
+});

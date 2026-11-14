@@ -7,10 +7,23 @@
  * key derivation and the bounded eviction can be unit-tested directly.
  */
 
+const MAX_DEDUP_ID_CHARS = 256;
+const MAX_DEDUP_KEY_CHARS = 1024;
+const MAX_DEDUP_CAPACITY = 1_000_000;
+
 /** Stable identity for a message frame, or null if it lacks string id/channel. */
 export function messageDedupKey(data: any): string | null {
   if (!data || typeof data.id !== "string" || typeof data.channel_id !== "string") return null;
-  if (!data.id.trim() || !data.channel_id.trim()) return null;
+  if (
+    !data.id.trim() ||
+    !data.channel_id.trim() ||
+    data.id.length > MAX_DEDUP_ID_CHARS ||
+    data.channel_id.length > MAX_DEDUP_ID_CHARS ||
+    /[\x00-\x1f\x7f]/.test(data.id) ||
+    /[\x00-\x1f\x7f]/.test(data.channel_id)
+  ) {
+    return null;
+  }
   const safeChannel = data.channel_id.replace(/\\/g, "\\\\").replace(/:/g, "\\:");
   return `${safeChannel}:${data.id}`;
 }
@@ -26,7 +39,7 @@ export class MessageDedup {
     /** How many oldest keys to drop on eviction (Set preserves insertion order). */
     dropOnEvict: number = 1000,
   ) {
-    const safeMax = Number.isFinite(max) ? Math.max(1, Math.floor(max)) : 5000;
+    const safeMax = Number.isFinite(max) ? Math.min(MAX_DEDUP_CAPACITY, Math.max(1, Math.floor(max))) : 5000;
     const safeDrop = Number.isFinite(dropOnEvict)
       ? Math.min(safeMax, Math.max(1, Math.floor(dropOnEvict)))
       : Math.min(safeMax, 1000);
@@ -36,7 +49,9 @@ export class MessageDedup {
 
   /** Returns true if `key` was already delivered (skip), false if newly recorded. */
   recordOrSkip(key: string): boolean {
-    if (typeof key !== "string" || key.length === 0) return false;
+    if (typeof key !== "string" || key.length === 0 || key.length > MAX_DEDUP_KEY_CHARS || /[\x00-\x1f\x7f]/.test(key)) {
+      return false;
+    }
     if (this.seen.has(key)) return true;
     this.seen.add(key);
     if (this.seen.size > this.max) {

@@ -55,3 +55,15 @@ test("MessageDedup clamps invalid constructor bounds so overflow always evicts",
   expect(d.size).toBe(2);
   expect(d.recordOrSkip("a")).toBe(false);
 });
+
+test("Campaign #112 KR3: rejects control chars and oversized IDs/keys and caps max capacity", () => {
+  expect(messageDedupKey({ channel_id: "room\n1", id: "m-1" })).toBeNull();
+  expect(messageDedupKey({ channel_id: "room-1", id: "m\x001" })).toBeNull();
+  expect(messageDedupKey({ channel_id: "r".repeat(257), id: "m-1" })).toBeNull();
+  expect(messageDedupKey({ channel_id: "room-1", id: "m".repeat(257) })).toBeNull();
+
+  const d = new MessageDedup(999_999_999, 10);
+  expect(d.recordOrSkip("bad\nkey")).toBe(false);
+  expect(d.recordOrSkip("k".repeat(1025))).toBe(false);
+  expect(d.size).toBe(0);
+});

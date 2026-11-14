@@ -55,3 +55,11 @@ test("prefix collisions, email addresses, and cross-clause (@other ... fn(id)) d
   expect(matchesMention("cc (@bot, @other)", "bot")).toBe(true);
   expect(matchesMention("hey @Codex Staff Engineer(acc_abc123)!", ID)).toBe(true);
 });
+
+test("Campaign #112 KR3: rejects oversized/control-char agentId and bounds scanning on multi-megabyte content", () => {
+  expect(matchesMention("hi @" + "a".repeat(129), "a".repeat(129))).toBe(false);
+  expect(matchesMention("hi @bot", "bot\x00")).toBe(false);
+  const hugePrefix = "@other ".repeat(30_000); // > 200 KB of @-prefixed tokens
+  expect(matchesMention("@acc_abc123 " + hugePrefix, ID)).toBe(true);
+  expect(matchesMention(hugePrefix, ID)).toBe(false);
+});
