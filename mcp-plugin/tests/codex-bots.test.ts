@@ -268,3 +268,112 @@ test("registry checks directory leaves before default creation and canonicalizes
   expect(loadBots(file,home)[0]!.cwd).toBe(realpathSync(join(outside,"project")));
  } finally {rmSync(home,{recursive:true,force:true});}
 });
+
+test("manager save rechecks directory and destination after temporary write", () => {
+ for (const kind of ["file-link","file-directory","root-link"]) {
+  const home=mkdtempSync(join(tmpdir(),"bots-save-race-")),root=join(home,"root"),moved=join(home,"moved"),outside=join(home,"outside");
+  mkdirSync(root);writeFileSync(outside,"untouched");
+  const original=fs.writeFileSync;
+  const spy=spyOn(fs,"writeFileSync").mockImplementation(((path:any,data:any,options:any)=>{
+   const result=original(path,data,options);
+   if(String(path).endsWith(".tmp")) {
+    if(kind==="root-link") {fs.renameSync(root,moved);symlinkSync(moved,root);}
+    else if(kind==="file-link")symlinkSync(outside,join(root,"status.json"));
+    else mkdirSync(join(root,"status.json"));
+   }
+   return result;
+  }) as any);
+  try {save(root);} finally {spy.mockRestore();}
+  try {
+   expect(readFileSync(outside,"utf8")).toBe("untouched");
+   expect(readdirSync(kind==="root-link"?moved:root).filter(f=>f.endsWith(".tmp"))).toEqual([]);
+   if(kind==="root-link") {expect(lstatSync(root).isSymbolicLink()).toBe(true);expect(existsSync(join(moved,"status.json"))).toBe(false);}
+   else expect(kind==="file-link"?lstatSync(join(root,"status.json")).isSymbolicLink():lstatSync(join(root,"status.json")).isDirectory()).toBe(true);
+  } finally {rmSync(home,{recursive:true,force:true});}
+ }
+});
+
+// Mock only registry loading, so these source-CLI tests never start workers or contact a service.
+function managerFixture() {
+ const home=mkdtempSync(join(tmpdir(),"bots-source-")),events=join(home,"events.jsonl"),source=resolve(import.meta.dir,"../codex/manager.ts");
+ function run(args:string[]=[],afterMkdir=false) {
+  const harness=join(home,"harness.ts");
+  writeFileSync(harness,`
+   import { mock, spyOn } from "bun:test";
+   import * as fs from "node:fs";
+   const event = value => fs.appendFileSync(${JSON.stringify(events)},JSON.stringify(value)+"\\n");
+   mock.module(${JSON.stringify(resolve(import.meta.dir,"../codex/bots-config.ts"))},()=>({loadBots:()=>[],defaultRegistry:()=>"unused"}));
+   const read=fs.readFileSync;
+   spyOn(fs,"readFileSync").mockImplementation((path,...args)=>{if(String(path).endsWith("status.json"))event("read-status");return read(path,...args);});
+   const open=fs.openSync;
+   spyOn(fs,"openSync").mockImplementation((path,...args)=>{if(String(path).endsWith("manager.lock"))event("open-lock");return open(path,...args);});
+   ${afterMkdir?`
+    const mkdir=fs.mkdirSync;
+    spyOn(fs,"mkdirSync").mockImplementation((path,...args)=>{
+     const result=mkdir(path,...args);
+     if(String(path)===${JSON.stringify(join(home,".agentschat/codex-bots"))}) {
+      fs.rmSync(path,{recursive:true});fs.symlinkSync(${JSON.stringify(join(home,"outside"))},path);
+     }
+     return result;
+    });` : ""}
+   const schedule=globalThis.setTimeout;
+   globalThis.setTimeout=(fn,ms,...args)=>{
+    const timer=schedule(fn,ms,...args);
+    if(ms===5000){event({supervisorRef:timer.hasRef()});queueMicrotask(()=>process.emit("SIGTERM"));}
+    return timer;
+   };
+   process.argv=[process.execPath,${JSON.stringify(source)},"--codex-bots",...${JSON.stringify(args)}];
+   await import(${JSON.stringify(source)});
+  `);
+  rmSync(events,{force:true});
+  const child=spawnSync(process.execPath,[harness],{env:{...process.env,HOME:home},encoding:"utf8",timeout:5000,maxBuffer:2*1024*1024});
+  expect(child.error).toBeUndefined();
+  return {...child,events:existsSync(events)?readFileSync(events,"utf8").trim().split("\n").map(line=>JSON.parse(line)):[]};
+ }
+ return {home,run};
+}
+
+test("manager CLI rejects unsafe directory leaves and rechecks the created root", () => {
+ for(const leaf of [".agentschat",".agentschat/codex-bots"])for(const kind of ["link","dangling","file"]) {
+  const f=managerFixture(),outside=join(f.home,"outside"),path=join(f.home,leaf);mkdirSync(outside);
+  try {
+   if(leaf.includes("/"))mkdirSync(join(f.home,".agentschat"));
+   if(kind==="file")writeFileSync(path,"untouched");else symlinkSync(kind==="link"?outside:join(f.home,"absent"),path);
+   const result=f.run();expect(result.status).toBe(1);expect(result.events).not.toContain("open-lock");
+   expect(readdirSync(outside)).toEqual([]);expect(existsSync(join(f.home,"absent"))).toBe(false);
+  } finally {rmSync(f.home,{recursive:true,force:true});}
+ }
+ const f=managerFixture();mkdirSync(join(f.home,"outside"));
+ try {const result=f.run([],true);expect(result.status).toBe(1);expect(result.events).not.toContain("open-lock");expect(readdirSync(join(f.home,"outside"))).toEqual([]);}
+ finally {rmSync(f.home,{recursive:true,force:true});}
+});
+
+test("manager CLI rejects linked locks before opening and keeps its idle supervisor timer referenced", () => {
+ for(const dangling of [false,true]) {
+  const f=managerFixture(),root=join(f.home,".agentschat/codex-bots"),outside=join(f.home,"outside");mkdirSync(root,{recursive:true});
+  try {
+   if(!dangling)writeFileSync(outside,"untouched");
+   symlinkSync(outside,join(root,"manager.lock"));
+   const result=f.run();expect(result.status).toBe(1);expect(result.events).not.toContain("open-lock");
+   expect(lstatSync(join(root,"manager.lock")).isSymbolicLink()).toBe(true);
+   if(dangling)expect(existsSync(outside)).toBe(false);else expect(readFileSync(outside,"utf8")).toBe("untouched");
+  } finally {rmSync(f.home,{recursive:true,force:true});}
+ }
+ const f=managerFixture();
+ try {
+  const result=f.run();expect(result.status).toBe(0);expect(result.events).toContainEqual({supervisorRef:true});
+  const root=join(f.home,".agentschat/codex-bots");
+  expect(existsSync(join(root,"manager.lock"))).toBe(false);
+  expect(JSON.parse(readFileSync(join(root,"status.json"),"utf8")).bots).toEqual([]);
+ } finally {rmSync(f.home,{recursive:true,force:true});}
+});
+
+test("manager status caps regular files at exactly one MiB before reading", () => {
+ const f=managerFixture(),root=join(f.home,".agentschat/codex-bots"),file=join(root,"status.json");mkdirSync(root,{recursive:true});
+ try {
+  writeFileSync(file,"x".repeat(1_048_577));
+  const rejected=f.run(["--status"]);expect(rejected.status).toBe(1);expect(rejected.events).not.toContain("read-status");expect(rejected.stdout).toBe("");
+  writeFileSync(file,"x".repeat(1_048_576));
+  const accepted=f.run(["--status"]);expect(accepted.status).toBe(0);expect(accepted.events).toEqual(["read-status"]);expect(accepted.stdout.length).toBe(1_048_577);
+ } finally {rmSync(f.home,{recursive:true,force:true});}
+});

@@ -15,8 +15,8 @@ function fixture() {
     token: "ac_fixture_12345678901234567890", apiUrl: "https://test.invalid", wsUrl: "wss://test.invalid",
     permissions: "read-only", codexBin: "unused", channels: [], senders: [], codexHomeMode: "isolated" };
   const events = join(root, "events.jsonl");
-  function run(args: string[], options: { channels?: unknown; failure?: string; history?: unknown; token?: string; ipc?: unknown } = {}) {
-    writeFileSync(join(stateDir, "state.json"), JSON.stringify({ channels: Object.hasOwn(options, "channels") ? options.channels : {} }));
+  function run(args: string[], options: { channels?: unknown; failure?: string; history?: unknown; token?: string; ipc?: unknown; state?: unknown; beforeSpawn?: () => void } = {}) {
+    writeFileSync(join(stateDir, "state.json"), JSON.stringify(Object.hasOwn(options, "state") ? options.state : { channels: Object.hasOwn(options, "channels") ? options.channels : {} }));
     // Each CLI gets its own process: mocks never affect the bridge suites or a real Codex home.
     const harness = join(root, "harness.ts");
     writeFileSync(harness, `
@@ -45,7 +45,7 @@ function fixture() {
           if (ms === 10000) {
             const unref = timer.unref.bind(timer);
             timer.unref = () => {event("unref");return unref();};
-            queueMicrotask(() => process.emit("message", ${JSON.stringify(options.ipc)}));
+            queueMicrotask(() => process.emit("message", JSON.parse(${JSON.stringify(JSON.stringify(options.ipc))})));
           }
           return timer;
         };
@@ -54,6 +54,7 @@ function fixture() {
       await import(${JSON.stringify(join(codexDir, "run.ts"))});
     `);
     rmSync(events, { force: true });
+    options.beforeSpawn?.();
     const child = spawnSync(process.execPath, [harness], { env: { ...process.env, HOME: root }, encoding: "utf8", timeout: 5000 });
     expect(child.error).toBeUndefined();
     return { status: child.status, stdout: child.stdout, stderr: child.stderr,
@@ -149,4 +150,77 @@ test("managed CLI rejects non-object or empty IPC configs and unreferences its w
   }
   const result = f.run(["--managed-worker", "--conversations"], { ipc: f.config });
   expect(result.status).toBe(0); expect(result.events).toEqual(["unref"]);
+});
+
+
+test("conversation CLI rejects unsafe state paths and bounds state files before backend startup", () => {
+  for (const args of [["--conversations"], ["--read-conversation", "room"]]) {
+    for (const kind of ["directory-link", "file-link", "directory", "fifo", "oversized"]) {
+      if (kind === "fifo" && process.platform === "win32") continue;
+      const f = fixture(), stateFile = join(f.stateDir, "state.json");
+      const result = f.run(args, { beforeSpawn() {
+        if (kind === "directory-link") {
+          const moved = join(f.root, "moved"); mkdirSync(moved);
+          writeFileSync(join(moved, "state.json"), '{"channels":{}}');
+          rmSync(f.stateDir, { recursive: true }); symlinkSync(moved, f.stateDir);
+        } else if (kind === "oversized") writeFileSync(stateFile, " ".repeat(16 * 1024 * 1024 + 1));
+        else {
+          rmSync(stateFile);
+          if (kind === "directory") mkdirSync(stateFile);
+          else if (kind === "fifo") expect(spawnSync("mkfifo", [stateFile]).status).toBe(0);
+          else { const target = join(f.root, "target.json"); writeFileSync(target, '{"channels":{}}'); symlinkSync(target, stateFile); }
+        }
+      }});
+      expect(result.status).toBe(1); expect(result.events).not.toContain("start");
+      expect(result.stderr).toContain(kind === "directory-link" ? "real directory" : "Unsafe conversation state file");
+    }
+  }
+  const f = fixture();
+  const raw = '{"channels":{}}';
+  expect(f.run(["--conversations"], { beforeSpawn() {
+    writeFileSync(join(f.stateDir, "state.json"), raw + " ".repeat(16 * 1024 * 1024 - raw.length));
+  }}).status).toBe(0);
+});
+
+test("conversation CLI rejects non-object state and own prototype keys", () => {
+  const f = fixture();
+  for (const state of [null, [], 42, true, "bad", JSON.parse('{"channels":{},"__proto__":{}}')]) {
+    for (const args of [["--conversations"], ["--read-conversation", "room"]]) {
+      const result = f.run(args, { state });
+      expect(result.status).toBe(1); expect(result.stderr).toContain("Invalid conversation state");
+      expect(result.events).not.toContain("start");
+    }
+  }
+});
+
+test("managed CLI validates required IPC strings and rejects own prototype fields", () => {
+  const f = fixture();
+  const invalid: unknown[] = [JSON.parse(JSON.stringify(f.config).replace(/}$/, ',"__proto__":{}}'))];
+  for (const field of ["cwd", "stateDir", "agentId", "token", "apiUrl", "wsUrl"]) {
+    for (const value of [undefined, null, false, 1, {}, [], ...(field === "apiUrl" || field === "wsUrl" ? [] : [""])]) {
+      invalid.push({ ...f.config, [field]: value });
+    }
+  }
+  for (const ipc of invalid) {
+    const result = f.run(["--managed-worker", "--conversations"], { ipc });
+    expect(result.status).toBe(1); expect(result.stderr).toContain("Invalid parent configuration");
+    expect(result.events).toEqual(["unref", "error"]);
+    expect(result.stderr).not.toContain(f.config.token);
+  }
+  expect(f.run(["--managed-worker", "--conversations"], { ipc: { ...f.config, apiUrl: "", wsUrl: "" } }).status).toBe(0);
+});
+
+test("GUI CLI rejects unsafe parent directories before creating the outbox", () => {
+  for (const kind of ["link", "dangling", "file"]) {
+    const f = fixture(), parent = join(f.root, ".agentschat"), outside = join(f.root, "outside");
+    mkdirSync(outside);
+    if (kind === "file") writeFileSync(parent, "untouched");
+    else symlinkSync(kind === "link" ? outside : join(f.root, "missing"), parent);
+    for (const args of [["--gui-status"], ["--gui-thread", "target"], ["--gui-message-file", "unused"]]) {
+      const result = f.run(args);
+      expect(result.status).toBe(1); expect(result.stderr).toContain("GUI parent must be a real directory");
+      expect(existsSync(join(outside, "codex-gui-outbox"))).toBe(false);
+      expect(existsSync(join(f.root, "missing"))).toBe(false);
+    }
+  }
 });

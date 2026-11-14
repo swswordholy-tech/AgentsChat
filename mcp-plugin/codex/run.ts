@@ -52,6 +52,8 @@ async function main() {
     help: { type: "boolean", short: "h" } }, strict: true });
   if (values.help) { console.log(HELP); return; }
   if (values["gui-thread"] || values["gui-message-file"] || values["gui-status"]) {
+    const parent = lstatSync(join(homedir(), ".agentschat"), { throwIfNoEntry: false });
+    if (parent && (parent.isSymbolicLink() || !parent.isDirectory())) throw new Error("GUI parent must be a real directory, not a symlink");
     const channel = new GuiChannel(join(homedir(), ".agentschat/codex-gui-outbox"), values["gui-thread"] ? [values["gui-thread"]] : []);
     if (values["gui-status"]) { console.log(JSON.stringify(channel.list().map(({prompt, ...receipt}) => receipt))); return; }
     if (!values["gui-thread"] || !values["gui-message-file"]) throw new Error("GUI submission requires --gui-thread and --gui-message-file");
@@ -68,7 +70,12 @@ async function main() {
     timer.unref?.();
     process.once("message", config => {
       clearTimeout(timer);
-      if (!isPlainObject(config) || !Object.keys(config).length) { reject(new Error("Invalid parent configuration")); return; }
+      if (!isPlainObject(config) || Object.prototype.hasOwnProperty.call(config, "__proto__") ||
+        typeof config.cwd !== "string" || !config.cwd.length ||
+        typeof config.stateDir !== "string" || !config.stateDir.length ||
+        typeof config.agentId !== "string" || !config.agentId.length ||
+        typeof config.token !== "string" || !config.token.length ||
+        typeof config.apiUrl !== "string" || typeof config.wsUrl !== "string") { reject(new Error("Invalid parent configuration")); return; }
       resolve(config as unknown as BridgeConfig);
     });
   }) : undefined;
@@ -84,7 +91,12 @@ async function main() {
   const runtime = prepareRuntimeHome(c.stateDir, undefined, c.codexHomeMode, c.codexBin);
   codex = new AppServer(c.codexBin, undefined, undefined, c.permissions, runtime, c.effort, c.model, { profileFile: c.profileFile, agentId: c.agentId, apiUrl: c.apiUrl, wsUrl: c.wsUrl });
   if (values.conversations || values["read-conversation"]) {
-    const state = JSON.parse(readFileSync(join(c.stateDir, "state.json"), "utf8"));
+    const dir = lstatSync(c.stateDir), stateFile = join(c.stateDir, "state.json");
+    if (dir.isSymbolicLink() || !dir.isDirectory()) throw new Error("Conversation state must use a real directory");
+    const stat = lstatSync(stateFile);
+    if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 16 * 1024 * 1024) throw new Error("Unsafe conversation state file");
+    const state = JSON.parse(readFileSync(stateFile, "utf8"));
+    if (!isPlainObject(state) || Object.prototype.hasOwnProperty.call(state, "__proto__")) throw new Error("Invalid conversation state");
     const channels = state?.channels === undefined ? {} : state.channels;
     if (!isPlainObject(channels)) throw new Error("Invalid conversation channels");
     const safeOutput = (value: unknown) => {

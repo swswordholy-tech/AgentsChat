@@ -39,6 +39,10 @@ export function save(rootDir = root) {
     catch (e: any) { if (e.code !== "ENOENT") return; }
     writeFileSync(tmp, JSON.stringify({ pid: process.pid, updated_at: new Date().toISOString(), bots: [...workers.values()].map(w => ({ name: w.config.name, agent_id: w.config.agentId, workdir: w.config.cwd, effort: w.config.effort, model: w.config.model, pid: w.child?.pid, status: w.status })) }, null, 2), { mode: 0o600, flag: "wx" });
     created = true;
+    const currentDir = lstatSync(rootDir);
+    const currentFile = lstatSync(statusFile, { throwIfNoEntry: false });
+    if (currentDir.isSymbolicLink() || !currentDir.isDirectory() ||
+      (currentFile && (currentFile.isSymbolicLink() || !currentFile.isFile()))) throw new Error("Unsafe status destination");
     renameSync(tmp, statusFile);
   } catch {
     if (created) try { unlinkSync(tmp); } catch {}
@@ -111,14 +115,22 @@ async function main() {
   if (values.status) {
     try {
       const stat = lstatSync(statusFile);
-      if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("Unsafe status file");
+      if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 1_048_576) throw new Error("Unsafe status file");
       console.log(readFileSync(statusFile, "utf8"));
     } catch { console.error("Bot manager status unavailable; status file is missing, unsafe, or unreadable"); process.exitCode = 1; }
     return;
   }
   const configs = loadBots(registry);
   if (values.check) { console.log(JSON.stringify(configs.map(c => ({ name: c.name, agent_id: c.agentId, workdir: c.cwd, profile: c.profileFile })))); return; }
-  mkdirSync(root, { recursive: true, mode: 0o700 }); removeDeadLock(lock);
+  for (const directory of [join(homedir(), ".agentschat"), root]) {
+    const stat = lstatSync(directory, { throwIfNoEntry: false });
+    if (stat && (stat.isSymbolicLink() || !stat.isDirectory())) throw new Error("Unsafe manager directory");
+  }
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  const dir = lstatSync(root);
+  if (dir.isSymbolicLink() || !dir.isDirectory()) throw new Error("Unsafe manager directory");
+  removeDeadLock(lock);
+  if (lstatSync(lock, { throwIfNoEntry: false })?.isSymbolicLink()) throw new Error("Unsafe manager lock");
   const fd = openSync(lock, "wx", 0o600); writeFileSync(fd, String(process.pid)); closeSync(fd);
   let running: Promise<void> = Promise.resolve();
   const loop = () => { running = tick().catch(() => console.error("Supervisor tick failed")).finally(() => { if (!stopping) timer = setTimeout(loop, 5000); }); };
