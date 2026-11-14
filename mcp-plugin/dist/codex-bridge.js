@@ -2808,9 +2808,9 @@ class HeartbeatMonitor {
   connectTimeout;
   constructor(deps, pingInterval = 30000, pongTimeout = 90000, connectTimeout = 30000) {
     this.deps = deps;
-    this.pingInterval = Number.isFinite(pingInterval) && pingInterval > 0 ? Math.min(pingInterval, 2147483647) : 30000;
-    this.pongTimeout = Number.isFinite(pongTimeout) && pongTimeout > 0 ? pongTimeout : 90000;
-    this.connectTimeout = Number.isFinite(connectTimeout) && connectTimeout > 0 ? connectTimeout : 30000;
+    this.pingInterval = Number.isFinite(pingInterval) && pingInterval > 0 ? Math.max(1, Math.min(Math.floor(pingInterval), 2147483647)) : 30000;
+    this.pongTimeout = Number.isFinite(pongTimeout) && pongTimeout > 0 ? Math.max(1, Math.min(Math.floor(pongTimeout), 2147483647)) : 90000;
+    this.connectTimeout = Number.isFinite(connectTimeout) && connectTimeout > 0 ? Math.max(1, Math.min(Math.floor(connectTimeout), 2147483647)) : 30000;
     this.lastPong = Date.now();
   }
   receivedPong() {
@@ -2866,7 +2866,11 @@ class HeartbeatMonitor {
     if (this.reconnecting)
       return;
     this.reconnecting = true;
-    this.deps.reconnect();
+    try {
+      this.deps.reconnect();
+    } catch {
+      this.reconnecting = false;
+    }
   }
 }
 
@@ -3105,6 +3109,31 @@ class InboxSync {
 }
 
 // codex/transport.ts
+function safeChannel(channel) {
+  return typeof channel === "string" && channel.trim().length > 0 && channel.length <= 128 && !/[.\/\\\x00-\x1f\x7f]/.test(channel) && !/^(?:__proto__|constructor|prototype)$/i.test(channel);
+}
+function requireChannel(channel) {
+  if (!safeChannel(channel))
+    throw new Error("Invalid AgentsChat channel");
+}
+function apiUrl(path, base) {
+  const invalid = () => new Error("Invalid AgentsChat API path");
+  if (typeof path !== "string" || !path.startsWith("/") || path.startsWith("//") || /[\x00-\x1f\x7f\\]/.test(path))
+    throw invalid();
+  try {
+    const pathname = path.split(/[?#]/, 1)[0];
+    const decoded = decodeURIComponent(pathname);
+    if ([pathname, decoded].some((value) => value.split("/").includes("..")) || /[\x00-\x1f\x7f\\]/.test(decoded))
+      throw invalid();
+    const origin = new URL(base).origin, resolved = new URL(path, base);
+    if (resolved.origin !== origin)
+      throw invalid();
+    return resolved;
+  } catch {
+    throw invalid();
+  }
+}
+
 class AgentsChatTransport {
   config;
   receive;
@@ -3130,9 +3159,10 @@ class AgentsChatTransport {
       this.inboxSync = new InboxSync(config.stateDir, (path) => this.api(path), recover, () => !this.closed && this.authenticated, log);
   }
   async api(path, body) {
+    const resolved = apiUrl(path, this.config.apiUrl);
     let response;
     try {
-      response = await fetch(this.config.apiUrl + path, {
+      response = await fetch(resolved, {
         method: body ? "POST" : "GET",
         redirect: "error",
         headers: { Authorization: `Bearer ${this.config.token}`, "Content-Type": "application/json" },
@@ -3176,10 +3206,13 @@ class AgentsChatTransport {
     }
   }
   setTyping(channel, active) {
+    requireChannel(channel);
     clearInterval(this.typing.get(channel));
     this.typing.delete(channel);
     if (!active || this.closed)
       return;
+    if (this.typing.size >= 64)
+      throw new Error("AgentsChat typing limit reached");
     const pulse = () => {
       if (this.authenticated && this.socket?.readyState === WebSocket.OPEN) {
         try {
@@ -3205,7 +3238,10 @@ class AgentsChatTransport {
     this.pending.clear();
   }
   async send(channel, text) {
+    requireChannel(channel);
     if (this.authenticated && this.socket?.readyState === WebSocket.OPEN) {
+      if (this.pending.size >= 256)
+        throw new Error("AgentsChat pending message limit reached");
       const id = randomUUID2();
       await new Promise((resolve4, reject) => {
         const timer = setTimeout(() => {
@@ -3214,21 +3250,27 @@ class AgentsChatTransport {
         }, 15000);
         timer.unref?.();
         this.pending.set(id, { resolve: resolve4, reject, timer });
-        this.socket.send(JSON.stringify({
-          type: "message",
-          id,
-          channel_id: channel,
-          sender_id: this.config.agentId,
-          sender_type: "agent",
-          content_type: "text",
-          content: text
-        }), (error) => {
-          if (error) {
-            clearTimeout(timer);
-            this.pending.delete(id);
-            reject(new Error("AgentsChat socket send failed"));
-          }
-        });
+        try {
+          this.socket.send(JSON.stringify({
+            type: "message",
+            id,
+            channel_id: channel,
+            sender_id: this.config.agentId,
+            sender_type: "agent",
+            content_type: "text",
+            content: text
+          }), (error) => {
+            if (error) {
+              clearTimeout(timer);
+              this.pending.delete(id);
+              reject(new Error("AgentsChat socket send failed"));
+            }
+          });
+        } catch {
+          clearTimeout(timer);
+          this.pending.delete(id);
+          reject(new Error("AgentsChat socket send failed"));
+        }
       });
       return;
     }
@@ -3264,7 +3306,7 @@ class AgentsChatTransport {
       }
     };
     const join11 = (channel) => {
-      if (!this.config.channels.length || this.config.channels.includes(channel)) {
+      if (safeChannel(channel) && (!this.config.channels.length || this.config.channels.includes(channel))) {
         this.inboxSync?.watch(channel);
         send({ type: "join_channel", channel_id: channel, agent_id: this.config.agentId });
       }
@@ -3285,6 +3327,8 @@ class AgentsChatTransport {
       } catch {
         return;
       }
+      if (!data || typeof data !== "object" || Array.isArray(data))
+        return;
       if (data.type !== "auth_error")
         this.heartbeat?.receivedPong();
       if (data.type === "auth_ok") {
@@ -3303,7 +3347,7 @@ class AgentsChatTransport {
           const channels = Array.isArray(body) ? body : body.channels;
           if (!Array.isArray(channels))
             throw new Error("Invalid membership response");
-          const ids = channels.map((c) => c.id ?? c.channel_id).filter((id) => typeof id === "string" && (!this.config.channels.length || this.config.channels.includes(id)));
+          const ids = channels.map((c) => c?.id ?? c?.channel_id).filter((id) => safeChannel(id) && (!this.config.channels.length || this.config.channels.includes(id)));
           this.inboxSync?.memberships(ids);
           for (const id of ids)
             join11(id);

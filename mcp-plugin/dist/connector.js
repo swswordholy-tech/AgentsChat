@@ -638,8 +638,14 @@ function redactSecrets(text, opts) {
 // src/read-cursor.ts
 import { randomBytes } from "crypto";
 import { chmodSync, lstatSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "fs";
+import { dirname, join } from "path";
 var MAX_CURSOR_BYTES = 4 * 1024 * 1024;
+var MAX_CURSOR_ENTRIES = 50000;
+var RESERVED_PROTO_KEY = /^(?:__proto__|constructor|prototype)$/i;
 var tmpCounter = 0;
+function scrubDiag(value) {
+  return String(value ?? "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
+}
 function loadCursor(file, warn) {
   try {
     const st = lstatSync(file);
@@ -655,20 +661,23 @@ function loadCursor(file, warn) {
     }
     const entries = [];
     for (const [k, v] of Object.entries(parsed)) {
-      if (k === "__proto__" || k === "constructor" || k === "prototype")
+      if (RESERVED_PROTO_KEY.test(k))
         continue;
       if (typeof v !== "string") {
-        throw new Error(`cursor value for ${k} must be a string`);
+        throw new Error(`cursor value for ${scrubDiag(k)} must be a string`);
       }
-      if (!k || /[\x00-\x1f\x7f]/.test(k) || /[\x00-\x1f\x7f]/.test(v) || v.length > 256) {
-        throw new Error(`cursor entry for ${k} contains invalid characters or length`);
+      if (!k || k.length > 256 || /[\x00-\x1f\x7f]/.test(k) || /[\x00-\x1f\x7f]/.test(v) || v.length > 256) {
+        throw new Error(`cursor entry for ${scrubDiag(k)} contains invalid characters or length`);
+      }
+      if (entries.length >= MAX_CURSOR_ENTRIES) {
+        throw new Error(`cursor entry count exceeds ${MAX_CURSOR_ENTRIES}`);
       }
       entries.push([k, v]);
     }
     return new Map(entries);
   } catch (e) {
     if (e?.code !== "ENOENT") {
-      warn(`[agentchat] WARNING: could not read ${file} — resetting that state: ${e}
+      warn(`[agentchat] WARNING: could not read ${scrubDiag(file)} — resetting that state: ${scrubDiag(e)}
 `);
     }
     return new Map;
@@ -676,24 +685,47 @@ function loadCursor(file, warn) {
 }
 function persistCursor(file, cursor, warn) {
   try {
+    const parentStat = lstatSync(dirname(file));
+    if (parentStat.isSymbolicLink() || !parentStat.isDirectory()) {
+      warn(`[agentchat] WARNING: failed to persist read cursor to ${scrubDiag(file)}: parent is not a real directory
+`);
+      return false;
+    }
+  } catch (e) {
+    warn(`[agentchat] WARNING: failed to persist read cursor to ${scrubDiag(file)}: ${scrubDiag(e)}
+`);
+    return false;
+  }
+  try {
     const existing = lstatSync(file);
     if (existing.isSymbolicLink() || !existing.isFile()) {
-      warn(`[agentchat] WARNING: failed to persist read cursor to ${file}: target is not a regular file
+      warn(`[agentchat] WARNING: failed to persist read cursor to ${scrubDiag(file)}: target is not a regular file
 `);
       return false;
     }
   } catch (e) {
     if (e?.code !== "ENOENT") {
-      warn(`[agentchat] WARNING: failed to persist read cursor to ${file}: ${e}
+      warn(`[agentchat] WARNING: failed to persist read cursor to ${scrubDiag(file)}: ${scrubDiag(e)}
 `);
       return false;
     }
   }
+  const payloadObj = Object.create(null);
+  for (const [k, v] of cursor) {
+    if (!k || k.length > 256 || RESERVED_PROTO_KEY.test(k) || /[\x00-\x1f\x7f]/.test(k) || typeof v !== "string" || /[\x00-\x1f\x7f]/.test(v) || v.length > 256) {
+      continue;
+    }
+    payloadObj[k] = v;
+  }
   const tmp = `${file}.${process.pid}.${Date.now()}.${++tmpCounter}.${randomBytes(4).toString("hex")}.tmp`;
   try {
-    writeFileSync(tmp, JSON.stringify(Object.fromEntries(cursor)), { mode: 384, flag: "wx" });
+    writeFileSync(tmp, JSON.stringify(payloadObj), { mode: 384, flag: "wx" });
     if (process.platform !== "win32") {
       chmodSync(tmp, 384);
+    }
+    const current = lstatSync(file, { throwIfNoEntry: false });
+    if (current && (current.isSymbolicLink() || !current.isFile())) {
+      throw new Error("target was replaced by a symlink or non-file");
     }
     renameSync(tmp, file);
     return true;
@@ -701,7 +733,7 @@ function persistCursor(file, cursor, warn) {
     try {
       unlinkSync(tmp);
     } catch {}
-    warn(`[agentchat] WARNING: failed to persist read cursor to ${file}: ${e}
+    warn(`[agentchat] WARNING: failed to persist read cursor to ${scrubDiag(file)}: ${scrubDiag(e)}
 `);
     return false;
   }
@@ -764,7 +796,7 @@ function normalizeTimestampForCursor(ts, mode) {
 }
 
 // connector/backfill.ts
-import { join } from "node:path";
+import { join as join2 } from "node:path";
 function compareNormalizedTimestamps(aRaw, bRaw) {
   const aStr = String(aRaw ?? "");
   const bStr = String(bRaw ?? "");
@@ -818,7 +850,7 @@ function selectChannelContextMessages(msgs, sinceTs, excludeId) {
 function safeCursorBotFile(cursorDir, botId) {
   const cleaned = String(botId || "default").replace(/[^A-Za-z0-9._-]/g, "_").replace(/\.{2,}/g, "_");
   const safeId = cleaned && cleaned !== "." ? cleaned.slice(0, 128) : "default";
-  return join(cursorDir, `last-seen-msg-ts-${safeId}.json`);
+  return join2(cursorDir, `last-seen-msg-ts-${safeId}.json`);
 }
 
 // connector/ingest.ts
@@ -856,9 +888,9 @@ class HeartbeatMonitor {
   connectTimeout;
   constructor(deps, pingInterval = 30000, pongTimeout = 90000, connectTimeout = 30000) {
     this.deps = deps;
-    this.pingInterval = Number.isFinite(pingInterval) && pingInterval > 0 ? Math.min(pingInterval, 2147483647) : 30000;
-    this.pongTimeout = Number.isFinite(pongTimeout) && pongTimeout > 0 ? pongTimeout : 90000;
-    this.connectTimeout = Number.isFinite(connectTimeout) && connectTimeout > 0 ? connectTimeout : 30000;
+    this.pingInterval = Number.isFinite(pingInterval) && pingInterval > 0 ? Math.max(1, Math.min(Math.floor(pingInterval), 2147483647)) : 30000;
+    this.pongTimeout = Number.isFinite(pongTimeout) && pongTimeout > 0 ? Math.max(1, Math.min(Math.floor(pongTimeout), 2147483647)) : 90000;
+    this.connectTimeout = Number.isFinite(connectTimeout) && connectTimeout > 0 ? Math.max(1, Math.min(Math.floor(connectTimeout), 2147483647)) : 30000;
     this.lastPong = Date.now();
   }
   receivedPong() {
@@ -914,7 +946,11 @@ class HeartbeatMonitor {
     if (this.reconnecting)
       return;
     this.reconnecting = true;
-    this.deps.reconnect();
+    try {
+      this.deps.reconnect();
+    } catch {
+      this.reconnecting = false;
+    }
   }
 }
 

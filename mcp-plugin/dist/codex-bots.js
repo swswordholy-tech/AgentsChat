@@ -1158,7 +1158,9 @@ function loadBots(file = defaultRegistry(), home = homedir2()) {
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 function parseProcesses(text) {
-  return text.split(/\r?\n/).flatMap((line) => {
+  return text.split(/\r?\n/, 65536).flatMap((line) => {
+    if (/[\x00-\x1f\x7f]/.test(line))
+      return [];
     const m = /^\s*(\d+)\s+(\d+)\s+(.+)$/.exec(line);
     if (!m)
       return [];
@@ -1178,14 +1180,22 @@ function commandBasename(cmd) {
 }
 function externalCodexPresent(rows, managerPid) {
   const children = new Set(Number.isSafeInteger(managerPid) && managerPid > 0 ? [managerPid] : []);
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const row of rows)
-      if (children.has(row.ppid) && !children.has(row.pid)) {
-        children.add(row.pid);
-        changed = true;
-      }
+  const byParent = new Map;
+  for (const row of rows) {
+    const siblings = byParent.get(row.ppid);
+    if (siblings)
+      siblings.push(row.pid);
+    else
+      byParent.set(row.ppid, [row.pid]);
+  }
+  const queue = [...children];
+  for (let i = 0;i < queue.length; i++) {
+    for (const pid of byParent.get(queue[i]) ?? []) {
+      if (children.has(pid))
+        continue;
+      children.add(pid);
+      queue.push(pid);
+    }
   }
   return rows.some((r) => !children.has(r.pid) && commandBasename(r.command) === "codex");
 }

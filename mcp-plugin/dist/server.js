@@ -3819,8 +3819,14 @@ function loadSessionBinds2(configDir) {
 var MAX_PROFILE_BYTES = 64 * 1024;
 var RESERVED_PROFILE_KEY = /^(?:__proto__|constructor|prototype)$/i;
 function agentschatConfigDir(env = process.env) {
-  const home = env.HOME || env.USERPROFILE || homedir4();
-  return env.AGENTSCHAT_CONFIG_DIR ?? join6(home, ".agentschat");
+  const custom = typeof env.AGENTSCHAT_CONFIG_DIR === "string" ? env.AGENTSCHAT_CONFIG_DIR.trim() : "";
+  if (custom)
+    return custom;
+  const home = (env.HOME || env.USERPROFILE || homedir4()).trim() || homedir4();
+  return join6(home, ".agentschat");
+}
+function isSafeAgentId(id) {
+  return id.length > 0 && id.length <= 128 && id !== "." && id !== ".." && !RESERVED_PROFILE_KEY.test(id) && !/[/\\\s\x00-\x1f\x7f]/.test(id);
 }
 function isSafeRegularProfileFile(path) {
   try {
@@ -3830,15 +3836,27 @@ function isSafeRegularProfileFile(path) {
     return false;
   }
 }
+function isSafeRealDir(path) {
+  try {
+    const st = lstatSync6(path);
+    return !st.isSymbolicLink() && st.isDirectory();
+  } catch {
+    return false;
+  }
+}
 function profilePathForName(configDir, name) {
-  if (!name || name === "." || name === ".." || name.includes("/") || name.includes("\\"))
+  if (typeof name !== "string" || !name || name.length > 133 || name === "." || name === ".." || name.includes("/") || name.includes("\\") || /[\x00-\x1f\x7f]/.test(name) || !isSafeRealDir(configDir)) {
     return;
-  const base = name.replace(/\.json$/, "").replace(/[^a-zA-Z0-9_-]/g, "_");
-  if (!base || RESERVED_PROFILE_KEY.test(base))
+  }
+  const base = name.replace(/\.json$/i, "").replace(/[^a-zA-Z0-9_-]/g, "_");
+  if (!base || base.length > 128 || RESERVED_PROFILE_KEY.test(base))
     return;
-  const nested = join6(configDir, "profiles", `${base}.json`);
-  if (isSafeRegularProfileFile(nested))
-    return nested;
+  const profilesDir = join6(configDir, "profiles");
+  if (isSafeRealDir(profilesDir)) {
+    const nested = join6(profilesDir, `${base}.json`);
+    if (isSafeRegularProfileFile(nested))
+      return nested;
+  }
   const flat = join6(configDir, `${base}.json`);
   return isSafeRegularProfileFile(flat) ? flat : undefined;
 }
@@ -3848,14 +3866,14 @@ function readAgentId(path) {
       return;
     const parsed = JSON.parse(readFileSync7(path, "utf8"));
     const id = typeof parsed?.agent_id === "string" ? parsed.agent_id.trim() : "";
-    return id && !RESERVED_PROFILE_KEY.test(id) ? id : undefined;
+    return isSafeAgentId(id) ? id : undefined;
   } catch {
     return;
   }
 }
 function resolveSessionForAgent(agentId, opts = {}) {
   const targetAgentId = typeof agentId === "string" ? agentId.trim() : "";
-  if (!targetAgentId || RESERVED_PROFILE_KEY.test(targetAgentId))
+  if (!isSafeAgentId(targetAgentId))
     return;
   const configDir = opts.configDir ?? agentschatConfigDir(opts.env);
   let binds;
@@ -3894,9 +3912,9 @@ class HeartbeatMonitor {
   connectTimeout;
   constructor(deps, pingInterval = 30000, pongTimeout = 90000, connectTimeout = 30000) {
     this.deps = deps;
-    this.pingInterval = Number.isFinite(pingInterval) && pingInterval > 0 ? Math.min(pingInterval, 2147483647) : 30000;
-    this.pongTimeout = Number.isFinite(pongTimeout) && pongTimeout > 0 ? pongTimeout : 90000;
-    this.connectTimeout = Number.isFinite(connectTimeout) && connectTimeout > 0 ? connectTimeout : 30000;
+    this.pingInterval = Number.isFinite(pingInterval) && pingInterval > 0 ? Math.max(1, Math.min(Math.floor(pingInterval), 2147483647)) : 30000;
+    this.pongTimeout = Number.isFinite(pongTimeout) && pongTimeout > 0 ? Math.max(1, Math.min(Math.floor(pongTimeout), 2147483647)) : 90000;
+    this.connectTimeout = Number.isFinite(connectTimeout) && connectTimeout > 0 ? Math.max(1, Math.min(Math.floor(connectTimeout), 2147483647)) : 30000;
     this.lastPong = Date.now();
   }
   receivedPong() {
@@ -3952,7 +3970,11 @@ class HeartbeatMonitor {
     if (this.reconnecting)
       return;
     this.reconnecting = true;
-    this.deps.reconnect();
+    try {
+      this.deps.reconnect();
+    } catch {
+      this.reconnecting = false;
+    }
   }
 }
 // package.json
@@ -4108,7 +4130,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { readFileSync as readFileSync12, existsSync as existsSync6, writeFileSync as writeFileSync6, mkdirSync as mkdirSync4, readdirSync as readdirSync5 } from "fs";
 import { homedir as homedir6 } from "os";
-import { join as join12, dirname as dirname2 } from "path";
+import { join as join12, dirname as dirname4 } from "path";
 import { fileURLToPath } from "url";
 
 // src/profile-store.ts
@@ -4383,12 +4405,17 @@ function expectedAgentIdViolation(expected, liveAgentId) {
 // src/read-cursor.ts
 import { randomBytes } from "crypto";
 import { chmodSync as chmodSync3, lstatSync as lstatSync8, readFileSync as readFileSync9, renameSync as renameSync3, unlinkSync as unlinkSync5, writeFileSync as writeFileSync3 } from "fs";
-import { join as join8 } from "path";
+import { dirname, join as join8 } from "path";
 var MAX_CURSOR_BYTES = 4 * 1024 * 1024;
+var MAX_CURSOR_ENTRIES = 50000;
+var RESERVED_PROTO_KEY = /^(?:__proto__|constructor|prototype)$/i;
 var tmpCounter = 0;
+function scrubDiag(value) {
+  return String(value ?? "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
+}
 function safeAgentCursorSlug(agentId) {
   const cleaned = String(agentId || "").trim().replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 128);
-  if (!cleaned || cleaned === "." || cleaned === "..")
+  if (!cleaned || cleaned === "." || cleaned === ".." || RESERVED_PROTO_KEY.test(cleaned))
     return "_";
   return cleaned;
 }
@@ -4410,20 +4437,23 @@ function loadCursor(file, warn) {
     }
     const entries = [];
     for (const [k, v] of Object.entries(parsed)) {
-      if (k === "__proto__" || k === "constructor" || k === "prototype")
+      if (RESERVED_PROTO_KEY.test(k))
         continue;
       if (typeof v !== "string") {
-        throw new Error(`cursor value for ${k} must be a string`);
+        throw new Error(`cursor value for ${scrubDiag(k)} must be a string`);
       }
-      if (!k || /[\x00-\x1f\x7f]/.test(k) || /[\x00-\x1f\x7f]/.test(v) || v.length > 256) {
-        throw new Error(`cursor entry for ${k} contains invalid characters or length`);
+      if (!k || k.length > 256 || /[\x00-\x1f\x7f]/.test(k) || /[\x00-\x1f\x7f]/.test(v) || v.length > 256) {
+        throw new Error(`cursor entry for ${scrubDiag(k)} contains invalid characters or length`);
+      }
+      if (entries.length >= MAX_CURSOR_ENTRIES) {
+        throw new Error(`cursor entry count exceeds ${MAX_CURSOR_ENTRIES}`);
       }
       entries.push([k, v]);
     }
     return new Map(entries);
   } catch (e) {
     if (e?.code !== "ENOENT") {
-      warn(`[agentchat] WARNING: could not read ${file} — resetting that state: ${e}
+      warn(`[agentchat] WARNING: could not read ${scrubDiag(file)} — resetting that state: ${scrubDiag(e)}
 `);
     }
     return new Map;
@@ -4431,24 +4461,47 @@ function loadCursor(file, warn) {
 }
 function persistCursor(file, cursor, warn) {
   try {
+    const parentStat = lstatSync8(dirname(file));
+    if (parentStat.isSymbolicLink() || !parentStat.isDirectory()) {
+      warn(`[agentchat] WARNING: failed to persist read cursor to ${scrubDiag(file)}: parent is not a real directory
+`);
+      return false;
+    }
+  } catch (e) {
+    warn(`[agentchat] WARNING: failed to persist read cursor to ${scrubDiag(file)}: ${scrubDiag(e)}
+`);
+    return false;
+  }
+  try {
     const existing = lstatSync8(file);
     if (existing.isSymbolicLink() || !existing.isFile()) {
-      warn(`[agentchat] WARNING: failed to persist read cursor to ${file}: target is not a regular file
+      warn(`[agentchat] WARNING: failed to persist read cursor to ${scrubDiag(file)}: target is not a regular file
 `);
       return false;
     }
   } catch (e) {
     if (e?.code !== "ENOENT") {
-      warn(`[agentchat] WARNING: failed to persist read cursor to ${file}: ${e}
+      warn(`[agentchat] WARNING: failed to persist read cursor to ${scrubDiag(file)}: ${scrubDiag(e)}
 `);
       return false;
     }
   }
+  const payloadObj = Object.create(null);
+  for (const [k, v] of cursor) {
+    if (!k || k.length > 256 || RESERVED_PROTO_KEY.test(k) || /[\x00-\x1f\x7f]/.test(k) || typeof v !== "string" || /[\x00-\x1f\x7f]/.test(v) || v.length > 256) {
+      continue;
+    }
+    payloadObj[k] = v;
+  }
   const tmp = `${file}.${process.pid}.${Date.now()}.${++tmpCounter}.${randomBytes(4).toString("hex")}.tmp`;
   try {
-    writeFileSync3(tmp, JSON.stringify(Object.fromEntries(cursor)), { mode: 384, flag: "wx" });
+    writeFileSync3(tmp, JSON.stringify(payloadObj), { mode: 384, flag: "wx" });
     if (process.platform !== "win32") {
       chmodSync3(tmp, 384);
+    }
+    const current = lstatSync8(file, { throwIfNoEntry: false });
+    if (current && (current.isSymbolicLink() || !current.isFile())) {
+      throw new Error("target was replaced by a symlink or non-file");
     }
     renameSync3(tmp, file);
     return true;
@@ -4456,7 +4509,7 @@ function persistCursor(file, cursor, warn) {
     try {
       unlinkSync5(tmp);
     } catch {}
-    warn(`[agentchat] WARNING: failed to persist read cursor to ${file}: ${e}
+    warn(`[agentchat] WARNING: failed to persist read cursor to ${scrubDiag(file)}: ${scrubDiag(e)}
 `);
     return false;
   }
@@ -4473,7 +4526,7 @@ function flushCursor(state, persist) {
 // src/rest-cli.ts
 import { randomBytes as randomBytes3 } from "node:crypto";
 import { lstatSync as lstatSync10, mkdirSync as mkdirSync3, readFileSync as readFileSync11, renameSync as renameSync5, unlinkSync as unlinkSync7, writeFileSync as writeFileSync5 } from "node:fs";
-import { dirname, join as join11 } from "node:path";
+import { dirname as dirname3, join as join11 } from "node:path";
 
 // src/mentions.ts
 var MAX_MENTION_ID_CHARS2 = 128;
@@ -4497,12 +4550,17 @@ function matchesMention2(content, agentId) {
 // src/read-cursor.ts
 import { randomBytes as randomBytes2 } from "crypto";
 import { chmodSync as chmodSync4, lstatSync as lstatSync9, readFileSync as readFileSync10, renameSync as renameSync4, unlinkSync as unlinkSync6, writeFileSync as writeFileSync4 } from "fs";
-import { join as join9 } from "path";
+import { dirname as dirname2, join as join9 } from "path";
 var MAX_CURSOR_BYTES2 = 4 * 1024 * 1024;
+var MAX_CURSOR_ENTRIES2 = 50000;
+var RESERVED_PROTO_KEY2 = /^(?:__proto__|constructor|prototype)$/i;
 var tmpCounter2 = 0;
+function scrubDiag2(value) {
+  return String(value ?? "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
+}
 function safeAgentCursorSlug2(agentId) {
   const cleaned = String(agentId || "").trim().replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 128);
-  if (!cleaned || cleaned === "." || cleaned === "..")
+  if (!cleaned || cleaned === "." || cleaned === ".." || RESERVED_PROTO_KEY2.test(cleaned))
     return "_";
   return cleaned;
 }
@@ -4524,20 +4582,23 @@ function loadCursor2(file, warn) {
     }
     const entries = [];
     for (const [k, v] of Object.entries(parsed)) {
-      if (k === "__proto__" || k === "constructor" || k === "prototype")
+      if (RESERVED_PROTO_KEY2.test(k))
         continue;
       if (typeof v !== "string") {
-        throw new Error(`cursor value for ${k} must be a string`);
+        throw new Error(`cursor value for ${scrubDiag2(k)} must be a string`);
       }
-      if (!k || /[\x00-\x1f\x7f]/.test(k) || /[\x00-\x1f\x7f]/.test(v) || v.length > 256) {
-        throw new Error(`cursor entry for ${k} contains invalid characters or length`);
+      if (!k || k.length > 256 || /[\x00-\x1f\x7f]/.test(k) || /[\x00-\x1f\x7f]/.test(v) || v.length > 256) {
+        throw new Error(`cursor entry for ${scrubDiag2(k)} contains invalid characters or length`);
+      }
+      if (entries.length >= MAX_CURSOR_ENTRIES2) {
+        throw new Error(`cursor entry count exceeds ${MAX_CURSOR_ENTRIES2}`);
       }
       entries.push([k, v]);
     }
     return new Map(entries);
   } catch (e) {
     if (e?.code !== "ENOENT") {
-      warn(`[agentchat] WARNING: could not read ${file} — resetting that state: ${e}
+      warn(`[agentchat] WARNING: could not read ${scrubDiag2(file)} — resetting that state: ${scrubDiag2(e)}
 `);
     }
     return new Map;
@@ -4545,24 +4606,47 @@ function loadCursor2(file, warn) {
 }
 function persistCursor2(file, cursor, warn) {
   try {
+    const parentStat = lstatSync9(dirname2(file));
+    if (parentStat.isSymbolicLink() || !parentStat.isDirectory()) {
+      warn(`[agentchat] WARNING: failed to persist read cursor to ${scrubDiag2(file)}: parent is not a real directory
+`);
+      return false;
+    }
+  } catch (e) {
+    warn(`[agentchat] WARNING: failed to persist read cursor to ${scrubDiag2(file)}: ${scrubDiag2(e)}
+`);
+    return false;
+  }
+  try {
     const existing = lstatSync9(file);
     if (existing.isSymbolicLink() || !existing.isFile()) {
-      warn(`[agentchat] WARNING: failed to persist read cursor to ${file}: target is not a regular file
+      warn(`[agentchat] WARNING: failed to persist read cursor to ${scrubDiag2(file)}: target is not a regular file
 `);
       return false;
     }
   } catch (e) {
     if (e?.code !== "ENOENT") {
-      warn(`[agentchat] WARNING: failed to persist read cursor to ${file}: ${e}
+      warn(`[agentchat] WARNING: failed to persist read cursor to ${scrubDiag2(file)}: ${scrubDiag2(e)}
 `);
       return false;
     }
   }
+  const payloadObj = Object.create(null);
+  for (const [k, v] of cursor) {
+    if (!k || k.length > 256 || RESERVED_PROTO_KEY2.test(k) || /[\x00-\x1f\x7f]/.test(k) || typeof v !== "string" || /[\x00-\x1f\x7f]/.test(v) || v.length > 256) {
+      continue;
+    }
+    payloadObj[k] = v;
+  }
   const tmp = `${file}.${process.pid}.${Date.now()}.${++tmpCounter2}.${randomBytes2(4).toString("hex")}.tmp`;
   try {
-    writeFileSync4(tmp, JSON.stringify(Object.fromEntries(cursor)), { mode: 384, flag: "wx" });
+    writeFileSync4(tmp, JSON.stringify(payloadObj), { mode: 384, flag: "wx" });
     if (process.platform !== "win32") {
       chmodSync4(tmp, 384);
+    }
+    const current = lstatSync9(file, { throwIfNoEntry: false });
+    if (current && (current.isSymbolicLink() || !current.isFile())) {
+      throw new Error("target was replaced by a symlink or non-file");
     }
     renameSync4(tmp, file);
     return true;
@@ -4570,7 +4654,7 @@ function persistCursor2(file, cursor, warn) {
     try {
       unlinkSync6(tmp);
     } catch {}
-    warn(`[agentchat] WARNING: failed to persist read cursor to ${file}: ${e}
+    warn(`[agentchat] WARNING: failed to persist read cursor to ${scrubDiag2(file)}: ${scrubDiag2(e)}
 `);
     return false;
   }
@@ -4793,7 +4877,7 @@ function loadSeenIds(file) {
 }
 function saveSeenIds(file, ids) {
   try {
-    mkdirSync3(dirname(file), { recursive: true });
+    mkdirSync3(dirname3(file), { recursive: true });
     const list = [...ids].slice(-MAX_SEEN_IDS);
     safeWriteProfile(file, list);
   } catch {}
@@ -4821,7 +4905,7 @@ function acquireWakePidFile(wakePidFile, pid = process.pid, killFn = process.kil
   let tmp = "";
   let created = false;
   try {
-    const dirStat = lstatSync10(dirname(wakePidFile));
+    const dirStat = lstatSync10(dirname3(wakePidFile));
     if (dirStat.isSymbolicLink() || !dirStat.isDirectory())
       return false;
     try {
@@ -4870,7 +4954,7 @@ function releaseWakePidFile(wakePidFile, pid = process.pid) {
 }
 function saveJsonMap(file, data) {
   try {
-    mkdirSync3(dirname(file), { recursive: true });
+    mkdirSync3(dirname3(file), { recursive: true });
     safeWriteProfile(file, data);
   } catch {}
 }
@@ -5534,7 +5618,7 @@ function parseArgs() {
 var cliArgs = parseArgs();
 var isOneShotCli = Boolean(cliArgs.registerOnly || cliArgs.join || cliArgs.send || cliArgs.wakeOnce);
 if (process.argv.includes("--help") || process.argv.includes("-h")) {
-  const localOnboardingPath = join12(dirname2(fileURLToPath(import.meta.url)), "..", "skills", "onboarding.md");
+  const localOnboardingPath = join12(dirname4(fileURLToPath(import.meta.url)), "..", "skills", "onboarding.md");
   console.log(`agentschat-mcp v${package_default.version} \u2014 AgentsChat MCP and host bridges
 
 Usage: claude mcp add agentschat -- npx -y agentschat-mcp@latest --profile <Bot> [options]
@@ -5918,7 +6002,7 @@ if (identity.mode === "profile") {
 `);
     process.exit(1);
   }
-  mkdirSync4(dirname2(profileFile), { recursive: true });
+  mkdirSync4(dirname4(profileFile), { recursive: true });
   safeWriteProfile2(profileFile, profile);
   process.stderr.write(`[agentchat] Profile saved: ${profileFile}
 `);
@@ -9010,7 +9094,7 @@ async function registerAndConnectProfile(displayName, bindSessionId) {
     };
     const targetFile = nameToPath(cleanName);
     validateIdentityProfile(newProfile, targetFile);
-    mkdirSync4(dirname2(targetFile), { recursive: true });
+    mkdirSync4(dirname4(targetFile), { recursive: true });
     safeWriteProfile2(targetFile, newProfile);
     applyIdentityFromProfile(newProfile, targetFile, bindSessionId);
     const claimEntry = `${REST_URL}/chat/${encodeURIComponent(data.id)}?claim=1`;
@@ -9794,7 +9878,7 @@ ${idx}` }] };
               isError: true
             };
           }
-          mkdirSync4(dirname2(pMd), { recursive: true });
+          mkdirSync4(dirname4(pMd), { recursive: true });
           writeFileSync6(pMd, body);
           writeFileSync6(pMeta, JSON.stringify({ version: currentVersion, name: pSlug, syncedAt: new Date().toISOString() }));
           return { content: [{ type: "text", text: `synced personal skill "${pSlug}" v${currentVersion} \u2192 ${pMd} (was ${cachedVersion === null ? "missing" : `stale v${cachedVersion}`}). Read that file to run it.` }] };
@@ -9847,7 +9931,7 @@ ${idx}` }] };
             isError: true
           };
         }
-        mkdirSync4(dirname2(mdPath), { recursive: true });
+        mkdirSync4(dirname4(mdPath), { recursive: true });
         writeFileSync6(mdPath, body);
         writeFileSync6(metaPath, JSON.stringify({ version: currentVersion, title: doc?.title, doc_id: a.doc_id, chat_id: a.chat_id, syncedAt: new Date().toISOString() }));
         const was = cachedVersion === null ? "missing" : `stale v${cachedVersion}`;
