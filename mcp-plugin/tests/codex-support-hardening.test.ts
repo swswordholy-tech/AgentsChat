@@ -37,7 +37,7 @@ test("authorizedLoopTick permits regular grant files on win32 without getuid whi
     codexBin: "codex",
   };
   const grant = {
-    loop_id: "loop-win",
+    loop_id: "loop_win",
     channel_id: "dm-owner",
     agent_id: "bot-win",
     owner_id: "owner-1",
@@ -52,7 +52,7 @@ test("authorizedLoopTick permits regular grant files on win32 without getuid whi
     sender_id: "bot-win",
     meta: {
       kind: "loop_tick" as const,
-      loop_id: "loop-win",
+      loop_id: "loop_win",
       interval_ms: 600_000,
       next_tick_ms: 1_200_000,
       prompt: "Check status",
@@ -195,4 +195,73 @@ test("independent runtime home rejects planted FIFO special files on POSIX", () 
   const mk = spawnSync("mkfifo", [fifo]);
   if (mk.status !== 0) return;
   expect(() => prepareRuntimeHome(join(root, "bot"), join(root, "unused"), "isolated")).toThrow("regular files");
+});
+
+function configFixture() {
+  const home = tempDir("codex-config-gates-");
+  const cwd = join(home, "project");
+  mkdirSync(join(cwd, ".agentschat"), { recursive: true });
+  mkdirSync(join(cwd, ".codex"));
+  const profile = join(home, "valid.json");
+  writeFileSync(profile, JSON.stringify({ agent_id: "bot-ok", token: "ac_ok_token" }), { mode: 0o600 });
+  return { home, cwd, profile };
+}
+
+test("config rejects linked project directories and linked config/profile files, including dangling links", () => {
+  for (const relative of [".agentschat", ".codex", ".agentschat/config.json", ".codex/config.toml", ".agentschat/profile.json", "selected.json"]) {
+    for (const dangling of [false, true]) {
+      const { home, cwd, profile } = configFixture();
+      const path = join(cwd, relative);
+      const target = join(home, "outside");
+      const isDir = relative === ".agentschat" || relative === ".codex";
+      if (!dangling) {
+        if (isDir) mkdirSync(target);
+        else writeFileSync(target, relative.endsWith("toml") ? "" : '{}', { mode: 0o600 });
+      }
+      rmSync(path, { recursive: true, force: true });
+      symlinkSync(target, path, isDir ? "dir" : "file");
+      expect(() => resolveConfig({ cwd, profile: relative === "selected.json" ? path : profile }, {}, home)).toThrow(isDir ? "non-symlink directory" : "regular file");
+    }
+  }
+});
+
+test("config files enforce the exact 1 MiB byte boundary before parsing", () => {
+  for (const relative of [".agentschat/config.json", ".codex/config.toml", ".agentschat/profile.json", "selected.json"]) {
+    const { home, cwd, profile } = configFixture();
+    const path = join(cwd, relative);
+    const body = relative.endsWith("toml") ? "# config\n" : relative.endsWith("config.json") ? "{}" : JSON.stringify({ agent_id: "bot-ok", token: "ac_ok_token" });
+    writeFileSync(path, body + " ".repeat(1_048_576 - Buffer.byteLength(body)), { mode: 0o600 });
+    const opts = { cwd, profile: relative === "selected.json" ? path : profile };
+    expect(resolveConfig(opts, {}, home).agentId).toBe("bot-ok");
+    writeFileSync(path, body + " ".repeat(1_048_577 - Buffer.byteLength(body)), { mode: 0o600 });
+    expect(() => resolveConfig(opts, {}, home)).toThrow("1 MiB");
+  }
+});
+
+test("config rejects special files without reading them and rejects own prototype settings", () => {
+  const { home, cwd, profile } = configFixture();
+  for (const key of ["__proto__", "constructor", "prototype"]) {
+    const settings = Object.defineProperty({}, key, { value: "bad", enumerable: false });
+    expect(() => resolveConfig({ cwd, profile, settings }, {}, home)).toThrow("prototype key");
+    writeFileSync(join(cwd, ".agentschat/config.json"), `{ "${key}": "bad" }`);
+    expect(() => resolveConfig({ cwd, profile }, {}, home)).toThrow("prototype key");
+  }
+  rmSync(join(cwd, ".agentschat/config.json"));
+  if (process.platform !== "win32") {
+    const fifo = join(cwd, "fifo.json");
+    expect(spawnSync("mkfifo", [fifo]).status).toBe(0);
+    expect(() => resolveConfig({ cwd, profile: fifo }, {}, home)).toThrow("regular file");
+  }
+});
+
+test("config expands Windows tilde paths and accepts canonical loopback aliases while rejecting port zero", () => {
+  const { home, cwd } = configFixture();
+  const config = resolveConfig({ cwd, profile: "~\\valid.json", stateRoot: "~\\state", settings: { api_url: "http://LOCALHOST.:1234", ws_url: "ws://[::1]:1234/ws" } }, {}, home);
+  expect(config.profileFile).toBe(join(home, "valid.json"));
+  expect(config.stateDir.startsWith(join(home, "state") + "/")).toBe(true);
+  for (const field of ["api_url", "ws_url"]) {
+    for (const url of ["http://localhost:0", "https://localhost:0", "ws://[::1]:0/ws", "wss://localhost:0/ws"]) {
+      expect(() => resolveConfig({ cwd, profile: "~\\valid.json", settings: { [field]: url } }, {}, home)).toThrow("Server URLs");
+    }
+  }
 });
