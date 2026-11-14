@@ -181,9 +181,15 @@ class MuseBridge {
 }
 
 // src/reconnect.ts
+function safeUnitRand(rand) {
+  const r = rand();
+  if (!Number.isFinite(r) || r < 0)
+    return 0;
+  return r >= 1 ? 0.999999 : r;
+}
 function computePleaseReconnectDelay(jitterMs, rand = Math.random) {
   const maxJitter = typeof jitterMs === "number" && Number.isFinite(jitterMs) && jitterMs > 0 ? Math.min(Math.floor(jitterMs), 1e4) : 2000;
-  return 200 + Math.floor(rand() * maxJitter);
+  return 200 + Math.floor(safeUnitRand(rand) * maxJitter);
 }
 function resolveDrainReconnectDelay(frame, rand = Math.random) {
   return computePleaseReconnectDelay(frame?.jitter_ms ?? frame?.within_ms, rand);

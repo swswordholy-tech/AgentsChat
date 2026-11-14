@@ -381,7 +381,7 @@ ${text}`,
 }
 
 // codex/run.ts
-import { readFileSync as readFileSync11, lstatSync as lstatSync6 } from "node:fs";
+import { readFileSync as readFileSync11, lstatSync as lstatSync7 } from "node:fs";
 import { homedir as homedir6 } from "node:os";
 import { join as join11 } from "node:path";
 
@@ -2587,18 +2587,18 @@ var WS_OPEN = 1;
 var WS_CLOSING = 2;
 class HeartbeatMonitor {
   deps;
-  pingInterval;
-  pongTimeout;
-  connectTimeout;
   lastPong;
   timer = null;
   connectingSince = null;
   reconnecting = false;
+  pingInterval;
+  pongTimeout;
+  connectTimeout;
   constructor(deps, pingInterval = 30000, pongTimeout = 90000, connectTimeout = 30000) {
     this.deps = deps;
-    this.pingInterval = pingInterval;
-    this.pongTimeout = pongTimeout;
-    this.connectTimeout = connectTimeout;
+    this.pingInterval = Number.isFinite(pingInterval) && pingInterval > 0 ? Math.min(pingInterval, 2147483647) : 30000;
+    this.pongTimeout = Number.isFinite(pongTimeout) && pongTimeout > 0 ? pongTimeout : 90000;
+    this.connectTimeout = Number.isFinite(connectTimeout) && connectTimeout > 0 ? connectTimeout : 30000;
     this.lastPong = Date.now();
   }
   receivedPong() {
@@ -2631,11 +2631,15 @@ class HeartbeatMonitor {
         this.safeReconnect("pong timeout");
         return;
       }
-      this.deps.sendPing();
+      try {
+        this.deps.sendPing();
+      } catch {
+        this.safeReconnect("ping send failed");
+      }
       return;
     }
     if (state === WS_CONNECTING) {
-      if (!this.connectingSince) {
+      if (this.connectingSince === null) {
         this.connectingSince = Date.now();
       } else if (Date.now() - this.connectingSince > this.connectTimeout) {
         this.connectingSince = null;
@@ -2655,16 +2659,23 @@ class HeartbeatMonitor {
 }
 
 // src/reconnect.ts
+function safeUnitRand(rand) {
+  const r = rand();
+  if (!Number.isFinite(r) || r < 0)
+    return 0;
+  return r >= 1 ? 0.999999 : r;
+}
 function computePleaseReconnectDelay(jitterMs, rand = Math.random) {
   const maxJitter = typeof jitterMs === "number" && Number.isFinite(jitterMs) && jitterMs > 0 ? Math.min(Math.floor(jitterMs), 1e4) : 2000;
-  return 200 + Math.floor(rand() * maxJitter);
+  return 200 + Math.floor(safeUnitRand(rand) * maxJitter);
 }
 function resolveDrainReconnectDelay(frame, rand = Math.random) {
   return computePleaseReconnectDelay(frame?.jitter_ms ?? frame?.within_ms, rand);
 }
 
 // codex/inbox-sync.ts
-import { existsSync as existsSync7, mkdirSync as mkdirSync7, readFileSync as readFileSync10, renameSync as renameSync5, unlinkSync as unlinkSync5, writeFileSync as writeFileSync5 } from "node:fs";
+import { chmodSync as chmodSync3, lstatSync as lstatSync6, mkdirSync as mkdirSync7, readFileSync as readFileSync10, renameSync as renameSync5, unlinkSync as unlinkSync5, writeFileSync as writeFileSync5 } from "node:fs";
+import { randomBytes as randomBytes2 } from "node:crypto";
 import { join as join10 } from "node:path";
 
 // src/timestamps.ts
@@ -2698,6 +2709,13 @@ function timestamp(value) {
     throw new Error("Invalid history timestamp");
   return normalizeTimestampForCursor(value, "after");
 }
+function validChannel(channel) {
+  return typeof channel === "string" && channel.trim().length > 0 && !/[\x00-\x1f\x7f-\x9f]/.test(channel) && !["__proto__", "constructor", "prototype"].includes(channel.trim());
+}
+function validateChannel(channel) {
+  if (!validChannel(channel))
+    throw new Error("Invalid inbound channel");
+}
 
 class InboxSync {
   api;
@@ -2714,27 +2732,51 @@ class InboxSync {
     this.active = active;
     this.log = log;
     mkdirSync7(stateDir, { recursive: true, mode: 448 });
+    const dirStat = lstatSync6(stateDir);
+    if (dirStat.isSymbolicLink() || !dirStat.isDirectory())
+      throw new Error("Invalid inbound state directory");
+    if (process.platform !== "win32")
+      chmodSync3(stateDir, 448);
     this.file = join10(stateDir, "inbound-cursors.json");
-    this.state = existsSync7(this.file) ? JSON.parse(readFileSync10(this.file, "utf8")) : { version: 1, channels: {} };
-    if (this.state.version !== 1 || !this.state.channels || typeof this.state.channels !== "object" || Array.isArray(this.state.channels))
+    let fileStat;
+    try {
+      fileStat = lstatSync6(this.file);
+    } catch (err) {
+      if (err.code !== "ENOENT")
+        throw err;
+    }
+    if (fileStat && (fileStat.isSymbolicLink() || !fileStat.isFile()))
+      throw new Error("Invalid inbound cursors file");
+    this.state = fileStat ? JSON.parse(readFileSync10(this.file, "utf8")) : { version: 1, channels: {} };
+    if (!this.state || this.state.version !== 1 || !this.state.channels || typeof this.state.channels !== "object" || Array.isArray(this.state.channels))
       throw new Error("Invalid inbound cursors; refusing to discard checkpoint");
-    for (const value of Object.values(this.state.channels))
+    const channels = Object.create(null);
+    for (const [channel, value] of Object.entries(this.state.channels)) {
+      if (!validChannel(channel))
+        continue;
       timestamp(value);
-    this.state.channels = Object.assign(Object.create(null), this.state.channels);
+      channels[channel] = value;
+    }
+    this.state.channels = channels;
   }
   save() {
-    const tmp = `${this.file}.tmp.${process.pid}.${Date.now()}`;
+    const tmp = `${this.file}.${process.pid}.${Date.now()}.${randomBytes2(4).toString("hex")}.tmp`;
+    let created = false;
     try {
-      writeFileSync5(tmp, JSON.stringify(this.state), { mode: 384 });
+      writeFileSync5(tmp, JSON.stringify(this.state), { mode: 384, flag: "wx" });
+      created = true;
       renameSync5(tmp, this.file);
     } catch (err) {
-      try {
-        unlinkSync5(tmp);
-      } catch {}
+      if (created) {
+        try {
+          unlinkSync5(tmp);
+        } catch {}
+      }
       throw err;
     }
   }
   watch(channel) {
+    validateChannel(channel);
     this.channels.add(channel);
     if (!Object.hasOwn(this.state.channels, channel)) {
       this.state.channels[channel] = timestamp(new Date().toISOString());
@@ -2742,9 +2784,18 @@ class InboxSync {
     }
   }
   memberships(channels) {
-    this.channels.clear();
     for (const channel of channels)
-      this.watch(channel);
+      validateChannel(channel);
+    this.channels = new Set(channels);
+    let changed = false;
+    for (const channel of this.channels) {
+      if (!Object.hasOwn(this.state.channels, channel)) {
+        this.state.channels[channel] = timestamp(new Date().toISOString());
+        changed = true;
+      }
+    }
+    if (changed)
+      this.save();
   }
   sync() {
     if (!this.running)
@@ -2771,7 +2822,7 @@ class InboxSync {
         if (!Array.isArray(messages))
           throw new Error("Invalid history response");
         const rows = messages.map((m) => {
-          if (!m || m.channel_id !== channel || typeof m.id !== "string")
+          if (!m || m.channel_id !== channel || typeof m.id !== "string" || m.id.trim().length === 0)
             throw new Error("Invalid history message");
           return { message: m, time: timestamp(m.timestamp) };
         }).sort((a, b) => a.time.localeCompare(b.time));
@@ -3085,7 +3136,7 @@ async function main() {
     }
     if (!values["gui-thread"] || !values["gui-message-file"])
       throw new Error("GUI submission requires --gui-thread and --gui-message-file");
-    const stat = lstatSync6(values["gui-message-file"]);
+    const stat = lstatSync7(values["gui-message-file"]);
     if (stat.isSymbolicLink() || !stat.isFile())
       throw new Error("GUI message must be a regular file, not a symlink");
     if (stat.size > 256 * 1024)

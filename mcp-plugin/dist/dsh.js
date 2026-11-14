@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // dsh/src/cli.ts
-import { chmodSync as chmodSync3, lstatSync as lstatSync3, mkdirSync as mkdirSync4, readFileSync as readFileSync6, renameSync as renameSync3, unlinkSync as unlinkSync4, writeFileSync as writeFileSync3 } from "node:fs";
+import { chmodSync as chmodSync3, lstatSync as lstatSync4, mkdirSync as mkdirSync4, readFileSync as readFileSync6, renameSync as renameSync3, unlinkSync as unlinkSync4, writeFileSync as writeFileSync3 } from "node:fs";
 import { spawn } from "node:child_process";
 import { dirname as dirname3, join as join6 } from "node:path";
 import { homedir as homedir5 } from "node:os";
@@ -181,9 +181,15 @@ class MuseBridge {
 }
 
 // src/reconnect.ts
+function safeUnitRand(rand) {
+  const r = rand();
+  if (!Number.isFinite(r) || r < 0)
+    return 0;
+  return r >= 1 ? 0.999999 : r;
+}
 function computePleaseReconnectDelay(jitterMs, rand = Math.random) {
   const maxJitter = typeof jitterMs === "number" && Number.isFinite(jitterMs) && jitterMs > 0 ? Math.min(Math.floor(jitterMs), 1e4) : 2000;
-  return 200 + Math.floor(rand() * maxJitter);
+  return 200 + Math.floor(safeUnitRand(rand) * maxJitter);
 }
 function resolveDrainReconnectDelay(frame, rand = Math.random) {
   return computePleaseReconnectDelay(frame?.jitter_ms ?? frame?.within_ms, rand);
@@ -722,7 +728,7 @@ function appendWakeQueue(queueFile, payload, maxLines = MAX_WAKE_QUEUE_LINES) {
 }
 
 // src/session-route.ts
-import { existsSync as existsSync3, readFileSync as readFileSync3 } from "node:fs";
+import { lstatSync as lstatSync2, readFileSync as readFileSync3 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
 import { join as join3 } from "node:path";
 
@@ -780,30 +786,46 @@ function loadSessionBinds(configDir) {
 }
 
 // src/session-route.ts
+var MAX_PROFILE_BYTES2 = 64 * 1024;
+var RESERVED_PROFILE_KEY = /^(?:__proto__|constructor|prototype)$/i;
 function agentschatConfigDir(env = process.env) {
   const home = env.HOME || env.USERPROFILE || homedir2();
   return env.AGENTSCHAT_CONFIG_DIR ?? join3(home, ".agentschat");
 }
+function isSafeRegularProfileFile(path) {
+  try {
+    const st = lstatSync2(path);
+    return !st.isSymbolicLink() && st.isFile() && st.size <= MAX_PROFILE_BYTES2;
+  } catch {
+    return false;
+  }
+}
 function profilePathForName(configDir, name) {
-  if (!name || name.includes("/") || name.includes("\\"))
+  if (!name || name === "." || name === ".." || name.includes("/") || name.includes("\\"))
     return;
   const base = name.replace(/\.json$/, "").replace(/[^a-zA-Z0-9_-]/g, "_");
+  if (!base || RESERVED_PROFILE_KEY.test(base))
+    return;
   const nested = join3(configDir, "profiles", `${base}.json`);
-  if (existsSync3(nested))
+  if (isSafeRegularProfileFile(nested))
     return nested;
   const flat = join3(configDir, `${base}.json`);
-  return existsSync3(flat) ? flat : undefined;
+  return isSafeRegularProfileFile(flat) ? flat : undefined;
 }
 function readAgentId(path) {
   try {
+    if (!isSafeRegularProfileFile(path))
+      return;
     const parsed = JSON.parse(readFileSync3(path, "utf8"));
-    return typeof parsed.agent_id === "string" && parsed.agent_id ? parsed.agent_id : undefined;
+    const id = typeof parsed?.agent_id === "string" ? parsed.agent_id.trim() : "";
+    return id && !RESERVED_PROFILE_KEY.test(id) ? id : undefined;
   } catch {
     return;
   }
 }
 function resolveSessionForAgent(agentId, opts = {}) {
-  if (typeof agentId !== "string" || agentId.length === 0)
+  const targetAgentId = typeof agentId === "string" ? agentId.trim() : "";
+  if (!targetAgentId || RESERVED_PROFILE_KEY.test(targetAgentId))
     return;
   const configDir = opts.configDir ?? agentschatConfigDir(opts.env);
   let binds;
@@ -818,15 +840,15 @@ function resolveSessionForAgent(agentId, opts = {}) {
     const path = profilePathForName(configDir, profileName);
     if (path === undefined)
       continue;
-    if (readAgentId(path) !== agentId)
+    if (readAgentId(path) !== targetAgentId)
       continue;
-    return { sessionId, profileName, agentId };
+    return { sessionId, profileName, agentId: targetAgentId };
   }
   return;
 }
 
 // src/wake.ts
-import { existsSync as existsSync4, readFileSync as readFileSync4 } from "node:fs";
+import { existsSync as existsSync3, readFileSync as readFileSync4 } from "node:fs";
 import { homedir as homedir3 } from "node:os";
 import { join as join4, win32 as pathWin32 } from "node:path";
 var GROK_GATEWAY_PATH_CANDIDATES = [
@@ -847,7 +869,7 @@ function resolveWindowsCliSpawn(cmd, args, opts) {
     return { cmd: trimmed, args };
   }
   const env = opts?.env ?? process.env;
-  const exists = opts?.existsImpl ?? existsSync4;
+  const exists = opts?.existsImpl ?? existsSync3;
   const readText = opts?.readTextImpl ?? ((p) => readFileSync4(p, "utf8"));
   const hasSep = /[\\/]/.test(trimmed) || /^[A-Za-z]:/.test(trimmed);
   const hasWinExt = /\.(?:exe|cmd|bat)$/i.test(trimmed);
@@ -899,7 +921,7 @@ function resolveWindowsCliSpawn(cmd, args, opts) {
 }
 
 // dsh/src/patch.ts
-import { chmodSync as chmodSync2, lstatSync as lstatSync2, mkdirSync as mkdirSync3, readFileSync as readFileSync5, renameSync as renameSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2 } from "node:fs";
+import { chmodSync as chmodSync2, lstatSync as lstatSync3, mkdirSync as mkdirSync3, readFileSync as readFileSync5, renameSync as renameSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2 } from "node:fs";
 import { dirname as dirname2, join as join5 } from "node:path";
 import { homedir as homedir4 } from "node:os";
 var FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
@@ -1035,7 +1057,7 @@ function applyDshCordisPatchFile(opts = {}) {
   let existed = false;
   let mode = 384;
   try {
-    const lst = lstatSync2(patchPath);
+    const lst = lstatSync3(patchPath);
     if (lst.isSymbolicLink() || !lst.isFile()) {
       throw new Error(`Refusing to modify non-regular or symlinked DSH patch file: ${patchPath}`);
     }
@@ -1099,7 +1121,7 @@ function validateHttpOrWsUrl(raw, allowedProtocols, label) {
 function loadDshConfig(env = process.env, profilePath = DSH_PROFILE_PATH) {
   let profile = {};
   try {
-    const lst = lstatSync3(profilePath);
+    const lst = lstatSync4(profilePath);
     if (!lst.isSymbolicLink() && lst.isFile() && lst.size <= 256 * 1024) {
       const parsed = JSON.parse(readFileSync6(profilePath, "utf8"));
       if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
@@ -1162,7 +1184,7 @@ async function registerOnly(name, restUrl, profilePath = DSH_PROFILE_PATH) {
     throw new Error("Registration response did not include a valid agent id/token");
   }
   try {
-    const lst = lstatSync3(profilePath);
+    const lst = lstatSync4(profilePath);
     if (lst.isSymbolicLink() || !lst.isFile()) {
       throw new Error(`Refusing to overwrite non-regular file ${profilePath}`);
     }
@@ -1380,7 +1402,7 @@ DeepSeek Harness (dsh) integration for AgentsChat:
             const candidates = [join6(cfgDir, "profiles", `${base}.json`), join6(cfgDir, `${base}.json`)];
             const profPath = candidates.find((p) => {
               try {
-                const lst = lstatSync3(p);
+                const lst = lstatSync4(p);
                 return !lst.isSymbolicLink() && lst.isFile() && lst.size <= 256 * 1024;
               } catch {
                 return false;

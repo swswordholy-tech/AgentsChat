@@ -764,18 +764,18 @@ var WS_CLOSED = 3;
 
 class HeartbeatMonitor {
   deps;
-  pingInterval;
-  pongTimeout;
-  connectTimeout;
   lastPong;
   timer = null;
   connectingSince = null;
   reconnecting = false;
+  pingInterval;
+  pongTimeout;
+  connectTimeout;
   constructor(deps, pingInterval = 30000, pongTimeout = 90000, connectTimeout = 30000) {
     this.deps = deps;
-    this.pingInterval = pingInterval;
-    this.pongTimeout = pongTimeout;
-    this.connectTimeout = connectTimeout;
+    this.pingInterval = Number.isFinite(pingInterval) && pingInterval > 0 ? Math.min(pingInterval, 2147483647) : 30000;
+    this.pongTimeout = Number.isFinite(pongTimeout) && pongTimeout > 0 ? pongTimeout : 90000;
+    this.connectTimeout = Number.isFinite(connectTimeout) && connectTimeout > 0 ? connectTimeout : 30000;
     this.lastPong = Date.now();
   }
   receivedPong() {
@@ -808,11 +808,15 @@ class HeartbeatMonitor {
         this.safeReconnect("pong timeout");
         return;
       }
-      this.deps.sendPing();
+      try {
+        this.deps.sendPing();
+      } catch {
+        this.safeReconnect("ping send failed");
+      }
       return;
     }
     if (state === WS_CONNECTING) {
-      if (!this.connectingSince) {
+      if (this.connectingSince === null) {
         this.connectingSince = Date.now();
       } else if (Date.now() - this.connectingSince > this.connectTimeout) {
         this.connectingSince = null;
@@ -832,16 +836,30 @@ class HeartbeatMonitor {
 }
 
 // src/reconnect.ts
+var MAX_TIMEOUT_MS = 2147483647;
+function safeUnitRand(rand) {
+  const r = rand();
+  if (!Number.isFinite(r) || r < 0)
+    return 0;
+  return r >= 1 ? 0.999999 : r;
+}
 function computePleaseReconnectDelay(jitterMs, rand = Math.random) {
   const maxJitter = typeof jitterMs === "number" && Number.isFinite(jitterMs) && jitterMs > 0 ? Math.min(Math.floor(jitterMs), 1e4) : 2000;
-  return 200 + Math.floor(rand() * maxJitter);
+  return 200 + Math.floor(safeUnitRand(rand) * maxJitter);
 }
 function resolveDrainReconnectDelay(frame, rand = Math.random) {
   return computePleaseReconnectDelay(frame?.jitter_ms ?? frame?.within_ms, rand);
 }
 function withTimeoutController(parentSignal, timeoutMs) {
   const controller = new AbortController;
-  const onParentAbort = () => controller.abort(parentSignal?.reason);
+  let timer = null;
+  const onParentAbort = () => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    controller.abort(parentSignal?.reason);
+  };
   if (parentSignal) {
     if (parentSignal.aborted) {
       controller.abort(parentSignal.reason);
@@ -849,17 +867,25 @@ function withTimeoutController(parentSignal, timeoutMs) {
     }
     parentSignal.addEventListener("abort", onParentAbort, { once: true });
   }
-  const timer = timeoutMs > 0 ? setTimeout(() => {
-    const err = new Error(`HTTP request timed out after ${timeoutMs}ms`);
-    err.name = "TimeoutError";
-    controller.abort(err);
-  }, timeoutMs) : null;
-  timer?.unref?.();
+  const boundedTimeoutMs = typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.min(Math.floor(timeoutMs), MAX_TIMEOUT_MS) : 0;
+  if (boundedTimeoutMs > 0) {
+    timer = setTimeout(() => {
+      timer = null;
+      if (parentSignal)
+        parentSignal.removeEventListener("abort", onParentAbort);
+      const err = new Error(`HTTP request timed out after ${boundedTimeoutMs}ms`);
+      err.name = "TimeoutError";
+      controller.abort(err);
+    }, boundedTimeoutMs);
+    timer?.unref?.();
+  }
   return {
     signal: controller.signal,
     cleanup: () => {
-      if (timer)
+      if (timer) {
         clearTimeout(timer);
+        timer = null;
+      }
       if (parentSignal)
         parentSignal.removeEventListener("abort", onParentAbort);
     }
