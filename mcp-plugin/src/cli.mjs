@@ -34,6 +34,13 @@ if ([connectorMode, codexMode, botsMode, museMode, dshMode].filter(Boolean).leng
   throw new Error("Choose only one bridge mode");
 }
 const helpRequested = args.includes("--help") || args.includes("-h");
+const oneShotRequested =
+  helpRequested ||
+  args.includes("--register-only") ||
+  args.includes("--version") ||
+  args.includes("-v") ||
+  args.includes("--check") ||
+  args.includes("--status");
 const superviseRequested =
   args.includes("--supervise") || process.env.AGENTCHAT_WAKE_SUPERVISE === "1";
 
@@ -137,13 +144,20 @@ async function runSupervised(childArgs) {
   /** @type {(() => void) | null} */
   let cancelSleep = null;
 
+  const MAX_TIMER_MS = 2_147_483_647;
+  const clampTimerMs = (raw, minMs, fallbackMs) => {
+    const num = Number(raw);
+    if (!Number.isFinite(num) || num <= 0) return fallbackMs;
+    return Math.min(Math.max(minMs, Math.floor(num)), MAX_TIMER_MS);
+  };
+
   const requestStop = () => {
     stopping = true;
     if (cancelSleep) {
       cancelSleep();
       cancelSleep = null;
     }
-    if (child && child.pid && !child.killed) {
+    if (child && child.pid && child.exitCode === null && child.signalCode === null) {
       try {
         child.kill("SIGTERM");
       } catch {
@@ -153,6 +167,9 @@ async function runSupervised(childArgs) {
   };
   process.on("SIGTERM", requestStop);
   process.on("SIGINT", requestStop);
+  if (process.platform !== "win32") {
+    process.on("SIGHUP", requestStop);
+  }
 
   const interruptibleSleep = (ms) =>
     new Promise((resolve) => {
@@ -160,10 +177,11 @@ async function runSupervised(childArgs) {
         resolve();
         return;
       }
+      const safeMs = Math.min(Math.max(0, Math.floor(ms)), MAX_TIMER_MS);
       const timer = setTimeout(() => {
         cancelSleep = null;
         resolve();
-      }, ms);
+      }, safeMs);
       cancelSleep = () => {
         clearTimeout(timer);
         resolve();
@@ -174,9 +192,12 @@ async function runSupervised(childArgs) {
   const childEnv = { ...process.env };
   delete childEnv.AGENTCHAT_WAKE_SUPERVISE;
 
-  const initialDelayMs = Math.max(10, Number(process.env.AGENTCHAT_SUPERVISE_INITIAL_DELAY_MS) || 1000);
-  const maxDelayMs = Math.max(initialDelayMs, Number(process.env.AGENTCHAT_SUPERVISE_MAX_DELAY_MS) || 30_000);
-  const healthyResetMs = Math.max(50, Number(process.env.AGENTCHAT_SUPERVISE_RESET_MS) || 60_000);
+  const initialDelayMs = clampTimerMs(process.env.AGENTCHAT_SUPERVISE_INITIAL_DELAY_MS, 10, 1000);
+  const maxDelayMs = Math.max(
+    initialDelayMs,
+    clampTimerMs(process.env.AGENTCHAT_SUPERVISE_MAX_DELAY_MS, initialDelayMs, Math.max(initialDelayMs, 30_000)),
+  );
+  const healthyResetMs = clampTimerMs(process.env.AGENTCHAT_SUPERVISE_RESET_MS, 50, 60_000);
   let delayMs = initialDelayMs;
 
   while (!stopping) {
@@ -206,7 +227,7 @@ async function runSupervised(childArgs) {
   process.exit(0);
 }
 
-if (superviseRequested && !helpRequested) {
+if (superviseRequested && !oneShotRequested) {
   process.argv = [process.argv[0], process.argv[1], ...filteredArgs];
   await runSupervised(filteredArgs);
   process.exit(0);
@@ -259,7 +280,9 @@ if (typeof globalThis.Bun !== "undefined") {
       env: childEnv,
       stdio: "inherit",
     });
-    for (const sig of ["SIGINT", "SIGTERM"]) {
+    const proxySignals =
+      process.platform === "win32" ? ["SIGINT", "SIGTERM"] : ["SIGINT", "SIGTERM", "SIGHUP"];
+    for (const sig of proxySignals) {
       process.on(sig, () => {
         try {
           child.kill(sig);
