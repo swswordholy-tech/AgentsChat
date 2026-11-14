@@ -31,6 +31,15 @@ test("claimed false, true, absent, mismatched and failed status stay distinct",a
   const s=await getOnboardingStatus(badBase,"bot",badToken,(async()=>{called=true;return Response.json({agent_id:"bot",claimed:true});}));
   expect(called).toBe(false);expect(s.claimed).toBeNull();expect(s.authentication).toBe("unknown");
  }
+ // Oversized (>64 KiB) onboarding JSON bodies are cancelled and rejected without buffering unbounded payloads
+ let oversizeCancelled=false;
+ const hugeChunk=new TextEncoder().encode(`{"agent_id":"bot","claimed":true,"pad":"${"x".repeat(80*1024)}"}`);
+ const hugeStream=new ReadableStream({pull(c){c.enqueue(hugeChunk);},cancel(){oversizeCancelled=true;}});
+ const oversizeStatus=await getOnboardingStatus("https://example.com","bot","ac_private",(async()=>new Response(hugeStream,{status:200,headers:{"content-type":"application/json"}})));
+ expect(oversizeStatus.claimed).toBeNull();expect(oversizeStatus.authentication).toBe("unknown");expect(oversizeCancelled).toBe(true);
+ // claimSummary strips terminal escape / control characters from claim_url
+ const forgedSummary=claimSummary({...oversizeStatus,claimed:false,claim_url:"https://example.com/chat/bot\x1b[31m\r\n?claim=1"});
+ expect(forgedSummary).not.toMatch(/[\x00-\x1f\x7f]/);expect(forgedSummary).toContain("https://example.com/chat/bot[31m?claim=1");
 });
 test("one-shot registration exits with private clickable claim link, without logging key or starting MCP",async()=>{
  let calls=0;

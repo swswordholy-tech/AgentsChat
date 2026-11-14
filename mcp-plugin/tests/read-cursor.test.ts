@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { flushCursor, loadCursor, persistCursor } from "../src/read-cursor.ts";
-import { mkdtempSync, readdirSync, rmSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -101,12 +101,28 @@ describe("persistCursor reports failures instead of swallowing them", () => {
   });
 
   test("loadCursor rejects non-object JSON roots and non-string cursor values with a warning", () => {
-    for (const badContent of ["null", "[1,2]", '"str"', JSON.stringify({ chan: 12345 })]) {
+    for (const badContent of ["null", "[1,2]", '"str"', JSON.stringify({ chan: 12345 }), JSON.stringify({ chan: "bad\x00ts" })]) {
       const file = join(dir, "bad-shape.json");
       writeFileSync(file, badContent);
       const warnings: string[] = [];
       expect(loadCursor(file, (m) => warnings.push(m)).size).toBe(0);
       expect(warnings.join("")).toMatch(/could not read/);
     }
+  });
+
+  test("loadCursor and persistCursor reject symbolic links without following or clobbering targets", () => {
+    const victim = join(dir, "victim.json");
+    writeFileSync(victim, JSON.stringify({ secret: "untouched" }));
+    const link = join(dir, "link-cursor.json");
+    symlinkSync(victim, link);
+
+    const loadWarnings: string[] = [];
+    expect(loadCursor(link, (m) => loadWarnings.push(m)).size).toBe(0);
+    expect(loadWarnings.join("")).toMatch(/could not read/);
+
+    const persistWarnings: string[] = [];
+    expect(persistCursor(link, new Map([["chan", "2026-07-10T00:00:00Z"]]), (m) => persistWarnings.push(m))).toBe(false);
+    expect(persistWarnings.join("")).toMatch(/failed to persist read cursor/);
+    expect(JSON.parse(readFileSync(victim, "utf-8"))).toEqual({ secret: "untouched" });
   });
 });

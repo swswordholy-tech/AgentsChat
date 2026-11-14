@@ -14,11 +14,13 @@
  *
  * So: the write reports success, and the dirty flag is cleared ONLY once it lands.
  */
-import { readFileSync, renameSync, unlinkSync, writeFileSync } from "fs";
+import { randomBytes } from "crypto";
+import { chmodSync, lstatSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "fs";
 import { join } from "path";
 
 export type Warn = (message: string) => void;
 
+const MAX_CURSOR_BYTES = 4 * 1024 * 1024;
 let tmpCounter = 0;
 
 /**
@@ -48,6 +50,13 @@ export function cursorFileForAgent(configDir: string, agentId: string): string {
  */
 export function loadCursor(file: string, warn: Warn): Map<string, string> {
   try {
+    const st = lstatSync(file);
+    if (st.isSymbolicLink() || !st.isFile()) {
+      throw new Error("cursor path must be a regular file");
+    }
+    if (st.size > MAX_CURSOR_BYTES) {
+      throw new Error(`cursor file exceeds ${MAX_CURSOR_BYTES} byte limit`);
+    }
     const parsed = JSON.parse(readFileSync(file, "utf-8")) as unknown;
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       throw new Error("cursor root must be a JSON object");
@@ -57,6 +66,9 @@ export function loadCursor(file: string, warn: Warn): Map<string, string> {
       if (k === "__proto__" || k === "constructor" || k === "prototype") continue;
       if (typeof v !== "string") {
         throw new Error(`cursor value for ${k} must be a string`);
+      }
+      if (!k || /[\x00-\x1f\x7f]/.test(k) || /[\x00-\x1f\x7f]/.test(v) || v.length > 256) {
+        throw new Error(`cursor entry for ${k} contains invalid characters or length`);
       }
       entries.push([k, v]);
     }
@@ -71,9 +83,24 @@ export function loadCursor(file: string, warn: Warn): Map<string, string> {
 
 /** Write the cursor to disk atomically (0600 tmp + rename). Returns true iff it actually landed. Never throws. */
 export function persistCursor(file: string, cursor: Map<string, string>, warn: Warn): boolean {
-  const tmp = `${file}.${process.pid}.${Date.now()}.${++tmpCounter}.tmp`;
   try {
-    writeFileSync(tmp, JSON.stringify(Object.fromEntries(cursor)), { mode: 0o600 });
+    const existing = lstatSync(file);
+    if (existing.isSymbolicLink() || !existing.isFile()) {
+      warn(`[agentchat] WARNING: failed to persist read cursor to ${file}: target is not a regular file\n`);
+      return false;
+    }
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException)?.code !== "ENOENT") {
+      warn(`[agentchat] WARNING: failed to persist read cursor to ${file}: ${e}\n`);
+      return false;
+    }
+  }
+  const tmp = `${file}.${process.pid}.${Date.now()}.${++tmpCounter}.${randomBytes(4).toString("hex")}.tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify(Object.fromEntries(cursor)), { mode: 0o600, flag: "wx" });
+    if (process.platform !== "win32") {
+      chmodSync(tmp, 0o600);
+    }
     renameSync(tmp, file);
     return true;
   } catch (e) {

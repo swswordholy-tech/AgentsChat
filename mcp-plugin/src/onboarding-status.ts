@@ -14,6 +14,36 @@ function isSafeOnboardingBase(base: string): boolean {
     return false;
   }
 }
+const MAX_ONBOARDING_JSON_BYTES = 64 * 1024;
+
+async function readBoundedJson(r: Response, maxBytes = MAX_ONBOARDING_JSON_BYTES): Promise<unknown> {
+  if (!r.body) {
+    const txt = await r.text();
+    if (Buffer.byteLength(txt, "utf8") > maxBytes) throw new Error("onboarding response too large");
+    return JSON.parse(txt);
+  }
+  const reader = r.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        total += value.byteLength;
+        if (total > maxBytes) {
+          await reader.cancel().catch(() => {});
+          throw new Error("onboarding response too large");
+        }
+        chunks.push(value);
+      }
+    }
+  } finally {
+    try { reader.releaseLock(); } catch {}
+  }
+  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
+
 export async function getOnboardingStatus(base: string, agentId: string, token: string, request: (url: string, options: RequestInit) => Promise<Response> = fetch): Promise<OnboardingStatus> {
   const cleanBase = typeof base === "string" ? base.trim().replace(/\/+$/, "") : "";
   const safeAgentId = typeof agentId === "string" ? agentId.trim() : "";
@@ -37,7 +67,7 @@ export async function getOnboardingStatus(base: string, agentId: string, token: 
       try { await r.body?.cancel?.(); } catch {}
       return result;
     }
-    const data = await r.json() as any;
+    const data = await readBoundedJson(r) as any;
     if (!data || typeof data !== "object" || data.agent_id !== safeAgentId || typeof data.claimed !== "boolean") return result;
     result.authentication = "ok"; result.claimed = data.claimed;
     result.next_step = data.claimed ? "verify_reply" : "join_public_chat";
@@ -45,7 +75,10 @@ export async function getOnboardingStatus(base: string, agentId: string, token: 
   return result;
 }
 export function claimSummary(status: OnboardingStatus): string {
-  if (status.claimed === true) return "Claimed: yes — verify an actual message/reply in the authorized conversation before marking setup complete.";
-  if (status.claimed === false) return `Claimed: NO — public group chat can proceed within the authorized scope and service limits. Claiming unlocks DMs, private channels and owner features: open ${status.claim_url} and enter the token from your private profile.`;
-  return `Claimed: unknown — ownership could not be verified. Check the service and account; do not register a replacement. Claim entry: ${status.claim_url}`;
+  const safeClaimUrl = typeof status?.claim_url === "string"
+    ? status.claim_url.replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 512)
+    : "";
+  if (status?.claimed === true) return "Claimed: yes — verify an actual message/reply in the authorized conversation before marking setup complete.";
+  if (status?.claimed === false) return `Claimed: NO — public group chat can proceed within the authorized scope and service limits. Claiming unlocks DMs, private channels and owner features: open ${safeClaimUrl} and enter the token from your private profile.`;
+  return `Claimed: unknown — ownership could not be verified. Check the service and account; do not register a replacement. Claim entry: ${safeClaimUrl}`;
 }
