@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // dsh/src/cli.ts
-import { chmodSync as chmodSync3, lstatSync as lstatSync4, mkdirSync as mkdirSync4, readFileSync as readFileSync6, renameSync as renameSync3, unlinkSync as unlinkSync4, writeFileSync as writeFileSync3 } from "node:fs";
+import { chmodSync as chmodSync3, lstatSync as lstatSync5, mkdirSync as mkdirSync4, readFileSync as readFileSync6, renameSync as renameSync3, unlinkSync as unlinkSync4, writeFileSync as writeFileSync3 } from "node:fs";
 import { randomBytes as randomBytes2 } from "node:crypto";
 import { spawn } from "node:child_process";
 import { dirname as dirname3, join as join6, resolve as resolve2 } from "node:path";
@@ -119,6 +119,7 @@ class TypingHeartbeat {
 // muse/src/bridge.ts
 class MuseBridge {
   client;
+  activeReplies = new Map;
   history = new Map;
   opts;
   typing = new TypingHeartbeat((channelId) => this.client.sendTyping(channelId));
@@ -138,13 +139,14 @@ class MuseBridge {
   }
   stop() {
     this.typing.stopAll();
+    this.activeReplies.clear();
     this.client.disconnect();
   }
   get isConnected() {
     return this.client.isConnected;
   }
   async handleMessage(message) {
-    if (!message.channel_id)
+    if (!message.channel_id || message.content === "__typing__")
       return;
     if (!this.history.has(message.channel_id) && this.history.size >= 200) {
       const oldest = this.history.keys().next().value;
@@ -159,7 +161,10 @@ class MuseBridge {
     if (!shouldDispatch(message, { agentId: this.opts.agentId, displayName: this.opts.displayName, channelKind: kind })) {
       return;
     }
-    this.typing.start(message.channel_id);
+    const active = this.activeReplies.get(message.channel_id) ?? 0;
+    this.activeReplies.set(message.channel_id, active + 1);
+    if (active === 0)
+      this.typing.start(message.channel_id);
     try {
       const ctx = {
         message,
@@ -176,7 +181,13 @@ class MuseBridge {
         }
       }
     } finally {
-      this.typing.stop(message.channel_id);
+      const remaining = (this.activeReplies.get(message.channel_id) ?? 1) - 1;
+      if (remaining <= 0) {
+        this.activeReplies.delete(message.channel_id);
+        this.typing.stop(message.channel_id);
+      } else {
+        this.activeReplies.set(message.channel_id, remaining);
+      }
     }
   }
 }
@@ -243,6 +254,21 @@ class MuseAgentChatClient {
   onDebug;
   onReconnect;
   constructor(options) {
+    let url;
+    try {
+      url = new URL(options.url);
+    } catch {
+      throw new Error("Invalid Muse ws URL");
+    }
+    if (url.protocol !== "ws:" && url.protocol !== "wss:") {
+      throw new Error("Invalid Muse ws URL protocol");
+    }
+    if (url.username || url.password) {
+      throw new Error("Embedded credentials are not allowed in Muse ws URL");
+    }
+    if (url.protocol === "ws:" && !["127.0.0.1", "localhost", "[::1]", "::1"].includes(url.hostname.toLowerCase())) {
+      throw new Error("Remote Muse ws URL must use wss://");
+    }
     this.url = options.url;
     this.agentId = options.agentId;
     this.token = options.token;
@@ -324,12 +350,17 @@ class MuseAgentChatClient {
       this.connectSettled = true;
       this.connectReject?.(new Error("Disconnected before authentication completed"));
     }
-    try {
-      this.ws?.close();
-    } catch {}
+    this.connectResolve = null;
+    this.connectReject = null;
+    this.lifecycleResolve?.();
+    this.lifecycleResolve = null;
+    const prev = this.ws;
     this.ws = null;
     this.sessionId = null;
-    this.lifecycleResolve?.();
+    this.sessionJoined.clear();
+    try {
+      prev?.close();
+    } catch {}
   }
   get isConnected() {
     return this.ws?.readyState === WebSocket.OPEN && this.sessionId !== null;
@@ -410,23 +441,53 @@ class MuseAgentChatClient {
       this.connectTimer.unref?.();
     }
     ws.onopen = () => {
-      this.send({
-        type: "auth",
-        agent_id: this.agentId,
-        token: this.token,
-        capabilities: this.capabilities
-      });
+      if (this.ws !== ws)
+        return;
+      try {
+        this.send({
+          type: "auth",
+          agent_id: this.agentId,
+          token: this.token,
+          capabilities: this.capabilities
+        });
+      } catch (err) {
+        this.clearConnectTimer();
+        if (!this.connectSettled) {
+          this.connectSettled = true;
+          this.connectReject?.(err instanceof Error ? err : new Error(String(err)));
+        }
+        this.emitError(err instanceof Error ? err : new Error(String(err)));
+        try {
+          ws.close();
+        } catch {}
+        return;
+      }
       if (this.heartbeatTimer)
         clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = setInterval(() => {
-        if (this.ws?.readyState === WebSocket.OPEN) {
-          this.send({ type: "ping", timestamp: new Date().toISOString() });
+        if (this.ws !== ws)
+          return;
+        if (ws.readyState === WebSocket.OPEN) {
+          try {
+            this.send({ type: "ping", timestamp: new Date().toISOString() });
+          } catch (err) {
+            this.emitError(err instanceof Error ? err : new Error(String(err)));
+            try {
+              ws.close();
+            } catch {}
+          }
         }
       }, this.heartbeatIntervalMs);
       this.heartbeatTimer.unref?.();
     };
-    ws.onmessage = (event) => this.handleMessage(String(event.data));
+    ws.onmessage = (event) => {
+      if (this.ws !== ws)
+        return;
+      this.handleMessage(String(event.data));
+    };
     ws.onerror = () => {
+      if (this.ws !== ws)
+        return;
       const err = new Error("WebSocket error");
       if (!this.connectSettled) {
         this.clearConnectTimer();
@@ -436,7 +497,7 @@ class MuseAgentChatClient {
       this.emitError(err);
     };
     ws.onclose = () => {
-      if (this.ws && this.ws !== ws)
+      if (this.ws !== ws)
         return;
       this.clearConnectTimer();
       if (this.heartbeatTimer)
@@ -729,12 +790,12 @@ function appendWakeQueue(queueFile, payload, maxLines = MAX_WAKE_QUEUE_LINES) {
 }
 
 // src/session-route.ts
-import { lstatSync as lstatSync2, readFileSync as readFileSync3 } from "node:fs";
+import { lstatSync as lstatSync3, readFileSync as readFileSync3 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
 import { join as join3 } from "node:path";
 
 // src/session-bind.ts
-import { closeSync, existsSync as existsSync2, mkdirSync as mkdirSync2, openSync, readFileSync as readFileSync2, readSync, readdirSync, statSync, unlinkSync as unlinkSync2 } from "node:fs";
+import { closeSync, existsSync as existsSync2, lstatSync as lstatSync2, mkdirSync as mkdirSync2, openSync, readFileSync as readFileSync2, readSync, readdirSync, statSync, unlinkSync as unlinkSync2 } from "node:fs";
 import { join as join2 } from "node:path";
 
 // src/profile-store.ts
@@ -753,6 +814,22 @@ var NON_PROFILE_JSON_FILES = new Set([
 // src/session-bind.ts
 var DEFAULT_SESSION_BINDS_FILENAME = "session-binds.json";
 var LEGACY_AGY_BINDS_FILENAME = "agy-binds.json";
+var LOCK_FILE_MAX_BYTES = 64 * 1024;
+var SESSION_BINDS_MAX_BYTES = 1024 * 1024;
+var CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
+function readBoundedRegularJson(path, maxBytes) {
+  try {
+    const st = lstatSync2(path);
+    if (st.isSymbolicLink() || !st.isFile() || st.size > maxBytes)
+      return null;
+    return JSON.parse(readFileSync2(path, "utf8"));
+  } catch {
+    return null;
+  }
+}
+function isValidBindToken(value) {
+  return value.length > 0 && value.length <= 256 && !CONTROL_CHAR_RE.test(value);
+}
 function isUnsafeBindKey(key) {
   const lower = key.toLowerCase();
   return lower === "__proto__" || lower === "constructor" || lower === "prototype";
@@ -763,12 +840,16 @@ function parseSessionBinds(raw) {
   const out = {};
   for (const [k, v] of Object.entries(raw)) {
     const key = k.trim();
-    if (!key || isUnsafeBindKey(key))
+    if (!isValidBindToken(key) || isUnsafeBindKey(key))
       continue;
-    if (typeof v === "string" && v.trim()) {
-      out[key] = v.trim();
-    } else if (v && typeof v === "object" && typeof v.profile === "string" && v.profile.trim()) {
-      out[key] = v.profile.trim();
+    if (typeof v === "string") {
+      const val = v.trim();
+      if (isValidBindToken(val))
+        out[key] = val;
+    } else if (v && typeof v === "object" && typeof v.profile === "string") {
+      const val = v.profile.trim();
+      if (isValidBindToken(val))
+        out[key] = val;
     }
   }
   return out;
@@ -777,11 +858,10 @@ function loadSessionBinds(configDir) {
   const merged = {};
   for (const filename of [LEGACY_AGY_BINDS_FILENAME, DEFAULT_SESSION_BINDS_FILENAME]) {
     const path = join2(configDir, filename);
-    if (!existsSync2(path))
-      continue;
-    try {
-      Object.assign(merged, parseSessionBinds(JSON.parse(readFileSync2(path, "utf8"))));
-    } catch {}
+    const parsed = readBoundedRegularJson(path, SESSION_BINDS_MAX_BYTES);
+    if (parsed !== null) {
+      Object.assign(merged, parseSessionBinds(parsed));
+    }
   }
   return merged;
 }
@@ -795,7 +875,7 @@ function agentschatConfigDir(env = process.env) {
 }
 function isSafeRegularProfileFile(path) {
   try {
-    const st = lstatSync2(path);
+    const st = lstatSync3(path);
     return !st.isSymbolicLink() && st.isFile() && st.size <= MAX_PROFILE_BYTES2;
   } catch {
     return false;
@@ -923,7 +1003,7 @@ function resolveWindowsCliSpawn(cmd, args, opts) {
 
 // dsh/src/patch.ts
 import { randomBytes } from "node:crypto";
-import { chmodSync as chmodSync2, lstatSync as lstatSync3, mkdirSync as mkdirSync3, readFileSync as readFileSync5, renameSync as renameSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2 } from "node:fs";
+import { chmodSync as chmodSync2, lstatSync as lstatSync4, mkdirSync as mkdirSync3, readFileSync as readFileSync5, renameSync as renameSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2 } from "node:fs";
 import { dirname as dirname2, join as join5, resolve } from "node:path";
 import { homedir as homedir4 } from "node:os";
 var FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
@@ -933,7 +1013,7 @@ function checkParentDirectory(path) {
   for (;; ) {
     if (!(process.platform === "darwin" && DARWIN_ROOT_LINKS.has(parent))) {
       try {
-        const stat = lstatSync3(parent);
+        const stat = lstatSync4(parent);
         if (stat.isSymbolicLink() || !stat.isDirectory()) {
           throw new Error(`Refusing symlinked or non-directory parent: ${parent}`);
         }
@@ -1080,7 +1160,7 @@ function applyDshCordisPatchFile(opts = {}) {
   let existed = false;
   let mode = 384;
   try {
-    const lst = lstatSync3(patchPath);
+    const lst = lstatSync4(patchPath);
     if (lst.isSymbolicLink() || !lst.isFile()) {
       throw new Error(`Refusing to modify non-regular or symlinked DSH patch file: ${patchPath}`);
     }
@@ -1136,7 +1216,7 @@ function checkParentDirectory2(path) {
   for (;; ) {
     if (!(process.platform === "darwin" && DARWIN_ROOT_LINKS2.has(parent))) {
       try {
-        const stat = lstatSync4(parent);
+        const stat = lstatSync5(parent);
         if (stat.isSymbolicLink() || !stat.isDirectory()) {
           throw new Error(`Refusing symlinked or non-directory parent: ${parent}`);
         }
@@ -1172,7 +1252,7 @@ function validateHttpOrWsUrl(raw, allowedProtocols, label) {
 function loadDshConfig(env = process.env, profilePath = DSH_PROFILE_PATH) {
   let profile = {};
   try {
-    const lst = lstatSync4(profilePath);
+    const lst = lstatSync5(profilePath);
     if (!lst.isSymbolicLink() && lst.isFile() && lst.size <= 256 * 1024) {
       const parsed = JSON.parse(readFileSync6(profilePath, "utf8"));
       if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
@@ -1236,7 +1316,7 @@ async function registerOnly(name, restUrl, profilePath = DSH_PROFILE_PATH) {
     throw new Error("Registration response did not include a valid agent id/token");
   }
   try {
-    const lst = lstatSync4(profilePath);
+    const lst = lstatSync5(profilePath);
     if (lst.isSymbolicLink() || !lst.isFile()) {
       throw new Error(`Refusing to overwrite non-regular file ${profilePath}`);
     }
@@ -1461,7 +1541,7 @@ DeepSeek Harness (dsh) integration for AgentsChat:
             const candidates = [join6(cfgDir, "profiles", `${base}.json`), join6(cfgDir, `${base}.json`)];
             const profPath = candidates.find((p) => {
               try {
-                const lst = lstatSync4(p);
+                const lst = lstatSync5(p);
                 return !lst.isSymbolicLink() && lst.isFile() && lst.size <= 256 * 1024;
               } catch {
                 return false;

@@ -118,6 +118,7 @@ class TypingHeartbeat {
 // muse/src/bridge.ts
 class MuseBridge {
   client;
+  activeReplies = new Map;
   history = new Map;
   opts;
   typing = new TypingHeartbeat((channelId) => this.client.sendTyping(channelId));
@@ -137,13 +138,14 @@ class MuseBridge {
   }
   stop() {
     this.typing.stopAll();
+    this.activeReplies.clear();
     this.client.disconnect();
   }
   get isConnected() {
     return this.client.isConnected;
   }
   async handleMessage(message) {
-    if (!message.channel_id)
+    if (!message.channel_id || message.content === "__typing__")
       return;
     if (!this.history.has(message.channel_id) && this.history.size >= 200) {
       const oldest = this.history.keys().next().value;
@@ -158,7 +160,10 @@ class MuseBridge {
     if (!shouldDispatch(message, { agentId: this.opts.agentId, displayName: this.opts.displayName, channelKind: kind })) {
       return;
     }
-    this.typing.start(message.channel_id);
+    const active = this.activeReplies.get(message.channel_id) ?? 0;
+    this.activeReplies.set(message.channel_id, active + 1);
+    if (active === 0)
+      this.typing.start(message.channel_id);
     try {
       const ctx = {
         message,
@@ -175,7 +180,13 @@ class MuseBridge {
         }
       }
     } finally {
-      this.typing.stop(message.channel_id);
+      const remaining = (this.activeReplies.get(message.channel_id) ?? 1) - 1;
+      if (remaining <= 0) {
+        this.activeReplies.delete(message.channel_id);
+        this.typing.stop(message.channel_id);
+      } else {
+        this.activeReplies.set(message.channel_id, remaining);
+      }
     }
   }
 }
@@ -242,6 +253,21 @@ class MuseAgentChatClient {
   onDebug;
   onReconnect;
   constructor(options) {
+    let url;
+    try {
+      url = new URL(options.url);
+    } catch {
+      throw new Error("Invalid Muse ws URL");
+    }
+    if (url.protocol !== "ws:" && url.protocol !== "wss:") {
+      throw new Error("Invalid Muse ws URL protocol");
+    }
+    if (url.username || url.password) {
+      throw new Error("Embedded credentials are not allowed in Muse ws URL");
+    }
+    if (url.protocol === "ws:" && !["127.0.0.1", "localhost", "[::1]", "::1"].includes(url.hostname.toLowerCase())) {
+      throw new Error("Remote Muse ws URL must use wss://");
+    }
     this.url = options.url;
     this.agentId = options.agentId;
     this.token = options.token;
@@ -323,12 +349,17 @@ class MuseAgentChatClient {
       this.connectSettled = true;
       this.connectReject?.(new Error("Disconnected before authentication completed"));
     }
-    try {
-      this.ws?.close();
-    } catch {}
+    this.connectResolve = null;
+    this.connectReject = null;
+    this.lifecycleResolve?.();
+    this.lifecycleResolve = null;
+    const prev = this.ws;
     this.ws = null;
     this.sessionId = null;
-    this.lifecycleResolve?.();
+    this.sessionJoined.clear();
+    try {
+      prev?.close();
+    } catch {}
   }
   get isConnected() {
     return this.ws?.readyState === WebSocket.OPEN && this.sessionId !== null;
@@ -409,23 +440,53 @@ class MuseAgentChatClient {
       this.connectTimer.unref?.();
     }
     ws.onopen = () => {
-      this.send({
-        type: "auth",
-        agent_id: this.agentId,
-        token: this.token,
-        capabilities: this.capabilities
-      });
+      if (this.ws !== ws)
+        return;
+      try {
+        this.send({
+          type: "auth",
+          agent_id: this.agentId,
+          token: this.token,
+          capabilities: this.capabilities
+        });
+      } catch (err) {
+        this.clearConnectTimer();
+        if (!this.connectSettled) {
+          this.connectSettled = true;
+          this.connectReject?.(err instanceof Error ? err : new Error(String(err)));
+        }
+        this.emitError(err instanceof Error ? err : new Error(String(err)));
+        try {
+          ws.close();
+        } catch {}
+        return;
+      }
       if (this.heartbeatTimer)
         clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = setInterval(() => {
-        if (this.ws?.readyState === WebSocket.OPEN) {
-          this.send({ type: "ping", timestamp: new Date().toISOString() });
+        if (this.ws !== ws)
+          return;
+        if (ws.readyState === WebSocket.OPEN) {
+          try {
+            this.send({ type: "ping", timestamp: new Date().toISOString() });
+          } catch (err) {
+            this.emitError(err instanceof Error ? err : new Error(String(err)));
+            try {
+              ws.close();
+            } catch {}
+          }
         }
       }, this.heartbeatIntervalMs);
       this.heartbeatTimer.unref?.();
     };
-    ws.onmessage = (event) => this.handleMessage(String(event.data));
+    ws.onmessage = (event) => {
+      if (this.ws !== ws)
+        return;
+      this.handleMessage(String(event.data));
+    };
     ws.onerror = () => {
+      if (this.ws !== ws)
+        return;
       const err = new Error("WebSocket error");
       if (!this.connectSettled) {
         this.clearConnectTimer();
@@ -435,7 +496,7 @@ class MuseAgentChatClient {
       this.emitError(err);
     };
     ws.onclose = () => {
-      if (this.ws && this.ws !== ws)
+      if (this.ws !== ws)
         return;
       this.clearConnectTimer();
       if (this.heartbeatTimer)

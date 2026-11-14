@@ -421,7 +421,7 @@ ${text}`,
 }
 
 // codex/run.ts
-import { readFileSync as readFileSync11, lstatSync as lstatSync8 } from "node:fs";
+import { readFileSync as readFileSync11, lstatSync as lstatSync9 } from "node:fs";
 import { homedir as homedir6 } from "node:os";
 import { join as join11 } from "node:path";
 
@@ -2135,7 +2135,7 @@ async function verifyLoopTick(raw, config, owner, list) {
 
 // src/session-bind.ts
 import { createHash as createHash3 } from "node:crypto";
-import { closeSync, existsSync as existsSync5, mkdirSync as mkdirSync5, openSync, readFileSync as readFileSync8, readSync, readdirSync as readdirSync4, statSync as statSync3, unlinkSync as unlinkSync3 } from "node:fs";
+import { closeSync, existsSync as existsSync5, lstatSync as lstatSync7, mkdirSync as mkdirSync5, openSync, readFileSync as readFileSync8, readSync, readdirSync as readdirSync4, statSync as statSync3, unlinkSync as unlinkSync3 } from "node:fs";
 import { homedir as homedir5, tmpdir } from "node:os";
 import { join as join8 } from "node:path";
 
@@ -2247,6 +2247,34 @@ function resolveLockDir(homeDir, env = process.env) {
   const baseTmp = process.platform === "win32" ? tmpdir() : "/tmp";
   return join8(baseTmp, `agentschat-locks-${hash}`);
 }
+var LOCK_FILE_MAX_BYTES = 64 * 1024;
+var SESSION_BINDS_MAX_BYTES = 1024 * 1024;
+function readBoundedRegularJson(path, maxBytes) {
+  try {
+    const st = lstatSync7(path);
+    if (st.isSymbolicLink() || !st.isFile() || st.size > maxBytes)
+      return null;
+    return JSON.parse(readFileSync8(path, "utf8"));
+  } catch {
+    return null;
+  }
+}
+function isSafeTargetFileOrMissing(path) {
+  try {
+    const st = lstatSync7(path);
+    return !st.isSymbolicLink() && st.isFile();
+  } catch (e) {
+    return Boolean(e && typeof e === "object" && e.code === "ENOENT");
+  }
+}
+function isSafeDirOrMissing(dirPath) {
+  try {
+    const st = lstatSync7(dirPath);
+    return !st.isSymbolicLink() && st.isDirectory();
+  } catch (e) {
+    return Boolean(e && typeof e === "object" && e.code === "ENOENT");
+  }
+}
 function lockFilePath(lockDir, agentId) {
   const safe = String(agentId || "").trim().replace(/[^a-zA-Z0-9_-]/g, "_");
   return join8(lockDir, `${safe}.lock`);
@@ -2255,20 +2283,17 @@ function readAgentLock(lockDir, agentId) {
   if (!agentId)
     return null;
   const file = lockFilePath(lockDir, agentId);
-  if (!existsSync5(file))
-    return null;
-  try {
-    const raw = JSON.parse(readFileSync8(file, "utf8"));
-    if (!raw || typeof raw !== "object" || typeof raw.pid !== "number" || typeof raw.agentId !== "string") {
-      return null;
-    }
-    return raw;
-  } catch {
+  const raw = readBoundedRegularJson(file, LOCK_FILE_MAX_BYTES);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw) || typeof raw.pid !== "number" || typeof raw.agentId !== "string") {
     return null;
   }
+  return raw;
 }
 function acquireAgentLock(opts) {
   if (!opts.agentId)
+    return null;
+  const file = lockFilePath(opts.lockDir, opts.agentId);
+  if (!isSafeDirOrMissing(opts.lockDir) || !isSafeTargetFileOrMissing(file))
     return null;
   const record = {
     pid: opts.currentPid ?? process.pid,
@@ -2280,7 +2305,7 @@ function acquireAgentLock(opts) {
   };
   try {
     mkdirSync5(opts.lockDir, { recursive: true, mode: 448 });
-    safeWriteProfile(lockFilePath(opts.lockDir, opts.agentId), record);
+    safeWriteProfile(file, record);
     return record;
   } catch {
     return null;
@@ -2293,15 +2318,13 @@ function releaseAgentLock(opts) {
   const file = lockFilePath(opts.lockDir, opts.agentId);
   const existing = readAgentLock(opts.lockDir, opts.agentId);
   if (!existing) {
-    if (existsSync5(file)) {
-      try {
-        const st = statSync3(file);
-        if (Date.now() - st.mtimeMs > 1000) {
-          unlinkSync3(file);
-          return true;
-        }
-      } catch {}
-    }
+    try {
+      const st = lstatSync7(file);
+      if (!st.isSymbolicLink() && st.isFile() && Date.now() - st.mtimeMs > 1000) {
+        unlinkSync3(file);
+        return true;
+      }
+    } catch {}
     return false;
   }
   const samePid = existing.pid === currentPid;
@@ -2310,7 +2333,7 @@ function releaseAgentLock(opts) {
   if (!samePid && !sameSession && !dead)
     return false;
   try {
-    unlinkSync3(lockFilePath(opts.lockDir, opts.agentId));
+    unlinkSync3(file);
     return true;
   } catch {
     return false;
@@ -2717,7 +2740,7 @@ function resolveDrainReconnectDelay(frame, rand = Math.random) {
 }
 
 // codex/inbox-sync.ts
-import { chmodSync as chmodSync3, lstatSync as lstatSync7, mkdirSync as mkdirSync7, readFileSync as readFileSync10, renameSync as renameSync5, unlinkSync as unlinkSync5, writeFileSync as writeFileSync5 } from "node:fs";
+import { chmodSync as chmodSync3, lstatSync as lstatSync8, mkdirSync as mkdirSync7, readFileSync as readFileSync10, renameSync as renameSync5, unlinkSync as unlinkSync5, writeFileSync as writeFileSync5 } from "node:fs";
 import { randomBytes as randomBytes2 } from "node:crypto";
 import { join as join10 } from "node:path";
 
@@ -2775,7 +2798,7 @@ class InboxSync {
     this.active = active;
     this.log = log;
     mkdirSync7(stateDir, { recursive: true, mode: 448 });
-    const dirStat = lstatSync7(stateDir);
+    const dirStat = lstatSync8(stateDir);
     if (dirStat.isSymbolicLink() || !dirStat.isDirectory())
       throw new Error("Invalid inbound state directory");
     if (process.platform !== "win32")
@@ -2783,7 +2806,7 @@ class InboxSync {
     this.file = join10(stateDir, "inbound-cursors.json");
     let fileStat;
     try {
-      fileStat = lstatSync7(this.file);
+      fileStat = lstatSync8(this.file);
     } catch (err) {
       if (err.code !== "ENOENT")
         throw err;
@@ -3230,7 +3253,7 @@ async function main() {
     }
     if (!values["gui-thread"] || !values["gui-message-file"])
       throw new Error("GUI submission requires --gui-thread and --gui-message-file");
-    const stat = lstatSync8(values["gui-message-file"]);
+    const stat = lstatSync9(values["gui-message-file"]);
     if (stat.isSymbolicLink() || !stat.isFile())
       throw new Error("GUI message must be a regular file, not a symlink");
     if (stat.size > 256 * 1024)
