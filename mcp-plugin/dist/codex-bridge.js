@@ -124,13 +124,42 @@ function redactSecrets(text, opts) {
 }
 
 // codex/owner.ts
+async function ownerJson(response) {
+  if (!response.body)
+    throw new Error("Missing owner response");
+  const reader = response.body.getReader();
+  const chunks = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done)
+        break;
+      size += value.byteLength;
+      if (size > 65536) {
+        reader.cancel().catch(() => {});
+        throw new Error("Owner response exceeds size limit");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+}
 async function getBotOwner(base, agentId, token, request = fetch) {
   try {
-    if (!base || base !== base.trim() || /[\x00-\x1f\x7f]/.test(base) || !agentId || agentId !== agentId.trim() || /[\x00-\x1f\x7f]/.test(agentId) || !token || token !== token.trim() || /[\x00-\x1f\x7f]/.test(token))
+    if (!base || base !== base.trim() || /[\x00-\x1f\x7f]/.test(base) || !agentId || agentId !== agentId.trim() || /[\x00-\x1f\x7f]/.test(agentId) || [".", "..", "__proto__", "constructor", "prototype"].includes(agentId.toLowerCase()) || /[\/\\\s]/.test(agentId) || !token || token !== token.trim() || /[\x00-\x1f\x7f]/.test(token))
       return null;
     const parsed = new URL(base);
-    const loopback = ["127.0.0.1", "localhost", "[::1]", "::1"].includes(parsed.hostname);
-    if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && loopback) || parsed.username || parsed.password || parsed.search || parsed.hash)
+    const loopback = ["127.0.0.1", "localhost", "[::1]", "::1"].includes(parsed.hostname.toLowerCase().replace(/\.$/, ""));
+    if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && loopback) || parsed.username || parsed.password || parsed.search || parsed.hash || parsed.port === "0")
       return null;
     const origin = parsed.href.replace(/\/+$/, "");
     const options = {
@@ -153,14 +182,12 @@ async function getBotOwner(base, agentId, token, request = fetch) {
       ]);
       return null;
     }
-    const [statusResult, entitlementResult] = await Promise.allSettled([
-      statusResponse.json(),
-      entitlementResponse.json()
+    const [statusValue, entitlementValue] = await Promise.all([
+      ownerJson(statusResponse),
+      ownerJson(entitlementResponse)
     ]);
-    if (statusResult.status !== "fulfilled" || entitlementResult.status !== "fulfilled")
-      return null;
-    const status = statusResult.value;
-    const entitlement = entitlementResult.value;
+    const status = statusValue;
+    const entitlement = entitlementValue;
     if (!status || typeof status !== "object" || Array.isArray(status) || status.agent_id !== agentId || status.claimed !== true)
       return null;
     if (!entitlement || typeof entitlement !== "object" || Array.isArray(entitlement))
@@ -301,6 +328,8 @@ function payload(result) {
     const text = result.content.find((c) => c.type === "text")?.text;
     if (!text)
       throw new Error("GUI tool returned no receipt");
+    if (typeof text !== "string" || text.length > 1048576)
+      throw new Error("GUI receipt exceeds size limit");
     return JSON.parse(text);
   }
   return result;
@@ -312,6 +341,9 @@ class GuiChannel {
   constructor(directory, allowedThreads) {
     this.directory = directory;
     this.allowedThreads = allowedThreads;
+    const existing = lstatSync2(directory, { throwIfNoEntry: false });
+    if (existing && (existing.isSymbolicLink() || !existing.isDirectory()))
+      throw new Error("GUI outbox must be a real directory, not a symlink");
     mkdirSync2(directory, { recursive: true, mode: 448 });
     const stat = lstatSync2(directory);
     if (stat.isSymbolicLink() || !stat.isDirectory())
@@ -329,6 +361,9 @@ class GuiChannel {
       throw new Error("GUI receipt must be a regular file, not a symlink");
     try {
       writeFileSync(temp, JSON.stringify(entry), { mode: 384, flag: "wx" });
+      const current = lstatSync2(path, { throwIfNoEntry: false });
+      if (current && (current.isSymbolicLink() || !current.isFile()))
+        throw new Error("GUI receipt must be a regular file, not a symlink");
       renameSync(temp, path);
     } catch (error) {
       if (error.code !== "EEXIST")
@@ -340,6 +375,8 @@ class GuiChannel {
     const path = this.path(id), stat = lstatSync2(path);
     if (stat.isSymbolicLink() || !stat.isFile())
       throw new Error("GUI receipt must be a regular file, not a symlink");
+    if (stat.size > 1048576)
+      throw new Error("GUI receipt exceeds size limit");
     const entry = JSON.parse(readFileSync(path, "utf8"));
     if (!entry || typeof entry !== "object" || Array.isArray(entry) || entry.id !== id || typeof entry.threadId !== "string" || !entry.threadId.trim() || typeof entry.prompt !== "string" || typeof entry.createdAt !== "string" || !["pending", "sending", "submitted", "delivered", "uncertain"].includes(entry.status) || entry.hostId !== undefined && typeof entry.hostId !== "string" || entry.turnId !== undefined && typeof entry.turnId !== "string" || entry.deliveredAt !== undefined && typeof entry.deliveredAt !== "string")
       throw new Error("Invalid GUI receipt");
@@ -2855,8 +2892,29 @@ import { join as join10 } from "node:path";
 
 // src/timestamps.ts
 var ISO_OFFSET_RE = /^(\d{4}-\d{2}-\d{2})[Tt ](\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|z|[+-]\d{2}:\d{2})$/;
+function isValidCalendarDateTime(datePart, timePart, tzPart) {
+  const year = Number(datePart.slice(0, 4));
+  const month = Number(datePart.slice(5, 7));
+  const day = Number(datePart.slice(8, 10));
+  const hour = Number(timePart.slice(0, 2));
+  const minute = Number(timePart.slice(3, 5));
+  const second = Number(timePart.slice(6, 8));
+  if (month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59)
+    return false;
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const maxDay = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+  if (day < 1 || day > maxDay)
+    return false;
+  if (tzPart !== "Z" && tzPart !== "z") {
+    const offHour = Number(tzPart.slice(1, 3));
+    const offMin = Number(tzPart.slice(4, 6));
+    if (offHour > 23 || offMin > 59)
+      return false;
+  }
+  return true;
+}
 function normalizeTimestampForCursor(ts, mode) {
-  if (!ts || typeof ts !== "string")
+  if (!ts || typeof ts !== "string" || ts.length > 128)
     return ts;
   const padChar = mode === "before" ? "9" : "0";
   const m = ts.match(ISO_OFFSET_RE);
@@ -2865,6 +2923,8 @@ function normalizeTimestampForCursor(ts, mode) {
     const timePart = m[2];
     const rawFrac = m[3] ?? "";
     const tzPart = m[4];
+    if (!isValidCalendarDateTime(datePart, timePart, tzPart))
+      return ts;
     const frac9 = rawFrac.length === 9 ? rawFrac : rawFrac.length > 9 ? rawFrac.slice(0, 9) : rawFrac + padChar.repeat(9 - rawFrac.length);
     if (tzPart === "Z" || tzPart === "z") {
       return `${datePart}T${timePart}.${frac9}Z`;
@@ -2880,12 +2940,15 @@ function normalizeTimestampForCursor(ts, mode) {
 
 // codex/inbox-sync.ts
 function timestamp(value) {
-  if (typeof value !== "string" || !Number.isFinite(Date.parse(value)))
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|z|[+-]\d{2}:\d{2})$/.test(value) || !Number.isFinite(Date.parse(value)))
     throw new Error("Invalid history timestamp");
-  return normalizeTimestampForCursor(value, "after");
+  const normalized = normalizeTimestampForCursor(value, "after");
+  if (!normalized || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{9}Z$/.test(normalized))
+    throw new Error("Invalid history timestamp");
+  return normalized;
 }
 function validChannel(channel) {
-  return typeof channel === "string" && channel.trim().length > 0 && !/[\x00-\x1f\x7f-\x9f]/.test(channel) && !["__proto__", "constructor", "prototype"].includes(channel.trim());
+  return typeof channel === "string" && channel.trim().length > 0 && channel.trim().length <= 128 && !channel.includes("..") && !/[\/\\]/.test(channel) && !/[\x00-\x1f\x7f-\x9f]/.test(channel) && !["__proto__", "constructor", "prototype"].includes(channel.trim().toLowerCase());
 }
 function validateChannel(channel) {
   if (!validChannel(channel))
@@ -2906,6 +2969,9 @@ class InboxSync {
     this.receive = receive;
     this.active = active;
     this.log = log;
+    const existing = lstatSync11(stateDir, { throwIfNoEntry: false });
+    if (existing && (existing.isSymbolicLink() || !existing.isDirectory()))
+      throw new Error("Invalid inbound state directory");
     mkdirSync7(stateDir, { recursive: true, mode: 448 });
     const dirStat = lstatSync11(stateDir);
     if (dirStat.isSymbolicLink() || !dirStat.isDirectory())
@@ -2922,6 +2988,8 @@ class InboxSync {
     }
     if (fileStat && (fileStat.isSymbolicLink() || !fileStat.isFile()))
       throw new Error("Invalid inbound cursors file");
+    if (fileStat && fileStat.size > 1048576)
+      throw new Error("Inbound cursors exceed size limit");
     this.state = fileStat ? JSON.parse(readFileSync10(this.file, "utf8")) : { version: 1, channels: {} };
     if (!this.state || this.state.version !== 1 || !this.state.channels || typeof this.state.channels !== "object" || Array.isArray(this.state.channels))
       throw new Error("Invalid inbound cursors; refusing to discard checkpoint");
@@ -2940,6 +3008,9 @@ class InboxSync {
     try {
       writeFileSync5(tmp, JSON.stringify(this.state), { mode: 384, flag: "wx" });
       created = true;
+      const current = lstatSync11(this.file, { throwIfNoEntry: false });
+      if (current && (current.isSymbolicLink() || !current.isFile()))
+        throw new Error("Invalid inbound cursors file");
       renameSync5(tmp, this.file);
     } catch (err) {
       if (created) {

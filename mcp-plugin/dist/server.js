@@ -178,26 +178,34 @@ function redactParticipantPii(rawId) {
 }
 
 // src/mentions.ts
+var MAX_MENTION_ID_CHARS = 128;
+var MAX_MENTION_CONTENT_CHARS = 1e5;
 function matchesMention(content, agentId) {
   if (typeof content !== "string" || typeof agentId !== "string")
     return false;
   const trimmedId = agentId.trim();
-  if (!content || !trimmedId || /[\x00-\x1f\x7f]/.test(trimmedId))
+  if (!content || !trimmedId || trimmedId.length > MAX_MENTION_ID_CHARS || /[\x00-\x1f\x7f]/.test(trimmedId)) {
     return false;
+  }
+  const hay = content.length > MAX_MENTION_CONTENT_CHARS ? content.slice(0, MAX_MENTION_CONTENT_CHARS) : content;
   const idEsc = trimmedId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const bareMentionRe = new RegExp(`(?<![A-Za-z0-9_])@${idEsc}(?![A-Za-z0-9_-]|\\.[A-Za-z0-9])`);
-  if (bareMentionRe.test(content))
+  if (bareMentionRe.test(hay))
     return true;
   const displayMentionRe = new RegExp(`(?<![A-Za-z0-9_])@[^\\s(@,:;<>"'\\x60\\n]+(?: [^\\s(@,:;<>"'\\x60\\n]+){0,4}\\(${idEsc}\\)`);
-  return displayMentionRe.test(content);
+  return displayMentionRe.test(hay);
 }
 
 // src/dedup.ts
+var MAX_DEDUP_ID_CHARS = 256;
+var MAX_DEDUP_KEY_CHARS = 1024;
+var MAX_DEDUP_CAPACITY = 1e6;
 function messageDedupKey(data) {
   if (!data || typeof data.id !== "string" || typeof data.channel_id !== "string")
     return null;
-  if (!data.id.trim() || !data.channel_id.trim())
+  if (!data.id.trim() || !data.channel_id.trim() || data.id.length > MAX_DEDUP_ID_CHARS || data.channel_id.length > MAX_DEDUP_ID_CHARS || /[\x00-\x1f\x7f]/.test(data.id) || /[\x00-\x1f\x7f]/.test(data.channel_id)) {
     return null;
+  }
   const safeChannel = data.channel_id.replace(/\\/g, "\\\\").replace(/:/g, "\\:");
   return `${safeChannel}:${data.id}`;
 }
@@ -207,14 +215,15 @@ class MessageDedup {
   max;
   dropOnEvict;
   constructor(max = 5000, dropOnEvict = 1000) {
-    const safeMax = Number.isFinite(max) ? Math.max(1, Math.floor(max)) : 5000;
+    const safeMax = Number.isFinite(max) ? Math.min(MAX_DEDUP_CAPACITY, Math.max(1, Math.floor(max))) : 5000;
     const safeDrop = Number.isFinite(dropOnEvict) ? Math.min(safeMax, Math.max(1, Math.floor(dropOnEvict))) : Math.min(safeMax, 1000);
     this.max = safeMax;
     this.dropOnEvict = safeDrop;
   }
   recordOrSkip(key) {
-    if (typeof key !== "string" || key.length === 0)
+    if (typeof key !== "string" || key.length === 0 || key.length > MAX_DEDUP_KEY_CHARS || /[\x00-\x1f\x7f]/.test(key)) {
       return false;
+    }
     if (this.seen.has(key))
       return true;
     this.seen.add(key);
@@ -299,8 +308,29 @@ function withTimeoutController(parentSignal, timeoutMs) {
 
 // src/timestamps.ts
 var ISO_OFFSET_RE = /^(\d{4}-\d{2}-\d{2})[Tt ](\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|z|[+-]\d{2}:\d{2})$/;
+function isValidCalendarDateTime(datePart, timePart, tzPart) {
+  const year = Number(datePart.slice(0, 4));
+  const month = Number(datePart.slice(5, 7));
+  const day = Number(datePart.slice(8, 10));
+  const hour = Number(timePart.slice(0, 2));
+  const minute = Number(timePart.slice(3, 5));
+  const second = Number(timePart.slice(6, 8));
+  if (month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59)
+    return false;
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const maxDay = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+  if (day < 1 || day > maxDay)
+    return false;
+  if (tzPart !== "Z" && tzPart !== "z") {
+    const offHour = Number(tzPart.slice(1, 3));
+    const offMin = Number(tzPart.slice(4, 6));
+    if (offHour > 23 || offMin > 59)
+      return false;
+  }
+  return true;
+}
 function normalizeTimestampForCursor(ts, mode) {
-  if (!ts || typeof ts !== "string")
+  if (!ts || typeof ts !== "string" || ts.length > 128)
     return ts;
   const padChar = mode === "before" ? "9" : "0";
   const m = ts.match(ISO_OFFSET_RE);
@@ -309,6 +339,8 @@ function normalizeTimestampForCursor(ts, mode) {
     const timePart = m[2];
     const rawFrac = m[3] ?? "";
     const tzPart = m[4];
+    if (!isValidCalendarDateTime(datePart, timePart, tzPart))
+      return ts;
     const frac9 = rawFrac.length === 9 ? rawFrac : rawFrac.length > 9 ? rawFrac.slice(0, 9) : rawFrac + padChar.repeat(9 - rawFrac.length);
     if (tzPart === "Z" || tzPart === "z") {
       return `${datePart}T${timePart}.${frac9}Z`;
@@ -4444,18 +4476,22 @@ import { lstatSync as lstatSync10, mkdirSync as mkdirSync3, readFileSync as read
 import { dirname, join as join11 } from "node:path";
 
 // src/mentions.ts
+var MAX_MENTION_ID_CHARS2 = 128;
+var MAX_MENTION_CONTENT_CHARS2 = 1e5;
 function matchesMention2(content, agentId) {
   if (typeof content !== "string" || typeof agentId !== "string")
     return false;
   const trimmedId = agentId.trim();
-  if (!content || !trimmedId || /[\x00-\x1f\x7f]/.test(trimmedId))
+  if (!content || !trimmedId || trimmedId.length > MAX_MENTION_ID_CHARS2 || /[\x00-\x1f\x7f]/.test(trimmedId)) {
     return false;
+  }
+  const hay = content.length > MAX_MENTION_CONTENT_CHARS2 ? content.slice(0, MAX_MENTION_CONTENT_CHARS2) : content;
   const idEsc = trimmedId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const bareMentionRe = new RegExp(`(?<![A-Za-z0-9_])@${idEsc}(?![A-Za-z0-9_-]|\\.[A-Za-z0-9])`);
-  if (bareMentionRe.test(content))
+  if (bareMentionRe.test(hay))
     return true;
   const displayMentionRe = new RegExp(`(?<![A-Za-z0-9_])@[^\\s(@,:;<>"'\\x60\\n]+(?: [^\\s(@,:;<>"'\\x60\\n]+){0,4}\\(${idEsc}\\)`);
-  return displayMentionRe.test(content);
+  return displayMentionRe.test(hay);
 }
 
 // src/read-cursor.ts
@@ -4542,8 +4578,29 @@ function persistCursor2(file, cursor, warn) {
 
 // src/timestamps.ts
 var ISO_OFFSET_RE2 = /^(\d{4}-\d{2}-\d{2})[Tt ](\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|z|[+-]\d{2}:\d{2})$/;
+function isValidCalendarDateTime2(datePart, timePart, tzPart) {
+  const year = Number(datePart.slice(0, 4));
+  const month = Number(datePart.slice(5, 7));
+  const day = Number(datePart.slice(8, 10));
+  const hour = Number(timePart.slice(0, 2));
+  const minute = Number(timePart.slice(3, 5));
+  const second = Number(timePart.slice(6, 8));
+  if (month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59)
+    return false;
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const maxDay = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+  if (day < 1 || day > maxDay)
+    return false;
+  if (tzPart !== "Z" && tzPart !== "z") {
+    const offHour = Number(tzPart.slice(1, 3));
+    const offMin = Number(tzPart.slice(4, 6));
+    if (offHour > 23 || offMin > 59)
+      return false;
+  }
+  return true;
+}
 function normalizeTimestampForCursor2(ts, mode) {
-  if (!ts || typeof ts !== "string")
+  if (!ts || typeof ts !== "string" || ts.length > 128)
     return ts;
   const padChar = mode === "before" ? "9" : "0";
   const m = ts.match(ISO_OFFSET_RE2);
@@ -4552,6 +4609,8 @@ function normalizeTimestampForCursor2(ts, mode) {
     const timePart = m[2];
     const rawFrac = m[3] ?? "";
     const tzPart = m[4];
+    if (!isValidCalendarDateTime2(datePart, timePart, tzPart))
+      return ts;
     const frac9 = rawFrac.length === 9 ? rawFrac : rawFrac.length > 9 ? rawFrac.slice(0, 9) : rawFrac + padChar.repeat(9 - rawFrac.length);
     if (tzPart === "Z" || tzPart === "z") {
       return `${datePart}T${timePart}.${frac9}Z`;

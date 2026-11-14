@@ -169,7 +169,7 @@ test('inbound channels reject traversal, case-insensitive prototype keys and exc
 });
 
 test('non-ISO finite dates reject checkpoints and full history pages before delivery', async () => {
-  for(const timestamp of ['1','2026-09-27','09/27/2026','2026-09-27T00:00:00','2026-99-99T00:00:00Z']) {
+  for(const timestamp of ['1','2026-09-27','09/27/2026','2026-09-27T00:00:00','2026-99-99T00:00:00Z','2026-02-31T10:00:00+08:00']) {
     const f=fixture();
     writeFileSync(f.file,JSON.stringify({version:1,channels:{group:timestamp}}));
     expect(()=>idle(f.dir)).toThrow('Invalid history timestamp');

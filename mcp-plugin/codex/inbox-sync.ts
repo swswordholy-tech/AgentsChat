@@ -12,7 +12,9 @@ interface Snapshot {
 }
 function timestamp(value: unknown): string {
   if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|z|[+-]\d{2}:\d{2})$/.test(value) || !Number.isFinite(Date.parse(value))) throw new Error("Invalid history timestamp");
-  return normalizeTimestampForCursor(value, "after")!;
+  const normalized = normalizeTimestampForCursor(value, "after");
+  if (!normalized || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{9}Z$/.test(normalized)) throw new Error("Invalid history timestamp");
+  return normalized;
 }
 function validChannel(channel: unknown): channel is string {
   return typeof channel === "string" && channel.trim().length > 0 && channel.trim().length <= 128
