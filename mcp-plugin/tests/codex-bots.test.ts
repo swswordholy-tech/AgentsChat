@@ -2,10 +2,14 @@
 // Invariant: central identities ignore project settings; one bot survives bad registry edits.
 // Goal: detect duplicate accounts and prevent orphan workers or app-server processes.
 // Migration: legacy single-bot profiles remain supported; registry mode is explicit.
-import { test, expect } from "bun:test";
-import { realpathSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
+import { test, expect, spyOn } from "bun:test";
+import { realpathSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, symlinkSync, lstatSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import * as fs from "node:fs";
+import { EventEmitter } from "node:events";
+import { spawnSync } from "node:child_process";
+import { removeDeadLock, removeOwnedLock, save, start, stop, type Worker } from "../codex/manager.ts";
 import { loadBots } from "../codex/bots-config.ts";
 import { reasoningEffort, resolveConfig } from "../codex/config.ts";
 import { parseProcesses, externalCodexPresent } from "../codex/processes.ts";
@@ -138,4 +142,97 @@ test("registry expands both home path separators for workdir and state root", ()
    expect(bot.stateDir.startsWith(join(home,"state")+"/")).toBe(true);
   }
  } finally {rmSync(home,{recursive:true,force:true});}
+});
+
+
+test("manager import stays inert and direct/dynamic CLI entries handle missing and linked status", () => {
+ const home=mkdtempSync(join(tmpdir(),"bots-entry-"));
+ const manager=resolve(import.meta.dir,"../codex/manager.ts");
+ const cli=resolve(import.meta.dir,"../src/cli.mjs");
+ const run=(args:string[])=>spawnSync(process.execPath,args,{env:{...process.env,HOME:home},encoding:"utf8",timeout:5000});
+ try {
+  const imported=run(["-e",`await import(${JSON.stringify(manager)}); console.log('imported')`,"--unknown-test-option"]);
+  expect(imported.status).toBe(0); expect(imported.stdout.trim()).toBe("imported");
+  expect(existsSync(join(home,".agentschat/codex-bots"))).toBe(false);
+  for(const args of [[manager,"--help"],[cli,"--codex-bots","--help"]]) {
+   const result=run(args); expect(result.status).toBe(0); expect(result.stdout).toContain("Central registry");
+  }
+  const root=join(home,".agentschat/codex-bots"); mkdirSync(root,{recursive:true});
+  for(const entry of [[manager],[cli,"--codex-bots"]]) {
+   const absent=run([...entry,"--status"]);
+   expect(absent.status).toBe(1); expect(absent.stderr).toContain("status file is missing, unsafe, or unreadable");
+   const target=join(home,"private-status"); writeFileSync(target,"DO_NOT_PRINT"); symlinkSync(target,join(root,"status.json"));
+   const linked=run([...entry,"--status"]);
+   expect(linked.status).toBe(1); expect(linked.stdout).not.toContain("DO_NOT_PRINT");
+   rmSync(join(root,"status.json"));
+  }
+ } finally {rmSync(home,{recursive:true,force:true});}
+});
+
+test("manager dead-lock cleanup preserves symlinks, directories, live PIDs and oversized files", () => {
+ const dir=mkdtempSync(join(tmpdir(),"bots-lock-")), file=join(dir,"lock"), target=join(dir,"target");
+ try {
+  expect(()=>removeDeadLock(file)).not.toThrow();
+  writeFileSync(target,"invalid"); symlinkSync(target,file);
+  removeDeadLock(file); expect(lstatSync(file).isSymbolicLink()).toBe(true); expect(readFileSync(target,"utf8")).toBe("invalid");
+  rmSync(file); mkdirSync(file); removeDeadLock(file); expect(lstatSync(file).isDirectory()).toBe(true); rmSync(file,{recursive:true});
+  writeFileSync(file," ".repeat(65537)); removeDeadLock(file); expect(existsSync(file)).toBe(true);
+  writeFileSync(file,String(process.pid)); removeDeadLock(file); expect(existsSync(file)).toBe(true);
+  writeFileSync(file," ".repeat(65536)); removeDeadLock(file); expect(existsSync(file)).toBe(false);
+  writeFileSync(file,"2147483647"); removeDeadLock(file); expect(existsSync(file)).toBe(false);
+ } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
+test("manager saves private atomic snapshots and refuses linked roots/status or occupied temp paths", () => {
+ const dir=mkdtempSync(join(tmpdir(),"bots-save-")), root=join(dir,"root"), target=join(dir,"target"), link=join(dir,"linked");
+ mkdirSync(root); writeFileSync(target,"private");
+ try {
+  symlinkSync(root,link); save(link); expect(readdirSync(root)).toEqual([]);
+  const status=join(root,"status.json"); symlinkSync(target,status); save(root);
+  expect(lstatSync(status).isSymbolicLink()).toBe(true); expect(readFileSync(target,"utf8")).toBe("private"); rmSync(status);
+  save(root); expect(JSON.parse(readFileSync(status,"utf8")).pid).toBe(process.pid);
+  expect(lstatSync(status).mode & 0o777).toBe(0o600); expect(readdirSync(root)).toEqual(["status.json"]);
+  // The next sequence is observable from exclusive create attempts, without exposing it publicly.
+  const original=fs.writeFileSync;
+  let occupied="";
+  const spy=spyOn(fs,"writeFileSync").mockImplementation(((path:any,data:any,options:any)=>{
+   if(String(path).endsWith(".tmp")) { occupied=String(path); original(path,"existing"); expect(options.flag).toBe("wx"); }
+   return original(path,data,options);
+  }) as any);
+  const before=readFileSync(status,"utf8");
+  try {save(root);} finally {spy.mockRestore();}
+  expect(readFileSync(status,"utf8")).toBe(before); expect(readFileSync(occupied,"utf8")).toBe("existing");
+ } finally {rmSync(dir,{recursive:true,force:true});}
+});
+
+function worker(child?:any):Worker {
+ return {child,config:{stateDir:"/nonexistent",cwd:tmpdir(),agentId:"test"} as any,fingerprint:"",failures:0,next:0,status:"running"};
+}
+
+test("manager stop resolves and clears its timer when SIGTERM throws", async () => {
+ const child=Object.assign(new EventEmitter(),{exitCode:null,signalCode:null,kill:()=>{throw Error("already gone");}});
+ const w=worker(child), clear=spyOn(globalThis,"clearTimeout");
+ try {await stop(w); expect(w.child).toBeUndefined(); expect(w.status).toBe("stopped"); expect(child.listenerCount("exit")).toBe(0); expect(clear).toHaveBeenCalled();}
+ finally {clear.mockRestore();}
+});
+
+test("manager IPC spawn callback tolerates disconnected channels and synchronous send failure", () => {
+ for(const connected of [false,true]) {
+  let sent=0;
+  const child=Object.assign(new EventEmitter(),{connected,send:()=>{sent++;throw Error("closed IPC");}});
+  start(worker(),(()=>child) as any);
+  expect(()=>child.emit("spawn")).not.toThrow(); expect(sent).toBe(connected?1:0);
+ }
+});
+
+test("manager shutdown lock cleanup tolerates absent files and removes only its own regular lock", () => {
+ const dir=mkdtempSync(join(tmpdir(),"bots-unlock-")), file=join(dir,"lock"), target=join(dir,"target");
+ try {
+  expect(()=>removeOwnedLock(file)).not.toThrow();
+  writeFileSync(file,"other-pid"); removeOwnedLock(file); expect(existsSync(file)).toBe(true);
+  writeFileSync(file,` ${process.pid}\n`); removeOwnedLock(file); expect(existsSync(file)).toBe(false);
+  writeFileSync(target,String(process.pid)); symlinkSync(target,file); removeOwnedLock(file);
+  expect(lstatSync(file).isSymbolicLink()).toBe(true); expect(existsSync(target)).toBe(true);
+  rmSync(file); mkdirSync(file); expect(()=>removeOwnedLock(file)).not.toThrow(); expect(lstatSync(file).isDirectory()).toBe(true);
+ } finally {rmSync(dir,{recursive:true,force:true});}
 });

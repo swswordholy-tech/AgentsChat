@@ -1,20 +1,26 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdirSync, openSync, closeSync, readFileSync, writeFileSync, unlinkSync, existsSync, renameSync } from "node:fs";
+import { mkdirSync, openSync, closeSync, readFileSync, writeFileSync, unlinkSync, lstatSync, renameSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { loadBots, defaultRegistry, type BotConfig } from "./bots-config.ts";
 import { codexPresent } from "./processes.ts";
-const { values } = parseArgs({ options: { "codex-bots": { type: "boolean" }, config: { type: "string" }, "watch-codex": { type: "boolean" }, check: { type: "boolean" }, status: { type: "boolean" }, help: { type: "boolean" } } });
-const root = join(homedir(), ".agentschat/codex-bots"), registry = resolve(values.config ?? defaultRegistry());
+let values: { config?: string; "watch-codex"?: boolean; check?: boolean; status?: boolean; help?: boolean } = {};
+const root = join(homedir(), ".agentschat/codex-bots");
+let registry = "";
 const statusFile = join(root, "status.json"), lock = join(root, "manager.lock");
-interface Worker { child?: ChildProcess; config: BotConfig; fingerprint: string; failures: number; next: number; status: string }
+export interface Worker { child?: ChildProcess; config: BotConfig; fingerprint: string; failures: number; next: number; status: string }
 const workers = new Map<string, Worker>();
 let stopping = false, missing = 0, saveSeq = 0, timer: ReturnType<typeof setTimeout> | undefined;
-function removeDeadLock(file: string) {
-  if (!existsSync(file)) return;
-  const raw = readFileSync(file, "utf8").trim();
+export function removeDeadLock(file: string) {
+  let raw: string;
+  try {
+    const stat = lstatSync(file);
+    if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 64 * 1024) return;
+    raw = readFileSync(file, "utf8").trim();
+  } catch { return; }
   const pid = Number(raw);
   if (!raw || !Number.isInteger(pid) || pid <= 0) {
     try { unlinkSync(file); } catch {}
@@ -22,21 +28,31 @@ function removeDeadLock(file: string) {
   }
   try { process.kill(pid, 0); } catch (e: any) { if (e.code === "ESRCH") try { unlinkSync(file); } catch {} }
 }
-function save() {
+export function save(rootDir = root) {
+  const statusFile = join(rootDir, "status.json");
   const tmp = `${statusFile}.${process.pid}.${++saveSeq}.tmp`;
+  let created = false;
   try {
-    writeFileSync(tmp, JSON.stringify({ pid: process.pid, updated_at: new Date().toISOString(), bots: [...workers.values()].map(w => ({ name: w.config.name, agent_id: w.config.agentId, workdir: w.config.cwd, effort: w.config.effort, model: w.config.model, pid: w.child?.pid, status: w.status })) }, null, 2), { mode: 0o600 });
+    const dir = lstatSync(rootDir);
+    if (dir.isSymbolicLink() || !dir.isDirectory()) return;
+    try { if (lstatSync(statusFile).isSymbolicLink()) return; }
+    catch (e: any) { if (e.code !== "ENOENT") return; }
+    writeFileSync(tmp, JSON.stringify({ pid: process.pid, updated_at: new Date().toISOString(), bots: [...workers.values()].map(w => ({ name: w.config.name, agent_id: w.config.agentId, workdir: w.config.cwd, effort: w.config.effort, model: w.config.model, pid: w.child?.pid, status: w.status })) }, null, 2), { mode: 0o600, flag: "wx" });
+    created = true;
     renameSync(tmp, statusFile);
   } catch {
-    try { unlinkSync(tmp); } catch {}
+    if (created) try { unlinkSync(tmp); } catch {}
   }
 }
-async function stop(w: Worker) {
+export async function stop(w: Worker) {
   const child = w.child;
   if (child && child.exitCode === null && child.signalCode === null) await new Promise<void>(done => {
     const timeout = setTimeout(() => killGroup(child), 20_000);
     timeout.unref?.();
-    child.once("exit", () => { clearTimeout(timeout); killGroup(child); done(); }); child.kill("SIGTERM");
+    const exited = () => { clearTimeout(timeout); killGroup(child); done(); };
+    child.once("exit", exited);
+    try { child.kill("SIGTERM"); }
+    catch { clearTimeout(timeout); child.removeListener("exit", exited); done(); }
   });
   w.child = undefined; w.status = "stopped";
 }
@@ -47,11 +63,13 @@ function killGroup(child: ChildProcess) {
   }
   try { child.kill("SIGKILL"); } catch {}
 }
-function start(w: Worker) {
+export function start(w: Worker, spawnWorker = spawn) {
   removeDeadLock(join(w.config.stateDir, "bridge.lock")); w.status = "starting";
-  const child = spawn(process.execPath, [resolve(process.argv[1]!), "--codex-bridge", "--managed-worker"], { cwd: w.config.cwd, detached: process.platform !== "win32", windowsHide: true, stdio: ["ignore", "pipe", "pipe", "ipc"] });
+  const child = spawnWorker(process.execPath, [resolve(process.argv[1]!), "--codex-bridge", "--managed-worker"], { cwd: w.config.cwd, detached: process.platform !== "win32", windowsHide: true, stdio: ["ignore", "pipe", "pipe", "ipc"] });
   w.child = child;
-  child.once("spawn", () => child.send(w.config, () => {}));
+  child.once("spawn", () => {
+    if (child.connected) try { child.send(w.config, () => {}); } catch {}
+  });
   let buffer = "";
   child.stderr?.on("data", data => {
     buffer = (buffer + String(data)).slice(-8192);
@@ -82,16 +100,33 @@ async function tick() {
   }
   save();
 }
+export function removeOwnedLock(file: string) {
+  try {
+    const stat = lstatSync(file);
+    if (!stat.isSymbolicLink() && stat.isFile() && stat.size <= 64 * 1024 && readFileSync(file, "utf8").trim() === String(process.pid)) unlinkSync(file);
+  } catch {}
+}
 async function main() {
   if (values.help) { console.log("agentschat-mcp --codex-bots [--config FILE] [--watch-codex] [--check|--status]\nCentral registry: ~/.agentschat/codex-bots.json; profiles: ~/.agentschat/profiles\nWatch polls external Codex processes every 5 seconds."); return; }
-  if (values.status) { console.log(readFileSync(statusFile, "utf8")); return; }
+  if (values.status) {
+    try {
+      const stat = lstatSync(statusFile);
+      if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("Unsafe status file");
+      console.log(readFileSync(statusFile, "utf8"));
+    } catch { console.error("Bot manager status unavailable; status file is missing, unsafe, or unreadable"); process.exitCode = 1; }
+    return;
+  }
   const configs = loadBots(registry);
   if (values.check) { console.log(JSON.stringify(configs.map(c => ({ name: c.name, agent_id: c.agentId, workdir: c.cwd, profile: c.profileFile })))); return; }
   mkdirSync(root, { recursive: true, mode: 0o700 }); removeDeadLock(lock);
   const fd = openSync(lock, "wx", 0o600); writeFileSync(fd, String(process.pid)); closeSync(fd);
   let running: Promise<void> = Promise.resolve();
   const loop = () => { running = tick().catch(() => console.error("Supervisor tick failed")).finally(() => { if (!stopping) timer = setTimeout(loop, 5000); }); };
-  const shutdown = async () => { if (stopping) return; stopping = true; clearTimeout(timer); await running; await Promise.all([...workers.values()].map(stop)); save(); if (readFileSync(lock, "utf8") === String(process.pid)) unlinkSync(lock); };
+  const shutdown = async () => { if (stopping) return; stopping = true; clearTimeout(timer); await running; await Promise.all([...workers.values()].map(stop)); save(); removeOwnedLock(lock); };
   process.once("SIGINT", () => void shutdown()); process.once("SIGTERM", () => void shutdown()); loop();
 }
-main().catch(() => { console.error("Bot manager failed; check registry, profile permissions, and existing manager"); process.exitCode = 1; });
+if (import.meta.main || process.argv.includes("--codex-bots") || (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url))) {
+  ({ values } = parseArgs({ options: { "codex-bots": { type: "boolean" }, config: { type: "string" }, "watch-codex": { type: "boolean" }, check: { type: "boolean" }, status: { type: "boolean" }, help: { type: "boolean" } } }));
+  registry = resolve(values.config ?? defaultRegistry());
+  main().catch(() => { console.error("Bot manager failed; check registry, profile permissions, and existing manager"); process.exitCode = 1; });
+}

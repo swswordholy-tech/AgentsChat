@@ -109,7 +109,7 @@ export class AppServer {
         const err = new Error(`App-server request timed out (${method})`);
         this.fatal(err);
         reject(err);
-      }, Math.max(50, timeoutMs));
+      }, Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.min(Math.max(50, Math.floor(timeoutMs)), 2_147_483_647) : 30_000);
       timer.unref?.();
       this.pending.set(id, { method, timer, resolve, reject });
       try { this.write({ id, method, params }); }
@@ -117,6 +117,9 @@ export class AppServer {
     });
   }
   private receive(message: any) {
+    if (!message || typeof message !== "object" || Array.isArray(message)) {
+      this.fatal(new Error("Invalid app-server response")); return;
+    }
     if (message.id !== undefined && message.method) {
       // Headless bridge never approves commands or answers interactive prompts.
       try { this.write({ id: message.id, error: { code: -32601, message: "Interactive requests unsupported by bridge" } }); } catch {}
@@ -146,7 +149,7 @@ export class AppServer {
       (!p.item.phase || p.item.phase === "final_answer")) a.items.set(p.item.id, p.item.text);
     if (message.method === "turn/completed") {
       this.active = undefined;
-      if (p.turn.status !== "completed") { a.reject(new Error(`Codex turn ${p.turn.status}`)); return; }
+      if (p.turn?.status !== "completed") { a.reject(new Error(`Codex turn ${p.turn?.status ?? "unknown"}`)); return; }
       for (const item of p.turn.items ?? []) if (item.type === "agentMessage" && (!item.phase || item.phase === "final_answer")) a.items.set(item.id, item.text);
       const text = [...a.items.values()].join("\n").trim();
       text ? a.resolve(text) : a.reject(new Error("Codex completed without a final reply"));
@@ -222,12 +225,12 @@ export class AppServer {
     const child = this.child;
     if (!child) return;
     try { child.stdin.end(); } catch {}
-    if (child.exitCode === null) {
+    if (child.exitCode === null && child.signalCode === null) {
       try { child.kill("SIGTERM"); } catch {}
       if (!this.killTimer) {
         this.killTimer = setTimeout(() => {
           this.killTimer = undefined;
-          if (child.exitCode === null) {
+          if (child.exitCode === null && child.signalCode === null) {
             try { child.kill("SIGKILL"); } catch {}
           }
         }, 2_000);
