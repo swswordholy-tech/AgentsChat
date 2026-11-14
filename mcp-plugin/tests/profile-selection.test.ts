@@ -31,11 +31,19 @@ test("project selector: binding, local profile, absent; malformed declarations f
       '{"profile":"~/../../etc/passwd"}',
       '{"profile":"Chosen\\u0000evil"}',
       '{"profile":"Chosen","token":"ac_inline_secret"}',
+      '{"profile":"Chosen","agent_key":"ac_inline_secret"}',
+      '{"profile":"Chosen","constructor":"evil"}',
+      '{"profile":"constructor"}',
+      '{"profile":"Chosen","api_url":"http://127.0.0.1:0"}',
     ]) {
       writeFileSync(config, bad);
       expect(() => projectProfileSelector(cwd)).toThrow();
     }
+    writeFileSync(config, JSON.stringify({ profile: "Chosen", api_url: "http://localhost.:9876" }));
+    expect(projectProfileSelector(cwd)?.apiUrl).toBe("http://localhost.:9876");
     rmSync(config);
+    writeFileSync(profile, "x".repeat(1_048_577));
+    expect(() => projectProfileSelector(cwd)).toThrow(/non-regular|symlink/i);
     rmSync(profile);
     const outside = join(cwd, "outside.json");
     writeFileSync(outside, '{"profile":"Chosen"}');

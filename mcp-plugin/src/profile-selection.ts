@@ -11,7 +11,22 @@ export interface ProjectProfileSelection {
 }
 
 const MAX_PROJECT_CONFIG_BYTES = 64 * 1024;
-const FORBIDDEN_CREDENTIAL_KEYS = new Set(["token", "key", "api_key", "secret", "password", "authorization"]);
+const MAX_PROJECT_PROFILE_BYTES = 1_048_576;
+const FORBIDDEN_CREDENTIAL_KEYS = new Set([
+  "token",
+  "access_token",
+  "refresh_token",
+  "key",
+  "api_key",
+  "agent_key",
+  "private_key",
+  "secret",
+  "client_secret",
+  "password",
+  "authorization",
+  "bearer",
+]);
+const PROTOTYPE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
 function safeLstat(target: string): Stats | undefined {
   try {
@@ -23,7 +38,7 @@ function safeLstat(target: string): Stats | undefined {
 }
 
 function isLoopbackHost(hostname: string): boolean {
-  const lower = hostname.toLowerCase();
+  const lower = hostname.toLowerCase().replace(/\.$/, "");
   return lower === "127.0.0.1" || lower === "localhost" || lower === "[::1]" || lower === "::1";
 }
 
@@ -52,7 +67,10 @@ export function projectProfileSelector(cwd: string): ProjectProfileSelection | u
       throw new Error("Invalid project .agentschat/config.json; repair it before choosing an identity");
     }
     if (!doc || typeof doc !== "object" || Array.isArray(doc)) throw new Error("Invalid project identity configuration");
-    if (Object.prototype.hasOwnProperty.call(doc, "__proto__") || Object.keys(doc).some((k) => FORBIDDEN_CREDENTIAL_KEYS.has(k.toLowerCase()))) {
+    if (
+      Object.prototype.hasOwnProperty.call(doc, "__proto__") ||
+      Object.keys(doc).some((k) => PROTOTYPE_KEYS.has(k.toLowerCase()) || FORBIDDEN_CREDENTIAL_KEYS.has(k.toLowerCase()))
+    ) {
       throw new Error("Credentials must not be stored in project .agentschat/config.json");
     }
     for (const field of ["profile", "agent_id", "api_url", "ws_url"]) {
@@ -64,7 +82,8 @@ export function projectProfileSelector(cwd: string): ProjectProfileSelection | u
       if (doc[field] === undefined) continue;
       let url: URL;
       try { url = new URL((doc[field] as string).trim()); } catch { throw new Error(`Invalid project ${field}`); }
-      if (!(protocols as readonly string[]).includes(url.protocol) || url.username || url.password || url.search || url.hash ||
+      const portBad = url.port !== "" && (!Number.isInteger(Number(url.port)) || Number(url.port) < 1 || Number(url.port) > 65535);
+      if (portBad || !(protocols as readonly string[]).includes(url.protocol) || url.username || url.password || url.search || url.hash ||
           (!url.protocol.endsWith("s:") && !isLoopbackHost(url.hostname)))
         throw new Error(`Invalid project ${field}: require TLS (except loopback) and no credentials/query`);
     }
@@ -76,7 +95,9 @@ export function projectProfileSelector(cwd: string): ProjectProfileSelection | u
   };
   if (doc.profile !== undefined) {
     const value = (doc.profile as string).trim();
-    if (value === "." || value === "..") throw new Error("Invalid project profile");
+    if (value === "." || value === ".." || PROTOTYPE_KEYS.has(value.replace(/\.json$/i, "").toLowerCase())) {
+      throw new Error("Invalid project profile");
+    }
     if (value.startsWith("~/") || value.startsWith("~\\")) {
       const homeBase = resolve(homedir());
       const resolvedHomeTarget = resolve(homeBase, value.slice(2));
@@ -99,7 +120,7 @@ export function projectProfileSelector(cwd: string): ProjectProfileSelection | u
   const profile = join(projectDir, "profile.json");
   const profileStat = safeLstat(profile);
   if (profileStat) {
-    if (profileStat.isSymbolicLink() || !profileStat.isFile()) {
+    if (profileStat.isSymbolicLink() || !profileStat.isFile() || profileStat.size > MAX_PROJECT_PROFILE_BYTES) {
       throw new Error("Refusing symlinked or non-regular project .agentschat/profile.json");
     }
     return { selector: profile, source: "project-profile", ...settings };

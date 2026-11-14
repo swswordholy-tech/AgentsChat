@@ -160,4 +160,22 @@ describe("expected agent id pin (AGENTCHAT_EXPECT_AGENT_ID)", () => {
     expect(EXPECT_PIN_EXEMPT_TOOLS.has("switch_profile")).toBe(true);
     expect(EXPECT_PIN_EXEMPT_TOOLS.has("reply")).toBe(false);
   });
+
+  test("Campaign #111 KR3: strips terminal/control escapes from guard records, gate/warn messages, and expectedAgentIdViolation while keeping pins fail-closed", () => {
+    const dirtyRec = parseGuardRecord(JSON.stringify({
+      bySelector: { "Bad\nKey": "acc_1", "Good": "acc_good", "DirtyVal": "acc_\x1b[31m" },
+      lastEffective: { agentId: "acc_prev\x1b[31m\r\n", source: "flag\nprofile", declaredName: "Sel\r\n1", ts: "2026\n01" },
+    }));
+    expect(dirtyRec.bySelector["Bad\nKey"]).toBeUndefined();
+    expect(dirtyRec.bySelector["DirtyVal"]).toBeUndefined();
+    expect(dirtyRec.bySelector["Good"]).toBe("acc_good");
+    expect(dirtyRec.lastEffective?.agentId).toBe("acc_prev[31m");
+    const gate = decideIdentityGuard(dirtyRec, { agentId: "acc_cur\x1b[2J\r\n", source: "default" });
+    expect(gate.kind).toBe("gate");
+    if (gate.kind === "gate") expect(gate.message).not.toMatch(/[\x00-\x1f\x7f]/);
+
+    const violation = expectedAgentIdViolation("pin\x1b[31m\r\n", "live\x00\n")!;
+    expect(violation).toContain('AGENTCHAT_EXPECT_AGENT_ID is "pin[31m"');
+    expect(violation).not.toMatch(/[\x00-\x1f\x7f]/);
+  });
 });

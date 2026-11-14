@@ -5,7 +5,12 @@ export interface OnboardingStatus {
 function isSafeOnboardingBase(base: string): boolean {
   try {
     const parsed = new URL(base);
-    const host = parsed.hostname.toLowerCase();
+    const host = parsed.hostname.toLowerCase().replace(/\.$/, "");
+    if (!host) return false;
+    if (parsed.port !== "") {
+      const p = Number(parsed.port);
+      if (!Number.isInteger(p) || p < 1 || p > 65535) return false;
+    }
     const isLoopback = host === "127.0.0.1" || host === "localhost" || host === "[::1]" || host === "::1";
     if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && isLoopback)) return false;
     if (parsed.username || parsed.password || parsed.search || parsed.hash) return false;
@@ -14,9 +19,23 @@ function isSafeOnboardingBase(base: string): boolean {
     return false;
   }
 }
+
+function isSafeOnboardingAgentId(id: string): boolean {
+  if (!id || id.length > 128 || /[\x00-\x1f\x7f\s/\\]/.test(id)) return false;
+  if (id === "." || id.includes("..")) return false;
+  const lower = id.toLowerCase();
+  if (lower === "__proto__" || lower === "constructor" || lower === "prototype") return false;
+  return true;
+}
+
 const MAX_ONBOARDING_JSON_BYTES = 64 * 1024;
 
 async function readBoundedJson(r: Response, maxBytes = MAX_ONBOARDING_JSON_BYTES): Promise<unknown> {
+  const declaredLen = Number(r.headers?.get?.("content-length"));
+  if (Number.isFinite(declaredLen) && declaredLen > maxBytes) {
+    try { await r.body?.cancel?.(); } catch {}
+    throw new Error("onboarding response too large");
+  }
   if (!r.body) {
     const txt = await r.text();
     if (Buffer.byteLength(txt, "utf8") > maxBytes) throw new Error("onboarding response too large");
@@ -46,11 +65,13 @@ async function readBoundedJson(r: Response, maxBytes = MAX_ONBOARDING_JSON_BYTES
 
 export async function getOnboardingStatus(base: string, agentId: string, token: string, request: (url: string, options: RequestInit) => Promise<Response> = fetch): Promise<OnboardingStatus> {
   const cleanBase = typeof base === "string" ? base.trim().replace(/\/+$/, "") : "";
-  const safeAgentId = typeof agentId === "string" ? agentId.trim() : "";
+  const rawAgentId = typeof agentId === "string" ? agentId.trim() : "";
+  const validAgent = isSafeOnboardingAgentId(rawAgentId);
+  const safeAgentId = validAgent ? rawAgentId : "";
   const chat = `${cleanBase}/chat/${encodeURIComponent(safeAgentId)}`;
   const result: OnboardingStatus = {agent_id: safeAgentId, claimed: null, authentication: "unknown", chat_url: chat,
     claim_url: `${chat}?claim=1`, next_step: "check_identity"};
-  if (!cleanBase || !safeAgentId || /[\x00-\x1f\x7f]/.test(cleanBase) || /[\x00-\x1f\x7f]/.test(safeAgentId) ||
+  if (!cleanBase || !validAgent || /[\x00-\x1f\x7f]/.test(cleanBase) ||
       typeof token !== "string" || !token.trim() || /[\x00-\x1f\x7f]/.test(token) || !isSafeOnboardingBase(cleanBase)) {
     return result;
   }
@@ -68,7 +89,7 @@ export async function getOnboardingStatus(base: string, agentId: string, token: 
       return result;
     }
     const data = await readBoundedJson(r) as any;
-    if (!data || typeof data !== "object" || data.agent_id !== safeAgentId || typeof data.claimed !== "boolean") return result;
+    if (!data || typeof data !== "object" || Array.isArray(data) || data.agent_id !== safeAgentId || typeof data.claimed !== "boolean") return result;
     result.authentication = "ok"; result.claimed = data.claimed;
     result.next_step = data.claimed ? "verify_reply" : "join_public_chat";
   } catch { /* Network/unsupported endpoint is unknown, never unclaimed. */ }

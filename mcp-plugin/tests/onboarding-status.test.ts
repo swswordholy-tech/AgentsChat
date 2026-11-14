@@ -40,6 +40,16 @@ test("claimed false, true, absent, mismatched and failed status stay distinct",a
  // claimSummary strips terminal escape / control characters from claim_url
  const forgedSummary=claimSummary({...oversizeStatus,claimed:false,claim_url:"https://example.com/chat/bot\x1b[31m\r\n?claim=1"});
  expect(forgedSummary).not.toMatch(/[\x00-\x1f\x7f]/);expect(forgedSummary).toContain("https://example.com/chat/bot[31m?claim=1");
+ // Campaign #111 KR3: dot/slash/prototype agentId, port :0, and oversized Content-Length fail closed cleanly
+ for(const [base,id] of [["https://example.com","."],["https://example.com",".."],["https://example.com","a/b"],["https://example.com","constructor"],["http://localhost:0","bot"]] as const){
+  let called=false;
+  const s=await getOnboardingStatus(base,id,"ac_private",(async()=>{called=true;return Response.json({agent_id:id,claimed:true});}));
+  expect(called).toBe(false);expect(s.claimed).toBeNull();expect(s.chat_url).not.toContain("..");
+ }
+ let clCancelled=false;
+ const clStream=new ReadableStream({pull(c){c.enqueue(new Uint8Array([123,125]));},cancel(){clCancelled=true;}});
+ const clStatus=await getOnboardingStatus("http://localhost.:8080","bot","ac_private",(async()=>new Response(clStream,{status:200,headers:{"content-length":"999999"}})));
+ expect(clStatus.claimed).toBeNull();expect(clCancelled).toBe(true);
 });
 test("one-shot registration exits with private clickable claim link, without logging key or starting MCP",async()=>{
  let calls=0;

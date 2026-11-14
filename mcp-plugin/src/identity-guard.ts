@@ -64,33 +64,45 @@ function isUnsafeSelectorKey(key: string): boolean {
   return lower === "__proto__" || lower === "constructor" || lower === "prototype";
 }
 
+function cleanDisplayToken(raw: unknown, maxLen = 128): string {
+  if (typeof raw !== "string") return "";
+  return raw.replace(/[\x00-\x1f\x7f]+/g, "").trim().slice(0, maxLen);
+}
+
 /** Parse a persisted record; anything unreadable/malformed is an empty record (never blocks boot). */
 export function parseGuardRecord(text: string | null): IdentityGuardRecord {
-  if (!text) return emptyGuardRecord();
+  if (!text || typeof text !== "string" || text.length > 262_144) return emptyGuardRecord();
   try {
     const raw = JSON.parse(text);
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) return emptyGuardRecord();
     const bySelector: Record<string, string> = {};
     if (raw.bySelector && typeof raw.bySelector === "object" && !Array.isArray(raw.bySelector)) {
       for (const [k, v] of Object.entries(raw.bySelector as Record<string, unknown>)) {
+        if (/[\x00-\x1f\x7f]/.test(k) || typeof v !== "string" || /[\x00-\x1f\x7f]/.test(v)) continue;
         const key = k.trim();
-        if (!key || isUnsafeSelectorKey(key) || typeof v !== "string" || !v.trim()) continue;
-        bySelector[key] = v.trim();
+        const val = v.trim();
+        if (!key || key.length > 128 || isUnsafeSelectorKey(key) || !val || val.length > 128) continue;
+        bySelector[key] = val;
       }
     }
+    const rawLast = raw.lastEffective;
+    const cleanAgentId =
+      rawLast && typeof rawLast === "object" && !Array.isArray(rawLast) && typeof rawLast.agentId === "string"
+        ? cleanDisplayToken(rawLast.agentId, 128)
+        : "";
+    const cleanDecl =
+      rawLast && typeof rawLast === "object" && !Array.isArray(rawLast) && rawLast.declaredName
+        ? cleanDisplayToken(String(rawLast.declaredName), 128)
+        : "";
     return {
       bySelector,
       lastEffective:
-        raw.lastEffective &&
-        typeof raw.lastEffective === "object" &&
-        !Array.isArray(raw.lastEffective) &&
-        typeof raw.lastEffective.agentId === "string" &&
-        raw.lastEffective.agentId.trim().length > 0
+        cleanAgentId.length > 0 && !isUnsafeSelectorKey(cleanAgentId)
           ? {
-              agentId: raw.lastEffective.agentId,
-              source: String(raw.lastEffective.source ?? "unknown"),
-              ...(raw.lastEffective.declaredName ? { declaredName: String(raw.lastEffective.declaredName) } : {}),
-              ts: String(raw.lastEffective.ts ?? ""),
+              agentId: cleanAgentId,
+              source: cleanDisplayToken(String(rawLast.source ?? "unknown"), 64) || "unknown",
+              ...(cleanDecl ? { declaredName: cleanDecl } : {}),
+              ts: cleanDisplayToken(String(rawLast.ts ?? ""), 64),
             }
           : null,
     };
@@ -109,15 +121,20 @@ export function decideIdentityGuard(prev: IdentityGuardRecord, current: GuardIde
   if (!last) return { kind: "ok" }; // first recorded boot — nothing to drift from
   if (last.agentId === current.agentId) return { kind: "ok" };
 
+  const safeLastId = cleanDisplayToken(last.agentId, 128);
+  const safeLastSrc = cleanDisplayToken(last.source, 64) || "unknown";
+  const safeLastDecl = last.declaredName ? cleanDisplayToken(last.declaredName, 128) : "";
+  const safeCurId = cleanDisplayToken(current.agentId, 128);
+
   if (current.source === "default") {
     // THE incident pattern: we used to run as X (possibly via an explicit
     // selector), and this boot silently landed on the default profile Y.
     return {
       kind: "gate",
       message:
-        `IDENTITY CHANGED after reconnect/restart: previously trusted as "${last.agentId}" ` +
-        `(via ${last.source}${last.declaredName ? ` "${last.declaredName}"` : ""}), but this boot resolved the DEFAULT profile ` +
-        `"${current.agentId}". Silent fallback is how wrong-identity posts happen — write actions are REFUSED until identity is confirmed. ` +
+        `IDENTITY CHANGED after reconnect/restart: previously trusted as "${safeLastId}" ` +
+        `(via ${safeLastSrc}${safeLastDecl ? ` "${safeLastDecl}"` : ""}), but this boot resolved the DEFAULT profile ` +
+        `"${safeCurId}". Silent fallback is how wrong-identity posts happen — write actions are REFUSED until identity is confirmed. ` +
         `Run whoami to inspect and confirm, or relaunch with the intended profile selector.`,
     };
   }
@@ -131,11 +148,13 @@ export function decideIdentityGuard(prev: IdentityGuardRecord, current: GuardIde
   if (current.declaredName && typeof prevSelectorAgent === "string" && prevSelectorAgent !== current.agentId) {
     // Same selector, different identity: the profile file behind the selector
     // changed (likely an intentional edit). Loud, but not gated.
+    const safeCurDecl = cleanDisplayToken(current.declaredName, 128);
+    const safePrevSel = cleanDisplayToken(prevSelectorAgent, 128);
     return {
       kind: "warn",
       message:
-        `identity for selector "${current.declaredName}" changed: was "${prevSelectorAgent}", ` +
-        `now "${current.agentId}". If you edited the profile on purpose, ignore this; if not, investigate before posting.`,
+        `identity for selector "${safeCurDecl}" changed: was "${safePrevSel}", ` +
+        `now "${safeCurId}". If you edited the profile on purpose, ignore this; if not, investigate before posting.`,
     };
   }
 
@@ -202,9 +221,11 @@ export const EXPECT_PIN_EXEMPT_TOOLS = new Set(["whoami", "switch_profile", "con
 export function expectedAgentIdViolation(expected: string | null, liveAgentId: string): string | null {
   if (!expected) return null;
   if (liveAgentId === expected) return null;
+  const safeLive = cleanDisplayToken(liveAgentId, 128) || "(none)";
+  const safeExpected = cleanDisplayToken(expected, 128) || "(invalid-pin)";
   return (
-    `IDENTITY PIN: this MCP process is "${liveAgentId || "(none)"}" but AGENTCHAT_EXPECT_AGENT_ID is "${expected}". ` +
+    `IDENTITY PIN: this MCP process is "${safeLive}" but AGENTCHAT_EXPECT_AGENT_ID is "${safeExpected}". ` +
     `Write tools are refused so nothing posts under the wrong identity. ` +
-    `Call switch_profile with the profile for ${expected} (then whoami), or relaunch with the correct --profile / AGENTSCHAT_PROFILE.`
+    `Call switch_profile with the profile for ${safeExpected} (then whoami), or relaunch with the correct --profile / AGENTSCHAT_PROFILE.`
   );
 }
