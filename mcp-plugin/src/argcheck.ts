@@ -10,8 +10,19 @@
  *
  * Returns null when the args are acceptable, or a human-readable reason string.
  */
+const FORBIDDEN_ARG_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+function hasOwnProto(v: unknown): boolean {
+  return Boolean(v && typeof v === "object" && Object.prototype.hasOwnProperty.call(v, "__proto__"));
+}
+
+function isReservedIdKey(id: string): boolean {
+  return id === "." || id.includes("..") || FORBIDDEN_ARG_KEYS.has(id.toLowerCase());
+}
+
 export function validateToolArgs(schema: any, args: any): string | null {
   if (!schema || schema.type !== "object" || !schema.properties) return null;
+  if (hasOwnProto(args)) return 'disallowed argument "__proto__"';
   const a = args && typeof args === "object" && !Array.isArray(args) ? args : {};
 
   const required: string[] = Array.isArray(schema.required) ? schema.required : [];
@@ -55,7 +66,7 @@ function matchesJsonType(val: any, expected: string | string[]): boolean {
       case "array":
         return Array.isArray(val);
       case "object":
-        return val !== null && typeof val === "object" && !Array.isArray(val);
+        return val !== null && typeof val === "object" && !Array.isArray(val) && !hasOwnProto(val);
       case "null":
         return val === null;
       default:
@@ -85,7 +96,7 @@ const TASK_EVIDENCE_REF_MAX = 160;
 const TASK_EVIDENCE_NOTE_MAX = 200;
 const EVIDENCE_CTRL_RE = /[\u0000-\u001f\u007f]/;
 const EVIDENCE_SECRET_RE =
-  /(?:(?:ac|agent_key)_[A-Za-z0-9_-]{8,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|(?:sk|rk)-(?:live-|test-|proj-|ant-)?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|AIza[0-9A-Za-z_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [^-]*PRIVATE KEY-----)/;
+  /(?:(?:ac|agent_key|mcp_at|mcp_rt|mcp_code|whsec)_[A-Za-z0-9_-]{8,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|(?:sk|rk)-(?:live-|test-|proj-|ant-)?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|AIza[0-9A-Za-z_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [^-]*PRIVATE KEY-----)/;
 
 function isTaskEvidenceKind(v: unknown): v is TaskEvidenceKind {
   return typeof v === "string" && (TASK_EVIDENCE_KINDS as readonly string[]).includes(v);
@@ -320,11 +331,19 @@ export function parseLoopIntervalShorthandMs(raw: string): number | null {
 export function validateCreateLoopInput(
   args: unknown,
 ): { ok: true; value: ValidatedCreateLoopBody } | { ok: false; error: string } {
+  if (hasOwnProto(args)) {
+    return { ok: false, error: 'create_loop arguments cannot define own "__proto__".' };
+  }
   const a = args && typeof args === "object" && !Array.isArray(args)
     ? (args as Record<string, unknown>)
     : {};
   const channelId = typeof a.channel_id === "string" ? a.channel_id.trim() : "";
-  if (!SAFE_CHANNEL_OR_LOOP_ID_RE.test(channelId) || channelId.includes("..")) {
+  if (
+    !SAFE_CHANNEL_OR_LOOP_ID_RE.test(channelId) ||
+    isReservedIdKey(channelId) ||
+    EVIDENCE_CTRL_RE.test(channelId) ||
+    EVIDENCE_SECRET_RE.test(channelId)
+  ) {
     return { ok: false, error: "create_loop needs a valid channel_id." };
   }
   const rawMode = typeof a.mode === "string" ? a.mode.trim() : "";
@@ -379,7 +398,7 @@ export function validateCreateLoopInput(
       }
       const handle = entry.trim().replace(/^@+/, "");
       if (!handle) continue;
-      if (!SAFE_AGENT_HANDLE_RE.test(handle)) {
+      if (!SAFE_AGENT_HANDLE_RE.test(handle) || isReservedIdKey(handle) || EVIDENCE_SECRET_RE.test(handle)) {
         return { ok: false, error: `create_loop invalid target agent handle "${handle}".` };
       }
       if (!seenTargets.has(handle)) {
@@ -413,7 +432,7 @@ export function validateCreateLoopInput(
 
   if (mode === "okr_wake" || mode === "okr_watch") {
     const objectiveId = typeof a.objective_id === "string" ? a.objective_id.trim() : "";
-    if (!SAFE_OBJECTIVE_ID_RE.test(objectiveId)) {
+    if (!SAFE_OBJECTIVE_ID_RE.test(objectiveId) || isReservedIdKey(objectiveId) || EVIDENCE_SECRET_RE.test(objectiveId)) {
       return { ok: false, error: `create_loop mode="${mode}" requires a valid objective_id.` };
     }
     out.objective_id = objectiveId;
@@ -461,11 +480,20 @@ export interface ValidatedOkrAddKrInput {
 export function validateOkrAddKrInput(
   args: unknown,
 ): { ok: true; value: ValidatedOkrAddKrInput } | { ok: false; error: string } {
+  if (hasOwnProto(args)) {
+    return { ok: false, error: 'okr_add_kr arguments cannot define own "__proto__".' };
+  }
   const a = args && typeof args === "object" && !Array.isArray(args)
     ? (args as Record<string, unknown>)
     : {};
   const objectiveId = typeof a.objective_id === "string" ? a.objective_id.trim() : "";
-  if (!objectiveId || !SAFE_CHANNEL_OR_LOOP_ID_RE.test(objectiveId) || objectiveId.includes("..")) {
+  if (
+    !objectiveId ||
+    !SAFE_CHANNEL_OR_LOOP_ID_RE.test(objectiveId) ||
+    isReservedIdKey(objectiveId) ||
+    EVIDENCE_CTRL_RE.test(objectiveId) ||
+    EVIDENCE_SECRET_RE.test(objectiveId)
+  ) {
     return { ok: false, error: "okr_add_kr requires a valid objective_id." };
   }
   const rawTitle = typeof a.title === "string" ? a.title : "";
@@ -545,6 +573,9 @@ function validateOkrKrMutationInput(
   toolLabel: "okr_set_kr_progress" | "okr_update_kr",
   forceMetadataEndpoint: boolean,
 ): { ok: true; value: ValidatedOkrKrUpdateResult } | { ok: false; error: string } {
+  if (hasOwnProto(args)) {
+    return { ok: false, error: `${toolLabel} arguments cannot define own "__proto__".` };
+  }
   const a = args && typeof args === "object" && !Array.isArray(args)
     ? (args as Record<string, unknown>)
     : {};
@@ -552,7 +583,7 @@ function validateOkrKrMutationInput(
   if (
     !krId ||
     !SAFE_CHANNEL_OR_LOOP_ID_RE.test(krId) ||
-    krId.includes("..") ||
+    isReservedIdKey(krId) ||
     EVIDENCE_CTRL_RE.test(krId) ||
     EVIDENCE_SECRET_RE.test(krId)
   ) {
@@ -735,7 +766,7 @@ export function validateOkrTaskAssigneeInput(
   if (EVIDENCE_SECRET_RE.test(trimmed)) {
     return { ok: false, error: "assignee rejected: appears to contain a secret or token" };
   }
-  if (!SAFE_CHANNEL_OR_LOOP_ID_RE.test(trimmed) || trimmed.includes("..")) {
+  if (!SAFE_CHANNEL_OR_LOOP_ID_RE.test(trimmed) || isReservedIdKey(trimmed)) {
     return { ok: false, error: `assignee "${trimmed}" contains invalid characters` };
   }
   return { ok: true, value: trimmed };
@@ -769,7 +800,7 @@ export function validateOkrTaskContributesToInput(
     if (EVIDENCE_SECRET_RE.test(id)) {
       return { ok: false, error: `contributes_to[${i}] rejected: appears to contain a secret or token` };
     }
-    if (!SAFE_CHANNEL_OR_LOOP_ID_RE.test(id) || id.includes("..")) {
+    if (!SAFE_CHANNEL_OR_LOOP_ID_RE.test(id) || isReservedIdKey(id)) {
       return { ok: false, error: `contributes_to[${i}] contains invalid KR ID characters` };
     }
     if (!seen.has(id)) {
@@ -821,7 +852,7 @@ export function validateOkrTaskDependsOnInput(
     if (EVIDENCE_SECRET_RE.test(id)) {
       return { ok: false, error: `depends_on[${i}] rejected: appears to contain a secret or token` };
     }
-    if (!SAFE_CHANNEL_OR_LOOP_ID_RE.test(id) || id.includes("..")) {
+    if (!SAFE_CHANNEL_OR_LOOP_ID_RE.test(id) || isReservedIdKey(id)) {
       return { ok: false, error: `depends_on[${i}] contains invalid task ID characters` };
     }
     if (normalizedSelf && id === normalizedSelf) {
@@ -855,7 +886,7 @@ export function validateOkrLinkedChannelDocsInput(
   const seen = new Set<string>();
   for (let i = 0; i < raw.length; i++) {
     const item = raw[i];
-    if (!item || typeof item !== "object" || Array.isArray(item)) {
+    if (!item || typeof item !== "object" || Array.isArray(item) || hasOwnProto(item)) {
       return { ok: false, error: `linked_channel_docs[${i}] must be an object with channel_id and doc_id` };
     }
     const rawChannelId = (item as Record<string, unknown>).channel_id;
@@ -865,7 +896,13 @@ export function validateOkrLinkedChannelDocsInput(
     }
     const channelId = rawChannelId.trim();
     const docId = rawDocId.trim();
-    if (!channelId || !OKR_DOC_CHANNEL_ID_RE.test(channelId) || /^dm-/i.test(channelId)) {
+    if (
+      !channelId ||
+      !OKR_DOC_CHANNEL_ID_RE.test(channelId) ||
+      /^dm[-:]/i.test(channelId) ||
+      channelId === "direct" ||
+      isReservedIdKey(channelId)
+    ) {
       return {
         ok: false,
         error: `linked_channel_docs[${i}].channel_id must be a valid non-DM room ID (1..80 chars)`,
@@ -874,7 +911,7 @@ export function validateOkrLinkedChannelDocsInput(
     if (EVIDENCE_SECRET_RE.test(channelId) || EVIDENCE_SECRET_RE.test(docId)) {
       return { ok: false, error: `linked_channel_docs[${i}] rejected: appears to contain a secret or token` };
     }
-    if (!docId || !OKR_DOC_ID_RE.test(docId)) {
+    if (!docId || !OKR_DOC_ID_RE.test(docId) || isReservedIdKey(docId)) {
       return { ok: false, error: `linked_channel_docs[${i}].doc_id must match ^[A-Za-z0-9_-]{1,120}$` };
     }
     if (requiredChannel && channelId !== requiredChannel) {
@@ -941,6 +978,9 @@ export interface ValidatedOkrUpdateObjectiveInput {
 export function validateOkrUpdateObjectiveInput(
   args: unknown,
 ): { ok: true; value: ValidatedOkrUpdateObjectiveInput } | { ok: false; error: string } {
+  if (hasOwnProto(args)) {
+    return { ok: false, error: 'okr_update_objective arguments cannot define own "__proto__"' };
+  }
   const a = args && typeof args === "object" && !Array.isArray(args)
     ? (args as Record<string, unknown>)
     : {};
@@ -948,7 +988,7 @@ export function validateOkrUpdateObjectiveInput(
   if (
     !objectiveId ||
     !SAFE_CHANNEL_OR_LOOP_ID_RE.test(objectiveId) ||
-    objectiveId.includes("..") ||
+    isReservedIdKey(objectiveId) ||
     EVIDENCE_CTRL_RE.test(objectiveId) ||
     EVIDENCE_SECRET_RE.test(objectiveId)
   ) {
@@ -1063,6 +1103,9 @@ export function validateOkrUpdateObjectiveInput(
 export function validateOkrArchiveObjectiveInput(
   args: unknown,
 ): { ok: true; value: { objective_id: string; body: Record<string, unknown> } } | { ok: false; error: string } {
+  if (hasOwnProto(args)) {
+    return { ok: false, error: 'archive_objective arguments cannot define own "__proto__"' };
+  }
   const a = args && typeof args === "object" && !Array.isArray(args)
     ? (args as Record<string, unknown>)
     : {};
@@ -1070,7 +1113,7 @@ export function validateOkrArchiveObjectiveInput(
   if (
     !objectiveId ||
     !SAFE_CHANNEL_OR_LOOP_ID_RE.test(objectiveId) ||
-    objectiveId.includes("..") ||
+    isReservedIdKey(objectiveId) ||
     EVIDENCE_CTRL_RE.test(objectiveId) ||
     EVIDENCE_SECRET_RE.test(objectiveId)
   ) {
@@ -1097,13 +1140,16 @@ export interface ValidatedListLoopsFilter {
 export function validateListLoopsInput(
   args: unknown,
 ): { ok: true; value: ValidatedListLoopsFilter } | { ok: false; error: string } {
+  if (hasOwnProto(args)) {
+    return { ok: false, error: 'list_loops arguments cannot define own "__proto__".' };
+  }
   const a = args && typeof args === "object" && !Array.isArray(args)
     ? (args as Record<string, unknown>)
     : {};
   const out: ValidatedListLoopsFilter = {};
   if (a.channel_id !== undefined && a.channel_id !== null) {
     const cid = typeof a.channel_id === "string" ? a.channel_id.trim() : "";
-    if (!SAFE_CHANNEL_OR_LOOP_ID_RE.test(cid) || cid.includes("..") || EVIDENCE_SECRET_RE.test(cid)) {
+    if (!SAFE_CHANNEL_OR_LOOP_ID_RE.test(cid) || isReservedIdKey(cid) || EVIDENCE_CTRL_RE.test(cid) || EVIDENCE_SECRET_RE.test(cid)) {
       return { ok: false, error: "list_loops channel_id must be a valid channel identifier." };
     }
     out.channel_id = cid;
@@ -1122,7 +1168,7 @@ export function validateListLoopsInput(
   }
   if (a.objective_id !== undefined && a.objective_id !== null) {
     const oid = typeof a.objective_id === "string" ? a.objective_id.trim() : "";
-    if (!SAFE_OBJECTIVE_ID_RE.test(oid) || EVIDENCE_SECRET_RE.test(oid)) {
+    if (!SAFE_OBJECTIVE_ID_RE.test(oid) || isReservedIdKey(oid) || EVIDENCE_SECRET_RE.test(oid)) {
       return { ok: false, error: "list_loops objective_id must be a valid objective identifier." };
     }
     out.objective_id = oid;
@@ -1146,6 +1192,9 @@ export interface ValidatedLoadMemoryInput {
 export function validateLoadMemoryInput(
   args: unknown,
 ): { ok: true; value: ValidatedLoadMemoryInput } | { ok: false; error: string } {
+  if (hasOwnProto(args)) {
+    return { ok: false, error: 'load_memory arguments cannot define own "__proto__".' };
+  }
   const a = args && typeof args === "object" && !Array.isArray(args)
     ? (args as Record<string, unknown>)
     : {};
@@ -1158,7 +1207,7 @@ export function validateLoadMemoryInput(
     if (trimmed) {
       if (
         !SAFE_MEMORY_NAME_RE.test(trimmed) ||
-        trimmed.includes("..") ||
+        isReservedIdKey(trimmed) ||
         EVIDENCE_CTRL_RE.test(trimmed) ||
         EVIDENCE_SECRET_RE.test(trimmed)
       ) {
@@ -1185,6 +1234,9 @@ export function validateLoadMemoryInput(
 export function validateDeleteMemoryInput(
   args: unknown,
 ): { ok: true; value: ValidatedDeleteMemoryInput } | { ok: false; error: string } {
+  if (hasOwnProto(args)) {
+    return { ok: false, error: 'delete_memory arguments cannot define own "__proto__".' };
+  }
   const a = args && typeof args === "object" && !Array.isArray(args)
     ? (args as Record<string, unknown>)
     : {};
@@ -1192,7 +1244,7 @@ export function validateDeleteMemoryInput(
   if (
     !name ||
     !SAFE_MEMORY_NAME_RE.test(name) ||
-    name.includes("..") ||
+    isReservedIdKey(name) ||
     EVIDENCE_CTRL_RE.test(name) ||
     EVIDENCE_SECRET_RE.test(name)
   ) {
@@ -1240,7 +1292,7 @@ export function validateOkrParentIdOptionalInput(
   }
   if (
     !SAFE_CHANNEL_OR_LOOP_ID_RE.test(trimmed) ||
-    trimmed.includes("..") ||
+    isReservedIdKey(trimmed) ||
     EVIDENCE_CTRL_RE.test(trimmed)
   ) {
     return { ok: false, error: "parent_id must be a valid objective identifier" };
@@ -1251,7 +1303,7 @@ export function validateOkrParentIdOptionalInput(
 export function validateOkrReparentObjectiveInput(
   args: unknown,
 ): { ok: true; value: { objective_id: string; body: Record<string, unknown> } } | { ok: false; error: string } {
-  if (!args || typeof args !== "object" || Array.isArray(args)) {
+  if (!args || typeof args !== "object" || Array.isArray(args) || hasOwnProto(args)) {
     return { ok: false, error: "okr_reparent_objective requires objective_id and parent_id." };
   }
   const a = args as Record<string, unknown>;
@@ -1259,7 +1311,7 @@ export function validateOkrReparentObjectiveInput(
   if (
     !objectiveId ||
     !SAFE_CHANNEL_OR_LOOP_ID_RE.test(objectiveId) ||
-    objectiveId.includes("..") ||
+    isReservedIdKey(objectiveId) ||
     EVIDENCE_CTRL_RE.test(objectiveId) ||
     EVIDENCE_SECRET_RE.test(objectiveId)
   ) {
@@ -1281,7 +1333,7 @@ export function validateOkrReparentObjectiveInput(
     }
     if (
       !SAFE_CHANNEL_OR_LOOP_ID_RE.test(trimmedParent) ||
-      trimmedParent.includes("..") ||
+      isReservedIdKey(trimmedParent) ||
       EVIDENCE_CTRL_RE.test(trimmedParent)
     ) {
       return { ok: false, error: "parent_id must be a valid objective identifier or null to detach" };
@@ -1338,9 +1390,9 @@ function validateChannelDocRoomId(
   if (
     !chatId ||
     !OKR_DOC_CHANNEL_ID_RE.test(chatId) ||
-    /^dm-/i.test(chatId) ||
+    /^dm[-:]/i.test(chatId) ||
     chatId === "direct" ||
-    chatId.includes("..") ||
+    isReservedIdKey(chatId) ||
     EVIDENCE_CTRL_RE.test(chatId)
   ) {
     return { ok: false, error: `${toolName} requires a valid non-DM room chat_id (1..80 chars).` };
@@ -1356,7 +1408,7 @@ export function validateChannelDocIdInput(
   toolName = "channel_doc",
 ): { ok: true; value: string } | { ok: false; error: string } {
   const docId = typeof raw === "string" ? raw.trim() : "";
-  if (!docId || !SAFE_CHANNEL_DOC_ID_RE.test(docId) || EVIDENCE_CTRL_RE.test(docId)) {
+  if (!docId || !SAFE_CHANNEL_DOC_ID_RE.test(docId) || isReservedIdKey(docId) || EVIDENCE_CTRL_RE.test(docId)) {
     return { ok: false, error: `${toolName} doc_id must match ^[A-Za-z0-9_-]{1,64}$.` };
   }
   if (EVIDENCE_SECRET_RE.test(docId)) {
@@ -1374,6 +1426,9 @@ export interface ValidatedListChannelDocsInput {
 export function validateListChannelDocsInput(
   args: unknown,
 ): { ok: true; value: ValidatedListChannelDocsInput } | { ok: false; error: string } {
+  if (hasOwnProto(args)) {
+    return { ok: false, error: 'list_channel_docs arguments cannot define own "__proto__".' };
+  }
   const a = args && typeof args === "object" && !Array.isArray(args)
     ? (args as Record<string, unknown>)
     : {};
@@ -1406,6 +1461,9 @@ export function validateArchiveChannelDocInput(
   args: unknown,
   toolName = "archive_channel_doc",
 ): { ok: true; value: ValidatedArchiveChannelDocInput } | { ok: false; error: string } {
+  if (hasOwnProto(args)) {
+    return { ok: false, error: `${toolName} arguments cannot define own "__proto__".` };
+  }
   const a = args && typeof args === "object" && !Array.isArray(args)
     ? (args as Record<string, unknown>)
     : {};
@@ -1495,6 +1553,9 @@ function hasValidSkillFrontmatter(markdown: string): boolean {
 export function validateUpsertChannelDocInput(
   args: unknown,
 ): { ok: true; value: ValidatedUpsertChannelDocResult } | { ok: false; error: string } {
+  if (hasOwnProto(args)) {
+    return { ok: false, error: 'upsert_channel_doc arguments cannot define own "__proto__".' };
+  }
   const a = args && typeof args === "object" && !Array.isArray(args)
     ? (args as Record<string, unknown>)
     : {};
@@ -1584,19 +1645,19 @@ const PERSONAL_SKILL_BODY_MAX_CHARS = 100_000;
 export function derivePersonalSkillSlug(rawDocId: unknown, rawName: string): string {
   if (typeof rawDocId === "string" && rawDocId.trim()) {
     const trimmed = rawDocId.trim();
-    if (SAFE_PERSONAL_SKILL_SLUG_RE.test(trimmed) && !trimmed.includes("..")) {
+    if (SAFE_PERSONAL_SKILL_SLUG_RE.test(trimmed) && !isReservedIdKey(trimmed)) {
       return trimmed;
     }
   }
-  return (
+  const fallback =
     String(rawDocId || rawName)
       .toLowerCase()
       .replace(/[^a-z0-9._-]+/g, "-")
       .replace(/^[^a-z0-9]+/, "")
       .replace(/[^a-z0-9]+$/, "")
       .replace(/\.{2,}/g, "-")
-      .slice(0, 64) || "skill"
-  );
+      .slice(0, 64) || "skill";
+  return isReservedIdKey(fallback) ? "skill" : fallback;
 }
 
 export function validatePersonalSkillSlugInput(
@@ -1607,7 +1668,7 @@ export function validatePersonalSkillSlugInput(
   if (
     !slug ||
     !SAFE_PERSONAL_SKILL_SLUG_RE.test(slug) ||
-    slug.includes("..") ||
+    isReservedIdKey(slug) ||
     EVIDENCE_CTRL_RE.test(slug) ||
     EVIDENCE_SECRET_RE.test(slug)
   ) {
@@ -1627,6 +1688,9 @@ export type ValidatedLoadSkillTarget =
 export function validateLoadSkillInput(
   args: unknown,
 ): { ok: true; value: ValidatedLoadSkillTarget } | { ok: false; error: string } {
+  if (hasOwnProto(args)) {
+    return { ok: false, error: 'load_skill arguments cannot define own "__proto__".' };
+  }
   const a = args && typeof args === "object" && !Array.isArray(args)
     ? (args as Record<string, unknown>)
     : {};
@@ -1678,7 +1742,20 @@ export function validateLoadSkillInput(
       error: "load_skill include_revisions is supported for personal skills (name) or channel skills (chat_id + doc_id), not built-in global skills.",
     };
   }
+  if (a.skill_id !== undefined && a.skill_id !== null && typeof a.skill_id !== "string") {
+    return { ok: false, error: "load_skill skill_id must be a string when provided." };
+  }
   const skillId = hasSkillId ? (a.skill_id as string).trim() : undefined;
+  if (
+    skillId !== undefined &&
+    (!SAFE_CHANNEL_DOC_ID_RE.test(skillId) ||
+      isReservedIdKey(skillId) ||
+      skillId in Object.prototype ||
+      EVIDENCE_CTRL_RE.test(skillId) ||
+      EVIDENCE_SECRET_RE.test(skillId))
+  ) {
+    return { ok: false, error: "load_skill skill_id must be a valid global skill identifier." };
+  }
   return { ok: true, value: { scope: "global", ...(skillId ? { skill_id: skillId } : {}) } };
 }
 
@@ -1718,6 +1795,9 @@ export type ValidatedSaveSkillResult =
 export function validateSaveSkillInput(
   args: unknown,
 ): { ok: true; value: ValidatedSaveSkillResult } | { ok: false; error: string } {
+  if (hasOwnProto(args)) {
+    return { ok: false, error: 'save_skill arguments cannot define own "__proto__".' };
+  }
   const a = args && typeof args === "object" && !Array.isArray(args)
     ? (args as Record<string, unknown>)
     : {};

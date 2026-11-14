@@ -2,14 +2,25 @@
 // against a tool's declared inputSchema. Run with `bun test`.
 import { test, expect } from "bun:test";
 import {
+  derivePersonalSkillSlug,
+  validateChannelDocIdInput,
   validateCreateLoopInput,
   validateDeleteMemoryInput,
+  validateListChannelDocsInput,
   validateListLoopsInput,
+  validateLoadMemoryInput,
+  validateLoadSkillInput,
+  validateOkrAddKrInput,
+  validateOkrLinkedChannelDocsInput,
   validateOkrSetKrProgressInput,
+  validateOkrTaskAssigneeInput,
+  validateOkrTaskContributesToInput,
+  validateOkrTaskDependsOnInput,
   validateOkrTaskDueInput,
   validateOkrTaskTitleInput,
   validateOkrUpdateKrInput,
   validateOkrUpdateObjectiveInput,
+  validatePersonalSkillSlugInput,
   validateTaskEvidenceInput,
   validateTaskVersionToken,
   validateToolArgs,
@@ -414,4 +425,72 @@ test("validateOkrUpdateObjectiveInput and validateTaskVersionToken enforce CAS t
       if_match_updated_at: "sk-live-1234567890abcdef1234",
     }).ok,
   ).toBe(false);
+});
+
+test("Campaign #118 KR3: argcheck blocks own __proto__, dot/prototype IDs, dm: room docs, Object.prototype global skill_id, and OAuth/whsec tokens", () => {
+  // 1. Own __proto__ rejected at tool-arg & nested-object & validator boundaries
+  expect(
+    validateToolArgs(
+      { type: "object", properties: { chat_id: { type: "string" }, meta: { type: "object" } }, required: ["chat_id"] },
+      JSON.parse('{"__proto__":{"polluted":true},"chat_id":"welcome"}'),
+    ),
+  ).toContain("__proto__");
+  expect(
+    validateToolArgs(
+      { type: "object", properties: { meta: { type: "object" } }, required: [] },
+      { meta: JSON.parse('{"__proto__":{"polluted":true}}') },
+    ),
+  ).toContain('argument "meta" must be object');
+  expect(validateCreateLoopInput(JSON.parse('{"__proto__":{"x":1},"channel_id":"c1","mode":"prompt","prompt":"hi"}')).ok).toBe(false);
+  expect(validateOkrAddKrInput(JSON.parse('{"__proto__":{"x":1},"objective_id":"obj_123456","title":"t","metric_type":"bool","target":1}')).ok).toBe(false);
+
+  // 2. Single dot "." and case-insensitive prototype keys rejected across all ID/slug/handle validators
+  for (const badId of [".", "..", "__proto__", "CONSTRUCTOR", "Prototype"]) {
+    expect(validateCreateLoopInput({ channel_id: badId, mode: "prompt", prompt: "hi" }).ok).toBe(false);
+    expect(validateCreateLoopInput({ channel_id: "c1", mode: "prompt", prompt: "hi", target_agents: [badId] }).ok).toBe(false);
+    expect(validateCreateLoopInput({ channel_id: "c1", mode: "okr_wake", objective_id: badId }).ok).toBe(false);
+    expect(validateListLoopsInput({ channel_id: badId }).ok).toBe(false);
+    expect(validateListLoopsInput({ objective_id: badId }).ok).toBe(false);
+    expect(validateOkrAddKrInput({ objective_id: badId, title: "t", metric_type: "bool", target: 1 }).ok).toBe(false);
+    expect(validateOkrSetKrProgressInput({ kr_id: badId, current: 1 }).ok).toBe(false);
+    expect(validateOkrTaskAssigneeInput(badId).ok).toBe(false);
+    expect(validateOkrTaskContributesToInput([badId]).ok).toBe(false);
+    expect(validateOkrTaskDependsOnInput([badId]).ok).toBe(false);
+    expect(validateOkrUpdateObjectiveInput({ objective_id: badId, status: "done" }).ok).toBe(false);
+    expect(validateLoadMemoryInput({ name: badId }).ok).toBe(false);
+    expect(validateDeleteMemoryInput({ name: badId }).ok).toBe(false);
+    expect(validateChannelDocIdInput(badId).ok).toBe(false);
+    expect(validatePersonalSkillSlugInput(badId, "load_skill").ok).toBe(false);
+  }
+  expect(derivePersonalSkillSlug(undefined, "CONSTRUCTOR")).toBe("skill");
+  expect(derivePersonalSkillSlug("Prototype", "Prototype")).toBe("skill");
+
+  // 3. Channel doc room checks reject dm: colon DMs (parity with dm-) and direct/prototype rooms
+  expect(validateListChannelDocsInput({ chat_id: "dm-alice" }).ok).toBe(false);
+  expect(validateListChannelDocsInput({ chat_id: "dm:alice:bob" }).ok).toBe(false);
+  expect(validateListChannelDocsInput({ chat_id: "CONSTRUCTOR" }).ok).toBe(false);
+  expect(validateOkrLinkedChannelDocsInput([{ channel_id: "dm-alice", doc_id: "doc1" }]).ok).toBe(false);
+  expect(validateOkrLinkedChannelDocsInput([{ channel_id: "CONSTRUCTOR", doc_id: "doc1" }]).ok).toBe(false);
+  expect(validateOkrLinkedChannelDocsInput([{ channel_id: "room-1", doc_id: "Prototype" }]).ok).toBe(false);
+
+  // 4. load_skill global skill_id rejects Object.prototype keys & traversal
+  expect(validateLoadSkillInput({ skill_id: "workspace-driven-eng" })).toEqual({
+    ok: true,
+    value: { scope: "global", skill_id: "workspace-driven-eng" },
+  });
+  expect(validateLoadSkillInput({ skill_id: "constructor" }).ok).toBe(false);
+  expect(validateLoadSkillInput({ skill_id: "toString" }).ok).toBe(false);
+  expect(validateLoadSkillInput({ skill_id: "../etc/passwd" }).ok).toBe(false);
+
+  // 5. OAuth mcp_at_ / mcp_rt_ / mcp_code_ and whsec_ tokens blocked in evidence, titles & prompts
+  for (const tok of [
+    "mcp_at_secretAccessToken1234",
+    "mcp_rt_secretRefreshToken5678",
+    "mcp_code_secretAuthCode9012",
+    "whsec_webhookSigningSecret1234",
+  ]) {
+    expect(validateTaskEvidenceInput([{ kind: "probe", ref: `leak ${tok}` }]).ok).toBe(false);
+    expect(validateCreateLoopInput({ channel_id: "c1", mode: "prompt", prompt: `leak ${tok}` }).ok).toBe(false);
+    expect(validateOkrTaskTitleInput(`task ${tok}`).ok).toBe(false);
+  }
 });

@@ -17,7 +17,7 @@ function temporary() { const dir=mkdtempSync(join(tmpdir(), "agentschat-team-lea
 function fixture(prompt="执行 $agentschat-team-lead") {
   const stateDir=temporary();
   const config: BridgeConfig = {stateDir,agentId:"team-bot",cwd:stateDir,permissions:"full-access",token:"test-token",profileFile:"unused",source:"test",apiUrl:"https://example.com",wsUrl:"wss://example.com/ws",channels:[],senders:[],codexBin:"unused"};
-  const grant={loop_id:"team-loop",channel_id:"team-group",agent_id:config.agentId,owner_id:"owner",interval_ms:1800000,prompt};
+  const grant={loop_id:"loop_team",channel_id:"team-group",agent_id:config.agentId,owner_id:"owner",interval_ms:1800000,prompt};
   writeFileSync(join(stateDir,"loop-grants.json"),JSON.stringify({version:1,grants:[grant]}),{mode:0o600});
   const row={...grant,status:"active",expires_at:null,last_tick_at:1000000,next_tick_ms:2800000};
   const tick: ChatMessage={id:"tick-1",channel_id:grant.channel_id,sender_id:config.agentId,content:"untrusted tick body",meta:{kind:"loop_tick",loop_id:grant.loop_id,interval_ms:grant.interval_ms,next_tick_ms:row.next_tick_ms,prompt}};
