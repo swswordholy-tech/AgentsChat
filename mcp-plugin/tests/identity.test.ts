@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { decideIdentity, shouldMigrateDevToken, type IdentityInputs } from "../src/identity.ts";
+import { decideIdentity, shouldMigrateDevToken, validateIdentityProfile, type IdentityInputs } from "../src/identity.ts";
 
 const base: IdentityInputs = {
   profileExists: false,
@@ -107,5 +107,38 @@ describe("grok-bind is a declared identity", () => {
 
   test("shouldMigrateDevToken: grok-bind may heal a dev-token (source !== default)", () => {
     expect(shouldMigrateDevToken({ source: "grok-bind", hasToken: false })).toBe(true);
+  });
+});
+
+describe("Campaign #100 — identity.ts input & credential hardening", () => {
+  test("decideIdentity rejects whitespace-only or control-character --name values", () => {
+    expect(decideIdentity({ ...base, source: "flag-name", cliName: "   " }).mode).toBe("error");
+    expect(decideIdentity({ ...base, source: "flag-name", cliName: "Bot\r\nInjected" }).mode).toBe("error");
+    expect(decideIdentity({ ...base, source: "flag-name", cliName: "  CleanBot  " }))
+      .toEqual({ mode: "register", displayName: "CleanBot" });
+  });
+
+  test("decideIdentity strips terminal control characters from declaredName and profileFile diagnostics", () => {
+    const d = decideIdentity({
+      ...base,
+      source: "flag-profile",
+      declaredName: "evil\x1b[31m\r\nname",
+      profileFile: "/tmp/bad\x00path.json",
+    });
+    expect(d.mode).toBe("error");
+    if (d.mode === "error") {
+      expect(d.message).not.toContain("\x1b");
+      expect(d.message).not.toContain("\x00");
+    }
+  });
+
+  test("validateIdentityProfile rejects control chars, padded dev-token, and prototype-polluting agent_id", () => {
+    expect(() => validateIdentityProfile({ agent_id: "bot\r\n", token: "ac_valid123" }, "/tmp/p.json")).toThrow();
+    expect(() => validateIdentityProfile({ agent_id: "bot", token: "ac_valid\nheader:1" }, "/tmp/p.json")).toThrow();
+    expect(() => validateIdentityProfile({ agent_id: "bot", token: "  dev-token  " }, "/tmp/p.json")).toThrow();
+    expect(() => validateIdentityProfile({ agent_id: "__proto__", token: "ac_valid123" }, "/tmp/p.json")).toThrow();
+    expect(() => validateIdentityProfile({ agent_id: "constructor", token: "ac_valid123" }, "/tmp/p.json")).toThrow();
+    expect(() => validateIdentityProfile({ agent_id: "bot", token: "ac_valid123", capabilities: ["chat", "bad\x00cap"] }, "/tmp/p.json")).toThrow();
+    expect(() => validateIdentityProfile({ agent_id: "bot-ok", token: "ac_valid123", capabilities: ["chat"] }, "/tmp/p.json")).not.toThrow();
   });
 });

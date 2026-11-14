@@ -59,14 +59,25 @@ export interface IdentityInputs {
   fallbackName: string;
 }
 
+const RESERVED_IDENTITY_IDS = new Set(["__proto__", "constructor", "prototype"]);
+
+function sanitizeDiagnosticField(raw: string | undefined, fallback = "(unknown)"): string {
+  if (typeof raw !== "string") return fallback;
+  const cleaned = raw.replace(/[\x00-\x1f\x7f]+/g, " ").trim();
+  return cleaned.length > 0 ? cleaned.slice(0, 256) : fallback;
+}
+
 export function decideIdentity(i: IdentityInputs): IdentityDecision {
   // An existing profile is authoritative — this is the overwhelmingly common path.
   if (i.profileExists) return { mode: "profile" };
 
+  const safeProfileFile = sanitizeDiagnosticField(i.profileFile, "(unknown-path)");
+
   // A selected existing identity cannot be replaced by credentials or registration
   // flags when its backing file is missing. --name is the separate creation path.
   if (i.source !== "default" && i.source !== "flag-name") {
-    return { mode: "error", message: `no profile for "${i.declaredName ?? "(unknown)"}" at ${i.profileFile}. Refusing to auto-register or fall back to another identity; repair the selection or use --name <new-name> separately.` };
+    const safeDeclared = sanitizeDiagnosticField(i.declaredName, "(unknown)");
+    return { mode: "error", message: `no profile for "${safeDeclared}" at ${safeProfileFile}. Refusing to auto-register or fall back to another identity; repair the selection or use --name <new-name> separately.` };
   }
 
   // Credentials handed to us directly: we can authenticate, so there is nothing to
@@ -75,16 +86,26 @@ export function decideIdentity(i: IdentityInputs): IdentityDecision {
   if (i.hasToken) return { mode: "env-creds" };
 
   // Explicit opt-in to creating a new account.
-  if (i.cliName) return { mode: "register", displayName: i.cliName };
-  if (i.registerFlag) return { mode: "register", displayName: i.fallbackName };
+  if (i.cliName !== undefined) {
+    if (typeof i.cliName !== "string" || /[\x00-\x1f\x7f]/.test(i.cliName) || i.cliName.trim().length === 0) {
+      return { mode: "error", message: `invalid --name value: display name must be non-empty and free of control characters.` };
+    }
+    return { mode: "register", displayName: i.cliName.trim() };
+  }
+  if (i.registerFlag) {
+    if (typeof i.fallbackName !== "string" || /[\x00-\x1f\x7f]/.test(i.fallbackName) || i.fallbackName.trim().length === 0) {
+      return { mode: "error", message: `invalid fallback display name for --register.` };
+    }
+    return { mode: "register", displayName: i.fallbackName.trim() };
+  }
 
   // An identity was named but no profile backs it. Do NOT invent one.
   if (i.source !== "default") {
-    const name = i.declaredName ?? i.cliName ?? "(unknown)";
+    const name = sanitizeDiagnosticField(i.declaredName ?? i.cliName, "(unknown)");
     return {
       mode: "error",
       message:
-        `no profile for "${name}" at ${i.profileFile}.\n` +
+        `no profile for "${name}" at ${safeProfileFile}.\n` +
         `  Refusing to auto-register — that creates a real account under a name you did not choose.\n` +
         `  Use an existing profile:  --profile <name>   (or AGENTSCHAT_PROFILE=<name>)\n` +
         `  Register a NEW agent:     --name <new-name>  (or --register)\n` +
@@ -98,7 +119,7 @@ export function decideIdentity(i: IdentityInputs): IdentityDecision {
     reason:
       `no agent identity configured — running ANONYMOUS (tools are listed; any call needing auth will fail).\n` +
       `  Refusing to auto-register: it would create a real account and persist its\n` +
-      `  credentials to the shared default profile (${i.profileFile}), which every later\n` +
+      `  credentials to the shared default profile (${safeProfileFile}), which every later\n` +
       `  identity-less session would then load as its own.\n` +
       `  To fix:  --name <your-agent>   register a new agent\n` +
       `           --profile <name>      use an existing profile (or AGENTSCHAT_PROFILE=<name>)\n` +
@@ -108,13 +129,17 @@ export function decideIdentity(i: IdentityInputs): IdentityDecision {
 
 /** Validate effective credentials without including credential values in errors. */
 export function validateIdentityProfile(profile: any, file: string, allowDevToken = false): void {
-  const nonempty = (value: unknown) => typeof value === "string" && value.trim().length > 0;
+  const cleanNonempty = (value: unknown): value is string =>
+    typeof value === "string" && value.trim().length > 0 && !/[\x00-\x1f\x7f]/.test(value);
+  const safeFile = sanitizeDiagnosticField(file, "(unknown-path)");
   if (!profile || typeof profile !== "object" || Array.isArray(profile) ||
-      !nonempty(profile.agent_id) || !nonempty(profile.token) ||
-      (!allowDevToken && profile.token === "dev-token") ||
+      !cleanNonempty(profile.agent_id) ||
+      RESERVED_IDENTITY_IDS.has(profile.agent_id.trim()) ||
+      !cleanNonempty(profile.token) ||
+      (!allowDevToken && profile.token.trim() === "dev-token") ||
       (profile.capabilities !== undefined && (!Array.isArray(profile.capabilities) ||
-        !profile.capabilities.every(nonempty)))) {
-    throw new Error(`Invalid identity profile at ${file}. Use --profile <valid-name>, or provide a paired --id / AGENTCHAT_AGENT_ID and --token / AGENTCHAT_TOKEN; token must not be empty or dev-token and capabilities must be a string array.`);
+        !profile.capabilities.every(cleanNonempty)))) {
+    throw new Error(`Invalid identity profile at ${safeFile}. Use --profile <valid-name>, or provide a paired --id / AGENTCHAT_AGENT_ID and --token / AGENTCHAT_TOKEN; token must not be empty or dev-token and capabilities must be a string array.`);
   }
 }
 
