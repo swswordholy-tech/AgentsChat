@@ -1,5 +1,6 @@
+import { randomBytes } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 
 export interface DshPatchOptions {
@@ -11,6 +12,23 @@ export interface DshPatchOptions {
 }
 
 const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+function checkParentDirectory(path: string): void {
+  let parent = dirname(resolve(path));
+  for (;;) {
+    try {
+      const stat = lstatSync(parent);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) {
+        throw new Error(`Refusing symlinked or non-directory parent: ${parent}`);
+      }
+    } catch (err: any) {
+      if (err?.code !== "ENOENT") throw err;
+    }
+    const next = dirname(parent);
+    if (next === parent) break;
+    parent = next;
+  }
+}
 
 export function resolveDshPatchPath(opts: DshPatchOptions = {}): string {
   const home = opts.dshHome ?? process.env.DSH_HOME ?? join(homedir(), ".dsh");
@@ -67,7 +85,7 @@ export function buildMcpAgentsChatArgs(opts: DshPatchOptions = {}): string[] {
     } catch {
       throw new Error("Invalid AgentsChat API URL");
     }
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    if (parsed.username || parsed.password || (parsed.protocol !== "http:" && parsed.protocol !== "https:")) {
       throw new Error("Invalid AgentsChat API URL");
     }
     args.push("--url", rawUrl);
@@ -165,13 +183,12 @@ export function mergeDshCordisPatch(existingContent: string, opts: DshPatchOptio
   };
 }
 
-let dshPatchTmpSeq = 0;
-
 export function applyDshCordisPatchFile(opts: DshPatchOptions = {}): {
   patchPath: string;
   changed: boolean;
 } {
   const patchPath = resolveDshPatchPath(opts);
+  checkParentDirectory(patchPath);
   let existed = false;
   let mode = 0o600;
   try {
@@ -188,9 +205,12 @@ export function applyDshCordisPatchFile(opts: DshPatchOptions = {}): {
   const { content, changed } = mergeDshCordisPatch(existing, opts);
   if (changed) {
     mkdirSync(dirname(patchPath), { recursive: true });
-    const tmp = `${patchPath}.${process.pid}.${Date.now()}.${++dshPatchTmpSeq}.tmp`;
+    checkParentDirectory(patchPath);
+    const tmp = `${patchPath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+    let created = false;
     try {
-      writeFileSync(tmp, content, { encoding: "utf8", mode });
+      writeFileSync(tmp, content, { encoding: "utf8", mode, flag: "wx" });
+      created = true;
       renameSync(tmp, patchPath);
       if (process.platform !== "win32") {
         try {
@@ -199,7 +219,7 @@ export function applyDshCordisPatchFile(opts: DshPatchOptions = {}): {
       }
     } catch (err) {
       try {
-        unlinkSync(tmp);
+        if (created) unlinkSync(tmp);
       } catch {}
       throw err;
     }

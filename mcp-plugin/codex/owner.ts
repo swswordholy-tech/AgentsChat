@@ -6,7 +6,14 @@ export async function getBotOwner(
   request: typeof fetch = fetch,
 ): Promise<string | null> {
   try {
-    const origin = base.replace(/\/+$/, "");
+    if (!base || base !== base.trim() || /[\x00-\x1f\x7f]/.test(base) ||
+      !agentId || agentId !== agentId.trim() || /[\x00-\x1f\x7f]/.test(agentId) ||
+      !token || token !== token.trim() || /[\x00-\x1f\x7f]/.test(token)) return null;
+    const parsed = new URL(base);
+    const loopback = ["127.0.0.1", "localhost", "[::1]", "::1"].includes(parsed.hostname);
+    if ((parsed.protocol !== "https:" && !(parsed.protocol === "http:" && loopback)) ||
+      parsed.username || parsed.password || parsed.search || parsed.hash) return null;
+    const origin = parsed.href.replace(/\/+$/, "");
     const options: RequestInit = {
       method: "GET",
       headers: { Authorization: `Bearer ${token}` },
@@ -38,7 +45,8 @@ export async function getBotOwner(
     if (!entitlement || typeof entitlement !== "object" || Array.isArray(entitlement)) return null;
     const owner = entitlement.owner_account_id;
     return typeof owner === "string" && owner.trim().length > 0 && owner === owner.trim() &&
-      !/[\x00-\x1f\x7f]/.test(owner) && owner !== agentId ? owner : null;
+      !/[\x00-\x1f\x7f]/.test(owner) && owner !== agentId &&
+      !["__proto__", "constructor", "prototype"].includes(owner.toLowerCase()) ? owner : null;
   } catch {
     // Missing endpoints, failed authentication and unavailable ownership all fail closed.
     // Never retain a previous owner or expose response bodies / credentials in diagnostics.

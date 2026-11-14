@@ -11,8 +11,9 @@
  *   npx -y agentschat-mcp@latest --dsh --send <channel-id> --text <text>
  */
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { MuseBridge } from "../../muse/src/bridge.ts";
 import { MuseAgentChatClient } from "../../muse/src/client.ts";
@@ -40,7 +41,8 @@ export interface DshBridgeConfig {
 
 function arg(name: string, argv: string[]): string | undefined {
   const i = argv.indexOf(name);
-  return i >= 0 ? argv[i + 1] : undefined;
+  const value = i >= 0 ? argv[i + 1] : undefined;
+  return value?.startsWith("--") ? undefined : value;
 }
 
 function has(name: string, argv: string[]): boolean {
@@ -48,6 +50,23 @@ function has(name: string, argv: string[]): boolean {
 }
 
 const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+function checkParentDirectory(path: string): void {
+  let parent = dirname(resolve(path));
+  for (;;) {
+    try {
+      const stat = lstatSync(parent);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) {
+        throw new Error(`Refusing symlinked or non-directory parent: ${parent}`);
+      }
+    } catch (err: any) {
+      if (err?.code !== "ENOENT") throw err;
+    }
+    const next = dirname(parent);
+    if (next === parent) break;
+    parent = next;
+  }
+}
 
 function validateHttpOrWsUrl(raw: string, allowedProtocols: string[], label: string): string {
   const trimmed = raw.trim();
@@ -60,6 +79,7 @@ function validateHttpOrWsUrl(raw: string, allowedProtocols: string[], label: str
   } catch {
     throw new Error(`Invalid ${label} URL`);
   }
+  if (parsed.username || parsed.password) throw new Error(`Invalid ${label} URL`);
   if (!allowedProtocols.includes(parsed.protocol)) {
     throw new Error(`Unsupported ${label} protocol: ${parsed.protocol}`);
   }
@@ -125,7 +145,8 @@ export function safeDshConfig(config: DshBridgeConfig): Record<string, unknown> 
   };
 }
 
-async function registerOnly(name: string, restUrl: string, profilePath = DSH_PROFILE_PATH): Promise<void> {
+export async function registerOnly(name: string, restUrl: string, profilePath = DSH_PROFILE_PATH): Promise<void> {
+  checkParentDirectory(profilePath);
   const safeRestUrl = validateHttpOrWsUrl(restUrl, ["http:", "https:"], "AgentChat REST");
   console.log("Terms notice: https://agents-chat.com/terms (notice only, no acceptance prompt)");
   const res = await fetch(`${safeRestUrl.replace(/\/+$/, "")}/api/account/register`, {
@@ -155,16 +176,20 @@ async function registerOnly(name: string, restUrl: string, profilePath = DSH_PRO
   } catch (err: any) {
     if (err?.code !== "ENOENT") throw err;
   }
+  checkParentDirectory(profilePath);
   mkdirSync(dirname(profilePath), { recursive: true, mode: 0o700 });
-  const tmp = `${profilePath}.${process.pid}.${Date.now()}.tmp`;
+  checkParentDirectory(profilePath);
+  const tmp = `${profilePath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+  let created = false;
   try {
-    writeFileSync(tmp, JSON.stringify({ agentId, token }, null, 2), { mode: 0o600 });
+    writeFileSync(tmp, JSON.stringify({ agentId, token }, null, 2), { mode: 0o600, flag: "wx" });
+    created = true;
     renameSync(tmp, profilePath);
     if (process.platform !== "win32") {
       try { chmodSync(profilePath, 0o600); } catch {}
     }
   } catch (err) {
-    try { unlinkSync(tmp); } catch {}
+    if (created) { try { unlinkSync(tmp); } catch {} }
     throw err;
   }
   console.log(`Registered DSH agent '${name}' as ${agentId}. Identity saved to ${profilePath} (token not printed).`);
@@ -188,7 +213,8 @@ export async function runDshHeadlessResponder(
     console.error("[dsh] invalid dshProfile");
     return null;
   }
-  const timeoutMs = opts.timeoutMs ?? 120_000;
+  const t = opts.timeoutMs ?? 120_000;
+  const timeoutMs = Number.isFinite(t) && t > 0 ? Math.min(Math.floor(t), 2_147_483_647) : 120_000;
 
   return new Promise((resolve) => {
     const resolved = resolveWindowsCliSpawn(dshBin, ["--profile", dshProfile, prompt], { env: process.env });
@@ -334,7 +360,7 @@ DeepSeek Harness (dsh) integration for AgentsChat:
           typing.stop(m.channel_id);
           return;
         }
-        const kind = m.channel_id.startsWith("dm-") ? "direct" : "group";
+        const kind = /^dm-/i.test(m.channel_id) ? "direct" : "group";
         if (!shouldDispatch(m, { agentId: botIdentity.agentId, displayName: botIdentity.displayName, channelKind: kind })) return;
         typing.start(m.channel_id);
         const route = resolveSessionForAgent(botIdentity.agentId);
@@ -498,7 +524,7 @@ DeepSeek Harness (dsh) integration for AgentsChat:
     const dshProfile = arg("--dsh-profile", argv) ?? "headless";
     const channelKinds: Record<string, "direct" | "group"> = {};
     for (const c of channels) {
-      channelKinds[c] = c.startsWith("dm-") ? "direct" : "group";
+      channelKinds[c] = /^dm-/i.test(c) ? "direct" : "group";
     }
     const bridge = new MuseBridge(client, {
       agentId: config.agentId,
