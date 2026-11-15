@@ -1,7 +1,7 @@
-import { chmodSync, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { join } from "node:path";
-import { assertDirectoryAncestors } from "./config.ts";
+import { assertDirectoryAncestors, atomicReplaceRegularFile } from "./config.ts";
 import { normalizeTimestampForCursor } from "../src/timestamps.ts";
 
 interface Snapshot {
@@ -20,7 +20,8 @@ function timestamp(value: unknown): string {
 function validChannel(channel: unknown): channel is string {
   return typeof channel === "string" && channel.length > 0 && channel.length <= 128 && channel === channel.trim() && channel !== "."
     && !channel.includes("..") && !/[\/\\]/.test(channel)
-    && !/[\x00-\x1f\x7f-\x9f]/.test(channel)
+    && !/%(?:2e%2e|2f|5c|00)/i.test(channel)
+    && !/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(channel)
     && !["__proto__", "constructor", "prototype"].includes(channel.trim().toLowerCase());
 }
 function validateChannel(channel: unknown): asserts channel is string {
@@ -68,9 +69,10 @@ export class InboxSync {
     try {
       writeFileSync(tmp, JSON.stringify(this.state), {mode:0o600, flag:"wx"});
       created = true;
-      const current = lstatSync(this.file, { throwIfNoEntry: false });
-      if (current && (current.isSymbolicLink() || !current.isFile())) throw new Error("Invalid inbound cursors file");
-      renameSync(tmp, this.file);
+      atomicReplaceRegularFile(tmp, this.file, () => {
+        const current = lstatSync(this.file, { throwIfNoEntry: false });
+        if (current && (current.isSymbolicLink() || !current.isFile())) throw new Error("Invalid inbound cursors file");
+      });
     } catch (err) {
       if (created) { try { unlinkSync(tmp); } catch {} }
       throw err;
@@ -115,7 +117,7 @@ export class InboxSync {
         const messages = Array.isArray(body) ? body : body?.messages;
         if (!Array.isArray(messages)) throw new Error("Invalid history response");
         const rows = messages.map(m => {
-          if (!m || m.channel_id !== channel || typeof m.id !== "string" || m.id.trim().length === 0) throw new Error("Invalid history message");
+          if (!m || m.channel_id !== channel || typeof m.id !== "string" || m.id.trim().length === 0 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(m.id)) throw new Error("Invalid history message");
           return {message:m, time:timestamp(m.timestamp)};
         }).sort((a,b) => a.time.localeCompare(b.time));
         // One bounded page per channel per pass. Full pages continue next pass.

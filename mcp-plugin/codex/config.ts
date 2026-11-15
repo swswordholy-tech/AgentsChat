@@ -1,6 +1,6 @@
-import { lstatSync, readFileSync, realpathSync, type Stats } from "node:fs";
+import { copyFileSync, lstatSync, readFileSync, realpathSync, renameSync, unlinkSync, type Stats } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, parse as parsePath, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { validateIdentityProfile } from "../src/identity.ts";
 import { parse as parseToml } from "smol-toml";
@@ -9,15 +9,16 @@ import { blockedServerHost } from "./owner.ts";
 export type PermissionMode = "full-access" | "read-only";
 // App Server advertises model-specific, nonempty effort names via model/list.
 export type ReasoningEffort = string;
+const CONTROL_CHAR_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
 export function reasoningEffort(value: unknown): ReasoningEffort | undefined {
   if (value === undefined) return undefined;
-  if (typeof value !== "string" || !value.trim() || /[\x00-\x1f\x7f]/.test(value))
+  if (typeof value !== "string" || !value.trim() || CONTROL_CHAR_RE.test(value))
     throw new Error("effort must be a nonempty model-supported reasoning effort name");
   return value.trim();
 }
 export function modelName(value: unknown): string | undefined {
   if (value === undefined) return undefined;
-  if (typeof value !== "string" || !value.trim() || /[\x00-\x1f\x7f]/.test(value))
+  if (typeof value !== "string" || !value.trim() || CONTROL_CHAR_RE.test(value))
     throw new Error("model must be a nonempty model ID");
   return value.trim();
 }
@@ -43,26 +44,77 @@ export function reservedProfileStem(selector: string): boolean {
   return ["__proto__", "constructor", "prototype", "grok-binds", "session-binds", "agy-binds",
     "cursor", "read-cursors", "wake-pids", "config", "codex-bots"].includes(selector.replace(/\.json$/i, "").toLowerCase());
 }
-/** Inspect every existing directory before reads or recursive creation. */
+function checkSingleAncestorDir(path: string): void {
+  const stat = lstatSync(path, { throwIfNoEntry: false });
+  if (!stat) return;
+  if (stat.isSymbolicLink()) {
+    // These exact Darwin system aliases are safe; arbitrary user links are not.
+    const target = `/private${path}`;
+    if (process.platform === "darwin" && ["/var", "/tmp", "/etc"].includes(path) && realpathSync(path) === target) {
+      const priv = lstatSync("/private", { throwIfNoEntry: false });
+      if (!priv || priv.isSymbolicLink() || !priv.isDirectory()) {
+        throw new Error("Config path must be a non-symlink directory: /private");
+      }
+      assertDirectoryAncestors(target);
+      return;
+    }
+    throw new Error(`Config path must be a non-symlink directory: ${path}`);
+  }
+  if (!stat.isDirectory()) throw new Error(`Config path must be a non-symlink directory: ${path}`);
+}
+/** Inspect every existing directory before reads or recursive creation, including raw `symlink/..` segments. */
 export function assertDirectoryAncestors(directory: string): void {
+  if (typeof directory !== "string" || !directory.trim() || CONTROL_CHAR_RE.test(directory)) {
+    throw new Error(`Config path must be a non-symlink directory: ${String(directory)}`);
+  }
+  if (/(?:^|[\\/])\.\.(?:[\\/]|$)/.test(directory)) {
+    let cur: string;
+    let remainder: string;
+    if (isAbsolute(directory)) {
+      const root = parsePath(directory).root || "/";
+      cur = root;
+      remainder = directory.slice(root.length);
+      checkSingleAncestorDir(cur);
+    } else {
+      const base = resolve(process.cwd());
+      assertDirectoryAncestors(base);
+      cur = base;
+      remainder = directory;
+    }
+    for (const seg of remainder.split(/[\\/]+/)) {
+      if (!seg || seg === ".") continue;
+      cur = seg === ".." ? dirname(cur) : join(cur, seg);
+      checkSingleAncestorDir(cur);
+    }
+  }
   const paths: string[] = [];
   for (let path = resolve(directory);; path = dirname(path)) {
     paths.unshift(path);
     if (dirname(path) === path) break;
   }
-  for (const path of paths) {
-    const stat = lstatSync(path, { throwIfNoEntry: false });
-    if (!stat) continue;
-    if (stat.isSymbolicLink()) {
-      // These exact Darwin system aliases are safe; arbitrary user links are not.
-      const target = `/private${path}`;
-      if (process.platform === "darwin" && ["/var", "/tmp", "/etc"].includes(path) && realpathSync(path) === target) {
-        assertDirectoryAncestors(target);
-        continue;
-      }
-      throw new Error(`Config path must be a non-symlink directory: ${path}`);
+  for (const path of paths) checkSingleAncestorDir(path);
+}
+
+/** Atomically replace a regular file, with Windows NTFS EPERM/EACCES fallback. */
+export function atomicReplaceRegularFile(
+  tmp: string,
+  target: string,
+  verifySafeTarget: () => void,
+  opts?: { platform?: NodeJS.Platform; rename?: typeof renameSync },
+): void {
+  verifySafeTarget();
+  const rename = opts?.rename ?? renameSync;
+  const platform = opts?.platform ?? process.platform;
+  try {
+    rename(tmp, target);
+  } catch (err: any) {
+    if (platform === "win32" && (err?.code === "EPERM" || err?.code === "EACCES")) {
+      verifySafeTarget();
+      copyFileSync(tmp, target);
+      unlinkSync(tmp);
+      return;
     }
-    if (!stat.isDirectory()) throw new Error(`Config path must be a non-symlink directory: ${path}`);
+    throw err;
   }
 }
 function checkedPath(path: string, directory = false): Stats | undefined {
@@ -84,7 +136,7 @@ function readJson(file: string): any {
 }
 function strings(value: unknown, name: string): string[] {
   if (value === undefined) return [];
-  if (!Array.isArray(value) || value.some(x => typeof x !== "string" || !x.trim()))
+  if (!Array.isArray(value) || value.some(x => typeof x !== "string" || !x.trim() || CONTROL_CHAR_RE.test(x)))
     throw new Error(`${name} must be an array of nonempty strings`);
   return value;
 }
@@ -127,7 +179,7 @@ export function resolveConfig(opts: { cwd?: string; profile?: string; codexBin?:
     [env.AGENTSCHAT_PROFILE, "env"], [env.AGENTCHAT_PROFILE, "legacy-env"], ["profile", "default"],
   ];
   const [selector, source] = choices.find(([v]) => v !== undefined && v !== "") as [string, string];
-  if (typeof selector !== "string" || /[\x00-\x1f\x7f]/.test(selector)) throw new Error("Invalid profile selector");
+  if (typeof selector !== "string" || CONTROL_CHAR_RE.test(selector)) throw new Error("Invalid profile selector");
   let profileFile: string;
   if (/^~[\\/]/.test(selector)) profileFile = join(home, selector.slice(2));
   else if (isAbsolute(selector) || selector.includes("/") || selector.includes("\\")) profileFile = resolve(cwd, selector);
@@ -158,9 +210,9 @@ export function resolveConfig(opts: { cwd?: string; profile?: string; codexBin?:
   const canonicalApi = new URL(apiUrl).href.replace(/\/$/, "");
   const key = createHash("sha256").update(JSON.stringify([cwd, canonicalApi, profile.agent_id])).digest("hex").slice(0, 24);
   const root = opts.stateRoot ?? project.state_root;
-  if (root !== undefined && (typeof root !== "string" || !root.trim() || /[\x00-\x1f\x7f]/.test(root))) throw new Error("Invalid state_root");
+  if (root !== undefined && (typeof root !== "string" || !root.trim() || CONTROL_CHAR_RE.test(root))) throw new Error("Invalid state_root");
   const codexBin = opts.codexBin ?? "codex";
-  if (typeof codexBin !== "string" || !codexBin.trim() || /[\x00-\x1f\x7f]/.test(codexBin)) throw new Error("Invalid codex_bin");
+  if (typeof codexBin !== "string" || !codexBin.trim() || CONTROL_CHAR_RE.test(codexBin)) throw new Error("Invalid codex_bin");
   const stateRoot = root === undefined ? join(home, ".agentschat/codex-bridge") : /^~[\\/]/.test(root) ? join(home, root.slice(2)) : resolve(cwd, root);
   return { cwd, profileFile, source, codexHomeMode: codexHomeMode(opts.codexHomeMode ?? project.codex_home_mode), permissions: permissionMode(project.permissions), effort: reasoningEffort(project.effort), model: modelName(project.model), agentId: profile.agent_id, token: profile.token,
     apiUrl: canonicalApi, wsUrl, channels: strings(project.channels, "channels"),

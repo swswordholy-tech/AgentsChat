@@ -7,22 +7,34 @@ import { InboxSync } from "./inbox-sync.ts";
 
 function safeChannel(channel: unknown): channel is string {
   return typeof channel === "string" && channel.trim().length > 0 && channel === channel.trim() && channel.length <= 128 &&
-    !/[.\/\\\x00-\x1f\x7f]/.test(channel) && !/^(?:__proto__|constructor|prototype)$/i.test(channel);
+    !/[.\/\\\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(channel) && !/%(?:2e%2e|2f|5c|00)/i.test(channel) &&
+    !/^(?:__proto__|constructor|prototype)$/i.test(channel);
 }
 function requireChannel(channel: unknown): asserts channel is string {
   if (!safeChannel(channel)) throw new Error("Invalid AgentsChat channel");
 }
 function apiUrl(path: string, base: string): URL {
   const invalid = () => new Error("Invalid AgentsChat API path");
-  if (typeof path !== "string" || !path.startsWith("/") || path.startsWith("//") || /[\x00-\x1f\x7f\\]/.test(path)) throw invalid();
+  if (typeof path !== "string" || !path.startsWith("/") || path.startsWith("//") || /[\x00-\x1f\x7f-\x9f\u2028\u2029\\]/.test(path)) throw invalid();
   try {
     const pathname = path.split(/[?#]/, 1)[0]!;
+    if (/%25(?:2e|2f|5c|00)/i.test(pathname)) throw invalid();
     const decoded = decodeURIComponent(pathname);
-    if ([pathname, decoded].some(value => value.split("/").includes("..")) || /[\x00-\x1f\x7f\\]/.test(decoded)) throw invalid();
+    if ([pathname, decoded].some(value => value.split("/").includes("..")) || /[\x00-\x1f\x7f-\x9f\u2028\u2029\\]/.test(decoded)) throw invalid();
     const origin = new URL(base).origin, resolved = new URL(path, base);
     if (resolved.origin !== origin) throw invalid();
     return resolved;
   } catch { throw invalid(); }
+}
+function rawWsFrameBytes(raw: WebSocket.RawData): number {
+  if (Buffer.isBuffer(raw)) return raw.byteLength;
+  if (raw instanceof ArrayBuffer) return raw.byteLength;
+  if (Array.isArray(raw)) {
+    let total = 0;
+    for (const chunk of raw) total += chunk.byteLength;
+    return total;
+  }
+  return Buffer.byteLength(String(raw), "utf8");
 }
 
 export class AgentsChatTransport {
@@ -150,7 +162,7 @@ export class AgentsChatTransport {
     this.heartbeat.start();
     socket.on("open", () => send({ type: "auth", agent_id: this.config.agentId, token: this.config.token, capabilities: ["chat", "codex"] }));
     socket.on("message", raw => {
-      if (!current()) return;
+      if (!current() || rawWsFrameBytes(raw) > 1_048_576) return;
       let data: any; try { data = JSON.parse(String(raw)); } catch { return; }
       if (!data || typeof data !== "object" || Array.isArray(data) || Object.hasOwn(data, "__proto__")) return;
       if (data.type !== "auth_error") this.heartbeat?.receivedPong();

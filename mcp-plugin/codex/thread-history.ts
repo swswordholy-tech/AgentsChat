@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
-import { chmodSync, lstatSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { assertDirectoryAncestors } from "./config.ts";
+import { assertDirectoryAncestors, atomicReplaceRegularFile } from "./config.ts";
 
 export interface ThreadHistory { id: string; createdAt?: number; turns: any[] }
 export function priorChannelThreads(threads: Record<string, string>, channel: string): string[] {
@@ -17,6 +17,9 @@ export function priorChannelThreads(threads: Record<string, string>, channel: st
 
 /** Keep complete source turns privately; seed the new task with past chat, not old instructions. */
 export function preserveChannelHistory(directory: string, channel: string, histories: ThreadHistory[], redact: (s: string) => string): string {
+  if (typeof channel !== "string" || !channel.trim() || channel.length > 256 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(channel)) {
+    throw new Error("Invalid history channel");
+  }
   const checkDirectory = (path: string) => {
     try {
       const stat = lstatSync(path);
@@ -41,11 +44,12 @@ export function preserveChannelHistory(directory: string, channel: string, histo
   try {
     writeFileSync(tmp, redact(JSON.stringify({channel_id:channel, threads:histories})), {flag:"wx", mode:0o600});
     if (process.platform !== "win32") chmodSync(tmp, 0o600);
-    try {
-      const stat = lstatSync(file);
-      if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("History archive must be a regular file, not a symlink");
-    } catch (error: any) { if (error.code !== "ENOENT") throw error; }
-    renameSync(tmp, file);
+    atomicReplaceRegularFile(tmp, file, () => {
+      try {
+        const stat = lstatSync(file);
+        if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("History archive must be a regular file, not a symlink");
+      } catch (error: any) { if (error.code !== "ENOENT") throw error; }
+    });
   } catch (err) {
     try { unlinkSync(tmp); } catch { /* Best-effort temp cleanup. */ }
     throw err;

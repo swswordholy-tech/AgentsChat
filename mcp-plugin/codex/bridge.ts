@@ -1,14 +1,14 @@
 import { ThreadBusyError } from "./app-server.ts";
 import { TEAM_LEAD_SKILL_ID, TEAM_LEAD_SKILL_BODY, TEAM_LEAD_NO_UPDATE, isTeamLeadSkillInvocation } from "../src/team-lead-skill.ts";
-import { lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync, openSync, closeSync, unlinkSync } from "node:fs";
+import { lstatSync, mkdirSync, readFileSync, writeFileSync, openSync, closeSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { priorChannelThreads, preserveChannelHistory, type ThreadHistory } from "./thread-history.ts";
-import { assertDirectoryAncestors } from "./config.ts";
+import { assertDirectoryAncestors, atomicReplaceRegularFile } from "./config.ts";
 import type { BridgeConfig, PermissionMode } from "./config.ts";
 import { redactSecrets } from "../src/redact.ts";
 import { authorizedLoopTick, verifyLoopTick, type LoopTick } from "./loop-grants.ts";
-import { acquireAgentLock, isPidAlive, releaseAgentLock, resolveLockDir } from "../src/session-bind.ts";
+import { acquireAgentLock, checkAgentLock, isPidAlive, releaseAgentLock, resolveLockDir } from "../src/session-bind.ts";
 
 export const MAX_BRIDGE_TERMINAL_ENTRIES = 500;
 export interface ChatMessage { id: string; channel_id: string; sender_id: string; content: string; mentions?: string[]; mentioned_ids?: string[]; parent_id?: string; reply_to?: string; meta?: LoopTick }
@@ -27,7 +27,8 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 }
 function safeMessageId(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value &&
-    value !== "." && value !== ".." && !/[\/\\\x00-\x1f\x7f]/.test(value) && !isPrototypeKey(value);
+    value !== "." && value !== ".." && !/[\/\\\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(value) &&
+    !/%(?:2e%2e|2f|5c|00)/i.test(value) && !isPrototypeKey(value);
 }
 function validMentions(value: unknown): boolean {
   return value === undefined || (Array.isArray(value) && value.length <= 128 && [...value].every(id => typeof id === "string"));
@@ -103,11 +104,26 @@ export class Bridge {
       try { unlinkSync(this.lock); } catch {}
       throw new Error("Cannot load bridge state; refusing to discard history");
     }
-    acquireAgentLock({
-      lockDir,
-      agentId: config.agentId,
-      runtime: "codex-bridge",
-    });
+    try {
+      const existingLock = checkAgentLock({ lockDir, agentId: config.agentId });
+      if (existingLock.locked) {
+        throw new Error(
+          `Agent identity ${config.agentId} is already locked by live process ${existingLock.holder?.pid ?? "unknown"} (${existingLock.holder?.runtime ?? "unknown"})`,
+        );
+      }
+      if (
+        !acquireAgentLock({
+          lockDir,
+          agentId: config.agentId,
+          runtime: "codex-bridge",
+        })
+      ) {
+        throw new Error(`Cannot acquire agent lock for ${config.agentId}`);
+      }
+    } catch (err) {
+      try { unlinkSync(this.lock); } catch {}
+      throw err;
+    }
   }
   private save() {
     const isTerminal = (status: Entry["status"]) =>
@@ -131,11 +147,13 @@ export class Bridge {
       const serialized = JSON.stringify(this.state);
       checkStateDir(this.config.stateDir);
       writeFileSync(tmp, serialized, { mode: 0o600, flag: "wx" });
-      try {
-        if (lstatSync(this.file).isSymbolicLink()) throw new Error("Bridge state must not be a symlink");
-      } catch (error: any) { if (error.code !== "ENOENT") throw error; }
-      checkStateDir(this.config.stateDir);
-      renameSync(tmp, this.file);
+      atomicReplaceRegularFile(tmp, this.file, () => {
+        try {
+          const stat = lstatSync(this.file);
+          if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("Bridge state must not be a symlink");
+        } catch (error: any) { if (error.code !== "ENOENT") throw error; }
+        checkStateDir(this.config.stateDir);
+      });
     } catch (err) {
       try { unlinkSync(tmp); } catch {}
       throw err;
@@ -154,8 +172,8 @@ export class Bridge {
     const message: ChatMessage = { id: raw.id, channel_id: raw.channel_id, sender_id: raw.sender_id,
       ...(Array.isArray(raw.mentioned_ids) ? { mentioned_ids: raw.mentioned_ids.filter((id: unknown) => typeof id === "string") } : {}),
       ...(Array.isArray(raw.mentions) ? { mentions: raw.mentions.filter((id: unknown) => typeof id === "string") } : {}),
-      ...(!tick && typeof raw.parent_id === "string" && raw.parent_id.trim() ? { parent_id: raw.parent_id.trim() } : {}),
-      ...(!tick && typeof raw.reply_to === "string" && raw.reply_to.trim() ? { reply_to: raw.reply_to.trim() } : {}),
+      ...(!tick && typeof raw.parent_id === "string" && safeMessageId(raw.parent_id.trim()) ? { parent_id: raw.parent_id.trim() } : {}),
+      ...(!tick && typeof raw.reply_to === "string" && safeMessageId(raw.reply_to.trim()) ? { reply_to: raw.reply_to.trim() } : {}),
       content: tick ? "Authorized scheduled loop" : this.redact(raw.content),
       ...(tick ? { meta: { kind: "loop_tick", loop_id: tick.loop_id, interval_ms: tick.interval_ms,
         next_tick_ms: tick.next_tick_ms, prompt: tick.prompt } as LoopTick } : {}) };

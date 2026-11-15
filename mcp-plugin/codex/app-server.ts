@@ -30,7 +30,7 @@ export class AppServer {
   get namespace() { return this.runtime?.home; }
   async start() {
     if (this.model !== undefined && (typeof this.model !== "string" || !this.model.trim() ||
-      this.model.length > 256 || /[\x00-\x1f\x7f]/.test(this.model))) throw new Error("Invalid app-server model");
+      this.model.length > 256 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(this.model))) throw new Error("Invalid app-server model");
     const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^AGENTS?CHAT_|^RELAY_/.test(k)));
     env.AGENTSCHAT_LOCK_OWNER_PID = String(process.pid);
     env.AGENTSCHAT_TOOL_ONLY = "1";
@@ -166,8 +166,10 @@ export class AppServer {
     }
   }
   async thread(cwd: string, existing?: string, ephemeral = false, permissions: PermissionMode = this.permissions): Promise<string> {
-    if (typeof cwd !== "string" || !cwd.trim() || cwd.length > 4096 || /[\x00-\x1f\x7f]/.test(cwd))
+    if (typeof cwd !== "string" || !cwd.trim() || cwd.length > 4096 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(cwd))
       throw new Error("Invalid app-server cwd");
+    if (existing !== undefined && (typeof existing !== "string" || !existing.trim() || existing.length > 256 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(existing)))
+      throw new Error("Invalid app-server thread ID");
     // Loaded-thread resume ignores MCP and developer-instruction overrides.
     // Keep the original runtime policy; a different permission needs a new thread.
     const configured = existing ? this.threadPermissions.get(existing) : undefined;

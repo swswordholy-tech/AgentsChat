@@ -4,7 +4,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // codex/manager.ts
 import { spawn } from "node:child_process";
-import { mkdirSync as mkdirSync2, openSync, closeSync, readFileSync as readFileSync3, writeFileSync, unlinkSync, lstatSync as lstatSync3, renameSync } from "node:fs";
+import { mkdirSync as mkdirSync2, openSync, closeSync, readFileSync as readFileSync3, writeFileSync, unlinkSync as unlinkSync2, lstatSync as lstatSync3, renameSync as renameSync2 } from "node:fs";
 import { join as join3, resolve as resolve3, dirname as dirname3 } from "node:path";
 import { homedir as homedir3 } from "node:os";
 import { createHash as createHash2 } from "node:crypto";
@@ -17,9 +17,9 @@ import { homedir as homedir2 } from "node:os";
 import { dirname as dirname2, isAbsolute as isAbsolute2, join as join2, resolve as resolve2 } from "node:path";
 
 // codex/config.ts
-import { lstatSync, readFileSync, realpathSync } from "node:fs";
+import { copyFileSync, lstatSync, readFileSync, realpathSync, renameSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, parse as parsePath, resolve } from "node:path";
 import { createHash } from "node:crypto";
 
 // src/redact.ts
@@ -934,21 +934,34 @@ function parse(toml, { maxDepth = 1000, integersAsBigInt } = {}) {
 // codex/owner.ts
 function blockedServerHost(url) {
   const host = url.hostname.toLowerCase().replace(/\.+$/, "").replace(/^\[|\]$/g, "");
-  return /^169\.254\./.test(host) || host === "metadata.google.internal" || host === "metadata.goog" || host.endsWith(".metadata.goog") || /^fe[89ab][0-9a-f]:/.test(host) || /^::ffff:(?:0:)?a9fe:/.test(host);
+  if (!host || host === "0.0.0.0" || /^0\./.test(host) || host === "::" || host === "0:0:0:0:0:0:0:0" || /^169\.254\./.test(host) || host === "100.100.100.200" || host === "fd00:ec2::254" || host === "fd00:ec2:0:0:0:0:0:254" || host === "metadata" || host === "instance-data" || host === "metadata.google.internal" || host.endsWith(".metadata.google.internal") || host === "metadata.goog" || host.endsWith(".metadata.goog") || /^fe[89ab][0-9a-f]:/.test(host)) {
+    return true;
+  }
+  if (host.startsWith("::ffff:")) {
+    const rawTail = host.slice(7);
+    if (rawTail === "0:0" || rawTail === "0.0.0.0")
+      return true;
+    const tail = /^0:(?:[0-9a-f]{1,4}:|\d{1,3}\.)/.test(rawTail) ? rawTail.slice(2) : rawTail;
+    if (tail === "0:0" || tail === "0.0.0.0" || /^0\./.test(tail) || /^[0-9a-f]{1,2}:[0-9a-f]{1,4}$/.test(tail) || /^127\./.test(tail) || /^7f[0-9a-f]{2}:/.test(tail) || /^169\.254\./.test(tail) || /^a9fe:/.test(tail) || tail === "100.100.100.200" || tail === "6464:64c8") {
+      return true;
+    }
+  }
+  return false;
 }
 
 // codex/config.ts
+var CONTROL_CHAR_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
 function reasoningEffort(value) {
   if (value === undefined)
     return;
-  if (typeof value !== "string" || !value.trim() || /[\x00-\x1f\x7f]/.test(value))
+  if (typeof value !== "string" || !value.trim() || CONTROL_CHAR_RE.test(value))
     throw new Error("effort must be a nonempty model-supported reasoning effort name");
   return value.trim();
 }
 function modelName(value) {
   if (value === undefined)
     return;
-  if (typeof value !== "string" || !value.trim() || /[\x00-\x1f\x7f]/.test(value))
+  if (typeof value !== "string" || !value.trim() || CONTROL_CHAR_RE.test(value))
     throw new Error("model must be a nonempty model ID");
   return value.trim();
 }
@@ -982,28 +995,58 @@ function reservedProfileStem(selector) {
     "codex-bots"
   ].includes(selector.replace(/\.json$/i, "").toLowerCase());
 }
+function checkSingleAncestorDir(path) {
+  const stat = lstatSync(path, { throwIfNoEntry: false });
+  if (!stat)
+    return;
+  if (stat.isSymbolicLink()) {
+    const target = `/private${path}`;
+    if (process.platform === "darwin" && ["/var", "/tmp", "/etc"].includes(path) && realpathSync(path) === target) {
+      const priv = lstatSync("/private", { throwIfNoEntry: false });
+      if (!priv || priv.isSymbolicLink() || !priv.isDirectory()) {
+        throw new Error("Config path must be a non-symlink directory: /private");
+      }
+      assertDirectoryAncestors(target);
+      return;
+    }
+    throw new Error(`Config path must be a non-symlink directory: ${path}`);
+  }
+  if (!stat.isDirectory())
+    throw new Error(`Config path must be a non-symlink directory: ${path}`);
+}
 function assertDirectoryAncestors(directory) {
+  if (typeof directory !== "string" || !directory.trim() || CONTROL_CHAR_RE.test(directory)) {
+    throw new Error(`Config path must be a non-symlink directory: ${String(directory)}`);
+  }
+  if (/(?:^|[\\/])\.\.(?:[\\/]|$)/.test(directory)) {
+    let cur;
+    let remainder;
+    if (isAbsolute(directory)) {
+      const root = parsePath(directory).root || "/";
+      cur = root;
+      remainder = directory.slice(root.length);
+      checkSingleAncestorDir(cur);
+    } else {
+      const base = resolve(process.cwd());
+      assertDirectoryAncestors(base);
+      cur = base;
+      remainder = directory;
+    }
+    for (const seg of remainder.split(/[\\/]+/)) {
+      if (!seg || seg === ".")
+        continue;
+      cur = seg === ".." ? dirname(cur) : join(cur, seg);
+      checkSingleAncestorDir(cur);
+    }
+  }
   const paths = [];
   for (let path = resolve(directory);; path = dirname(path)) {
     paths.unshift(path);
     if (dirname(path) === path)
       break;
   }
-  for (const path of paths) {
-    const stat = lstatSync(path, { throwIfNoEntry: false });
-    if (!stat)
-      continue;
-    if (stat.isSymbolicLink()) {
-      const target = `/private${path}`;
-      if (process.platform === "darwin" && ["/var", "/tmp", "/etc"].includes(path) && realpathSync(path) === target) {
-        assertDirectoryAncestors(target);
-        continue;
-      }
-      throw new Error(`Config path must be a non-symlink directory: ${path}`);
-    }
-    if (!stat.isDirectory())
-      throw new Error(`Config path must be a non-symlink directory: ${path}`);
-  }
+  for (const path of paths)
+    checkSingleAncestorDir(path);
 }
 function checkedPath(path, directory = false) {
   assertDirectoryAncestors(dirname(path));
@@ -1035,7 +1078,7 @@ function readJson(file) {
 function strings(value, name) {
   if (value === undefined)
     return [];
-  if (!Array.isArray(value) || value.some((x) => typeof x !== "string" || !x.trim()))
+  if (!Array.isArray(value) || value.some((x) => typeof x !== "string" || !x.trim() || CONTROL_CHAR_RE.test(x)))
     throw new Error(`${name} must be an array of nonempty strings`);
   return value;
 }
@@ -1088,7 +1131,7 @@ function resolveConfig(opts, env = process.env, home = homedir()) {
     ["profile", "default"]
   ];
   const [selector, source] = choices.find(([v]) => v !== undefined && v !== "");
-  if (typeof selector !== "string" || /[\x00-\x1f\x7f]/.test(selector))
+  if (typeof selector !== "string" || CONTROL_CHAR_RE.test(selector))
     throw new Error("Invalid profile selector");
   let profileFile;
   if (/^~[\\/]/.test(selector))
@@ -1128,10 +1171,10 @@ function resolveConfig(opts, env = process.env, home = homedir()) {
   const canonicalApi = new URL(apiUrl).href.replace(/\/$/, "");
   const key = createHash("sha256").update(JSON.stringify([cwd, canonicalApi, profile.agent_id])).digest("hex").slice(0, 24);
   const root = opts.stateRoot ?? project.state_root;
-  if (root !== undefined && (typeof root !== "string" || !root.trim() || /[\x00-\x1f\x7f]/.test(root)))
+  if (root !== undefined && (typeof root !== "string" || !root.trim() || CONTROL_CHAR_RE.test(root)))
     throw new Error("Invalid state_root");
   const codexBin = opts.codexBin ?? "codex";
-  if (typeof codexBin !== "string" || !codexBin.trim() || /[\x00-\x1f\x7f]/.test(codexBin))
+  if (typeof codexBin !== "string" || !codexBin.trim() || CONTROL_CHAR_RE.test(codexBin))
     throw new Error("Invalid codex_bin");
   const stateRoot = root === undefined ? join(home, ".agentschat/codex-bridge") : /^~[\\/]/.test(root) ? join(home, root.slice(2)) : resolve(cwd, root);
   return {
@@ -1318,7 +1361,7 @@ function removeDeadLock(file) {
   const pid = Number(raw);
   if (!raw || !Number.isInteger(pid) || pid <= 0) {
     try {
-      unlinkSync(file);
+      unlinkSync2(file);
     } catch {}
     return;
   }
@@ -1327,7 +1370,7 @@ function removeDeadLock(file) {
   } catch (e) {
     if (e.code === "ESRCH")
       try {
-        unlinkSync(file);
+        unlinkSync2(file);
       } catch {}
   }
 }
@@ -1354,11 +1397,11 @@ function save(rootDir = root) {
     const currentFile = lstatSync3(statusFile2, { throwIfNoEntry: false });
     if (currentDir.isSymbolicLink() || !currentDir.isDirectory() || currentFile && (currentFile.isSymbolicLink() || !currentFile.isFile()))
       throw new Error("Unsafe status destination");
-    renameSync(tmp, statusFile2);
+    renameSync2(tmp, statusFile2);
   } catch {
     if (created)
       try {
-        unlinkSync(tmp);
+        unlinkSync2(tmp);
       } catch {}
   }
 }
@@ -1477,7 +1520,7 @@ function removeOwnedLock(file) {
     assertDirectoryAncestors(dirname3(file));
     const stat = lstatSync3(file);
     if (!stat.isSymbolicLink() && stat.isFile() && stat.size <= 64 * 1024 && readFileSync3(file, "utf8").trim() === String(process.pid))
-      unlinkSync(file);
+      unlinkSync2(file);
   } catch {}
 }
 async function main() {

@@ -3,9 +3,9 @@
 import { existsSync, mkdirSync, readdirSync, accessSync, constants, lstatSync as lstatSync2, readlinkSync, realpathSync as realpathSync2, symlinkSync } from "node:fs";
 
 // codex/config.ts
-import { lstatSync, readFileSync, realpathSync } from "node:fs";
+import { copyFileSync, lstatSync, readFileSync, realpathSync, renameSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, parse as parsePath, resolve } from "node:path";
 import { createHash } from "node:crypto";
 
 // src/redact.ts
@@ -920,7 +920,19 @@ function parse(toml, { maxDepth = 1000, integersAsBigInt } = {}) {
 // codex/owner.ts
 function blockedServerHost(url) {
   const host = url.hostname.toLowerCase().replace(/\.+$/, "").replace(/^\[|\]$/g, "");
-  return /^169\.254\./.test(host) || host === "metadata.google.internal" || host === "metadata.goog" || host.endsWith(".metadata.goog") || /^fe[89ab][0-9a-f]:/.test(host) || /^::ffff:(?:0:)?a9fe:/.test(host);
+  if (!host || host === "0.0.0.0" || /^0\./.test(host) || host === "::" || host === "0:0:0:0:0:0:0:0" || /^169\.254\./.test(host) || host === "100.100.100.200" || host === "fd00:ec2::254" || host === "fd00:ec2:0:0:0:0:0:254" || host === "metadata" || host === "instance-data" || host === "metadata.google.internal" || host.endsWith(".metadata.google.internal") || host === "metadata.goog" || host.endsWith(".metadata.goog") || /^fe[89ab][0-9a-f]:/.test(host)) {
+    return true;
+  }
+  if (host.startsWith("::ffff:")) {
+    const rawTail = host.slice(7);
+    if (rawTail === "0:0" || rawTail === "0.0.0.0")
+      return true;
+    const tail = /^0:(?:[0-9a-f]{1,4}:|\d{1,3}\.)/.test(rawTail) ? rawTail.slice(2) : rawTail;
+    if (tail === "0:0" || tail === "0.0.0.0" || /^0\./.test(tail) || /^[0-9a-f]{1,2}:[0-9a-f]{1,4}$/.test(tail) || /^127\./.test(tail) || /^7f[0-9a-f]{2}:/.test(tail) || /^169\.254\./.test(tail) || /^a9fe:/.test(tail) || tail === "100.100.100.200" || tail === "6464:64c8") {
+      return true;
+    }
+  }
+  return false;
 }
 async function ownerJson(response) {
   if (!response.body)
@@ -953,7 +965,7 @@ async function ownerJson(response) {
 }
 async function getBotOwner(base, agentId, token, request = fetch) {
   try {
-    if (!base || base !== base.trim() || /[\x00-\x1f\x7f]/.test(base) || !agentId || agentId !== agentId.trim() || /[\x00-\x1f\x7f]/.test(agentId) || [".", "..", "__proto__", "constructor", "prototype"].includes(agentId.toLowerCase()) || /[\/\\\s]/.test(agentId) || !token || token !== token.trim() || /[\x00-\x1f\x7f]/.test(token))
+    if (!base || base !== base.trim() || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(base) || !agentId || agentId !== agentId.trim() || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(agentId) || /%(?:2e%2e|2f|5c|00)/i.test(agentId) || [".", "..", "__proto__", "constructor", "prototype"].includes(agentId.toLowerCase()) || /[\/\\\s]/.test(agentId) || !token || token !== token.trim() || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(token))
       return null;
     const parsed = new URL(base);
     const loopback = ["127.0.0.1", "localhost", "[::1]", "::1"].includes(parsed.hostname.toLowerCase().replace(/\.$/, ""));
@@ -991,24 +1003,25 @@ async function getBotOwner(base, agentId, token, request = fetch) {
     if (!entitlement || typeof entitlement !== "object" || Array.isArray(entitlement) || Object.hasOwn(entitlement, "__proto__"))
       return null;
     const owner = entitlement.owner_account_id;
-    return typeof owner === "string" && owner.trim().length > 0 && owner === owner.trim() && !/[\/\\\x00-\x1f\x7f]/.test(owner) && owner !== agentId && ![".", "..", "__proto__", "constructor", "prototype"].includes(owner.toLowerCase()) ? owner : null;
+    return typeof owner === "string" && owner.trim().length > 0 && owner === owner.trim() && !/[\/\\\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(owner) && !/%(?:2e%2e|2f|5c|00)/i.test(owner) && owner !== agentId && ![".", "..", "__proto__", "constructor", "prototype"].includes(owner.toLowerCase()) ? owner : null;
   } catch {
     return null;
   }
 }
 
 // codex/config.ts
+var CONTROL_CHAR_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
 function reasoningEffort(value) {
   if (value === undefined)
     return;
-  if (typeof value !== "string" || !value.trim() || /[\x00-\x1f\x7f]/.test(value))
+  if (typeof value !== "string" || !value.trim() || CONTROL_CHAR_RE.test(value))
     throw new Error("effort must be a nonempty model-supported reasoning effort name");
   return value.trim();
 }
 function modelName(value) {
   if (value === undefined)
     return;
-  if (typeof value !== "string" || !value.trim() || /[\x00-\x1f\x7f]/.test(value))
+  if (typeof value !== "string" || !value.trim() || CONTROL_CHAR_RE.test(value))
     throw new Error("model must be a nonempty model ID");
   return value.trim();
 }
@@ -1042,27 +1055,73 @@ function reservedProfileStem(selector) {
     "codex-bots"
   ].includes(selector.replace(/\.json$/i, "").toLowerCase());
 }
+function checkSingleAncestorDir(path) {
+  const stat = lstatSync(path, { throwIfNoEntry: false });
+  if (!stat)
+    return;
+  if (stat.isSymbolicLink()) {
+    const target = `/private${path}`;
+    if (process.platform === "darwin" && ["/var", "/tmp", "/etc"].includes(path) && realpathSync(path) === target) {
+      const priv = lstatSync("/private", { throwIfNoEntry: false });
+      if (!priv || priv.isSymbolicLink() || !priv.isDirectory()) {
+        throw new Error("Config path must be a non-symlink directory: /private");
+      }
+      assertDirectoryAncestors(target);
+      return;
+    }
+    throw new Error(`Config path must be a non-symlink directory: ${path}`);
+  }
+  if (!stat.isDirectory())
+    throw new Error(`Config path must be a non-symlink directory: ${path}`);
+}
 function assertDirectoryAncestors(directory) {
+  if (typeof directory !== "string" || !directory.trim() || CONTROL_CHAR_RE.test(directory)) {
+    throw new Error(`Config path must be a non-symlink directory: ${String(directory)}`);
+  }
+  if (/(?:^|[\\/])\.\.(?:[\\/]|$)/.test(directory)) {
+    let cur;
+    let remainder;
+    if (isAbsolute(directory)) {
+      const root = parsePath(directory).root || "/";
+      cur = root;
+      remainder = directory.slice(root.length);
+      checkSingleAncestorDir(cur);
+    } else {
+      const base = resolve(process.cwd());
+      assertDirectoryAncestors(base);
+      cur = base;
+      remainder = directory;
+    }
+    for (const seg of remainder.split(/[\\/]+/)) {
+      if (!seg || seg === ".")
+        continue;
+      cur = seg === ".." ? dirname(cur) : join(cur, seg);
+      checkSingleAncestorDir(cur);
+    }
+  }
   const paths = [];
   for (let path = resolve(directory);; path = dirname(path)) {
     paths.unshift(path);
     if (dirname(path) === path)
       break;
   }
-  for (const path of paths) {
-    const stat = lstatSync(path, { throwIfNoEntry: false });
-    if (!stat)
-      continue;
-    if (stat.isSymbolicLink()) {
-      const target = `/private${path}`;
-      if (process.platform === "darwin" && ["/var", "/tmp", "/etc"].includes(path) && realpathSync(path) === target) {
-        assertDirectoryAncestors(target);
-        continue;
-      }
-      throw new Error(`Config path must be a non-symlink directory: ${path}`);
+  for (const path of paths)
+    checkSingleAncestorDir(path);
+}
+function atomicReplaceRegularFile(tmp, target, verifySafeTarget, opts) {
+  verifySafeTarget();
+  const rename = opts?.rename ?? renameSync;
+  const platform = opts?.platform ?? process.platform;
+  try {
+    rename(tmp, target);
+  } catch (err) {
+    if (platform === "win32" && (err?.code === "EPERM" || err?.code === "EACCES")) {
+      verifySafeTarget();
+      copyFileSync(tmp, target);
+      unlinkSync(tmp);
+      return;
     }
-    if (!stat.isDirectory())
-      throw new Error(`Config path must be a non-symlink directory: ${path}`);
+    throw err;
   }
 }
 function checkedPath(path, directory = false) {
@@ -1095,7 +1154,7 @@ function readJson(file) {
 function strings(value, name) {
   if (value === undefined)
     return [];
-  if (!Array.isArray(value) || value.some((x) => typeof x !== "string" || !x.trim()))
+  if (!Array.isArray(value) || value.some((x) => typeof x !== "string" || !x.trim() || CONTROL_CHAR_RE.test(x)))
     throw new Error(`${name} must be an array of nonempty strings`);
   return value;
 }
@@ -1148,7 +1207,7 @@ function resolveConfig(opts, env = process.env, home = homedir()) {
     ["profile", "default"]
   ];
   const [selector, source] = choices.find(([v]) => v !== undefined && v !== "");
-  if (typeof selector !== "string" || /[\x00-\x1f\x7f]/.test(selector))
+  if (typeof selector !== "string" || CONTROL_CHAR_RE.test(selector))
     throw new Error("Invalid profile selector");
   let profileFile;
   if (/^~[\\/]/.test(selector))
@@ -1188,10 +1247,10 @@ function resolveConfig(opts, env = process.env, home = homedir()) {
   const canonicalApi = new URL(apiUrl).href.replace(/\/$/, "");
   const key = createHash("sha256").update(JSON.stringify([cwd, canonicalApi, profile.agent_id])).digest("hex").slice(0, 24);
   const root = opts.stateRoot ?? project.state_root;
-  if (root !== undefined && (typeof root !== "string" || !root.trim() || /[\x00-\x1f\x7f]/.test(root)))
+  if (root !== undefined && (typeof root !== "string" || !root.trim() || CONTROL_CHAR_RE.test(root)))
     throw new Error("Invalid state_root");
   const codexBin = opts.codexBin ?? "codex";
-  if (typeof codexBin !== "string" || !codexBin.trim() || /[\x00-\x1f\x7f]/.test(codexBin))
+  if (typeof codexBin !== "string" || !codexBin.trim() || CONTROL_CHAR_RE.test(codexBin))
     throw new Error("Invalid codex_bin");
   const stateRoot = root === undefined ? join(home, ".agentschat/codex-bridge") : /^~[\\/]/.test(root) ? join(home, root.slice(2)) : resolve(cwd, root);
   return {
@@ -1492,7 +1551,7 @@ async function getOnboardingStatus(base, agentId, token, request = fetch) {
 
 // codex/gui-channel.ts
 import { randomUUID } from "node:crypto";
-import { mkdirSync as mkdirSync2, writeFileSync, readFileSync as readFileSync2, renameSync, readdirSync as readdirSync2, rmSync, lstatSync as lstatSync3 } from "node:fs";
+import { mkdirSync as mkdirSync2, writeFileSync, readFileSync as readFileSync2, renameSync as renameSync2, readdirSync as readdirSync2, rmSync, lstatSync as lstatSync3 } from "node:fs";
 import { join as join3 } from "node:path";
 function payload(result) {
   if (result?.isError || result?.success === false || result?.error)
@@ -1544,7 +1603,7 @@ class GuiChannel {
       const current = lstatSync3(path, { throwIfNoEntry: false });
       if (current && (current.isSymbolicLink() || !current.isFile()))
         throw new Error("GUI receipt must be a regular file, not a symlink");
-      renameSync(temp, path);
+      renameSync2(temp, path);
     } catch (error) {
       if (error.code !== "EEXIST")
         rmSync(temp, { force: true });
@@ -1877,7 +1936,7 @@ class AppServer {
     return this.runtime?.home;
   }
   async start() {
-    if (this.model !== undefined && (typeof this.model !== "string" || !this.model.trim() || this.model.length > 256 || /[\x00-\x1f\x7f]/.test(this.model)))
+    if (this.model !== undefined && (typeof this.model !== "string" || !this.model.trim() || this.model.length > 256 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(this.model)))
       throw new Error("Invalid app-server model");
     const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^AGENTS?CHAT_|^RELAY_/.test(k)));
     env.AGENTSCHAT_LOCK_OWNER_PID = String(process.pid);
@@ -2042,8 +2101,10 @@ class AppServer {
     }
   }
   async thread(cwd, existing, ephemeral = false, permissions = this.permissions) {
-    if (typeof cwd !== "string" || !cwd.trim() || cwd.length > 4096 || /[\x00-\x1f\x7f]/.test(cwd))
+    if (typeof cwd !== "string" || !cwd.trim() || cwd.length > 4096 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(cwd))
       throw new Error("Invalid app-server cwd");
+    if (existing !== undefined && (typeof existing !== "string" || !existing.trim() || existing.length > 256 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(existing)))
+      throw new Error("Invalid app-server thread ID");
     const configured = existing ? this.threadPermissions.get(existing) : undefined;
     if (configured !== undefined && configured !== permissions) {
       throw new Error("Cannot change permissions of a loaded thread; create a new thread");
@@ -2183,13 +2244,13 @@ function isTeamLeadSkillInvocation(prompt) {
 }
 
 // codex/bridge.ts
-import { lstatSync as lstatSync10, mkdirSync as mkdirSync6, readFileSync as readFileSync9, renameSync as renameSync4, writeFileSync as writeFileSync4, openSync as openSync2, closeSync as closeSync2, unlinkSync as unlinkSync4 } from "node:fs";
+import { lstatSync as lstatSync10, mkdirSync as mkdirSync6, readFileSync as readFileSync9, writeFileSync as writeFileSync4, openSync as openSync2, closeSync as closeSync2, unlinkSync as unlinkSync5 } from "node:fs";
 import { join as join10 } from "node:path";
 import { randomBytes as randomBytes2 } from "node:crypto";
 
 // codex/thread-history.ts
 import { createHash as createHash2, randomBytes } from "node:crypto";
-import { chmodSync, lstatSync as lstatSync6, mkdirSync as mkdirSync4, renameSync as renameSync2, unlinkSync, writeFileSync as writeFileSync2 } from "node:fs";
+import { chmodSync, lstatSync as lstatSync6, mkdirSync as mkdirSync4, unlinkSync as unlinkSync2, writeFileSync as writeFileSync2 } from "node:fs";
 import { join as join6 } from "node:path";
 function priorChannelThreads(threads, channel) {
   if (!threads || typeof threads !== "object" || typeof channel !== "string" || !channel)
@@ -2210,6 +2271,9 @@ function priorChannelThreads(threads, channel) {
   }).map(([, id]) => id))];
 }
 function preserveChannelHistory(directory, channel, histories, redact) {
+  if (typeof channel !== "string" || !channel.trim() || channel.length > 256 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(channel)) {
+    throw new Error("Invalid history channel");
+  }
   const checkDirectory = (path) => {
     try {
       const stat = lstatSync6(path);
@@ -2242,18 +2306,19 @@ function preserveChannelHistory(directory, channel, histories, redact) {
     writeFileSync2(tmp, redact(JSON.stringify({ channel_id: channel, threads: histories })), { flag: "wx", mode: 384 });
     if (process.platform !== "win32")
       chmodSync(tmp, 384);
-    try {
-      const stat = lstatSync6(file);
-      if (stat.isSymbolicLink() || !stat.isFile())
-        throw new Error("History archive must be a regular file, not a symlink");
-    } catch (error) {
-      if (error.code !== "ENOENT")
-        throw error;
-    }
-    renameSync2(tmp, file);
+    atomicReplaceRegularFile(tmp, file, () => {
+      try {
+        const stat = lstatSync6(file);
+        if (stat.isSymbolicLink() || !stat.isFile())
+          throw new Error("History archive must be a regular file, not a symlink");
+      } catch (error) {
+        if (error.code !== "ENOENT")
+          throw error;
+      }
+    });
   } catch (err) {
     try {
-      unlinkSync(tmp);
+      unlinkSync2(tmp);
     } catch {}
     throw err;
   }
@@ -2353,8 +2418,8 @@ function grants(config, opts) {
     const ownProto = (value) => Object.prototype.hasOwnProperty.call(value, "__proto__");
     if (doc?.version !== 1 || ownProto(doc) || !Array.isArray(doc.grants) || doc.grants.length > 256)
       return [];
-    const safeId = (value) => typeof value === "string" && value.length > 0 && value.length <= 128 && value.trim() === value && value !== "." && value !== ".." && !/[\/\\\s\x00-\x1f\x7f]/.test(value) && !["__proto__", "constructor", "prototype"].includes(value.toLowerCase());
-    const safeOwnerId = (value) => typeof value === "string" && value.length > 0 && value.length <= 254 && value.trim() === value && value !== "." && !value.includes("..") && !/[\/\\\s\x00-\x1f\x7f]/.test(value) && !["__proto__", "constructor", "prototype"].includes(value.toLowerCase());
+    const safeId = (value) => typeof value === "string" && value.length > 0 && value.length <= 128 && value.trim() === value && value !== "." && value !== ".." && !/[\/\\\s\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(value) && !/%(?:2e%2e|2f|5c|00)/i.test(value) && !["__proto__", "constructor", "prototype"].includes(value.toLowerCase());
+    const safeOwnerId = (value) => typeof value === "string" && value.length > 0 && value.length <= 254 && value.trim() === value && value !== "." && !value.includes("..") && !/[\/\\\s\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(value) && !/%(?:2e%2e|2f|5c|00)/i.test(value) && !["__proto__", "constructor", "prototype"].includes(value.toLowerCase());
     return doc.grants.filter((g) => g && !ownProto(g) && [g.loop_id, g.channel_id, g.agent_id, g.owner_id, g.prompt].every((v) => typeof v === "string" && v.trim()) && /^loop_[A-Za-z0-9_-]+$/.test(g.loop_id) && [g.loop_id, g.channel_id, g.agent_id].every(safeId) && safeOwnerId(g.owner_id) && g.agent_id === config.agentId && g.prompt.length <= 4000 && Number.isSafeInteger(g.interval_ms) && g.interval_ms >= 60000 && g.interval_ms <= 86400000);
   } catch {
     return [];
@@ -2394,7 +2459,7 @@ async function verifyLoopTick(raw, config, owner, list, opts) {
 
 // src/session-bind.ts
 import { createHash as createHash3 } from "node:crypto";
-import { closeSync, lstatSync as lstatSync9, mkdirSync as mkdirSync5, openSync, readFileSync as readFileSync8, readSync, readdirSync as readdirSync4, readlinkSync as readlinkSync3, realpathSync as realpathSync5, statSync, unlinkSync as unlinkSync3 } from "node:fs";
+import { closeSync, lstatSync as lstatSync9, mkdirSync as mkdirSync5, openSync, readFileSync as readFileSync8, readSync, readdirSync as readdirSync4, readlinkSync as readlinkSync3, realpathSync as realpathSync5, statSync, unlinkSync as unlinkSync4 } from "node:fs";
 import { homedir as homedir5, tmpdir } from "node:os";
 import { isAbsolute as isAbsolute5, join as join9, parse as parse3, resolve as resolve6 } from "node:path";
 
@@ -2404,9 +2469,9 @@ import {
   realpathSync as realpathSync4,
   writeFileSync as writeFileSync3,
   renameSync as renameSync3,
-  copyFileSync,
+  copyFileSync as copyFileSync2,
   chmodSync as chmodSync2,
-  unlinkSync as unlinkSync2,
+  unlinkSync as unlinkSync3,
   readdirSync as readdirSync3,
   readFileSync as readFileSync7
 } from "fs";
@@ -2499,7 +2564,7 @@ function safeWriteProfile(path, data, warn = defaultWarn) {
   const tmpStat = safeLstat(tmp);
   if (tmpStat) {
     try {
-      unlinkSync2(tmp);
+      unlinkSync3(tmp);
     } catch (e) {
       warn(`[agentchat] WARNING: stale ${sanitizeWarnPart(tmp)} could not be removed: ${sanitizeWarnPart(e)}
 `);
@@ -2509,13 +2574,13 @@ function safeWriteProfile(path, data, warn = defaultWarn) {
   const currentParent = safeLstat(parentDir);
   if (!currentParent || currentParent.isSymbolicLink() || !currentParent.isDirectory() || !hasSafeAncestorDirs(path)) {
     try {
-      unlinkSync2(tmp);
+      unlinkSync3(tmp);
     } catch {}
     throw new Error(`Refusing to write profile into symlinked parent directory: ${sanitizeWarnPart(parentDir)}`);
   }
   if (safeLstat(path)?.isSymbolicLink()) {
     try {
-      unlinkSync2(tmp);
+      unlinkSync3(tmp);
     } catch {}
     throw new Error(`Refusing to overwrite symlinked profile: ${sanitizeWarnPart(path)}`);
   }
@@ -2526,13 +2591,13 @@ function safeWriteProfile(path, data, warn = defaultWarn) {
       const winTarget = safeLstat(path);
       if (winTarget?.isSymbolicLink() || winTarget?.isDirectory()) {
         try {
-          unlinkSync2(tmp);
+          unlinkSync3(tmp);
         } catch {}
         throw new Error(`Refusing to overwrite symlinked or directory profile: ${sanitizeWarnPart(path)}`);
       }
-      copyFileSync(tmp, path);
+      copyFileSync2(tmp, path);
       try {
-        unlinkSync2(tmp);
+        unlinkSync3(tmp);
       } catch {}
     } else {
       throw err;
@@ -2603,7 +2668,7 @@ function isPidAlive(pid) {
 }
 function resolveLockDir(homeDir, env = process.env) {
   const explicit = env.AGENTSCHAT_LOCK_DIR?.trim();
-  if (explicit && explicit.length <= 4096 && !explicit.startsWith("-") && !CONTROL_CHAR_RE.test(explicit) && isAbsolute5(explicit) && isSafeDirOrMissing(explicit)) {
+  if (explicit && explicit.length <= 4096 && !explicit.startsWith("-") && !CONTROL_CHAR_RE2.test(explicit) && isAbsolute5(explicit) && isSafeDirOrMissing(explicit)) {
     return explicit;
   }
   const hash = createHash3("sha256").update(homeDir || ".").digest("hex").slice(0, 12);
@@ -2613,7 +2678,7 @@ function resolveLockDir(homeDir, env = process.env) {
 var LOCK_FILE_MAX_BYTES = 64 * 1024;
 var LOCK_KEY_MAX_CHARS = 128;
 var SESSION_BINDS_MAX_BYTES = 1024 * 1024;
-var CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
+var CONTROL_CHAR_RE2 = /[\x00-\x1f\x7f]/;
 var RESERVED_BIND_SIDECARS = new Set([
   "session-binds",
   "session-binds.meta",
@@ -2702,7 +2767,7 @@ function hasSafeRawDotDotSegments(rawPath) {
   return true;
 }
 function isSafeDirOrMissing(dirPath) {
-  if (!dirPath || CONTROL_CHAR_RE.test(dirPath))
+  if (!dirPath || CONTROL_CHAR_RE2.test(dirPath))
     return false;
   if (!hasSafeRawDotDotSegments(dirPath))
     return false;
@@ -2751,6 +2816,40 @@ function readAgentLock(lockDir, agentId) {
   }
   return raw;
 }
+function checkAgentLock(opts) {
+  const { lockDir, agentId } = opts;
+  const currentPid = opts.currentPid ?? process.pid;
+  if (!agentId || !isSafeDirOrMissing(lockDir))
+    return { locked: false };
+  const file = lockFilePath(lockDir, agentId);
+  const record = readAgentLock(lockDir, agentId);
+  if (!record) {
+    try {
+      const st = lstatSync9(file);
+      if (!st.isSymbolicLink() && st.isFile() && Date.now() - st.mtimeMs > 1000)
+        unlinkSync4(file);
+    } catch {}
+    return { locked: false };
+  }
+  if (!isPidAlive(record.pid)) {
+    try {
+      unlinkSync4(file);
+    } catch {}
+    return { locked: false, stale: true };
+  }
+  if (record.pid === currentPid) {
+    if (opts.currentSessionId && record.sessionId && opts.currentSessionId !== record.sessionId) {
+      return { locked: true, holder: record };
+    }
+    return { locked: false, holder: record };
+  }
+  if (opts.lockOwnerPid && record.pid === opts.lockOwnerPid)
+    return { locked: false, holder: record };
+  if (opts.currentSessionId && record.sessionId && opts.currentSessionId === record.sessionId) {
+    return { locked: false, holder: record };
+  }
+  return { locked: true, holder: record };
+}
 function acquireAgentLock(opts) {
   if (!opts.agentId)
     return null;
@@ -2783,7 +2882,7 @@ function releaseAgentLock(opts) {
     try {
       const st = lstatSync9(file);
       if (!st.isSymbolicLink() && st.isFile() && Date.now() - st.mtimeMs > 1000) {
-        unlinkSync3(file);
+        unlinkSync4(file);
         return true;
       }
     } catch {}
@@ -2795,7 +2894,7 @@ function releaseAgentLock(opts) {
   if (!samePid && !sameSession && !dead)
     return false;
   try {
-    unlinkSync3(file);
+    unlinkSync4(file);
     return true;
   } catch {
     return false;
@@ -2819,7 +2918,7 @@ function isPlainObject(value) {
   return value !== null && typeof value === "object" && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
 }
 function safeMessageId(value) {
-  return typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value && value !== "." && value !== ".." && !/[\/\\\x00-\x1f\x7f]/.test(value) && !isPrototypeKey(value);
+  return typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value && value !== "." && value !== ".." && !/[\/\\\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(value) && !/%(?:2e%2e|2f|5c|00)/i.test(value) && !isPrototypeKey(value);
 }
 function validMentions(value) {
   return value === undefined || Array.isArray(value) && value.length <= 128 && [...value].every((id) => typeof id === "string");
@@ -2889,7 +2988,7 @@ class Bridge {
         const content = readFileSync9(this.lock, "utf8");
         const holderPid = /^\d+$/.test(content) && content.trim() === content ? Number(content) : NaN;
         if (!Number.isSafeInteger(holderPid) || holderPid <= 0 || !isPidAlive(holderPid))
-          unlinkSync4(this.lock);
+          unlinkSync5(this.lock);
       }
     } catch {}
     try {
@@ -2926,15 +3025,28 @@ class Bridge {
       this.save();
     } catch {
       try {
-        unlinkSync4(this.lock);
+        unlinkSync5(this.lock);
       } catch {}
       throw new Error("Cannot load bridge state; refusing to discard history");
     }
-    acquireAgentLock({
-      lockDir,
-      agentId: config.agentId,
-      runtime: "codex-bridge"
-    });
+    try {
+      const existingLock = checkAgentLock({ lockDir, agentId: config.agentId });
+      if (existingLock.locked) {
+        throw new Error(`Agent identity ${config.agentId} is already locked by live process ${existingLock.holder?.pid ?? "unknown"} (${existingLock.holder?.runtime ?? "unknown"})`);
+      }
+      if (!acquireAgentLock({
+        lockDir,
+        agentId: config.agentId,
+        runtime: "codex-bridge"
+      })) {
+        throw new Error(`Cannot acquire agent lock for ${config.agentId}`);
+      }
+    } catch (err) {
+      try {
+        unlinkSync5(this.lock);
+      } catch {}
+      throw err;
+    }
   }
   save() {
     const isTerminal = (status) => status === "sent" || status === "skipped" || status === "blocked";
@@ -2958,18 +3070,20 @@ class Bridge {
       const serialized = JSON.stringify(this.state);
       checkStateDir(this.config.stateDir);
       writeFileSync4(tmp, serialized, { mode: 384, flag: "wx" });
-      try {
-        if (lstatSync10(this.file).isSymbolicLink())
-          throw new Error("Bridge state must not be a symlink");
-      } catch (error) {
-        if (error.code !== "ENOENT")
-          throw error;
-      }
-      checkStateDir(this.config.stateDir);
-      renameSync4(tmp, this.file);
+      atomicReplaceRegularFile(tmp, this.file, () => {
+        try {
+          const stat = lstatSync10(this.file);
+          if (stat.isSymbolicLink() || !stat.isFile())
+            throw new Error("Bridge state must not be a symlink");
+        } catch (error) {
+          if (error.code !== "ENOENT")
+            throw error;
+        }
+        checkStateDir(this.config.stateDir);
+      });
     } catch (err) {
       try {
-        unlinkSync4(tmp);
+        unlinkSync5(tmp);
       } catch {}
       throw err;
     }
@@ -2992,8 +3106,8 @@ class Bridge {
       sender_id: raw.sender_id,
       ...Array.isArray(raw.mentioned_ids) ? { mentioned_ids: raw.mentioned_ids.filter((id) => typeof id === "string") } : {},
       ...Array.isArray(raw.mentions) ? { mentions: raw.mentions.filter((id) => typeof id === "string") } : {},
-      ...!tick && typeof raw.parent_id === "string" && raw.parent_id.trim() ? { parent_id: raw.parent_id.trim() } : {},
-      ...!tick && typeof raw.reply_to === "string" && raw.reply_to.trim() ? { reply_to: raw.reply_to.trim() } : {},
+      ...!tick && typeof raw.parent_id === "string" && safeMessageId(raw.parent_id.trim()) ? { parent_id: raw.parent_id.trim() } : {},
+      ...!tick && typeof raw.reply_to === "string" && safeMessageId(raw.reply_to.trim()) ? { reply_to: raw.reply_to.trim() } : {},
       content: tick ? "Authorized scheduled loop" : this.redact(raw.content),
       ...tick ? { meta: {
         kind: "loop_tick",
@@ -3160,7 +3274,7 @@ AgentsChat message:
     try {
       const stat = lstatSync10(this.lock);
       if (!stat.isSymbolicLink() && stat.isFile() && stat.size <= 64 * 1024 && readFileSync9(this.lock, "utf8") === String(process.pid))
-        unlinkSync4(this.lock);
+        unlinkSync5(this.lock);
     } catch (error) {
       if (error.code !== "ENOENT")
         throw error;
@@ -3284,7 +3398,7 @@ function resolveDrainReconnectDelay(frame, rand = Math.random) {
 }
 
 // codex/inbox-sync.ts
-import { chmodSync as chmodSync3, lstatSync as lstatSync11, mkdirSync as mkdirSync7, readFileSync as readFileSync10, renameSync as renameSync5, unlinkSync as unlinkSync5, writeFileSync as writeFileSync5 } from "node:fs";
+import { chmodSync as chmodSync3, lstatSync as lstatSync11, mkdirSync as mkdirSync7, readFileSync as readFileSync10, unlinkSync as unlinkSync6, writeFileSync as writeFileSync5 } from "node:fs";
 import { randomBytes as randomBytes3 } from "node:crypto";
 import { join as join11 } from "node:path";
 
@@ -3353,7 +3467,7 @@ function timestamp(value) {
   return normalized;
 }
 function validChannel(channel) {
-  return typeof channel === "string" && channel.length > 0 && channel.length <= 128 && channel === channel.trim() && channel !== "." && !channel.includes("..") && !/[\/\\]/.test(channel) && !/[\x00-\x1f\x7f-\x9f]/.test(channel) && !["__proto__", "constructor", "prototype"].includes(channel.trim().toLowerCase());
+  return typeof channel === "string" && channel.length > 0 && channel.length <= 128 && channel === channel.trim() && channel !== "." && !channel.includes("..") && !/[\/\\]/.test(channel) && !/%(?:2e%2e|2f|5c|00)/i.test(channel) && !/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(channel) && !["__proto__", "constructor", "prototype"].includes(channel.trim().toLowerCase());
 }
 function validateChannel(channel) {
   if (!validChannel(channel))
@@ -3414,14 +3528,15 @@ class InboxSync {
     try {
       writeFileSync5(tmp, JSON.stringify(this.state), { mode: 384, flag: "wx" });
       created = true;
-      const current = lstatSync11(this.file, { throwIfNoEntry: false });
-      if (current && (current.isSymbolicLink() || !current.isFile()))
-        throw new Error("Invalid inbound cursors file");
-      renameSync5(tmp, this.file);
+      atomicReplaceRegularFile(tmp, this.file, () => {
+        const current = lstatSync11(this.file, { throwIfNoEntry: false });
+        if (current && (current.isSymbolicLink() || !current.isFile()))
+          throw new Error("Invalid inbound cursors file");
+      });
     } catch (err) {
       if (created) {
         try {
-          unlinkSync5(tmp);
+          unlinkSync6(tmp);
         } catch {}
       }
       throw err;
@@ -3478,7 +3593,7 @@ class InboxSync {
         if (!Array.isArray(messages))
           throw new Error("Invalid history response");
         const rows = messages.map((m) => {
-          if (!m || m.channel_id !== channel || typeof m.id !== "string" || m.id.trim().length === 0)
+          if (!m || m.channel_id !== channel || typeof m.id !== "string" || m.id.trim().length === 0 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(m.id))
             throw new Error("Invalid history message");
           return { message: m, time: timestamp(m.timestamp) };
         }).sort((a, b) => a.time.localeCompare(b.time));
@@ -3516,7 +3631,7 @@ class InboxSync {
 
 // codex/transport.ts
 function safeChannel(channel) {
-  return typeof channel === "string" && channel.trim().length > 0 && channel === channel.trim() && channel.length <= 128 && !/[.\/\\\x00-\x1f\x7f]/.test(channel) && !/^(?:__proto__|constructor|prototype)$/i.test(channel);
+  return typeof channel === "string" && channel.trim().length > 0 && channel === channel.trim() && channel.length <= 128 && !/[.\/\\\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(channel) && !/%(?:2e%2e|2f|5c|00)/i.test(channel) && !/^(?:__proto__|constructor|prototype)$/i.test(channel);
 }
 function requireChannel(channel) {
   if (!safeChannel(channel))
@@ -3524,12 +3639,14 @@ function requireChannel(channel) {
 }
 function apiUrl(path, base) {
   const invalid = () => new Error("Invalid AgentsChat API path");
-  if (typeof path !== "string" || !path.startsWith("/") || path.startsWith("//") || /[\x00-\x1f\x7f\\]/.test(path))
+  if (typeof path !== "string" || !path.startsWith("/") || path.startsWith("//") || /[\x00-\x1f\x7f-\x9f\u2028\u2029\\]/.test(path))
     throw invalid();
   try {
     const pathname = path.split(/[?#]/, 1)[0];
+    if (/%25(?:2e|2f|5c|00)/i.test(pathname))
+      throw invalid();
     const decoded = decodeURIComponent(pathname);
-    if ([pathname, decoded].some((value) => value.split("/").includes("..")) || /[\x00-\x1f\x7f\\]/.test(decoded))
+    if ([pathname, decoded].some((value) => value.split("/").includes("..")) || /[\x00-\x1f\x7f-\x9f\u2028\u2029\\]/.test(decoded))
       throw invalid();
     const origin = new URL(base).origin, resolved = new URL(path, base);
     if (resolved.origin !== origin)
@@ -3538,6 +3655,19 @@ function apiUrl(path, base) {
   } catch {
     throw invalid();
   }
+}
+function rawWsFrameBytes(raw) {
+  if (Buffer.isBuffer(raw))
+    return raw.byteLength;
+  if (raw instanceof ArrayBuffer)
+    return raw.byteLength;
+  if (Array.isArray(raw)) {
+    let total = 0;
+    for (const chunk of raw)
+      total += chunk.byteLength;
+    return total;
+  }
+  return Buffer.byteLength(String(raw), "utf8");
 }
 
 class AgentsChatTransport {
@@ -3728,7 +3858,7 @@ class AgentsChatTransport {
     this.heartbeat.start();
     socket.on("open", () => send({ type: "auth", agent_id: this.config.agentId, token: this.config.token, capabilities: ["chat", "codex"] }));
     socket.on("message", (raw) => {
-      if (!current())
+      if (!current() || rawWsFrameBytes(raw) > 1048576)
         return;
       let data;
       try {

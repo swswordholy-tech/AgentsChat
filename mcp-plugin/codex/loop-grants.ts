@@ -40,11 +40,12 @@ function grants(
     const ownProto = (value: any) => Object.prototype.hasOwnProperty.call(value, "__proto__");
     if (doc?.version !== 1 || ownProto(doc) || !Array.isArray(doc.grants) || doc.grants.length > 256) return [];
     const safeId = (value: unknown): value is string => typeof value === "string" && value.length > 0 &&
-      value.length <= 128 && value.trim() === value && value !== "." && value !== ".." && !/[\/\\\s\x00-\x1f\x7f]/.test(value) &&
+      value.length <= 128 && value.trim() === value && value !== "." && value !== ".." &&
+      !/[\/\\\s\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(value) && !/%(?:2e%2e|2f|5c|00)/i.test(value) &&
       !["__proto__", "constructor", "prototype"].includes(value.toLowerCase());
     const safeOwnerId = (value: unknown): value is string => typeof value === "string" && value.length > 0 &&
       value.length <= 254 && value.trim() === value && value !== "." && !value.includes("..") &&
-      !/[\/\\\s\x00-\x1f\x7f]/.test(value) &&
+      !/[\/\\\s\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(value) && !/%(?:2e%2e|2f|5c|00)/i.test(value) &&
       !["__proto__", "constructor", "prototype"].includes(value.toLowerCase());
     return doc.grants.filter((g: any) => g && !ownProto(g) &&
       [g.loop_id, g.channel_id, g.agent_id, g.owner_id, g.prompt].every(v => typeof v === "string" && v.trim()) &&
