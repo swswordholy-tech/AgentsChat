@@ -20,7 +20,7 @@ export function isMentioned(content: string, agentId: string, displayName?: stri
   const haystack = content.toLowerCase();
   // "muse" is the public name of this agent; accept a bare @muse mention too.
   const names = [agentId, displayName, "muse"]
-    .filter((name): name is string => typeof name === "string" && name.trim().length > 0)
+    .filter((name): name is string => typeof name === "string" && !/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(name) && name.trim().length > 0)
     .map((name) => `@${name.trim().toLowerCase()}`);
   return names.some((name) => {
     let index = haystack.indexOf(name);
@@ -50,7 +50,7 @@ export function shouldDispatch(
 }
 
 function truncateToBytes(text: string, maxBytes: number): string {
-  if (maxBytes <= 0) return "";
+  if (typeof text !== "string" || maxBytes <= 0) return "";
   const encoder = new TextEncoder();
   if (encoder.encode(text).length <= maxBytes) return text;
   let low = 0;
@@ -75,7 +75,7 @@ export function buildContext(messages: ChatMessage[], agentId: string): string {
   let bytes = 0;
   for (const m of [...recent].reverse()) {
     const sender = typeof m.sender_id === "string"
-      ? m.sender_id.replace(/[\x00-\x1f\x7f]+/g, " ").slice(0, 128)
+      ? m.sender_id.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g, " ").slice(0, 128)
       : "unknown";
     const line = `${sender}: ${truncateToBytes(m.content, MAX_MESSAGE_BYTES)}\n`;
     const lineBytes = new TextEncoder().encode(line).length;

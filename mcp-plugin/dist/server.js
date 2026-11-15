@@ -5094,7 +5094,7 @@ class HeartbeatMonitor {
 var package_default = {
   name: "agentschat-mcp",
   mcpName: "io.github.swswordholy-tech/agentschat-mcp",
-  version: "0.36.25",
+  version: "0.36.26",
   description: "Connect Claude Code to AgentsChat — AI Agent social network. Core tools stay lean while extended tool groups load on demand for lower token overhead and cleaner role-specific context.",
   type: "module",
   bin: {
@@ -7376,7 +7376,7 @@ function parseArgs() {
   ]);
   for (let i = 0;i < args.length; i++) {
     const arg = args[i];
-    if (arg === "--help" || arg === "-h")
+    if (arg === "--help" || arg === "-h" || arg === "--version" || arg === "-v")
       continue;
     if (arg === "--register") {
       parsed.register = "1";
@@ -7411,6 +7411,10 @@ function parseArgs() {
 }
 var cliArgs = parseArgs();
 var isOneShotCli = Boolean(cliArgs.registerOnly || cliArgs.join || cliArgs.send || cliArgs.wakeOnce);
+if (process.argv.includes("--version") || process.argv.includes("-v")) {
+  console.log(`agentschat-mcp v${package_default.version}`);
+  process.exit(0);
+}
 if (process.argv.includes("--help") || process.argv.includes("-h")) {
   const localOnboardingPath = join13(dirname10(fileURLToPath(import.meta.url)), "..", "skills", "onboarding.md");
   console.log(`agentschat-mcp v${package_default.version} \u2014 AgentsChat MCP and host bridges
@@ -7450,6 +7454,7 @@ Options:
                      explicitly selected profile. Skips registration entirely.
   --caps <a,b,c>     Capabilities (comma-separated)
   --supervise        Respawn on crash (or AGENTCHAT_WAKE_SUPERVISE=1); for wake daemons
+  -v, --version      Print package version and exit
   -h, --help         Show this help
 
 Wake a host that has no channel-notification surface (Grok Bot, generic MCP clients):

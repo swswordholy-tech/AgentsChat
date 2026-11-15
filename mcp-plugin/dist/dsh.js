@@ -15,7 +15,7 @@ function isMentioned(content, agentId, displayName) {
   if (typeof content !== "string")
     return false;
   const haystack = content.toLowerCase();
-  const names = [agentId, displayName, "muse"].filter((name) => typeof name === "string" && name.trim().length > 0).map((name) => `@${name.trim().toLowerCase()}`);
+  const names = [agentId, displayName, "muse"].filter((name) => typeof name === "string" && !/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(name) && name.trim().length > 0).map((name) => `@${name.trim().toLowerCase()}`);
   return names.some((name) => {
     let index = haystack.indexOf(name);
     while (index !== -1) {
@@ -41,7 +41,7 @@ function shouldDispatch(message, opts) {
   return isMentioned(message.content, opts.agentId, opts.displayName);
 }
 function truncateToBytes(text, maxBytes) {
-  if (maxBytes <= 0)
+  if (typeof text !== "string" || maxBytes <= 0)
     return "";
   const encoder = new TextEncoder;
   if (encoder.encode(text).length <= maxBytes)
@@ -64,7 +64,7 @@ function buildContext(messages, agentId) {
   const lines = [];
   let bytes = 0;
   for (const m of [...recent].reverse()) {
-    const sender = typeof m.sender_id === "string" ? m.sender_id.replace(/[\x00-\x1f\x7f]+/g, " ").slice(0, 128) : "unknown";
+    const sender = typeof m.sender_id === "string" ? m.sender_id.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g, " ").slice(0, 128) : "unknown";
     const line = `${sender}: ${truncateToBytes(m.content, MAX_MESSAGE_BYTES)}
 `;
     const lineBytes = new TextEncoder().encode(line).length;
@@ -79,6 +79,8 @@ function buildContext(messages, agentId) {
 // muse/src/typing.ts
 var TYPING_HEARTBEAT_MS = 2000;
 var TYPING_HEARTBEAT_MAX_MS = 120000;
+var MAX_TYPING_CHANNELS = 256;
+var FORBIDDEN_TYPING_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
 class TypingHeartbeat {
   timers = new Map;
@@ -92,9 +94,15 @@ class TypingHeartbeat {
     } catch {}
   }
   start(channelId) {
-    if (!channelId || process.env.AGENTSCHAT_AUTO_TYPING === "0")
+    if (typeof channelId !== "string" || !channelId || channelId.length > 128 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(channelId) || FORBIDDEN_TYPING_KEYS.has(channelId.toLowerCase()) || process.env.AGENTSCHAT_AUTO_TYPING === "0") {
       return;
+    }
     this.stop(channelId);
+    if (this.timers.size >= MAX_TYPING_CHANNELS) {
+      const oldest = this.timers.keys().next().value;
+      if (oldest !== undefined)
+        this.stop(oldest);
+    }
     this.pulse(channelId);
     const interval = setInterval(() => this.pulse(channelId), TYPING_HEARTBEAT_MS);
     interval.unref?.();
@@ -117,6 +125,9 @@ class TypingHeartbeat {
 }
 
 // muse/src/bridge.ts
+var FORBIDDEN_BRIDGE_CHANNELS = new Set(["__proto__", "constructor", "prototype"]);
+var BRIDGE_CHANNEL_CTRL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+
 class MuseBridge {
   client;
   activeReplies = new Map;
@@ -146,8 +157,9 @@ class MuseBridge {
     return this.client.isConnected;
   }
   async handleMessage(message) {
-    if (!message.channel_id || message.content === "__typing__")
+    if (!message || typeof message.channel_id !== "string" || !message.channel_id || message.channel_id.length > 256 || FORBIDDEN_BRIDGE_CHANNELS.has(message.channel_id.toLowerCase()) || Object.getOwnPropertyNames(Object.prototype).some((k) => k.toLowerCase() === message.channel_id.toLowerCase()) || message.content === "__typing__") {
       return;
+    }
     if (!this.history.has(message.channel_id) && this.history.size >= 200) {
       const oldest = this.history.keys().next().value;
       if (oldest !== undefined)
@@ -173,8 +185,8 @@ class MuseBridge {
         context: buildContext(this.history.get(message.channel_id) ?? [], this.opts.agentId)
       };
       const reply = await this.opts.responder(ctx);
-      if (reply) {
-        if (message.thread_id) {
+      if (reply && !BRIDGE_CHANNEL_CTRL_RE.test(message.channel_id)) {
+        if (message.thread_id && !BRIDGE_CHANNEL_CTRL_RE.test(message.thread_id)) {
           this.client.sendMessage(message.channel_id, reply, "text", message.thread_id);
         } else {
           this.client.sendMessage(message.channel_id, reply);
@@ -1466,17 +1478,25 @@ function resolveWindowsCliSpawn(cmd, args, opts) {
 
 // dsh/src/patch.ts
 import { randomBytes as randomBytes2 } from "node:crypto";
-import { chmodSync as chmodSync2, copyFileSync as copyFileSync2, lstatSync as lstatSync6, mkdirSync as mkdirSync3, readFileSync as readFileSync6, realpathSync as realpathSync4, renameSync as renameSync2, statSync as statSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2 } from "node:fs";
+import { chmodSync as chmodSync2, copyFileSync as copyFileSync2, lstatSync as lstatSync6, mkdirSync as mkdirSync3, readFileSync as readFileSync6, realpathSync as realpathSync4, renameSync as renameSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2 } from "node:fs";
 import { dirname as dirname5, isAbsolute as isAbsolute5, join as join5, resolve as resolve4 } from "node:path";
 import { homedir as homedir4 } from "node:os";
 var FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 var DARWIN_ROOT_LINKS = new Set(["/var", "/tmp", "/etc"]);
+var DSH_PATCH_CTRL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+var DSH_PATCH_PRETRIM_CTRL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u2028\u2029]/;
 function isAllowedDarwinSystemLink3(dirPath) {
   if (process.platform !== "darwin" || !DARWIN_ROOT_LINKS.has(dirPath))
     return false;
   try {
+    const priv = lstatSync6("/private");
+    if (priv.isSymbolicLink() || !priv.isDirectory())
+      return false;
     const real = realpathSync4(dirPath);
-    return real === `/private${dirPath}` && statSync2(real).isDirectory();
+    if (real !== `/private${dirPath}`)
+      return false;
+    const target = lstatSync6(real);
+    return !target.isSymbolicLink() && target.isDirectory();
   } catch {
     return false;
   }
@@ -1518,6 +1538,9 @@ function checkRawDotDotAncestors(rawPath) {
   }
 }
 function checkParentDirectory(path) {
+  if (typeof path !== "string" || !path.trim() || DSH_PATCH_CTRL_RE.test(path)) {
+    throw new Error("Invalid DSH target path");
+  }
   checkRawDotDotAncestors(path);
   let parent = dirname5(resolve4(path));
   for (;; ) {
@@ -1541,10 +1564,10 @@ function checkParentDirectory(path) {
 function isBlockedNormalizedHost(host) {
   if (!host)
     return true;
-  if (host === "0.0.0.0" || host === "::" || host === "0:0:0:0:0:0:0:0" || host === "100.100.100.200" || host === "fd00:ec2::254" || host === "fd00:ec2:0:0:0:0:0:254" || host === "metadata" || host === "instance-data" || host === "metadata.google.internal" || host.endsWith(".metadata.google.internal") || host === "metadata.goog" || host.endsWith(".metadata.goog") || /^169\.254\./.test(host)) {
+  if (host === "0.0.0.0" || /^0\./.test(host) || host === "::" || host === "0:0:0:0:0:0:0:0" || host === "100.100.100.200" || host === "fd00:ec2::254" || host === "fd00:ec2:0:0:0:0:0:254" || host === "metadata" || host === "instance-data" || host === "metadata.google.internal" || host.endsWith(".metadata.google.internal") || host === "metadata.goog" || host.endsWith(".metadata.goog") || /^169\.254\./.test(host)) {
     return true;
   }
-  if (/^::ffff:(?:0:)?(?:a9fe:[0-9a-f]{1,4}|169\.254\.\d{1,3}\.\d{1,3}|6464:64c8|100\.100\.100\.200|0:0|0\.0\.0\.0)$/.test(host) || /^(?:0:){5}ffff:(?:a9fe:[0-9a-f]{1,4}|169\.254\.\d{1,3}\.\d{1,3}|6464:64c8|100\.100\.100\.200|0:0|0\.0\.0\.0)$/.test(host)) {
+  if (/^::ffff:(?:0:)?(?:a9fe:[0-9a-f]{1,4}|169\.254\.\d{1,3}\.\d{1,3}|6464:64c8|100\.100\.100\.200|[0-9a-f]{1,2}:[0-9a-f]{1,4}|0\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.test(host) || /^(?:0:){5}ffff:(?:a9fe:[0-9a-f]{1,4}|169\.254\.\d{1,3}\.\d{1,3}|6464:64c8|100\.100\.100\.200|[0-9a-f]{1,2}:[0-9a-f]{1,4}|0\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.test(host)) {
     return true;
   }
   const first = host.split(":")[0];
@@ -1564,10 +1587,13 @@ function isBlockedDshHost(hostname) {
 }
 function resolveDshPatchPath(opts = {}) {
   const home = opts.dshHome ?? process.env.DSH_HOME ?? join5(homedir4(), ".dsh");
-  if (!home || home.length > 4096 || home.startsWith("-") || !isAbsolute5(home) || /[\x00-\x1f\x7f]/.test(home)) {
+  if (!home || home.length > 4096 || home.startsWith("-") || !isAbsolute5(home) || DSH_PATCH_CTRL_RE.test(home)) {
     throw new Error("Invalid DSH home path");
   }
   if (opts.dshProfile !== undefined) {
+    if (typeof opts.dshProfile !== "string" || DSH_PATCH_PRETRIM_CTRL_RE.test(opts.dshProfile)) {
+      throw new Error("Invalid DSH profile name");
+    }
     const profile = opts.dshProfile.trim();
     if (!profile || profile.length > 64 || !/^[A-Za-z0-9._-]+$/.test(profile) || profile === "." || profile.includes("..") || FORBIDDEN_KEYS.has(profile.toLowerCase())) {
       throw new Error("Invalid DSH profile name");
@@ -1577,21 +1603,31 @@ function resolveDshPatchPath(opts = {}) {
   return join5(home, "cordis.patch.yml");
 }
 function buildMcpAgentsChatArgs(opts = {}) {
-  const pkg = (opts.packageSpec ?? "agentschat-mcp@latest").trim();
-  if (!pkg || pkg.startsWith("-") || /[\x00-\x20\x7f]/.test(pkg)) {
+  const rawPkg = opts.packageSpec ?? "agentschat-mcp@latest";
+  if (typeof rawPkg !== "string" || DSH_PATCH_PRETRIM_CTRL_RE.test(rawPkg)) {
+    throw new Error("Invalid packageSpec");
+  }
+  const pkg = rawPkg.trim();
+  if (!pkg || pkg.startsWith("-") || /[\x00-\x20\x7f-\x9f\u2028\u2029]/.test(pkg)) {
     throw new Error("Invalid packageSpec");
   }
   const args = ["-y", pkg];
   if (opts.agentsChatProfile !== undefined && opts.agentsChatProfile !== "") {
+    if (typeof opts.agentsChatProfile !== "string" || DSH_PATCH_PRETRIM_CTRL_RE.test(opts.agentsChatProfile)) {
+      throw new Error("Invalid AgentsChat profile name");
+    }
     const profile = opts.agentsChatProfile.trim();
-    if (!profile || profile.length > 64 || profile.startsWith("-") || profile.includes("..") || profile.includes("/") || profile.includes("\\") || FORBIDDEN_KEYS.has(profile.toLowerCase()) || /[\x00-\x1f\x7f]/.test(profile)) {
+    if (!profile || profile.length > 64 || profile.startsWith("-") || profile.includes("..") || profile.includes("/") || profile.includes("\\") || FORBIDDEN_KEYS.has(profile.toLowerCase()) || DSH_PATCH_CTRL_RE.test(profile)) {
       throw new Error("Invalid AgentsChat profile name");
     }
     args.push("--profile", profile);
   }
   if (opts.apiUrl !== undefined && opts.apiUrl !== "") {
+    if (typeof opts.apiUrl !== "string" || DSH_PATCH_PRETRIM_CTRL_RE.test(opts.apiUrl)) {
+      throw new Error("Invalid AgentsChat API URL");
+    }
     const rawUrl = opts.apiUrl.trim();
-    if (!rawUrl || rawUrl.startsWith("-") || /[\x00-\x20\x7f]/.test(rawUrl)) {
+    if (!rawUrl || rawUrl.startsWith("-") || /[\x00-\x20\x7f-\x9f\u2028\u2029]/.test(rawUrl)) {
       throw new Error("Invalid AgentsChat API URL");
     }
     let parsed;
@@ -1786,15 +1822,26 @@ function has(name, argv) {
   return argv.includes(name);
 }
 var FORBIDDEN_KEYS2 = new Set(["__proto__", "constructor", "prototype"]);
+var DSH_CLI_CTRL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+var DSH_CLI_PRETRIM_CTRL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u2028\u2029]/;
 var RESERVED_DSH_PROFILE_BASENAMES = new Set([
   "profile",
   "session-binds",
   "session-binds_meta",
+  "session-binds.meta",
+  "session-binds-meta",
   "agy-binds",
   "agy-binds_meta",
+  "agy-binds.meta",
+  "agy-binds-meta",
   "grok-binds",
   "grok-binds_meta",
+  "grok-binds.meta",
+  "grok-binds-meta",
   "agy-session-binds",
+  "agy-session-binds_meta",
+  "agy-session-binds.meta",
+  "agy-session-binds-meta",
   "identity-guard",
   "cursor",
   "read-cursors",
@@ -1831,7 +1878,7 @@ async function readRegistrationText(res) {
   }
 }
 function isSafeAgentId2(value) {
-  return typeof value === "string" && !!value && value.length <= 128 && value !== "." && value !== ".." && !FORBIDDEN_KEYS2.has(value.toLowerCase()) && !/[\s\x00-\x1f\x7f/\\]/.test(value);
+  return typeof value === "string" && !!value && value.length <= 128 && value !== "." && value !== ".." && !FORBIDDEN_KEYS2.has(value.toLowerCase()) && !/[\s\x00-\x1f\x7f-\x9f\u2028\u2029/\\]/.test(value);
 }
 function validateChannelId(value) {
   if (!value || value.startsWith("--") || !isSafeAgentId2(value) || Object.getOwnPropertyNames(Object.prototype).some((key) => key.toLowerCase() === value.toLowerCase()))
@@ -1839,18 +1886,21 @@ function validateChannelId(value) {
   return value;
 }
 function logText(value) {
-  return redact(value.replace(/[\x00-\x1f\x7f]/g, ""));
+  return redact(value.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ""));
 }
 function promptHeader(value) {
-  return value.replace(/[\r\n\x00-\x1f\x7f]/g, "");
+  return value.replace(/[\r\n\x00-\x1f\x7f-\x9f\u2028\u2029]/g, "");
 }
 function isLoopbackHost2(hostname) {
   const h = hostname.toLowerCase().replace(/\.$/, "");
   return h === "localhost" || h === "127.0.0.1" || h === "[::1]" || h === "::1";
 }
 function validateHttpOrWsUrl(raw, allowedProtocols, label) {
+  if (typeof raw !== "string" || DSH_CLI_PRETRIM_CTRL_RE.test(raw)) {
+    throw new Error(`Invalid ${label} URL`);
+  }
   const trimmed = raw.trim();
-  if (!trimmed || raw !== trimmed || /[\x00-\x20\x7f"<>\\]/.test(raw)) {
+  if (!trimmed || raw !== trimmed || /[\x00-\x20\x7f-\x9f\u2028\u2029"<>\\]/.test(raw)) {
     throw new Error(`Invalid ${label} URL`);
   }
   let parsed;
@@ -1886,21 +1936,22 @@ function loadDshConfig(env = process.env, profilePath = DSH_PROFILE_PATH) {
   }
   const rawAgentId = env.AGENTCHAT_AGENT_ID ?? (typeof profile.agentId === "string" ? profile.agentId : undefined);
   const rawToken = env.AGENTCHAT_TOKEN ?? (typeof profile.token === "string" ? profile.token : undefined);
-  const agentId = typeof rawAgentId === "string" ? rawAgentId.trim() : "";
-  const token = typeof rawToken === "string" ? rawToken.trim() : "";
-  if (!isSafeAgentId2(agentId) || !token || /[\x00-\x1f\x7f]/.test(agentId) || /[\x00-\x1f\x7f]/.test(token)) {
+  const agentId = typeof rawAgentId === "string" && !DSH_CLI_PRETRIM_CTRL_RE.test(rawAgentId) ? rawAgentId.trim() : "";
+  const token = typeof rawToken === "string" && !DSH_CLI_PRETRIM_CTRL_RE.test(rawToken) ? rawToken.trim() : "";
+  if (!isSafeAgentId2(agentId) || !token || DSH_CLI_CTRL_RE.test(agentId) || DSH_CLI_CTRL_RE.test(token)) {
     throw new Error("Missing AgentsChat identity for DSH: set AGENTCHAT_AGENT_ID and AGENTCHAT_TOKEN, " + `or create ${profilePath} via 'agentschat-mcp --dsh --register-only --name <name>'.`);
   }
   const wsUrl = validateHttpOrWsUrl(env.AGENTCHAT_WS_URL ?? (typeof profile.wsUrl === "string" ? profile.wsUrl : DEFAULT_WS_URL), ["ws:", "wss:"], "AgentChat WebSocket");
   const restUrl = validateHttpOrWsUrl(env.AGENTCHAT_REST_URL ?? (typeof profile.restUrl === "string" ? profile.restUrl : DEFAULT_REST_URL), ["http:", "https:"], "AgentChat REST");
   const rawDisplay = env.AGENTCHAT_DISPLAY_NAME ?? (typeof profile.displayName === "string" ? profile.displayName : undefined);
   const rawChan = env.AGENTCHAT_CHANNEL_ID ?? (typeof profile.defaultChannelId === "string" ? profile.defaultChannelId : undefined);
+  const cleanDisplay = typeof rawDisplay === "string" ? rawDisplay.replace(DSH_CLI_CTRL_RE, "").trim() : "";
   return {
     agentId,
     token,
     wsUrl,
     restUrl,
-    displayName: rawDisplay?.trim() || undefined,
+    displayName: cleanDisplay || undefined,
     defaultChannelId: rawChan?.trim() || undefined
   };
 }
@@ -1915,8 +1966,11 @@ function safeDshConfig(config) {
   };
 }
 async function registerOnly(name, restUrl, profilePath = DSH_PROFILE_PATH) {
-  const cleanName = typeof name === "string" ? name.trim() : "";
-  if (!cleanName || cleanName.length > 64 || /[\x00-\x1f\x7f]/.test(cleanName)) {
+  if (typeof name !== "string" || DSH_CLI_PRETRIM_CTRL_RE.test(name)) {
+    throw new Error("Invalid --name value");
+  }
+  const cleanName = name.trim();
+  if (!cleanName || cleanName.length > 64 || DSH_CLI_CTRL_RE.test(cleanName)) {
     throw new Error("Invalid --name value");
   }
   checkParentDirectory(profilePath);
@@ -1939,9 +1993,9 @@ async function registerOnly(name, restUrl, profilePath = DSH_PROFILE_PATH) {
   }
   const rawAgentId = data.agentId ?? data.agent_id ?? data.id;
   const rawToken = data.agentKey ?? data.token ?? data.key;
-  const agentId = typeof rawAgentId === "string" ? rawAgentId.trim() : "";
-  const token = typeof rawToken === "string" ? rawToken.trim() : "";
-  if (!isSafeAgentId2(rawAgentId) || !token || /[\x00-\x1f\x7f]/.test(agentId) || /[\x00-\x1f\x7f]/.test(token)) {
+  const agentId = typeof rawAgentId === "string" && !DSH_CLI_CTRL_RE.test(rawAgentId) ? rawAgentId.trim() : "";
+  const token = typeof rawToken === "string" && !DSH_CLI_CTRL_RE.test(rawToken) ? rawToken.trim() : "";
+  if (!isSafeAgentId2(rawAgentId) || !token || DSH_CLI_CTRL_RE.test(agentId) || DSH_CLI_CTRL_RE.test(token)) {
     throw new Error("Registration response did not include a valid agent id/token");
   }
   try {
@@ -2007,13 +2061,15 @@ async function registerOnly(name, restUrl, profilePath = DSH_PROFILE_PATH) {
   console.log(`Registered DSH agent '${cleanName}' as ${agentId}. Identity saved to ${profilePath} (token not printed).`);
 }
 async function runDshHeadlessResponder(prompt, opts = {}) {
-  const dshBin = (opts.dshBin ?? process.env.DSH_BIN ?? "dsh").trim();
-  const dshProfile = (opts.dshProfile ?? process.env.DSH_PROFILE ?? "headless").trim();
-  if (!dshBin || /[\x00-\x1f\x7f]/.test(dshBin)) {
+  const rawBin = opts.dshBin ?? process.env.DSH_BIN ?? "dsh";
+  const rawProfile = opts.dshProfile ?? process.env.DSH_PROFILE ?? "headless";
+  const dshBin = typeof rawBin === "string" && !DSH_CLI_PRETRIM_CTRL_RE.test(rawBin) ? rawBin.trim() : "";
+  const dshProfile = typeof rawProfile === "string" && !DSH_CLI_PRETRIM_CTRL_RE.test(rawProfile) ? rawProfile.trim() : "";
+  if (!dshBin || DSH_CLI_CTRL_RE.test(dshBin)) {
     console.error("[dsh] invalid dshBin");
     return null;
   }
-  if (!dshProfile || dshProfile.startsWith("-") || /[\x00-\x1f\x7f]/.test(dshProfile)) {
+  if (!dshProfile || dshProfile.startsWith("-") || DSH_CLI_CTRL_RE.test(dshProfile)) {
     console.error("[dsh] invalid dshProfile");
     return null;
   }
@@ -2197,7 +2253,7 @@ DeepSeek Harness (dsh) integration for AgentsChat:
         const cfgDir = agentschatConfigDir();
         const binds = loadSessionBinds(cfgDir);
         for (const [sid, profName] of Object.entries(binds)) {
-          if (!sid.startsWith("session-") || sid.length > 128 || sid.includes("..") || /[\s\x00-\x1f\x7f/\\]/.test(sid) || FORBIDDEN_KEYS2.has(sid.toLowerCase()) || !profName || typeof profName !== "string") {
+          if (!sid.startsWith("session-") || sid.length > 128 || sid.includes("..") || /[\s\x00-\x1f\x7f-\x9f\u2028\u2029/\\]/.test(sid) || FORBIDDEN_KEYS2.has(sid.toLowerCase()) || !profName || typeof profName !== "string") {
             continue;
           }
           const base = profName.replace(/\.json$/i, "").replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -2233,7 +2289,7 @@ DeepSeek Harness (dsh) integration for AgentsChat:
                 botWsUrl = defaultWsUrl;
               }
             }
-            if (!isSafeAgentId2(rawAgentId) || !botToken || botToken === "dev-token" || /[\x00-\x1f\x7f]/.test(botAgentId) || /[\x00-\x1f\x7f]/.test(botToken) || connectedAgentIds.has(botAgentId)) {
+            if (!isSafeAgentId2(rawAgentId) || !botToken || botToken === "dev-token" || DSH_CLI_CTRL_RE.test(rawAgentId) || DSH_CLI_CTRL_RE.test(rawToken) || connectedAgentIds.has(botAgentId)) {
               continue;
             }
             extraClient = new MuseAgentChatClient({
@@ -2267,25 +2323,37 @@ DeepSeek Harness (dsh) integration for AgentsChat:
     const bindTimer = setInterval(() => void syncBoundDshClients(), 3000);
     bindTimer.unref?.();
     console.log(`DSH wake daemon listening on ${wakeChannels.join(", ") || "(no channels — pass --channel <id>)"}, queue=${queueFile}.`);
-    await new Promise((resolve5) => {
-      const shutdown = () => {
-        for (const t of activeTyping)
-          t.stopAll();
-        for (const c of activeClients) {
-          try {
-            c.disconnect();
-          } catch {}
+    let shutdownWakeRef;
+    try {
+      await new Promise((resolve5) => {
+        const shutdown = () => {
+          for (const t of activeTyping)
+            t.stopAll();
+          for (const c of activeClients) {
+            try {
+              c.disconnect();
+            } catch {}
+          }
+          resolve5();
+        };
+        shutdownWakeRef = shutdown;
+        process.once("SIGINT", shutdown);
+        process.once("SIGTERM", shutdown);
+        if (process.platform !== "win32")
+          process.once("SIGHUP", shutdown);
+        if (primaryClient) {
+          primaryClient.waitUntilClosed().then(resolve5);
         }
-        resolve5();
-      };
-      process.once("SIGINT", shutdown);
-      process.once("SIGTERM", shutdown);
-      process.once("SIGHUP", shutdown);
-      if (primaryClient) {
-        primaryClient.waitUntilClosed().then(resolve5);
+      });
+    } finally {
+      clearInterval(bindTimer);
+      if (shutdownWakeRef) {
+        process.removeListener("SIGINT", shutdownWakeRef);
+        process.removeListener("SIGTERM", shutdownWakeRef);
+        if (process.platform !== "win32")
+          process.removeListener("SIGHUP", shutdownWakeRef);
       }
-    });
-    clearInterval(bindTimer);
+    }
     return;
   }
   const config = loadDshConfig();
@@ -2353,7 +2421,8 @@ ${ctx.context}`,
     };
     process.once("SIGINT", shutdownListen);
     process.once("SIGTERM", shutdownListen);
-    process.once("SIGHUP", shutdownListen);
+    if (process.platform !== "win32")
+      process.once("SIGHUP", shutdownListen);
     try {
       await bridge.start();
       console.log(`DSH bridge listening on ${channels.join(", ") || "(no channels — pass --channel <id>)"} (profile=${dshProfile}).`);
@@ -2361,7 +2430,8 @@ ${ctx.context}`,
     } finally {
       process.removeListener("SIGINT", shutdownListen);
       process.removeListener("SIGTERM", shutdownListen);
-      process.removeListener("SIGHUP", shutdownListen);
+      if (process.platform !== "win32")
+        process.removeListener("SIGHUP", shutdownListen);
     }
     return;
   }
@@ -2380,5 +2450,6 @@ export {
   registerOnly,
   main,
   loadDshConfig,
+  RESERVED_DSH_PROFILE_BASENAMES,
   DSH_PROFILE_PATH
 };

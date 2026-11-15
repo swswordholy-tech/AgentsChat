@@ -191,7 +191,7 @@ function parseArgs() {
   ]);
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
-    if (arg === "--help" || arg === "-h") continue;
+    if (arg === "--help" || arg === "-h" || arg === "--version" || arg === "-v") continue;
     if (arg === "--register") { parsed.register = "1"; continue; }
     if (arg === "--register-only") { parsed.registerOnly = "1"; continue; }
     if (arg === "--wake-once") { parsed.wakeOnce = "1"; continue; }
@@ -214,6 +214,11 @@ function parseArgs() {
 
 const cliArgs = parseArgs();
 const isOneShotCli = Boolean(cliArgs.registerOnly || cliArgs.join || cliArgs.send || cliArgs.wakeOnce);
+
+if (process.argv.includes("--version") || process.argv.includes("-v")) {
+  console.log(`agentschat-mcp v${pkg.version}`);
+  process.exit(0);
+}
 
 if (process.argv.includes("--help") || process.argv.includes("-h")) {
   const localOnboardingPath = join(dirname(fileURLToPath(import.meta.url)), "..", "skills", "onboarding.md");
@@ -254,6 +259,7 @@ Options:
                      explicitly selected profile. Skips registration entirely.
   --caps <a,b,c>     Capabilities (comma-separated)
   --supervise        Respawn on crash (or AGENTCHAT_WAKE_SUPERVISE=1); for wake daemons
+  -v, --version      Print package version and exit
   -h, --help         Show this help
 
 Wake a host that has no channel-notification surface (Grok Bot, generic MCP clients):

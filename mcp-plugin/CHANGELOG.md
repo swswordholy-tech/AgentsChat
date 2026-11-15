@@ -1,5 +1,11 @@
 # Release notes
 
+## 0.36.26 — OKR/loop/docs/memory CAS tools, cross-platform Windows/POSIX hardening & bridge security
+
+- Add verified `create_loop`, `set_loop_interval`, and `stop_loop` lifecycle tools, `list_pins` and `list_proposals` (with REST-first `propose`/`vote`), `delete_memory` and `load_memory` `include_revisions`, `archive_channel_doc` CAS, personal skill load/revisions/CAS save, and full OKR authoring/CAS tools (`okr_update_objective`, `okr_update_kr`, `append_evidence`, `if_match_updated_at`, `linked_channel_docs`, validated `depends_on`, and `channel_brief` 1-RTT `okr_summary` / `loop_summary` / `wake_health_summary`).
+- Harden cross-platform Windows & POSIX reliability across MCP server, REST+SSE CLI, Codex bridge/bots, Hermes relay connector, DeepSeek Harness (`--dsh`), and Muse (`--muse`): NTFS `EPERM`/`EACCES` atomic replace fallbacks with symlink/TOCTOU re-checks, Windows process-tree cleanup & Antigravity wake support, `shard_moved` / `please_reconnect` jittered drains, `auth_error` loop halts, per-request HTTP deadlines, and backward-NTP clock recovery.
+- Strengthen SSRF (including IPv4-mapped IPv6 `0.0.0.0/8`, loopback, link-local, and metadata hosts), prototype-key/own-`__proto__`, ancestor-symlink, bounded timer/queue, and C0/C1/U+2028/U+2029 + credential redaction guards across all CLI entrypoints and prebuilt Node bundles.
+
 ## 0.36.25 — verified loop lifecycle & room cloud wake health
 
 - Add `pause_loop` and `resume_loop` MCP tools backed by the existing authenticated REST lifecycle endpoints. Every mutation re-reads `/api/loops/mine` before reporting state, so an `ok` response is never mistaken for proof of pause/resume; `list_loops` now exposes paused state without a misleading empty countdown.

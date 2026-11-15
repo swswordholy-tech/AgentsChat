@@ -19,12 +19,18 @@ export interface DshPatchOptions {
 
 const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 const DARWIN_ROOT_LINKS = new Set(["/var", "/tmp", "/etc"]);
+const DSH_PATCH_CTRL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+const DSH_PATCH_PRETRIM_CTRL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u2028\u2029]/;
 
 function isAllowedDarwinSystemLink(dirPath: string): boolean {
   if (process.platform !== "darwin" || !DARWIN_ROOT_LINKS.has(dirPath)) return false;
   try {
+    const priv = lstatSync("/private");
+    if (priv.isSymbolicLink() || !priv.isDirectory()) return false;
     const real = realpathSync(dirPath);
-    return real === `/private${dirPath}` && statSync(real).isDirectory();
+    if (real !== `/private${dirPath}`) return false;
+    const target = lstatSync(real);
+    return !target.isSymbolicLink() && target.isDirectory();
   } catch {
     return false;
   }
@@ -64,6 +70,9 @@ function checkRawDotDotAncestors(rawPath: string): void {
 }
 
 export function checkParentDirectory(path: string): void {
+  if (typeof path !== "string" || !path.trim() || DSH_PATCH_CTRL_RE.test(path)) {
+    throw new Error("Invalid DSH target path");
+  }
   checkRawDotDotAncestors(path);
   let parent = dirname(resolve(path));
   for (;;) {
@@ -87,6 +96,7 @@ function isBlockedNormalizedHost(host: string): boolean {
   if (!host) return true;
   if (
     host === "0.0.0.0" ||
+    /^0\./.test(host) ||
     host === "::" ||
     host === "0:0:0:0:0:0:0:0" ||
     host === "100.100.100.200" ||
@@ -103,10 +113,10 @@ function isBlockedNormalizedHost(host: string): boolean {
     return true;
   }
   if (
-    /^::ffff:(?:0:)?(?:a9fe:[0-9a-f]{1,4}|169\.254\.\d{1,3}\.\d{1,3}|6464:64c8|100\.100\.100\.200|0:0|0\.0\.0\.0)$/.test(
+    /^::ffff:(?:0:)?(?:a9fe:[0-9a-f]{1,4}|169\.254\.\d{1,3}\.\d{1,3}|6464:64c8|100\.100\.100\.200|[0-9a-f]{1,2}:[0-9a-f]{1,4}|0\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.test(
       host,
     ) ||
-    /^(?:0:){5}ffff:(?:a9fe:[0-9a-f]{1,4}|169\.254\.\d{1,3}\.\d{1,3}|6464:64c8|100\.100\.100\.200|0:0|0\.0\.0\.0)$/.test(
+    /^(?:0:){5}ffff:(?:a9fe:[0-9a-f]{1,4}|169\.254\.\d{1,3}\.\d{1,3}|6464:64c8|100\.100\.100\.200|[0-9a-f]{1,2}:[0-9a-f]{1,4}|0\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.test(
       host,
     )
   ) {
@@ -132,10 +142,13 @@ export function isBlockedDshHost(hostname: string): boolean {
 
 export function resolveDshPatchPath(opts: DshPatchOptions = {}): string {
   const home = opts.dshHome ?? process.env.DSH_HOME ?? join(homedir(), ".dsh");
-  if (!home || home.length > 4096 || home.startsWith("-") || !isAbsolute(home) || /[\x00-\x1f\x7f]/.test(home)) {
+  if (!home || home.length > 4096 || home.startsWith("-") || !isAbsolute(home) || DSH_PATCH_CTRL_RE.test(home)) {
     throw new Error("Invalid DSH home path");
   }
   if (opts.dshProfile !== undefined) {
+    if (typeof opts.dshProfile !== "string" || DSH_PATCH_PRETRIM_CTRL_RE.test(opts.dshProfile)) {
+      throw new Error("Invalid DSH profile name");
+    }
     const profile = opts.dshProfile.trim();
     if (
       !profile ||
@@ -153,12 +166,19 @@ export function resolveDshPatchPath(opts: DshPatchOptions = {}): string {
 }
 
 export function buildMcpAgentsChatArgs(opts: DshPatchOptions = {}): string[] {
-  const pkg = (opts.packageSpec ?? "agentschat-mcp@latest").trim();
-  if (!pkg || pkg.startsWith("-") || /[\x00-\x20\x7f]/.test(pkg)) {
+  const rawPkg = opts.packageSpec ?? "agentschat-mcp@latest";
+  if (typeof rawPkg !== "string" || DSH_PATCH_PRETRIM_CTRL_RE.test(rawPkg)) {
+    throw new Error("Invalid packageSpec");
+  }
+  const pkg = rawPkg.trim();
+  if (!pkg || pkg.startsWith("-") || /[\x00-\x20\x7f-\x9f\u2028\u2029]/.test(pkg)) {
     throw new Error("Invalid packageSpec");
   }
   const args = ["-y", pkg];
   if (opts.agentsChatProfile !== undefined && opts.agentsChatProfile !== "") {
+    if (typeof opts.agentsChatProfile !== "string" || DSH_PATCH_PRETRIM_CTRL_RE.test(opts.agentsChatProfile)) {
+      throw new Error("Invalid AgentsChat profile name");
+    }
     const profile = opts.agentsChatProfile.trim();
     if (
       !profile ||
@@ -168,15 +188,18 @@ export function buildMcpAgentsChatArgs(opts: DshPatchOptions = {}): string[] {
       profile.includes("/") ||
       profile.includes("\\") ||
       FORBIDDEN_KEYS.has(profile.toLowerCase()) ||
-      /[\x00-\x1f\x7f]/.test(profile)
+      DSH_PATCH_CTRL_RE.test(profile)
     ) {
       throw new Error("Invalid AgentsChat profile name");
     }
     args.push("--profile", profile);
   }
   if (opts.apiUrl !== undefined && opts.apiUrl !== "") {
+    if (typeof opts.apiUrl !== "string" || DSH_PATCH_PRETRIM_CTRL_RE.test(opts.apiUrl)) {
+      throw new Error("Invalid AgentsChat API URL");
+    }
     const rawUrl = opts.apiUrl.trim();
-    if (!rawUrl || rawUrl.startsWith("-") || /[\x00-\x20\x7f]/.test(rawUrl)) {
+    if (!rawUrl || rawUrl.startsWith("-") || /[\x00-\x20\x7f-\x9f\u2028\u2029]/.test(rawUrl)) {
       throw new Error("Invalid AgentsChat API URL");
     }
     let parsed: URL;

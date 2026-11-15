@@ -16,7 +16,7 @@
  * shows the nonblocking Terms notice at https://agents-chat.com/terms.
  */
 import { randomBytes } from "node:crypto";
-import { writeFileSync, mkdirSync, renameSync, unlinkSync, lstatSync } from "node:fs";
+import { chmodSync, copyFileSync, writeFileSync, mkdirSync, renameSync, unlinkSync, lstatSync } from "node:fs";
 import { dirname } from "node:path";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -32,6 +32,32 @@ function safeLogText(text: string): string {
 }
 
 const MAX_REGISTRATION_BYTES = 1024 * 1024;
+const MUSE_CLI_CTRL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+const MUSE_CLI_PRETRIM_CTRL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u2028\u2029]/;
+const FORBIDDEN_CHANNEL_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+export interface MuseProfileFsOps {
+  renameSync?: typeof renameSync;
+  copyFileSync?: typeof copyFileSync;
+}
+
+export function validateMuseChannelId(value: string | undefined): string {
+  if (
+    typeof value !== "string" ||
+    !value ||
+    value.startsWith("--") ||
+    value.length > 128 ||
+    value === "." ||
+    value === ".." ||
+    value.includes("..") ||
+    /[\s\x00-\x1f\x7f-\x9f\u2028\u2029/\\]/.test(value) ||
+    FORBIDDEN_CHANNEL_KEYS.has(value.toLowerCase()) ||
+    Object.getOwnPropertyNames(Object.prototype).some((k) => k.toLowerCase() === value.toLowerCase())
+  ) {
+    throw new Error("Invalid channel id");
+  }
+  return value;
+}
 
 async function readRegistrationBody(res: Response): Promise<string> {
   if (!res.body) throw new Error("Registration response body is missing");
@@ -72,9 +98,13 @@ export async function registerOnly(
   restUrl: string,
   profilePath: string = PROFILE_PATH,
   fetchImpl: typeof fetch = fetch,
+  fsOps: MuseProfileFsOps = {},
 ): Promise<void> {
+  if (typeof name !== "string" || MUSE_CLI_PRETRIM_CTRL_RE.test(name)) {
+    throw new Error("Invalid --name value");
+  }
   const cleanName = name.trim();
-  if (!cleanName || cleanName.length > 64 || /[\x00-\x1f\x7f]/.test(cleanName)) {
+  if (!cleanName || cleanName.length > 64 || MUSE_CLI_CTRL_RE.test(cleanName)) {
     throw new Error("Invalid --name value");
   }
   const endpoint = validateEndpointUrl(restUrl, "rest");
@@ -104,22 +134,36 @@ export async function registerOnly(
     throw new Error(`Registration failed: ${res.status} ${errBody}`);
   }
   const data = JSON.parse(responseBody) as Record<string, unknown>;
-  if (!data || typeof data !== "object" || Array.isArray(data) || Object.hasOwn(data, "__proto__")) {
+  if (
+    !data ||
+    typeof data !== "object" ||
+    Array.isArray(data) ||
+    Object.getPrototypeOf(data) !== Object.prototype ||
+    Object.hasOwn(data, "__proto__")
+  ) {
     throw new Error("Invalid registration response");
   }
-  const agentId = String(data.agentId ?? data.agent_id ?? data.id ?? "").trim();
-  const token = String(data.agentKey ?? data.token ?? data.key ?? "").trim();
-  if (!agentId || !token) throw new Error("Registration response did not include an agent id/token");
-  if (
-    !isSafeAgentId(agentId) ||
-    /[\x00-\x1f\x7f]/.test(token)
-  ) {
+  const rawAgentId = data.agentId ?? data.agent_id ?? data.id;
+  const rawToken = data.agentKey ?? data.token ?? data.key;
+  if (typeof rawAgentId !== "string" || typeof rawToken !== "string" || !rawAgentId || !rawToken) {
+    throw new Error("Registration response did not include an agent id/token");
+  }
+  if (MUSE_CLI_PRETRIM_CTRL_RE.test(rawAgentId) || MUSE_CLI_PRETRIM_CTRL_RE.test(rawToken)) {
     throw new Error("Registration response contained unsafe agent id or token");
   }
+  const agentId = rawAgentId.trim();
+  const token = rawToken.trim();
+  if (!agentId || !token) throw new Error("Registration response did not include an agent id/token");
+  if (!isSafeAgentId(agentId) || MUSE_CLI_CTRL_RE.test(token)) {
+    throw new Error("Registration response contained unsafe agent id or token");
+  }
+  const doRename = fsOps.renameSync ?? renameSync;
+  const doCopy = fsOps.copyFileSync ?? copyFileSync;
   const tmp = `${profilePath}.${process.pid}.${Date.now()}.${randomBytes(6).toString("hex")}.tmp`;
   try {
     assertSafeParentDirectories(profilePath);
     writeFileSync(tmp, JSON.stringify({ agentId, token }, null, 2), { mode: 0o600, flag: "wx" });
+    assertSafeParentDirectories(profilePath);
     try {
       const st = lstatSync(profilePath);
       if (st.isSymbolicLink() || !st.isFile()) {
@@ -128,7 +172,26 @@ export async function registerOnly(
     } catch (err) {
       if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err;
     }
-    renameSync(tmp, profilePath);
+    try {
+      doRename(tmp, profilePath);
+    } catch (renameErr) {
+      const code = (renameErr as NodeJS.ErrnoException)?.code;
+      if (code !== "EPERM" && code !== "EACCES") throw renameErr;
+      assertSafeParentDirectories(profilePath);
+      try {
+        const st = lstatSync(profilePath);
+        if (st.isSymbolicLink() || !st.isFile()) {
+          throw new Error("Refusing to overwrite symlink or non-regular Muse profile");
+        }
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err;
+      }
+      doCopy(tmp, profilePath);
+      try { unlinkSync(tmp); } catch {}
+    }
+    if (process.platform !== "win32") {
+      try { chmodSync(profilePath, 0o600); } catch {}
+    }
   } catch (err) {
     try { unlinkSync(tmp); } catch {}
     throw err;
@@ -148,6 +211,11 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     await registerOnly(name, restUrl);
     return;
   }
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === "--channel" || argv[i] === "--send") {
+      validateMuseChannelId(argv[i + 1]);
+    }
+  }
   const config = loadConfig();
   console.log("Muse AgentsChat:", safeLogText(JSON.stringify(safeConfig(config))));
   const client = new MuseAgentChatClient({
@@ -163,9 +231,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     // Muse turn to pick up. Replying is the host turn's job.
     const wakeChannels: string[] = [];
     for (let i = 0; i < argv.length; i++) {
-      if (argv[i] === "--channel" && argv[i + 1] && !argv[i + 1].startsWith("--")) wakeChannels.push(argv[i + 1]);
+      if (argv[i] === "--channel" && argv[i + 1] && !argv[i + 1].startsWith("--")) wakeChannels.push(validateMuseChannelId(argv[i + 1]));
     }
-    if (config.defaultChannelId) wakeChannels.push(config.defaultChannelId);
+    if (config.defaultChannelId) wakeChannels.push(validateMuseChannelId(config.defaultChannelId));
     const uniqueWakeChannels = [...new Set(wakeChannels)];
     const queueFile =
       process.env.MUSE_WAKE_QUEUE ?? join(homedir(), ".agentschat", "muse-wake-queue.jsonl");
@@ -181,7 +249,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     };
     process.once("SIGINT", shutdownWake);
     process.once("SIGTERM", shutdownWake);
-    process.once("SIGHUP", shutdownWake);
+    if (process.platform !== "win32") process.once("SIGHUP", shutdownWake);
     client.onMessage((m) => {
       if (m.sender_id === config.agentId) {
         typing.stop(m.channel_id);
@@ -206,12 +274,12 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     } finally {
       process.removeListener("SIGINT", shutdownWake);
       process.removeListener("SIGTERM", shutdownWake);
-      process.removeListener("SIGHUP", shutdownWake);
+      if (process.platform !== "win32") process.removeListener("SIGHUP", shutdownWake);
     }
     return;
   }
   if (has("--send", argv)) {
-    const channelId = arg("--send", argv);
+    const channelId = validateMuseChannelId(arg("--send", argv));
     const text = arg("--text", argv);
     if (!channelId || !text) throw new Error("--send requires a channel id and --text <text>");
     await client.connect();
@@ -225,9 +293,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   // Default: --listen
   const channels: string[] = [];
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === "--channel" && argv[i + 1] && !argv[i + 1].startsWith("--")) channels.push(argv[i + 1]);
+    if (argv[i] === "--channel" && argv[i + 1] && !argv[i + 1].startsWith("--")) channels.push(validateMuseChannelId(argv[i + 1]));
   }
-  if (config.defaultChannelId) channels.push(config.defaultChannelId);
+  if (config.defaultChannelId) channels.push(validateMuseChannelId(config.defaultChannelId));
   const uniqueChannels = [...new Set(channels)];
   const autoReply = arg("--auto-reply", argv);
   const bridge = new MuseBridge(client, {
@@ -244,7 +312,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   const shutdownListen = () => bridge.stop();
   process.once("SIGINT", shutdownListen);
   process.once("SIGTERM", shutdownListen);
-  process.once("SIGHUP", shutdownListen);
+  if (process.platform !== "win32") process.once("SIGHUP", shutdownListen);
   // Re-join after reconnects.
   client.onReconnect = () => bridge.rejoin();
   try {
@@ -254,7 +322,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   } finally {
     process.removeListener("SIGINT", shutdownListen);
     process.removeListener("SIGTERM", shutdownListen);
-    process.removeListener("SIGHUP", shutdownListen);
+    if (process.platform !== "win32") process.removeListener("SIGHUP", shutdownListen);
   }
 }
 

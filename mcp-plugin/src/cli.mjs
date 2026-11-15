@@ -40,7 +40,10 @@ const oneShotRequested =
   args.includes("--version") ||
   args.includes("-v") ||
   args.includes("--check") ||
-  args.includes("--status");
+  args.includes("--status") ||
+  args.includes("--join") ||
+  args.includes("--send") ||
+  args.some((a) => a.startsWith("--join=") || a.startsWith("--send="));
 const superviseRequested =
   args.includes("--supervise") || process.env.AGENTCHAT_WAKE_SUPERVISE === "1";
 
@@ -231,7 +234,8 @@ async function runSupervised(childArgs) {
       });
       child.on("error", () => resolve(1));
     });
-    const ranMs = Date.now() - startedAt;
+    const now = Date.now();
+    const ranMs = now >= startedAt ? now - startedAt : 0;
     if (killTimer) {
       clearTimeout(killTimer);
       killTimer = null;
@@ -291,7 +295,7 @@ if (typeof globalThis.Bun !== "undefined") {
     const selfPath = fileURLToPath(import.meta.url);
     const childEnv = { ...process.env, NODE_USE_ENV_PROXY: "1" };
     for (const key of ["NO_PROXY", "no_proxy"]) {
-      const cur = (childEnv[key] || "").replace(/[\x00-\x1f\x7f]+/g, "").trim();
+      const cur = (childEnv[key] || "").replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g, "").trim();
       const items = cur ? cur.split(",").map((s) => s.trim()).filter(Boolean) : [];
       for (const host of ["localhost", "127.0.0.1", "::1", "[::1]"]) {
         if (!items.includes(host)) items.push(host);
@@ -306,9 +310,11 @@ if (typeof globalThis.Bun !== "undefined") {
       process.platform === "win32" ? ["SIGINT", "SIGTERM"] : ["SIGINT", "SIGTERM", "SIGHUP"];
     for (const sig of proxySignals) {
       process.on(sig, () => {
-        try {
-          child.kill(sig);
-        } catch {}
+        if (child.exitCode === null && child.signalCode === null) {
+          try {
+            child.kill(sig);
+          } catch {}
+        }
       });
     }
     const exitCode = await new Promise((resolve) => {

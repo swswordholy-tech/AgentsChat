@@ -29,6 +29,9 @@ export interface MuseBridgeOptions {
  * separation is deliberate — this plugin must not invent a Muse model API;
  * the embedding Muse host passes in whatever responder it already has.
  */
+const FORBIDDEN_BRIDGE_CHANNELS = new Set(["__proto__", "constructor", "prototype"]);
+const BRIDGE_CHANNEL_CTRL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+
 export class MuseBridge {
   private readonly client: MuseAgentChatClient;
   private readonly activeReplies = new Map<string, number>();
@@ -64,7 +67,17 @@ export class MuseBridge {
 
   /** Test seam: feed an inbound message without a socket. */
   async handleMessage(message: ChatMessage): Promise<void> {
-    if (!message.channel_id || message.content === "__typing__") return;
+    if (
+      !message ||
+      typeof message.channel_id !== "string" ||
+      !message.channel_id ||
+      message.channel_id.length > 256 ||
+      FORBIDDEN_BRIDGE_CHANNELS.has(message.channel_id.toLowerCase()) ||
+      Object.getOwnPropertyNames(Object.prototype).some((k) => k.toLowerCase() === message.channel_id.toLowerCase()) ||
+      message.content === "__typing__"
+    ) {
+      return;
+    }
     if (!this.history.has(message.channel_id) && this.history.size >= 200) {
       const oldest = this.history.keys().next().value;
       if (oldest !== undefined) this.history.delete(oldest);
@@ -91,8 +104,8 @@ export class MuseBridge {
         context: buildContext(this.history.get(message.channel_id) ?? [], this.opts.agentId),
       };
       const reply = await this.opts.responder(ctx);
-      if (reply) {
-        if (message.thread_id) {
+      if (reply && !BRIDGE_CHANNEL_CTRL_RE.test(message.channel_id)) {
+        if (message.thread_id && !BRIDGE_CHANNEL_CTRL_RE.test(message.thread_id)) {
           this.client.sendMessage(message.channel_id, reply, "text", message.thread_id);
         } else {
           this.client.sendMessage(message.channel_id, reply);

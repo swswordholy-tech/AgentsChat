@@ -50,16 +50,27 @@ function has(name: string, argv: string[]): boolean {
 }
 
 const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+const DSH_CLI_CTRL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+const DSH_CLI_PRETRIM_CTRL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u2028\u2029]/;
 
-const RESERVED_DSH_PROFILE_BASENAMES = new Set([
+export const RESERVED_DSH_PROFILE_BASENAMES = new Set([
   "profile",
   "session-binds",
   "session-binds_meta",
+  "session-binds.meta",
+  "session-binds-meta",
   "agy-binds",
   "agy-binds_meta",
+  "agy-binds.meta",
+  "agy-binds-meta",
   "grok-binds",
   "grok-binds_meta",
+  "grok-binds.meta",
+  "grok-binds-meta",
   "agy-session-binds",
+  "agy-session-binds_meta",
+  "agy-session-binds.meta",
+  "agy-session-binds-meta",
   "identity-guard",
   "cursor",
   "read-cursors",
@@ -103,7 +114,7 @@ function isSafeAgentId(value: unknown): boolean {
     value !== "." &&
     value !== ".." &&
     !FORBIDDEN_KEYS.has(value.toLowerCase()) &&
-    !/[\s\x00-\x1f\x7f/\\]/.test(value)
+    !/[\s\x00-\x1f\x7f-\x9f\u2028\u2029/\\]/.test(value)
   );
 }
 
@@ -114,11 +125,11 @@ function validateChannelId(value: string | undefined): string {
 }
 
 function logText(value: string): string {
-  return redact(value.replace(/[\x00-\x1f\x7f]/g, ""));
+  return redact(value.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ""));
 }
 
 function promptHeader(value: string): string {
-  return value.replace(/[\r\n\x00-\x1f\x7f]/g, "");
+  return value.replace(/[\r\n\x00-\x1f\x7f-\x9f\u2028\u2029]/g, "");
 }
 
 function isLoopbackHost(hostname: string): boolean {
@@ -127,8 +138,11 @@ function isLoopbackHost(hostname: string): boolean {
 }
 
 function validateHttpOrWsUrl(raw: string, allowedProtocols: string[], label: string): string {
+  if (typeof raw !== "string" || DSH_CLI_PRETRIM_CTRL_RE.test(raw)) {
+    throw new Error(`Invalid ${label} URL`);
+  }
   const trimmed = raw.trim();
-  if (!trimmed || raw !== trimmed || /[\x00-\x20\x7f"<>\\]/.test(raw)) {
+  if (!trimmed || raw !== trimmed || /[\x00-\x20\x7f-\x9f\u2028\u2029"<>\\]/.test(raw)) {
     throw new Error(`Invalid ${label} URL`);
   }
   let parsed: URL;
@@ -175,9 +189,9 @@ export function loadDshConfig(
   }
   const rawAgentId = env.AGENTCHAT_AGENT_ID ?? (typeof profile.agentId === "string" ? profile.agentId : undefined);
   const rawToken = env.AGENTCHAT_TOKEN ?? (typeof profile.token === "string" ? profile.token : undefined);
-  const agentId = typeof rawAgentId === "string" ? rawAgentId.trim() : "";
-  const token = typeof rawToken === "string" ? rawToken.trim() : "";
-  if (!isSafeAgentId(agentId) || !token || /[\x00-\x1f\x7f]/.test(agentId) || /[\x00-\x1f\x7f]/.test(token)) {
+  const agentId = typeof rawAgentId === "string" && !DSH_CLI_PRETRIM_CTRL_RE.test(rawAgentId) ? rawAgentId.trim() : "";
+  const token = typeof rawToken === "string" && !DSH_CLI_PRETRIM_CTRL_RE.test(rawToken) ? rawToken.trim() : "";
+  if (!isSafeAgentId(agentId) || !token || DSH_CLI_CTRL_RE.test(agentId) || DSH_CLI_CTRL_RE.test(token)) {
     throw new Error(
       "Missing AgentsChat identity for DSH: set AGENTCHAT_AGENT_ID and AGENTCHAT_TOKEN, " +
         `or create ${profilePath} via 'agentschat-mcp --dsh --register-only --name <name>'.`,
@@ -195,12 +209,13 @@ export function loadDshConfig(
   );
   const rawDisplay = env.AGENTCHAT_DISPLAY_NAME ?? (typeof profile.displayName === "string" ? profile.displayName : undefined);
   const rawChan = env.AGENTCHAT_CHANNEL_ID ?? (typeof profile.defaultChannelId === "string" ? profile.defaultChannelId : undefined);
+  const cleanDisplay = typeof rawDisplay === "string" ? rawDisplay.replace(DSH_CLI_CTRL_RE, "").trim() : "";
   return {
     agentId,
     token,
     wsUrl,
     restUrl,
-    displayName: rawDisplay?.trim() || undefined,
+    displayName: cleanDisplay || undefined,
     defaultChannelId: rawChan?.trim() || undefined,
   };
 }
@@ -217,8 +232,11 @@ export function safeDshConfig(config: DshBridgeConfig): Record<string, unknown> 
 }
 
 export async function registerOnly(name: string, restUrl: string, profilePath = DSH_PROFILE_PATH): Promise<void> {
-  const cleanName = typeof name === "string" ? name.trim() : "";
-  if (!cleanName || cleanName.length > 64 || /[\x00-\x1f\x7f]/.test(cleanName)) {
+  if (typeof name !== "string" || DSH_CLI_PRETRIM_CTRL_RE.test(name)) {
+    throw new Error("Invalid --name value");
+  }
+  const cleanName = name.trim();
+  if (!cleanName || cleanName.length > 64 || DSH_CLI_CTRL_RE.test(cleanName)) {
     throw new Error("Invalid --name value");
   }
   checkParentDirectory(profilePath);
@@ -242,9 +260,9 @@ export async function registerOnly(name: string, restUrl: string, profilePath = 
   }
   const rawAgentId = (data.agentId ?? data.agent_id ?? data.id) as string | undefined;
   const rawToken = (data.agentKey ?? data.token ?? data.key) as string | undefined;
-  const agentId = typeof rawAgentId === "string" ? rawAgentId.trim() : "";
-  const token = typeof rawToken === "string" ? rawToken.trim() : "";
-  if (!isSafeAgentId(rawAgentId) || !token || /[\x00-\x1f\x7f]/.test(agentId) || /[\x00-\x1f\x7f]/.test(token)) {
+  const agentId = typeof rawAgentId === "string" && !DSH_CLI_CTRL_RE.test(rawAgentId) ? rawAgentId.trim() : "";
+  const token = typeof rawToken === "string" && !DSH_CLI_CTRL_RE.test(rawToken) ? rawToken.trim() : "";
+  if (!isSafeAgentId(rawAgentId) || !token || DSH_CLI_CTRL_RE.test(agentId) || DSH_CLI_CTRL_RE.test(token)) {
     throw new Error("Registration response did not include a valid agent id/token");
   }
   try {
@@ -305,13 +323,15 @@ export async function runDshHeadlessResponder(
   prompt: string,
   opts: { dshBin?: string; dshProfile?: string; timeoutMs?: number } = {},
 ): Promise<string | null> {
-  const dshBin = (opts.dshBin ?? process.env.DSH_BIN ?? "dsh").trim();
-  const dshProfile = (opts.dshProfile ?? process.env.DSH_PROFILE ?? "headless").trim();
-  if (!dshBin || /[\x00-\x1f\x7f]/.test(dshBin)) {
+  const rawBin = opts.dshBin ?? process.env.DSH_BIN ?? "dsh";
+  const rawProfile = opts.dshProfile ?? process.env.DSH_PROFILE ?? "headless";
+  const dshBin = typeof rawBin === "string" && !DSH_CLI_PRETRIM_CTRL_RE.test(rawBin) ? rawBin.trim() : "";
+  const dshProfile = typeof rawProfile === "string" && !DSH_CLI_PRETRIM_CTRL_RE.test(rawProfile) ? rawProfile.trim() : "";
+  if (!dshBin || DSH_CLI_CTRL_RE.test(dshBin)) {
     console.error("[dsh] invalid dshBin");
     return null;
   }
-  if (!dshProfile || dshProfile.startsWith("-") || /[\x00-\x1f\x7f]/.test(dshProfile)) {
+  if (!dshProfile || dshProfile.startsWith("-") || DSH_CLI_CTRL_RE.test(dshProfile)) {
     console.error("[dsh] invalid dshProfile");
     return null;
   }
@@ -524,7 +544,7 @@ DeepSeek Harness (dsh) integration for AgentsChat:
             !sid.startsWith("session-") ||
             sid.length > 128 ||
             sid.includes("..") ||
-            /[\s\x00-\x1f\x7f/\\]/.test(sid) ||
+            /[\s\x00-\x1f\x7f-\x9f\u2028\u2029/\\]/.test(sid) ||
             FORBIDDEN_KEYS.has(sid.toLowerCase()) ||
             !profName ||
             typeof profName !== "string"
@@ -566,8 +586,8 @@ DeepSeek Harness (dsh) integration for AgentsChat:
               !isSafeAgentId(rawAgentId) ||
               !botToken ||
               botToken === "dev-token" ||
-              /[\x00-\x1f\x7f]/.test(botAgentId) ||
-              /[\x00-\x1f\x7f]/.test(botToken) ||
+              DSH_CLI_CTRL_RE.test(rawAgentId) ||
+              DSH_CLI_CTRL_RE.test(rawToken) ||
               connectedAgentIds.has(botAgentId)
             ) {
               continue;
@@ -603,24 +623,34 @@ DeepSeek Harness (dsh) integration for AgentsChat:
     bindTimer.unref?.();
 
     console.log(`DSH wake daemon listening on ${wakeChannels.join(", ") || "(no channels — pass --channel <id>)"}, queue=${queueFile}.`);
-    await new Promise<void>((resolve) => {
-      const shutdown = () => {
-        for (const t of activeTyping) t.stopAll();
-        for (const c of activeClients) {
-          try {
-            c.disconnect();
-          } catch {}
+    let shutdownWakeRef: (() => void) | undefined;
+    try {
+      await new Promise<void>((resolve) => {
+        const shutdown = () => {
+          for (const t of activeTyping) t.stopAll();
+          for (const c of activeClients) {
+            try {
+              c.disconnect();
+            } catch {}
+          }
+          resolve();
+        };
+        shutdownWakeRef = shutdown;
+        process.once("SIGINT", shutdown);
+        process.once("SIGTERM", shutdown);
+        if (process.platform !== "win32") process.once("SIGHUP", shutdown);
+        if (primaryClient) {
+          void primaryClient.waitUntilClosed().then(resolve);
         }
-        resolve();
-      };
-      process.once("SIGINT", shutdown);
-      process.once("SIGTERM", shutdown);
-      process.once("SIGHUP", shutdown);
-      if (primaryClient) {
-        void primaryClient.waitUntilClosed().then(resolve);
+      });
+    } finally {
+      clearInterval(bindTimer);
+      if (shutdownWakeRef) {
+        process.removeListener("SIGINT", shutdownWakeRef);
+        process.removeListener("SIGTERM", shutdownWakeRef);
+        if (process.platform !== "win32") process.removeListener("SIGHUP", shutdownWakeRef);
       }
-    });
-    clearInterval(bindTimer);
+    }
     return;
   }
 
@@ -684,7 +714,7 @@ DeepSeek Harness (dsh) integration for AgentsChat:
     };
     process.once("SIGINT", shutdownListen);
     process.once("SIGTERM", shutdownListen);
-    process.once("SIGHUP", shutdownListen);
+    if (process.platform !== "win32") process.once("SIGHUP", shutdownListen);
     try {
       await bridge.start();
       console.log(`DSH bridge listening on ${channels.join(", ") || "(no channels — pass --channel <id>)"} (profile=${dshProfile}).`);
@@ -692,7 +722,7 @@ DeepSeek Harness (dsh) integration for AgentsChat:
     } finally {
       process.removeListener("SIGINT", shutdownListen);
       process.removeListener("SIGTERM", shutdownListen);
-      process.removeListener("SIGHUP", shutdownListen);
+      if (process.platform !== "win32") process.removeListener("SIGHUP", shutdownListen);
     }
     return;
   }

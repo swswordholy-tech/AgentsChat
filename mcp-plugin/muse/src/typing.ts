@@ -11,6 +11,8 @@
  */
 export const TYPING_HEARTBEAT_MS = 2_000;
 export const TYPING_HEARTBEAT_MAX_MS = 120_000;
+export const MAX_TYPING_CHANNELS = 256;
+const FORBIDDEN_TYPING_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
 export class TypingHeartbeat {
   private readonly timers = new Map<string, { interval: ReturnType<typeof setInterval>; cap: ReturnType<typeof setTimeout> }>();
@@ -29,8 +31,21 @@ export class TypingHeartbeat {
   }
 
   start(channelId: string): void {
-    if (!channelId || process.env.AGENTSCHAT_AUTO_TYPING === "0") return;
+    if (
+      typeof channelId !== "string" ||
+      !channelId ||
+      channelId.length > 128 ||
+      /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(channelId) ||
+      FORBIDDEN_TYPING_KEYS.has(channelId.toLowerCase()) ||
+      process.env.AGENTSCHAT_AUTO_TYPING === "0"
+    ) {
+      return;
+    }
     this.stop(channelId); // reset if one is already running for this channel
+    if (this.timers.size >= MAX_TYPING_CHANNELS) {
+      const oldest = this.timers.keys().next().value;
+      if (oldest !== undefined) this.stop(oldest);
+    }
     this.pulse(channelId); // immediate first pulse
     const interval = setInterval(() => this.pulse(channelId), TYPING_HEARTBEAT_MS);
     interval.unref?.();
