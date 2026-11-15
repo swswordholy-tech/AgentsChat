@@ -4,7 +4,7 @@
 import { chmodSync as chmodSync3, lstatSync as lstatSync7, mkdirSync as mkdirSync4, readFileSync as readFileSync7, renameSync as renameSync3, unlinkSync as unlinkSync4, writeFileSync as writeFileSync3 } from "node:fs";
 import { randomBytes as randomBytes3 } from "node:crypto";
 import { spawn } from "node:child_process";
-import { dirname as dirname4, join as join6, resolve as resolve4 } from "node:path";
+import { dirname as dirname5, join as join6, resolve as resolve5 } from "node:path";
 import { homedir as homedir5 } from "node:os";
 
 // muse/src/policy.ts
@@ -1161,9 +1161,9 @@ function resolveSessionForAgent(agentId, opts = {}) {
 }
 
 // src/wake.ts
-import { existsSync as existsSync2, lstatSync as lstatSync5, readFileSync as readFileSync5 } from "node:fs";
+import { existsSync as existsSync2, lstatSync as lstatSync5, readFileSync as readFileSync5, readlinkSync as readlinkSync3 } from "node:fs";
 import { homedir as homedir3 } from "node:os";
-import { join as join4, win32 as pathWin32 } from "node:path";
+import { dirname as dirname3, join as join4, parse as parse3, resolve as resolve3, win32 as pathWin32 } from "node:path";
 var GROK_GATEWAY_PATH_CANDIDATES = [
   join4(process.env.HOME || process.env.USERPROFILE || homedir3(), ".grok", "gateway.json"),
   "/home/box/sand-data/gateway.json"
@@ -1236,12 +1236,12 @@ function resolveWindowsCliSpawn(cmd, args, opts) {
 // dsh/src/patch.ts
 import { randomBytes as randomBytes2 } from "node:crypto";
 import { chmodSync as chmodSync2, lstatSync as lstatSync6, mkdirSync as mkdirSync3, readFileSync as readFileSync6, renameSync as renameSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2 } from "node:fs";
-import { dirname as dirname3, isAbsolute as isAbsolute4, join as join5, resolve as resolve3 } from "node:path";
+import { dirname as dirname4, isAbsolute as isAbsolute4, join as join5, resolve as resolve4 } from "node:path";
 import { homedir as homedir4 } from "node:os";
 var FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 var DARWIN_ROOT_LINKS = new Set(["/var", "/tmp", "/etc"]);
 function checkParentDirectory(path) {
-  let parent = dirname3(resolve3(path));
+  let parent = dirname4(resolve4(path));
   for (;; ) {
     if (!(process.platform === "darwin" && DARWIN_ROOT_LINKS.has(parent))) {
       try {
@@ -1254,7 +1254,7 @@ function checkParentDirectory(path) {
           throw err;
       }
     }
-    const next = dirname3(parent);
+    const next = dirname4(parent);
     if (next === parent)
       break;
     parent = next;
@@ -1419,7 +1419,7 @@ function applyDshCordisPatchFile(opts = {}) {
   const existing = existed ? readFileSync6(patchPath, "utf8") : "";
   const { content, changed } = mergeDshCordisPatch(existing, opts);
   if (changed) {
-    mkdirSync3(dirname3(patchPath), { recursive: true });
+    mkdirSync3(dirname4(patchPath), { recursive: true });
     checkParentDirectory(patchPath);
     const tmp = `${patchPath}.${process.pid}.${randomBytes2(4).toString("hex")}.tmp`;
     let created = false;
@@ -1466,7 +1466,7 @@ function has(name, argv) {
 var FORBIDDEN_KEYS2 = new Set(["__proto__", "constructor", "prototype"]);
 var DARWIN_ROOT_LINKS2 = new Set(["/var", "/tmp", "/etc"]);
 function checkParentDirectory2(path) {
-  let parent = dirname4(resolve4(path));
+  let parent = dirname5(resolve5(path));
   for (;; ) {
     if (!(process.platform === "darwin" && DARWIN_ROOT_LINKS2.has(parent))) {
       try {
@@ -1479,7 +1479,7 @@ function checkParentDirectory2(path) {
           throw err;
       }
     }
-    const next = dirname4(parent);
+    const next = dirname5(parent);
     if (next === parent)
       break;
     parent = next;
@@ -1632,7 +1632,7 @@ async function registerOnly(name, restUrl, profilePath = DSH_PROFILE_PATH) {
       throw err;
   }
   checkParentDirectory2(profilePath);
-  mkdirSync4(dirname4(profilePath), { recursive: true, mode: 448 });
+  mkdirSync4(dirname5(profilePath), { recursive: true, mode: 448 });
   checkParentDirectory2(profilePath);
   const tmp = `${profilePath}.${process.pid}.${randomBytes3(4).toString("hex")}.tmp`;
   let created = false;
@@ -1677,7 +1677,7 @@ async function runDshHeadlessResponder(prompt, opts = {}) {
   }
   const t = opts.timeoutMs ?? 120000;
   const timeoutMs = Number.isFinite(t) && t > 0 ? Math.min(Math.floor(t), 2147483647) : 120000;
-  return new Promise((resolve5) => {
+  return new Promise((resolve6) => {
     const resolved = resolveWindowsCliSpawn(dshBin, ["--profile", dshProfile, prompt], { env: process.env });
     const child = spawn(resolved.cmd, resolved.args, {
       stdio: ["ignore", "pipe", "pipe"],
@@ -1724,17 +1724,17 @@ async function runDshHeadlessResponder(prompt, opts = {}) {
     child.on("error", (err) => {
       clearTimers();
       console.error(`[dsh] failed to spawn ${dshBin}: ${redact(err.message)}`);
-      resolve5(null);
+      resolve6(null);
     });
     child.on("close", (code) => {
       clearTimers();
       if (code !== 0) {
         console.error(`[dsh] exited with code ${code}: ${redact(stderr.trim().slice(0, 300))}`);
-        resolve5(null);
+        resolve6(null);
         return;
       }
       const trimmed = stdout.trim();
-      resolve5(trimmed.length > 0 ? trimmed : null);
+      resolve6(trimmed.length > 0 ? trimmed : null);
     });
   });
 }
@@ -1922,7 +1922,7 @@ DeepSeek Harness (dsh) integration for AgentsChat:
     const bindTimer = setInterval(() => void syncBoundDshClients(), 3000);
     bindTimer.unref?.();
     console.log(`DSH wake daemon listening on ${wakeChannels.join(", ") || "(no channels — pass --channel <id>)"}, queue=${queueFile}.`);
-    await new Promise((resolve5) => {
+    await new Promise((resolve6) => {
       const shutdown = () => {
         for (const t of activeTyping)
           t.stopAll();
@@ -1931,13 +1931,13 @@ DeepSeek Harness (dsh) integration for AgentsChat:
             c.disconnect();
           } catch {}
         }
-        resolve5();
+        resolve6();
       };
       process.once("SIGINT", shutdown);
       process.once("SIGTERM", shutdown);
       process.once("SIGHUP", shutdown);
       if (primaryClient) {
-        primaryClient.waitUntilClosed().then(resolve5);
+        primaryClient.waitUntilClosed().then(resolve6);
       }
     });
     clearInterval(bindTimer);

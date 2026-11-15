@@ -13,7 +13,7 @@ function redactSecrets(text, opts) {
   if (typeof text !== "string" || !text)
     return "";
   const step = opts?.preserveAcKeys ? text : text.replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***");
-  return step.replace(/mcp_(?:at|rt|code)_[A-Za-z0-9_-]{16,}/g, "mcp_***REDACTED***").replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
+  return step.replace(/-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)/g, "***PRIVATE_KEY_REDACTED***").replace(/mcp_(?:at|rt|code)_[A-Za-z0-9_-]{16,}/g, "mcp_***REDACTED***").replace(/agent_key_[A-Za-z0-9_-]{12,}/g, "agent_key_***REDACTED***").replace(/whsec_[A-Za-z0-9_-]{12,}/g, "whsec_***REDACTED***").replace(/\bsk-(?:proj-|ant-|live-|test-)?[A-Za-z0-9_-]{16,}/g, "sk-***REDACTED***").replace(/\brk_(?:live|test)_[A-Za-z0-9]{12,}/g, "rk_***REDACTED***").replace(/\bgh[pousr]_[A-Za-z0-9_]{16,}/g, "gh_***REDACTED***").replace(/\bgithub_pat_[A-Za-z0-9_]{16,}/g, "github_pat_***REDACTED***").replace(/\bglpat-[A-Za-z0-9_-]{12,}/g, "glpat-***REDACTED***").replace(/\bxox[baprs]-[A-Za-z0-9-]{10,}/g, "xox-***REDACTED***").replace(/\bAIza[0-9A-Za-z_-]{20,}/g, "AIza***REDACTED***").replace(/(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])/g, "AKIA***REDACTED***").replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
 }
 
 // src/identity.ts
@@ -1753,9 +1753,9 @@ import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 
 // src/wake.ts
-import { existsSync as existsSync2, lstatSync as lstatSync5, readFileSync as readFileSync4 } from "node:fs";
+import { existsSync as existsSync2, lstatSync as lstatSync5, readFileSync as readFileSync4, readlinkSync as readlinkSync2 } from "node:fs";
 import { homedir as homedir4 } from "node:os";
-import { join as join5, win32 as pathWin32 } from "node:path";
+import { dirname as dirname3, join as join5, parse as parse2, resolve as resolve4, win32 as pathWin32 } from "node:path";
 var GROK_GATEWAY_PATH_CANDIDATES = [
   join5(process.env.HOME || process.env.USERPROFILE || homedir4(), ".grok", "gateway.json"),
   "/home/box/sand-data/gateway.json"
@@ -1953,7 +1953,7 @@ class AppServer {
 `);
   }
   request(method, params, timeoutMs = this.requestTimeoutMs) {
-    return new Promise((resolve4, reject) => {
+    return new Promise((resolve5, reject) => {
       const id = ++this.nextId;
       const timer = setTimeout(() => {
         if (!this.pending.delete(id))
@@ -1963,7 +1963,7 @@ class AppServer {
         reject(err);
       }, Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.min(Math.max(50, Math.floor(timeoutMs)), 2147483647) : 30000);
       timer.unref?.();
-      this.pending.set(id, { method, timer, resolve: resolve4, reject });
+      this.pending.set(id, { method, timer, resolve: resolve5, reject });
       try {
         this.write({ id, method, params });
       } catch (e) {
@@ -2082,8 +2082,8 @@ class AppServer {
     const permissions = this.threadPermissions.get(thread);
     if (!permissions)
       throw new Error("Thread permissions have not been configured");
-    const completed = new Promise((resolve4, reject) => {
-      this.active = { thread, items: new Map, early: [], resolve: resolve4, reject };
+    const completed = new Promise((resolve5, reject) => {
+      this.active = { thread, items: new Map, early: [], resolve: resolve5, reject };
     });
     completed.catch(() => {});
     try {
@@ -2377,9 +2377,9 @@ async function verifyLoopTick(raw, config, owner, list, opts) {
 
 // src/session-bind.ts
 import { createHash as createHash3 } from "node:crypto";
-import { closeSync, lstatSync as lstatSync9, mkdirSync as mkdirSync5, openSync, readFileSync as readFileSync8, readSync, readdirSync as readdirSync4, readlinkSync as readlinkSync2, unlinkSync as unlinkSync3 } from "node:fs";
+import { closeSync, lstatSync as lstatSync9, mkdirSync as mkdirSync5, openSync, readFileSync as readFileSync8, readSync, readdirSync as readdirSync4, readlinkSync as readlinkSync3, unlinkSync as unlinkSync3 } from "node:fs";
 import { homedir as homedir5, tmpdir } from "node:os";
-import { isAbsolute as isAbsolute4, join as join9, parse as parse2, resolve as resolve5 } from "node:path";
+import { isAbsolute as isAbsolute4, join as join9, parse as parse3, resolve as resolve6 } from "node:path";
 
 // src/profile-store.ts
 import {
@@ -2393,7 +2393,7 @@ import {
   readdirSync as readdirSync3,
   readFileSync as readFileSync7
 } from "fs";
-import { dirname as dirname3, join as join8, resolve as resolve4 } from "path";
+import { dirname as dirname4, join as join8, resolve as resolve5 } from "path";
 var defaultWarn = (m) => process.stderr.write(m);
 var MAX_PROFILE_JSON_BYTES = 64 * 1024;
 var CONTROL_CHAR_GLOBAL_RE = /[\x00-\x1f\x7f]/g;
@@ -2424,7 +2424,7 @@ function isAllowedDarwinSystemSymlink(dirPath) {
   }
 }
 function hasSafeAncestorDirs(targetPath) {
-  let cur = dirname3(resolve4(targetPath));
+  let cur = dirname4(resolve5(targetPath));
   for (let depth = 0;depth < 64; depth += 1) {
     const st = safeLstat(cur);
     if (st) {
@@ -2435,7 +2435,7 @@ function hasSafeAncestorDirs(targetPath) {
         return false;
       }
     }
-    const parent = dirname3(cur);
+    const parent = dirname4(cur);
     if (parent === cur)
       break;
     cur = parent;
@@ -2443,7 +2443,7 @@ function hasSafeAncestorDirs(targetPath) {
   return true;
 }
 function safeWriteProfile(path, data, warn = defaultWarn) {
-  const parentDir = dirname3(path);
+  const parentDir = dirname4(path);
   const parentStat = safeLstat(parentDir);
   if (!parentStat || parentStat.isSymbolicLink() || !parentStat.isDirectory() || !hasSafeAncestorDirs(path)) {
     throw new Error(`Refusing to write profile into invalid or symlinked parent directory: ${sanitizeWarnPart(parentDir)}`);
@@ -2602,7 +2602,7 @@ function isAllowedDarwinSystemLink(dirPath) {
   if (dirPath !== "/var" && dirPath !== "/tmp" && dirPath !== "/etc")
     return false;
   try {
-    return readlinkSync2(dirPath) === `private${dirPath}`;
+    return readlinkSync3(dirPath) === `private${dirPath}`;
   } catch {
     return false;
   }
@@ -2610,8 +2610,8 @@ function isAllowedDarwinSystemLink(dirPath) {
 function isSafeDirOrMissing(dirPath) {
   if (!dirPath || CONTROL_CHAR_RE.test(dirPath))
     return false;
-  const abs = resolve5(dirPath);
-  const root = parse2(abs).root;
+  const abs = resolve6(dirPath);
+  const root = parse3(abs).root;
   const segments = abs.slice(root.length).split(/[\\/]+/).filter(Boolean);
   let cur = root;
   for (let i = 0;i < segments.length; i++) {
@@ -3555,13 +3555,13 @@ class AgentsChatTransport {
       if (this.pending.size >= 256)
         throw new Error("AgentsChat pending message limit reached");
       const id = randomUUID2();
-      await new Promise((resolve6, reject) => {
+      await new Promise((resolve7, reject) => {
         const timer = setTimeout(() => {
           this.pending.delete(id);
           reject(new Error("AgentsChat acknowledgement timed out"));
         }, 15000);
         timer.unref?.();
-        this.pending.set(id, { resolve: resolve6, reject, timer });
+        this.pending.set(id, { resolve: resolve7, reject, timer });
         try {
           this.socket.send(JSON.stringify({
             type: "message",
@@ -3803,7 +3803,7 @@ async function main() {
   }
   if ((values.bot || values["managed-worker"]) && (values["state-root"] || values["codex-home-mode"]))
     throw new Error("For managed bots, configure state_root/codex_home_mode in the bot registry");
-  const snapshot = values["managed-worker"] ? await new Promise((resolve6, reject) => {
+  const snapshot = values["managed-worker"] ? await new Promise((resolve7, reject) => {
     if (!process.connected) {
       reject(new Error("Managed worker needs parent IPC"));
       return;
@@ -3816,7 +3816,7 @@ async function main() {
         reject(new Error("Invalid parent configuration"));
         return;
       }
-      resolve6(config);
+      resolve7(config);
     });
   }) : undefined;
   const c = snapshot ?? (values.bot ? loadBots(values.registry).find((b) => b.name === values.bot) : resolveConfig({ cwd: values.cwd, profile: values.profile, codexBin: values["codex-bin"], stateRoot: values["state-root"], codexHomeMode: values["codex-home-mode"] }));

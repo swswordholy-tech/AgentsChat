@@ -23,9 +23,9 @@
  * timeout, then drop with a stderr note.
  */
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { existsSync, lstatSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, readlinkSync, type Stats } from "node:fs";
 import { homedir } from "node:os";
-import { join, win32 as pathWin32 } from "node:path";
+import { dirname, join, parse, resolve, win32 as pathWin32 } from "node:path";
 import { redactSecrets } from "./redact.ts";
 
 /** Signature header the receiver reads to verify a wake POST. */
@@ -33,11 +33,82 @@ export const WAKE_SIG_HEADER = "x-agentschat-signature";
 /** Header forwarded on authenticated REST calls when AGENTSCHAT_WAKE_ID is present. */
 export const WAKE_ID_HEADER = "X-AgentsChat-Wake-Id";
 const SAFE_WAKE_ID_RE = /^[a-zA-Z0-9_-]{1,128}$/;
-const CREDENTIAL_PREFIX_RE = /^(ac_|sk-|sk_|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_)/i;
+const CREDENTIAL_PREFIX_RE =
+  /^(ac_|mcp_(?:at|rt|code)_|agent_key_|whsec_|sk-|sk_|rk_live_|rk_test_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|AIza|AKIA|ASIA)/i;
 const MAX_WAKE_TIMER_MS = 2_147_483_647;
 const GROK_GATEWAY_MAX_BYTES = 1_048_576;
 const DIRECT_CHANNEL_RE = /^dm[-:]/i;
 const SAFE_ZCODE_SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
+function isAllowedDarwinSystemLink(dirPath: string): boolean {
+  if (process.platform !== "darwin") return false;
+  if (dirPath !== "/var" && dirPath !== "/tmp" && dirPath !== "/etc") return false;
+  try {
+    return readlinkSync(dirPath) === `private${dirPath}`;
+  } catch {
+    return false;
+  }
+}
+
+function hasSafeDirChain(dirPath: string): boolean {
+  const abs = resolve(dirPath);
+  const root = parse(abs).root;
+  const rel = abs.slice(root.length);
+  const segments = rel.split(/[\\/]+/).filter(Boolean);
+  let cur = root;
+  for (let i = 0; i < segments.length; i++) {
+    cur = join(cur, segments[i]!);
+    let st: Stats;
+    try {
+      st = lstatSync(cur);
+    } catch (err: any) {
+      if (err && err.code === "ENOENT") return true;
+      return false;
+    }
+    if (st.isSymbolicLink()) {
+      if (isAllowedDarwinSystemLink(cur)) continue;
+      return false;
+    }
+    if (!st.isDirectory()) return false;
+  }
+  return true;
+}
+
+function isUnsafeMetadataOrLinkLocalHost(hostname: string): boolean {
+  const lower = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  if (
+    !lower ||
+    lower === "0.0.0.0" ||
+    lower === "::" ||
+    lower === "100.100.100.200" ||
+    lower === "fd00:ec2::254" ||
+    lower === "metadata.google.internal" ||
+    lower === "metadata" ||
+    lower === "metadata.goog" ||
+    lower.endsWith(".metadata.goog") ||
+    lower === "instance-data"
+  ) {
+    return true;
+  }
+  if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(lower)) return true;
+  if (/^fe[89ab][0-9a-f]:/.test(lower)) return true;
+  if (lower.startsWith("::ffff:")) {
+    const tail = lower.slice("::ffff:".length);
+    const tailParts = tail.startsWith("0:") ? tail.slice(2) : tail;
+    if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(tailParts) || tailParts === "100.100.100.200" || tailParts === "0.0.0.0") {
+      return true;
+    }
+    const hexMatch = tailParts.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    if (hexMatch) {
+      const hi = parseInt(hexMatch[1]!, 16);
+      const lo = parseInt(hexMatch[2]!, 16);
+      if ((((hi >> 8) & 0xff) === 169 && (hi & 0xff) === 254) || (hi === 0x6464 && lo === 0x64c8) || (hi === 0 && lo === 0)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
 
 /** Clamp timeout/grace durations to safe positive 32-bit signed integers so setTimeout never overflows to 1ms. */
 export function clampWakeTimerMs(raw: unknown, fallback: number, minMs = 1): number {
@@ -60,6 +131,15 @@ function sanitizeWakeAttachmentUrl(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
   const cleaned = raw.trim().replace(/[\x00-\x1f\x7f\r\n]+/g, "");
   if (!cleaned || cleaned.length > 2048 || /\s/.test(cleaned) || !/^https?:\/\//i.test(cleaned)) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(cleaned);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+  if (parsed.username || parsed.password) return null;
+  if (isUnsafeMetadataOrLinkLocalHost(parsed.hostname)) return null;
   return cleaned;
 }
 
@@ -159,6 +239,7 @@ function isAllowedWakeHttpUrl(rawUrl: string): boolean {
     return false;
   }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+  if (isUnsafeMetadataOrLinkLocalHost(parsed.hostname)) return false;
   if (parsed.port) {
     const port = Number(parsed.port);
     if (!Number.isInteger(port) || port < 1 || port > 65535) return false;
@@ -364,11 +445,15 @@ export function buildGrokPrompt(msg: WakeMessage, agentId: string, contextPrefix
  * rotate it are picked up automatically, and it never touches argv/env/channel.
  */
 export function grokBearerFromGatewayConfig(cfg: any): string | null {
-  if (!cfg || typeof cfg !== "object") return null;
+  if (!cfg || typeof cfg !== "object" || Object.prototype.hasOwnProperty.call(cfg, "__proto__")) return null;
   const candidate =
     typeof cfg.token === "string" && cfg.token
       ? cfg.token.trim()
-      : cfg.auth && typeof cfg.auth.bearer === "string" && cfg.auth.bearer
+      : cfg.auth &&
+          typeof cfg.auth === "object" &&
+          !Object.prototype.hasOwnProperty.call(cfg.auth, "__proto__") &&
+          typeof cfg.auth.bearer === "string" &&
+          cfg.auth.bearer
         ? cfg.auth.bearer.trim()
         : "";
   if (!candidate || candidate.length > 4096 || /[\x00-\x1f\x7f]/.test(candidate)) return null;
@@ -447,7 +532,7 @@ export async function resolveGrokAgentId(opts: {
         return hit.id;
       }
     } catch (e) {
-      log(`[agentchat] grok wake: listAgents fallback failed: ${e}`);
+      log(`[agentchat] grok wake: listAgents fallback failed: ${redactSecrets(String(e)).slice(0, 200)}`);
     }
   }
   log(`[agentchat] grok wake: no Grok agentId bound. Set AGENTCHAT_GROK_AGENT_ID=<gateway agent uuid> (1:1 mapping).`);
@@ -466,14 +551,23 @@ export async function fireGrokWake(msg: WakeMessage, cfg: GrokWakeConfig): Promi
   }
   let gwcfg: any;
   try {
-    const stat = lstatSync(cfg.gatewayConfigPath);
+    const resolvedGatewayPath = resolve(cfg.gatewayConfigPath);
+    if (!hasSafeDirChain(dirname(resolvedGatewayPath))) {
+      log(`[agentchat] grok wake: rejected symlinked ancestor directory for ${cfg.gatewayConfigPath}`);
+      return;
+    }
+    const stat = lstatSync(resolvedGatewayPath);
     if (stat.isSymbolicLink() || !stat.isFile() || stat.size > GROK_GATEWAY_MAX_BYTES) {
       log(`[agentchat] grok wake: rejected unsafe or oversized gateway config ${cfg.gatewayConfigPath}`);
       return;
     }
-    gwcfg = JSON.parse(readFileSync(cfg.gatewayConfigPath, "utf8"));
+    gwcfg = JSON.parse(readFileSync(resolvedGatewayPath, "utf8"));
+    if (!gwcfg || typeof gwcfg !== "object" || Object.prototype.hasOwnProperty.call(gwcfg, "__proto__")) {
+      log(`[agentchat] grok wake: rejected malformed gateway config ${cfg.gatewayConfigPath}`);
+      return;
+    }
   } catch (e) {
-    log(`[agentchat] grok wake: cannot read ${cfg.gatewayConfigPath}: ${e}`);
+    log(`[agentchat] grok wake: cannot read ${cfg.gatewayConfigPath}: ${redactSecrets(String(e)).slice(0, 200)}`);
     return;
   }
   const token = grokBearerFromGatewayConfig(gwcfg);
@@ -609,8 +703,8 @@ export async function fireAntigravityWake(msg: WakeMessage, cfg: AntigravityWake
   }
 
   const prompt = cfg.promptOverride ?? buildWakePrompt(msg, cfg.contextPrefix);
-  const channel = msg.channel_id ?? "chat";
-  const sender = msg.sender_id ?? "channel";
+  const channel = sanitizeWakeHeaderToken(redactSecrets(String(msg.channel_id ?? "")), 128) ?? "chat";
+  const sender = sanitizeWakeHeaderToken(redactSecrets(String(msg.sender_id ?? "")), 128) ?? "channel";
   const body = JSON.stringify({
     recipient: conversationId,
     senderId: `agentschat:${sender}`,
@@ -869,7 +963,7 @@ export function fireZcodeWake(msg: WakeMessage, cfg: ZcodeWakeConfig): Promise<b
         timer.unref?.();
         child.on("error", (err) => {
           clearTimers();
-          log(`[agentchat] zcode wake spawn error (${sessionId}): ${err}`);
+          log(`[agentchat] zcode wake spawn error (${sessionId}): ${redactSecrets(String(err)).slice(0, 200)}`);
           resolve();
         });
         child.on("close", (code) => {

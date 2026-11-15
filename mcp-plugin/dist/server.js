@@ -168,7 +168,7 @@ function redactSecrets(text, opts) {
   if (typeof text !== "string" || !text)
     return "";
   const step = opts?.preserveAcKeys ? text : text.replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***");
-  return step.replace(/mcp_(?:at|rt|code)_[A-Za-z0-9_-]{16,}/g, "mcp_***REDACTED***").replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
+  return step.replace(/-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)/g, "***PRIVATE_KEY_REDACTED***").replace(/mcp_(?:at|rt|code)_[A-Za-z0-9_-]{16,}/g, "mcp_***REDACTED***").replace(/agent_key_[A-Za-z0-9_-]{12,}/g, "agent_key_***REDACTED***").replace(/whsec_[A-Za-z0-9_-]{12,}/g, "whsec_***REDACTED***").replace(/\bsk-(?:proj-|ant-|live-|test-)?[A-Za-z0-9_-]{16,}/g, "sk-***REDACTED***").replace(/\brk_(?:live|test)_[A-Za-z0-9]{12,}/g, "rk_***REDACTED***").replace(/\bgh[pousr]_[A-Za-z0-9_]{16,}/g, "gh_***REDACTED***").replace(/\bgithub_pat_[A-Za-z0-9_]{16,}/g, "github_pat_***REDACTED***").replace(/\bglpat-[A-Za-z0-9_-]{12,}/g, "glpat-***REDACTED***").replace(/\bxox[baprs]-[A-Za-z0-9-]{10,}/g, "xox-***REDACTED***").replace(/\bAIza[0-9A-Za-z_-]{20,}/g, "AIza***REDACTED***").replace(/(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])/g, "AKIA***REDACTED***").replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
 }
 var PHONE_PII_RE = /^\+?\d[\d\s()-]{5,}[\d)]$/;
 function isPhoneShapedPii(s) {
@@ -1899,7 +1899,7 @@ function redactSecrets2(text, opts) {
   if (typeof text !== "string" || !text)
     return "";
   const step = opts?.preserveAcKeys ? text : text.replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***");
-  return step.replace(/mcp_(?:at|rt|code)_[A-Za-z0-9_-]{16,}/g, "mcp_***REDACTED***").replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
+  return step.replace(/-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)/g, "***PRIVATE_KEY_REDACTED***").replace(/mcp_(?:at|rt|code)_[A-Za-z0-9_-]{16,}/g, "mcp_***REDACTED***").replace(/agent_key_[A-Za-z0-9_-]{12,}/g, "agent_key_***REDACTED***").replace(/whsec_[A-Za-z0-9_-]{12,}/g, "whsec_***REDACTED***").replace(/\bsk-(?:proj-|ant-|live-|test-)?[A-Za-z0-9_-]{16,}/g, "sk-***REDACTED***").replace(/\brk_(?:live|test)_[A-Za-z0-9]{12,}/g, "rk_***REDACTED***").replace(/\bgh[pousr]_[A-Za-z0-9_]{16,}/g, "gh_***REDACTED***").replace(/\bgithub_pat_[A-Za-z0-9_]{16,}/g, "github_pat_***REDACTED***").replace(/\bglpat-[A-Za-z0-9_-]{12,}/g, "glpat-***REDACTED***").replace(/\bxox[baprs]-[A-Za-z0-9-]{10,}/g, "xox-***REDACTED***").replace(/\bAIza[0-9A-Za-z_-]{20,}/g, "AIza***REDACTED***").replace(/(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])/g, "AKIA***REDACTED***").replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
 }
 var PHONE_PII_RE2 = /^\+?\d[\d\s()-]{5,}[\d)]$/;
 function isPhoneShapedPii2(s) {
@@ -2541,17 +2541,80 @@ function annotateTools(tools) {
 
 // src/wake.ts
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { existsSync, lstatSync as lstatSync2, readFileSync as readFileSync3 } from "node:fs";
+import { existsSync, lstatSync as lstatSync2, readFileSync as readFileSync3, readlinkSync as readlinkSync2 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
-import { join as join3, win32 as pathWin32 } from "node:path";
+import { dirname as dirname2, join as join3, parse as parse2, resolve as resolve2, win32 as pathWin32 } from "node:path";
 var WAKE_SIG_HEADER = "x-agentschat-signature";
 var WAKE_ID_HEADER = "X-AgentsChat-Wake-Id";
 var SAFE_WAKE_ID_RE = /^[a-zA-Z0-9_-]{1,128}$/;
-var CREDENTIAL_PREFIX_RE = /^(ac_|sk-|sk_|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_)/i;
+var CREDENTIAL_PREFIX_RE = /^(ac_|mcp_(?:at|rt|code)_|agent_key_|whsec_|sk-|sk_|rk_live_|rk_test_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|AIza|AKIA|ASIA)/i;
 var MAX_WAKE_TIMER_MS = 2147483647;
 var GROK_GATEWAY_MAX_BYTES = 1048576;
 var DIRECT_CHANNEL_RE = /^dm[-:]/i;
 var SAFE_ZCODE_SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+function isAllowedDarwinSystemLink2(dirPath) {
+  if (process.platform !== "darwin")
+    return false;
+  if (dirPath !== "/var" && dirPath !== "/tmp" && dirPath !== "/etc")
+    return false;
+  try {
+    return readlinkSync2(dirPath) === `private${dirPath}`;
+  } catch {
+    return false;
+  }
+}
+function hasSafeDirChain2(dirPath) {
+  const abs = resolve2(dirPath);
+  const root = parse2(abs).root;
+  const rel = abs.slice(root.length);
+  const segments = rel.split(/[\\/]+/).filter(Boolean);
+  let cur = root;
+  for (let i = 0;i < segments.length; i++) {
+    cur = join3(cur, segments[i]);
+    let st;
+    try {
+      st = lstatSync2(cur);
+    } catch (err) {
+      if (err && err.code === "ENOENT")
+        return true;
+      return false;
+    }
+    if (st.isSymbolicLink()) {
+      if (isAllowedDarwinSystemLink2(cur))
+        continue;
+      return false;
+    }
+    if (!st.isDirectory())
+      return false;
+  }
+  return true;
+}
+function isUnsafeMetadataOrLinkLocalHost2(hostname) {
+  const lower = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  if (!lower || lower === "0.0.0.0" || lower === "::" || lower === "100.100.100.200" || lower === "fd00:ec2::254" || lower === "metadata.google.internal" || lower === "metadata" || lower === "metadata.goog" || lower.endsWith(".metadata.goog") || lower === "instance-data") {
+    return true;
+  }
+  if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(lower))
+    return true;
+  if (/^fe[89ab][0-9a-f]:/.test(lower))
+    return true;
+  if (lower.startsWith("::ffff:")) {
+    const tail = lower.slice("::ffff:".length);
+    const tailParts = tail.startsWith("0:") ? tail.slice(2) : tail;
+    if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(tailParts) || tailParts === "100.100.100.200" || tailParts === "0.0.0.0") {
+      return true;
+    }
+    const hexMatch = tailParts.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    if (hexMatch) {
+      const hi = parseInt(hexMatch[1], 16);
+      const lo = parseInt(hexMatch[2], 16);
+      if ((hi >> 8 & 255) === 169 && (hi & 255) === 254 || hi === 25700 && lo === 25800 || hi === 0 && lo === 0) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
 function clampWakeTimerMs(raw, fallback, minMs = 1) {
   return typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? Math.min(MAX_WAKE_TIMER_MS, Math.max(minMs, Math.floor(raw))) : fallback;
 }
@@ -2571,6 +2634,18 @@ function sanitizeWakeAttachmentUrl(raw) {
     return null;
   const cleaned = raw.trim().replace(/[\x00-\x1f\x7f\r\n]+/g, "");
   if (!cleaned || cleaned.length > 2048 || /\s/.test(cleaned) || !/^https?:\/\//i.test(cleaned))
+    return null;
+  let parsed;
+  try {
+    parsed = new URL(cleaned);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:")
+    return null;
+  if (parsed.username || parsed.password)
+    return null;
+  if (isUnsafeMetadataOrLinkLocalHost2(parsed.hostname))
     return null;
   return cleaned;
 }
@@ -2621,6 +2696,8 @@ function isAllowedWakeHttpUrl(rawUrl) {
     return false;
   }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:")
+    return false;
+  if (isUnsafeMetadataOrLinkLocalHost2(parsed.hostname))
     return false;
   if (parsed.port) {
     const port = Number(parsed.port);
@@ -2743,9 +2820,9 @@ function buildGrokPrompt(msg, agentId, contextPrefix = "") {
   return { agentId, prompt };
 }
 function grokBearerFromGatewayConfig(cfg) {
-  if (!cfg || typeof cfg !== "object")
+  if (!cfg || typeof cfg !== "object" || Object.prototype.hasOwnProperty.call(cfg, "__proto__"))
     return null;
-  const candidate = typeof cfg.token === "string" && cfg.token ? cfg.token.trim() : cfg.auth && typeof cfg.auth.bearer === "string" && cfg.auth.bearer ? cfg.auth.bearer.trim() : "";
+  const candidate = typeof cfg.token === "string" && cfg.token ? cfg.token.trim() : cfg.auth && typeof cfg.auth === "object" && !Object.prototype.hasOwnProperty.call(cfg.auth, "__proto__") && typeof cfg.auth.bearer === "string" && cfg.auth.bearer ? cfg.auth.bearer.trim() : "";
   if (!candidate || candidate.length > 4096 || /[\x00-\x1f\x7f]/.test(candidate))
     return null;
   return candidate;
@@ -2780,7 +2857,7 @@ async function resolveGrokAgentId(opts) {
         return hit.id;
       }
     } catch (e) {
-      log(`[agentchat] grok wake: listAgents fallback failed: ${e}`);
+      log(`[agentchat] grok wake: listAgents fallback failed: ${redactSecrets2(String(e)).slice(0, 200)}`);
     }
   }
   log(`[agentchat] grok wake: no Grok agentId bound. Set AGENTCHAT_GROK_AGENT_ID=<gateway agent uuid> (1:1 mapping).`);
@@ -2794,14 +2871,23 @@ async function fireGrokWake(msg, cfg) {
   }
   let gwcfg;
   try {
-    const stat = lstatSync2(cfg.gatewayConfigPath);
+    const resolvedGatewayPath = resolve2(cfg.gatewayConfigPath);
+    if (!hasSafeDirChain2(dirname2(resolvedGatewayPath))) {
+      log(`[agentchat] grok wake: rejected symlinked ancestor directory for ${cfg.gatewayConfigPath}`);
+      return;
+    }
+    const stat = lstatSync2(resolvedGatewayPath);
     if (stat.isSymbolicLink() || !stat.isFile() || stat.size > GROK_GATEWAY_MAX_BYTES) {
       log(`[agentchat] grok wake: rejected unsafe or oversized gateway config ${cfg.gatewayConfigPath}`);
       return;
     }
-    gwcfg = JSON.parse(readFileSync3(cfg.gatewayConfigPath, "utf8"));
+    gwcfg = JSON.parse(readFileSync3(resolvedGatewayPath, "utf8"));
+    if (!gwcfg || typeof gwcfg !== "object" || Object.prototype.hasOwnProperty.call(gwcfg, "__proto__")) {
+      log(`[agentchat] grok wake: rejected malformed gateway config ${cfg.gatewayConfigPath}`);
+      return;
+    }
   } catch (e) {
-    log(`[agentchat] grok wake: cannot read ${cfg.gatewayConfigPath}: ${e}`);
+    log(`[agentchat] grok wake: cannot read ${cfg.gatewayConfigPath}: ${redactSecrets2(String(e)).slice(0, 200)}`);
     return;
   }
   const token = grokBearerFromGatewayConfig(gwcfg);
@@ -2888,8 +2974,8 @@ async function fireAntigravityWake(msg, cfg) {
     return false;
   }
   const prompt = cfg.promptOverride ?? buildWakePrompt(msg, cfg.contextPrefix);
-  const channel = msg.channel_id ?? "chat";
-  const sender = msg.sender_id ?? "channel";
+  const channel = sanitizeWakeHeaderToken(redactSecrets2(String(msg.channel_id ?? "")), 128) ?? "chat";
+  const sender = sanitizeWakeHeaderToken(redactSecrets2(String(msg.sender_id ?? "")), 128) ?? "channel";
   const body = JSON.stringify({
     recipient: conversationId,
     senderId: `agentschat:${sender}`,
@@ -3047,7 +3133,7 @@ function fireZcodeWake(msg, cfg) {
         return;
       }
       const { spawn } = await import("node:child_process");
-      await new Promise((resolve2) => {
+      await new Promise((resolve3) => {
         const child = spawn(resolved.cmd, resolved.args, {
           cwd: cfg.workspacePath || process.cwd(),
           env,
@@ -3081,8 +3167,8 @@ function fireZcodeWake(msg, cfg) {
         timer.unref?.();
         child.on("error", (err) => {
           clearTimers();
-          log(`[agentchat] zcode wake spawn error (${sessionId}): ${err}`);
-          resolve2();
+          log(`[agentchat] zcode wake spawn error (${sessionId}): ${redactSecrets2(String(err)).slice(0, 200)}`);
+          resolve3();
         });
         child.on("close", (code) => {
           clearTimers();
@@ -3090,7 +3176,7 @@ function fireZcodeWake(msg, cfg) {
           if (!succeeded) {
             log(`[agentchat] zcode wake (${sessionId}) exited code=${code}${stderr ? `: ${redactSecrets2(stderr.trim()).slice(0, 200)}` : ""}`);
           }
-          resolve2();
+          resolve3();
         });
       });
     } catch (e) {
@@ -3109,9 +3195,9 @@ function fireZcodeWake(msg, cfg) {
 
 // src/session-bind.ts
 import { createHash } from "node:crypto";
-import { closeSync, lstatSync as lstatSync4, mkdirSync, openSync, readFileSync as readFileSync5, readSync, readdirSync as readdirSync2, readlinkSync as readlinkSync2, unlinkSync as unlinkSync2 } from "node:fs";
+import { closeSync, lstatSync as lstatSync4, mkdirSync, openSync, readFileSync as readFileSync5, readSync, readdirSync as readdirSync2, readlinkSync as readlinkSync3, unlinkSync as unlinkSync2 } from "node:fs";
 import { homedir as homedir3, tmpdir } from "node:os";
-import { isAbsolute as isAbsolute2, join as join5, parse as parse2, resolve as resolve3 } from "node:path";
+import { isAbsolute as isAbsolute2, join as join5, parse as parse3, resolve as resolve4 } from "node:path";
 import { spawnSync } from "node:child_process";
 
 // src/profile-store.ts
@@ -3126,7 +3212,7 @@ import {
   readdirSync,
   readFileSync as readFileSync4
 } from "fs";
-import { dirname as dirname2, join as join4, resolve as resolve2 } from "path";
+import { dirname as dirname3, join as join4, resolve as resolve3 } from "path";
 var defaultWarn = (m) => process.stderr.write(m);
 var MAX_PROFILE_JSON_BYTES = 64 * 1024;
 var CONTROL_CHAR_GLOBAL_RE = /[\x00-\x1f\x7f]/g;
@@ -3157,7 +3243,7 @@ function isAllowedDarwinSystemSymlink(dirPath) {
   }
 }
 function hasSafeAncestorDirs(targetPath) {
-  let cur = dirname2(resolve2(targetPath));
+  let cur = dirname3(resolve3(targetPath));
   for (let depth = 0;depth < 64; depth += 1) {
     const st = safeLstat2(cur);
     if (st) {
@@ -3168,7 +3254,7 @@ function hasSafeAncestorDirs(targetPath) {
         return false;
       }
     }
-    const parent = dirname2(cur);
+    const parent = dirname3(cur);
     if (parent === cur)
       break;
     cur = parent;
@@ -3176,7 +3262,7 @@ function hasSafeAncestorDirs(targetPath) {
   return true;
 }
 function safeWriteProfile(path, data, warn = defaultWarn) {
-  const parentDir = dirname2(path);
+  const parentDir = dirname3(path);
   const parentStat = safeLstat2(parentDir);
   if (!parentStat || parentStat.isSymbolicLink() || !parentStat.isDirectory() || !hasSafeAncestorDirs(path)) {
     throw new Error(`Refusing to write profile into invalid or symlinked parent directory: ${sanitizeWarnPart(parentDir)}`);
@@ -3339,13 +3425,13 @@ function isSafeTargetFileOrMissing(path) {
     return Boolean(e && typeof e === "object" && e.code === "ENOENT");
   }
 }
-function isAllowedDarwinSystemLink2(dirPath) {
+function isAllowedDarwinSystemLink3(dirPath) {
   if (process.platform !== "darwin")
     return false;
   if (dirPath !== "/var" && dirPath !== "/tmp" && dirPath !== "/etc")
     return false;
   try {
-    return readlinkSync2(dirPath) === `private${dirPath}`;
+    return readlinkSync3(dirPath) === `private${dirPath}`;
   } catch {
     return false;
   }
@@ -3353,8 +3439,8 @@ function isAllowedDarwinSystemLink2(dirPath) {
 function isSafeDirOrMissing(dirPath) {
   if (!dirPath || CONTROL_CHAR_RE.test(dirPath))
     return false;
-  const abs = resolve3(dirPath);
-  const root = parse2(abs).root;
+  const abs = resolve4(dirPath);
+  const root = parse3(abs).root;
   const segments = abs.slice(root.length).split(/[\\/]+/).filter(Boolean);
   let cur = root;
   for (let i = 0;i < segments.length; i++) {
@@ -3362,7 +3448,7 @@ function isSafeDirOrMissing(dirPath) {
     try {
       const st = lstatSync4(cur);
       if (st.isSymbolicLink()) {
-        if (isAllowedDarwinSystemLink2(cur))
+        if (isAllowedDarwinSystemLink3(cur))
           continue;
         return false;
       }
@@ -4310,13 +4396,13 @@ async function detectDshCallerSession(opts) {
 }
 
 // src/session-route.ts
-import { lstatSync as lstatSync6, readFileSync as readFileSync7, readlinkSync as readlinkSync4 } from "node:fs";
+import { lstatSync as lstatSync6, readFileSync as readFileSync7, readlinkSync as readlinkSync5 } from "node:fs";
 import { homedir as homedir4 } from "node:os";
-import { isAbsolute as isAbsolute4, join as join7, parse as parse4, resolve as resolve5 } from "node:path";
+import { isAbsolute as isAbsolute4, join as join7, parse as parse5, resolve as resolve6 } from "node:path";
 
 // src/session-bind.ts
-import { closeSync as closeSync2, lstatSync as lstatSync5, mkdirSync as mkdirSync2, openSync as openSync2, readFileSync as readFileSync6, readSync as readSync2, readdirSync as readdirSync3, readlinkSync as readlinkSync3, unlinkSync as unlinkSync3 } from "node:fs";
-import { isAbsolute as isAbsolute3, join as join6, parse as parse3, resolve as resolve4 } from "node:path";
+import { closeSync as closeSync2, lstatSync as lstatSync5, mkdirSync as mkdirSync2, openSync as openSync2, readFileSync as readFileSync6, readSync as readSync2, readdirSync as readdirSync3, readlinkSync as readlinkSync4, unlinkSync as unlinkSync3 } from "node:fs";
+import { isAbsolute as isAbsolute3, join as join6, parse as parse4, resolve as resolve5 } from "node:path";
 var DEFAULT_SESSION_BINDS_FILENAME2 = "session-binds.json";
 var LEGACY_AGY_BINDS_FILENAME2 = "agy-binds.json";
 var LOCK_FILE_MAX_BYTES2 = 64 * 1024;
@@ -4343,13 +4429,13 @@ function readBoundedRegularJson2(path, maxBytes) {
     return null;
   }
 }
-function isAllowedDarwinSystemLink3(dirPath) {
+function isAllowedDarwinSystemLink4(dirPath) {
   if (process.platform !== "darwin")
     return false;
   if (dirPath !== "/var" && dirPath !== "/tmp" && dirPath !== "/etc")
     return false;
   try {
-    return readlinkSync3(dirPath) === `private${dirPath}`;
+    return readlinkSync4(dirPath) === `private${dirPath}`;
   } catch {
     return false;
   }
@@ -4357,8 +4443,8 @@ function isAllowedDarwinSystemLink3(dirPath) {
 function isSafeDirOrMissing2(dirPath) {
   if (!dirPath || CONTROL_CHAR_RE2.test(dirPath))
     return false;
-  const abs = resolve4(dirPath);
-  const root = parse3(abs).root;
+  const abs = resolve5(dirPath);
+  const root = parse4(abs).root;
   const segments = abs.slice(root.length).split(/[\\/]+/).filter(Boolean);
   let cur = root;
   for (let i = 0;i < segments.length; i++) {
@@ -4366,7 +4452,7 @@ function isSafeDirOrMissing2(dirPath) {
     try {
       const st = lstatSync5(cur);
       if (st.isSymbolicLink()) {
-        if (isAllowedDarwinSystemLink3(cur))
+        if (isAllowedDarwinSystemLink4(cur))
           continue;
         return false;
       }
@@ -4475,13 +4561,13 @@ function isSafeRegularProfileFile(path) {
     return false;
   }
 }
-function isAllowedDarwinSystemLink4(dirPath) {
+function isAllowedDarwinSystemLink5(dirPath) {
   if (process.platform !== "darwin")
     return false;
   if (dirPath !== "/var" && dirPath !== "/tmp" && dirPath !== "/etc")
     return false;
   try {
-    return readlinkSync4(dirPath) === `private${dirPath}`;
+    return readlinkSync5(dirPath) === `private${dirPath}`;
   } catch {
     return false;
   }
@@ -4491,15 +4577,15 @@ function isSafeRealDir(path) {
     const st = lstatSync6(path);
     if (st.isSymbolicLink() || !st.isDirectory())
       return false;
-    const abs = resolve5(path);
-    const root = parse4(abs).root;
+    const abs = resolve6(path);
+    const root = parse5(abs).root;
     const segments = abs.slice(root.length).split(/[\\/]+/).filter(Boolean);
     let cur = root;
     for (let i = 0;i < segments.length; i++) {
       cur = join7(cur, segments[i]);
       const anc = lstatSync6(cur);
       if (anc.isSymbolicLink()) {
-        if (isAllowedDarwinSystemLink4(cur))
+        if (isAllowedDarwinSystemLink5(cur))
           continue;
         return false;
       }
@@ -4808,7 +4894,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { readFileSync as readFileSync12, existsSync as existsSync2, writeFileSync as writeFileSync6, mkdirSync as mkdirSync4, readdirSync as readdirSync5 } from "fs";
 import { homedir as homedir6 } from "os";
-import { join as join13, dirname as dirname7 } from "path";
+import { join as join13, dirname as dirname9 } from "path";
 import { fileURLToPath } from "url";
 
 // src/profile-store.ts
@@ -4823,7 +4909,7 @@ import {
   readdirSync as readdirSync4,
   readFileSync as readFileSync8
 } from "fs";
-import { dirname as dirname3, join as join8, resolve as resolve6 } from "path";
+import { dirname as dirname4, join as join8, resolve as resolve7 } from "path";
 var defaultWarn2 = (m) => process.stderr.write(m);
 var MAX_PROFILE_JSON_BYTES2 = 64 * 1024;
 var CONTROL_CHAR_GLOBAL_RE2 = /[\x00-\x1f\x7f]/g;
@@ -4854,7 +4940,7 @@ function isAllowedDarwinSystemSymlink2(dirPath) {
   }
 }
 function hasSafeAncestorDirs2(targetPath) {
-  let cur = dirname3(resolve6(targetPath));
+  let cur = dirname4(resolve7(targetPath));
   for (let depth = 0;depth < 64; depth += 1) {
     const st = safeLstat4(cur);
     if (st) {
@@ -4865,7 +4951,7 @@ function hasSafeAncestorDirs2(targetPath) {
         return false;
       }
     }
-    const parent = dirname3(cur);
+    const parent = dirname4(cur);
     if (parent === cur)
       break;
     cur = parent;
@@ -4873,7 +4959,7 @@ function hasSafeAncestorDirs2(targetPath) {
   return true;
 }
 function safeWriteProfile2(path, data, warn = defaultWarn2) {
-  const parentDir = dirname3(path);
+  const parentDir = dirname4(path);
   const parentStat = safeLstat4(parentDir);
   if (!parentStat || parentStat.isSymbolicLink() || !parentStat.isDirectory() || !hasSafeAncestorDirs2(path)) {
     throw new Error(`Refusing to write profile into invalid or symlinked parent directory: ${sanitizeWarnPart2(parentDir)}`);
@@ -4995,7 +5081,7 @@ function findDefaultProfileCollision(configDir, defaultProfilePath) {
   if (!cfgStat || cfgStat.isSymbolicLink() || !cfgStat.isDirectory() || !hasSafeAncestorDirs2(join8(configDir, "probe"))) {
     return null;
   }
-  const resolvedDefault = resolve6(defaultProfilePath);
+  const resolvedDefault = resolve7(defaultProfilePath);
   for (const dir of [join8(configDir, "profiles"), configDir]) {
     const dirStat = safeLstat4(dir);
     if (!dirStat || dirStat.isSymbolicLink() || !dirStat.isDirectory())
@@ -5010,7 +5096,7 @@ function findDefaultProfileCollision(configDir, defaultProfilePath) {
       if (NON_PROFILE_JSON_FILES2.has(file.toLowerCase()))
         continue;
       const candidatePath = join8(dir, file);
-      if (resolve6(candidatePath) === resolvedDefault)
+      if (resolve7(candidatePath) === resolvedDefault)
         continue;
       const baseName = file.replace(/\.json$/i, "");
       if (baseName.toLowerCase() === "profile")
@@ -5172,7 +5258,7 @@ function expectedAgentIdViolation(expected, liveAgentId) {
 // src/read-cursor.ts
 import { randomBytes } from "crypto";
 import { chmodSync as chmodSync3, lstatSync as lstatSync8, readFileSync as readFileSync9, realpathSync as realpathSync3, renameSync as renameSync3, unlinkSync as unlinkSync5, writeFileSync as writeFileSync3 } from "fs";
-import { dirname as dirname4, isAbsolute as isAbsolute5, join as join9, sep } from "path";
+import { dirname as dirname5, isAbsolute as isAbsolute5, join as join9, sep } from "path";
 var MAX_CURSOR_BYTES = 4 * 1024 * 1024;
 var MAX_CURSOR_ENTRIES = 50000;
 var RESERVED_PROTO_KEY = /^(?:__proto__|constructor|prototype)$/i;
@@ -5181,7 +5267,7 @@ function scrubDiag(value) {
   return redactSecrets2(String(value ?? "")).replace(/\b(?:Bearer|Basic)\s+[^\s"'<>\\]+/gi, "[REDACTED]").replace(/(?:agent_key_|sk-|whsec_|gh[pousr]_|github_pat_|AIza|AKIA|ASIA)[A-Za-z0-9+/=_-]{12,}/g, "[REDACTED]").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
 }
 function hasSafeAncestorDirs3(targetFile) {
-  let dir = dirname4(isAbsolute5(targetFile) ? targetFile : `${process.cwd()}${sep}${targetFile}`);
+  let dir = dirname5(isAbsolute5(targetFile) ? targetFile : `${process.cwd()}${sep}${targetFile}`);
   while (true) {
     let st;
     try {
@@ -5199,7 +5285,7 @@ function hasSafeAncestorDirs3(targetFile) {
     if (!isDarwinRootLink && (st.isSymbolicLink() || !st.isDirectory())) {
       return false;
     }
-    const parent = dirname4(dir);
+    const parent = dirname5(dir);
     if (parent === dir)
       break;
     dir = parent;
@@ -5267,7 +5353,7 @@ function loadCursor(file, warn) {
 }
 function persistCursor(file, cursor, warn) {
   try {
-    const parentStat = lstatSync8(dirname4(file));
+    const parentStat = lstatSync8(dirname5(file));
     if (parentStat.isSymbolicLink() || !parentStat.isDirectory() || !hasSafeAncestorDirs3(file)) {
       warn(`[agentchat] WARNING: failed to persist read cursor to ${scrubDiag(file)}: parent is not a real directory
 `);
@@ -5337,7 +5423,7 @@ function flushCursor(state, persist) {
 // src/rest-cli.ts
 import { randomBytes as randomBytes3 } from "node:crypto";
 import { lstatSync as lstatSync10, mkdirSync as mkdirSync3, readFileSync as readFileSync11, renameSync as renameSync5, unlinkSync as unlinkSync7, writeFileSync as writeFileSync5 } from "node:fs";
-import { dirname as dirname6, join as join12 } from "node:path";
+import { dirname as dirname8, join as join12 } from "node:path";
 
 // src/mentions.ts
 var MAX_MENTION_ID_CHARS2 = 128;
@@ -5362,7 +5448,7 @@ function matchesMention2(content, agentId) {
 // src/read-cursor.ts
 import { randomBytes as randomBytes2 } from "crypto";
 import { chmodSync as chmodSync4, lstatSync as lstatSync9, readFileSync as readFileSync10, realpathSync as realpathSync4, renameSync as renameSync4, unlinkSync as unlinkSync6, writeFileSync as writeFileSync4 } from "fs";
-import { dirname as dirname5, isAbsolute as isAbsolute6, join as join10, sep as sep2 } from "path";
+import { dirname as dirname6, isAbsolute as isAbsolute6, join as join10, sep as sep2 } from "path";
 var MAX_CURSOR_BYTES2 = 4 * 1024 * 1024;
 var MAX_CURSOR_ENTRIES2 = 50000;
 var RESERVED_PROTO_KEY2 = /^(?:__proto__|constructor|prototype)$/i;
@@ -5371,7 +5457,7 @@ function scrubDiag2(value) {
   return redactSecrets2(String(value ?? "")).replace(/\b(?:Bearer|Basic)\s+[^\s"'<>\\]+/gi, "[REDACTED]").replace(/(?:agent_key_|sk-|whsec_|gh[pousr]_|github_pat_|AIza|AKIA|ASIA)[A-Za-z0-9+/=_-]{12,}/g, "[REDACTED]").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
 }
 function hasSafeAncestorDirs4(targetFile) {
-  let dir = dirname5(isAbsolute6(targetFile) ? targetFile : `${process.cwd()}${sep2}${targetFile}`);
+  let dir = dirname6(isAbsolute6(targetFile) ? targetFile : `${process.cwd()}${sep2}${targetFile}`);
   while (true) {
     let st;
     try {
@@ -5389,7 +5475,7 @@ function hasSafeAncestorDirs4(targetFile) {
     if (!isDarwinRootLink && (st.isSymbolicLink() || !st.isDirectory())) {
       return false;
     }
-    const parent = dirname5(dir);
+    const parent = dirname6(dir);
     if (parent === dir)
       break;
     dir = parent;
@@ -5457,7 +5543,7 @@ function loadCursor2(file, warn) {
 }
 function persistCursor2(file, cursor, warn) {
   try {
-    const parentStat = lstatSync9(dirname5(file));
+    const parentStat = lstatSync9(dirname6(file));
     if (parentStat.isSymbolicLink() || !parentStat.isDirectory() || !hasSafeAncestorDirs4(file)) {
       warn(`[agentchat] WARNING: failed to persist read cursor to ${scrubDiag2(file)}: parent is not a real directory
 `);
@@ -5573,13 +5659,51 @@ function normalizeTimestampForCursor2(ts, mode) {
 
 // src/wake.ts
 import { homedir as homedir5 } from "node:os";
-import { join as join11, win32 as pathWin322 } from "node:path";
+import { dirname as dirname7, join as join11, parse as parse6, resolve as resolve8, win32 as pathWin322 } from "node:path";
 var DIRECT_CHANNEL_RE2 = /^dm[-:]/i;
+function isUnsafeMetadataOrLinkLocalHost3(hostname) {
+  const lower = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  if (!lower || lower === "0.0.0.0" || lower === "::" || lower === "100.100.100.200" || lower === "fd00:ec2::254" || lower === "metadata.google.internal" || lower === "metadata" || lower === "metadata.goog" || lower.endsWith(".metadata.goog") || lower === "instance-data") {
+    return true;
+  }
+  if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(lower))
+    return true;
+  if (/^fe[89ab][0-9a-f]:/.test(lower))
+    return true;
+  if (lower.startsWith("::ffff:")) {
+    const tail = lower.slice("::ffff:".length);
+    const tailParts = tail.startsWith("0:") ? tail.slice(2) : tail;
+    if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(tailParts) || tailParts === "100.100.100.200" || tailParts === "0.0.0.0") {
+      return true;
+    }
+    const hexMatch = tailParts.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    if (hexMatch) {
+      const hi = parseInt(hexMatch[1], 16);
+      const lo = parseInt(hexMatch[2], 16);
+      if ((hi >> 8 & 255) === 169 && (hi & 255) === 254 || hi === 25700 && lo === 25800 || hi === 0 && lo === 0) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
 function sanitizeWakeAttachmentUrl2(raw) {
   if (typeof raw !== "string")
     return null;
   const cleaned = raw.trim().replace(/[\x00-\x1f\x7f\r\n]+/g, "");
   if (!cleaned || cleaned.length > 2048 || /\s/.test(cleaned) || !/^https?:\/\//i.test(cleaned))
+    return null;
+  let parsed;
+  try {
+    parsed = new URL(cleaned);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:")
+    return null;
+  if (parsed.username || parsed.password)
+    return null;
+  if (isUnsafeMetadataOrLinkLocalHost3(parsed.hostname))
     return null;
   return cleaned;
 }
@@ -5804,14 +5928,14 @@ async function fetchWithDeadline(f, url, init, timeoutMs, parentSignal) {
 function sleepAbortable(ms, signal) {
   if (signal.aborted)
     return Promise.resolve();
-  return new Promise((resolve7) => {
+  return new Promise((resolve9) => {
     const onAbort = () => {
       clearTimeout(t);
-      resolve7();
+      resolve9();
     };
     const t = setTimeout(() => {
       signal.removeEventListener("abort", onAbort);
-      resolve7();
+      resolve9();
     }, ms);
     t.unref?.();
     signal.addEventListener("abort", onAbort, { once: true });
@@ -5830,7 +5954,7 @@ function loadSeenIds(file) {
 }
 function saveSeenIds(file, ids) {
   try {
-    ensureRealDirectory(dirname6(file));
+    ensureRealDirectory(dirname8(file));
     const list = [...ids].slice(-MAX_SEEN_IDS);
     safeWriteProfile(file, list);
   } catch {}
@@ -5858,7 +5982,7 @@ function acquireWakePidFile(wakePidFile, pid = process.pid, killFn = process.kil
   let tmp = "";
   let created = false;
   try {
-    const dirStat = lstatSync10(dirname6(wakePidFile));
+    const dirStat = lstatSync10(dirname8(wakePidFile));
     if (dirStat.isSymbolicLink() || !dirStat.isDirectory())
       return false;
     try {
@@ -5884,7 +6008,7 @@ function acquireWakePidFile(wakePidFile, pid = process.pid, killFn = process.kil
     writeFileSync5(tmp, `${pid}
 `, { mode: 384, flag: "wx" });
     created = true;
-    const recheckDir = lstatSync10(dirname6(wakePidFile), { throwIfNoEntry: false });
+    const recheckDir = lstatSync10(dirname8(wakePidFile), { throwIfNoEntry: false });
     const recheckTarget = lstatSync10(wakePidFile, { throwIfNoEntry: false });
     if (!recheckDir || recheckDir.isSymbolicLink() || !recheckDir.isDirectory() || recheckTarget && (recheckTarget.isSymbolicLink() || !recheckTarget.isFile())) {
       unlinkSync7(tmp);
@@ -5915,7 +6039,7 @@ function releaseWakePidFile(wakePidFile, pid = process.pid) {
 }
 function saveJsonMap(file, data) {
   try {
-    ensureRealDirectory(dirname6(file));
+    ensureRealDirectory(dirname8(file));
     safeWriteProfile(file, data);
   } catch {}
 }
@@ -6587,7 +6711,7 @@ function parseArgs() {
 var cliArgs = parseArgs();
 var isOneShotCli = Boolean(cliArgs.registerOnly || cliArgs.join || cliArgs.send || cliArgs.wakeOnce);
 if (process.argv.includes("--help") || process.argv.includes("-h")) {
-  const localOnboardingPath = join13(dirname7(fileURLToPath(import.meta.url)), "..", "skills", "onboarding.md");
+  const localOnboardingPath = join13(dirname9(fileURLToPath(import.meta.url)), "..", "skills", "onboarding.md");
   console.log(`agentschat-mcp v${package_default.version} \u2014 AgentsChat MCP and host bridges
 
 Usage: claude mcp add agentschat -- npx -y agentschat-mcp@latest --profile <Bot> [options]
@@ -6973,7 +7097,7 @@ if (identity.mode === "profile") {
 `);
     process.exit(1);
   }
-  mkdirSync4(dirname7(profileFile), { recursive: true });
+  mkdirSync4(dirname9(profileFile), { recursive: true });
   safeWriteProfile2(profileFile, profile);
   process.stderr.write(`[agentchat] Profile saved: ${profileFile}
 `);
@@ -10075,7 +10199,7 @@ async function registerAndConnectProfile(displayName, bindSessionId) {
     };
     const targetFile = nameToPath(cleanName);
     validateIdentityProfile(newProfile, targetFile);
-    mkdirSync4(dirname7(targetFile), { recursive: true });
+    mkdirSync4(dirname9(targetFile), { recursive: true });
     safeWriteProfile2(targetFile, newProfile);
     applyIdentityFromProfile(newProfile, targetFile, bindSessionId);
     const claimEntry = `${REST_URL}/chat/${encodeURIComponent(data.id)}?claim=1`;
@@ -10896,7 +11020,7 @@ ${idx}` }] };
               isError: true
             };
           }
-          mkdirSync4(dirname7(pMd), { recursive: true });
+          mkdirSync4(dirname9(pMd), { recursive: true });
           writeFileSync6(pMd, body);
           writeFileSync6(pMeta, JSON.stringify({ version: currentVersion, name: pSlug, syncedAt: new Date().toISOString() }));
           return { content: [{ type: "text", text: `synced personal skill "${pSlug}" v${currentVersion} \u2192 ${pMd} (was ${cachedVersion === null ? "missing" : `stale v${cachedVersion}`}). Read that file to run it.` }] };
@@ -10949,7 +11073,7 @@ ${idx}` }] };
             isError: true
           };
         }
-        mkdirSync4(dirname7(mdPath), { recursive: true });
+        mkdirSync4(dirname9(mdPath), { recursive: true });
         writeFileSync6(mdPath, body);
         writeFileSync6(metaPath, JSON.stringify({ version: currentVersion, title: doc?.title, doc_id: a.doc_id, chat_id: a.chat_id, syncedAt: new Date().toISOString() }));
         const was = cachedVersion === null ? "missing" : `stale v${cachedVersion}`;

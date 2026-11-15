@@ -27,7 +27,7 @@ function redactSecrets(text, opts) {
   if (typeof text !== "string" || !text)
     return "";
   const step = opts?.preserveAcKeys ? text : text.replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***");
-  return step.replace(/mcp_(?:at|rt|code)_[A-Za-z0-9_-]{16,}/g, "mcp_***REDACTED***").replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
+  return step.replace(/-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)/g, "***PRIVATE_KEY_REDACTED***").replace(/mcp_(?:at|rt|code)_[A-Za-z0-9_-]{16,}/g, "mcp_***REDACTED***").replace(/agent_key_[A-Za-z0-9_-]{12,}/g, "agent_key_***REDACTED***").replace(/whsec_[A-Za-z0-9_-]{12,}/g, "whsec_***REDACTED***").replace(/\bsk-(?:proj-|ant-|live-|test-)?[A-Za-z0-9_-]{16,}/g, "sk-***REDACTED***").replace(/\brk_(?:live|test)_[A-Za-z0-9]{12,}/g, "rk_***REDACTED***").replace(/\bgh[pousr]_[A-Za-z0-9_]{16,}/g, "gh_***REDACTED***").replace(/\bgithub_pat_[A-Za-z0-9_]{16,}/g, "github_pat_***REDACTED***").replace(/\bglpat-[A-Za-z0-9_-]{12,}/g, "glpat-***REDACTED***").replace(/\bxox[baprs]-[A-Za-z0-9-]{10,}/g, "xox-***REDACTED***").replace(/\bAIza[0-9A-Za-z_-]{20,}/g, "AIza***REDACTED***").replace(/(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])/g, "AKIA***REDACTED***").replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
 }
 
 // src/identity.ts
