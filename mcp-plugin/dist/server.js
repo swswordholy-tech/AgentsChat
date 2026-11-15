@@ -203,11 +203,12 @@ function redactParticipantPii(rawId) {
 // src/mentions.ts
 var MAX_MENTION_ID_CHARS = 128;
 var MAX_MENTION_CONTENT_CHARS = 1e5;
+var PROTOTYPE_MENTION_IDS = new Set(["__proto__", "constructor", "prototype"]);
 function matchesMention(content, agentId) {
   if (typeof content !== "string" || typeof agentId !== "string")
     return false;
   const trimmedId = agentId.trim();
-  if (!content || !trimmedId || trimmedId.length > MAX_MENTION_ID_CHARS || /[\x00-\x1f\x7f]/.test(trimmedId)) {
+  if (!content || !trimmedId || trimmedId.length > MAX_MENTION_ID_CHARS || trimmedId === "." || trimmedId === ".." || /[\/\\\s\x00-\x1f\x7f]/.test(trimmedId) || PROTOTYPE_MENTION_IDS.has(trimmedId.toLowerCase())) {
     return false;
   }
   const hay = content.length > MAX_MENTION_CONTENT_CHARS ? content.slice(0, MAX_MENTION_CONTENT_CHARS) : content;
@@ -367,8 +368,13 @@ function isValidCalendarDateTime(datePart, timePart, tzPart) {
 function normalizeTimestampForCursor(ts, mode) {
   if (!ts || typeof ts !== "string" || ts.length > 128)
     return ts;
+  if (/[\x00-\x1f\x7f]/.test(ts))
+    return;
+  if (mode !== "before" && mode !== "after")
+    return ts;
   const padChar = mode === "before" ? "9" : "0";
-  const m = ts.match(ISO_OFFSET_RE);
+  const trimmed = ts.trim();
+  const m = trimmed.match(ISO_OFFSET_RE);
   if (m) {
     const datePart = m[1];
     const timePart = m[2];
@@ -382,8 +388,10 @@ function normalizeTimestampForCursor(ts, mode) {
     }
     const wholeUtcMs = Date.parse(`${datePart}T${timePart}${tzPart}`);
     if (Number.isFinite(wholeUtcMs)) {
-      const utcWhole = new Date(wholeUtcMs).toISOString().slice(0, 19);
-      return `${utcWhole}.${frac9}Z`;
+      const iso = new Date(wholeUtcMs).toISOString();
+      if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(iso)) {
+        return `${iso.slice(0, 19)}.${frac9}Z`;
+      }
     }
   }
   return ts;
@@ -1996,26 +2004,41 @@ function shouldMigrateDevToken(i) {
 }
 
 // src/profile-selection.ts
-import { lstatSync, readFileSync as readFileSync2 } from "node:fs";
+import { lstatSync, readFileSync as readFileSync2, readlinkSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, parse, relative, resolve } from "node:path";
 var MAX_PROJECT_CONFIG_BYTES = 64 * 1024;
 var MAX_PROJECT_PROFILE_BYTES = 1048576;
 var FORBIDDEN_CREDENTIAL_KEYS = new Set([
   "token",
   "access_token",
   "refresh_token",
+  "id_token",
+  "oauth_token",
+  "api_token",
   "key",
   "api_key",
   "agent_key",
   "private_key",
   "secret",
   "client_secret",
+  "webhook_secret",
   "password",
   "authorization",
-  "bearer"
+  "bearer",
+  "cookie"
 ]);
 var PROTOTYPE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+var RESERVED_SIDECAR_STEMS = new Set([
+  "grok-binds",
+  "session-binds",
+  "agy-binds",
+  "cursor",
+  "read-cursors",
+  "wake-pids",
+  "config",
+  "codex-bots"
+]);
 function safeLstat(target) {
   try {
     return lstatSync(target);
@@ -2025,9 +2048,72 @@ function safeLstat(target) {
     throw err;
   }
 }
+function isAllowedDarwinSystemLink(dirPath) {
+  if (process.platform !== "darwin")
+    return false;
+  if (dirPath !== "/var" && dirPath !== "/tmp" && dirPath !== "/etc")
+    return false;
+  try {
+    return readlinkSync(dirPath) === `private${dirPath}`;
+  } catch {
+    return false;
+  }
+}
+function hasSafeDirChain(dirPath) {
+  const abs = resolve(dirPath);
+  const root = parse(abs).root;
+  const rel = abs.slice(root.length);
+  const segments = rel.split(/[\\/]+/).filter(Boolean);
+  let cur = root;
+  for (let i = 0;i < segments.length; i++) {
+    cur = join(cur, segments[i]);
+    let st;
+    try {
+      st = lstatSync(cur);
+    } catch (err) {
+      if (err && err.code === "ENOENT")
+        return true;
+      return false;
+    }
+    if (st.isSymbolicLink()) {
+      if (isAllowedDarwinSystemLink(cur))
+        continue;
+      return false;
+    }
+    if (!st.isDirectory())
+      return false;
+  }
+  return true;
+}
 function isLoopbackHost(hostname) {
   const lower = hostname.toLowerCase().replace(/\.$/, "");
   return lower === "127.0.0.1" || lower === "localhost" || lower === "[::1]" || lower === "::1";
+}
+function isUnsafeMetadataOrLinkLocalHost(hostname) {
+  const lower = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  if (lower === "metadata.google.internal" || lower === "metadata" || lower === "metadata.goog" || lower.endsWith(".metadata.goog") || lower === "instance-data") {
+    return true;
+  }
+  if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(lower))
+    return true;
+  if (/^fe[89ab][0-9a-f]:/.test(lower))
+    return true;
+  if (lower.startsWith("::ffff:")) {
+    const tail = lower.slice("::ffff:".length);
+    const tailParts = tail.startsWith("0:") ? tail.slice(2) : tail;
+    if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(tailParts))
+      return true;
+    const hexMatch = tailParts.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    if (hexMatch) {
+      const hi = parseInt(hexMatch[1], 16);
+      if ((hi >> 8 & 255) === 169 && (hi & 255) === 254)
+        return true;
+    }
+  }
+  return false;
+}
+function isSafeProjectAgentId(id) {
+  return id.length > 0 && id.length <= 128 && id !== "." && id !== ".." && !/[\/\\\s\x00-\x1f\x7f]/.test(id) && !PROTOTYPE_KEYS.has(id.toLowerCase());
 }
 function projectProfileSelector(cwd) {
   const resolvedCwd = resolve(cwd);
@@ -2035,7 +2121,7 @@ function projectProfileSelector(cwd) {
   const dirStat = safeLstat(projectDir);
   if (!dirStat)
     return;
-  if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) {
+  if (dirStat.isSymbolicLink() || !dirStat.isDirectory() || !hasSafeDirChain(projectDir)) {
     throw new Error("Refusing symlinked or non-directory project .agentschat");
   }
   const config = join(projectDir, "config.json");
@@ -2062,6 +2148,9 @@ function projectProfileSelector(cwd) {
         throw new Error(`Invalid project ${field}`);
       }
     }
+    if (doc.agent_id !== undefined && !isSafeProjectAgentId(doc.agent_id.trim())) {
+      throw new Error("Invalid project agent_id");
+    }
     for (const [field, protocols] of [["api_url", ["https:", "http:"]], ["ws_url", ["wss:", "ws:"]]]) {
       if (doc[field] === undefined)
         continue;
@@ -2072,8 +2161,9 @@ function projectProfileSelector(cwd) {
         throw new Error(`Invalid project ${field}`);
       }
       const portBad = url.port !== "" && (!Number.isInteger(Number(url.port)) || Number(url.port) < 1 || Number(url.port) > 65535);
-      if (portBad || !protocols.includes(url.protocol) || url.username || url.password || url.search || url.hash || !url.protocol.endsWith("s:") && !isLoopbackHost(url.hostname))
-        throw new Error(`Invalid project ${field}: require TLS (except loopback) and no credentials/query`);
+      if (portBad || !protocols.includes(url.protocol) || url.username || url.password || url.search || url.hash || isUnsafeMetadataOrLinkLocalHost(url.hostname) || !url.protocol.endsWith("s:") && !isLoopbackHost(url.hostname)) {
+        throw new Error(`Invalid project ${field}: require TLS (except loopback), safe host, and no credentials/query`);
+      }
     }
   }
   const settings = {
@@ -2083,14 +2173,15 @@ function projectProfileSelector(cwd) {
   };
   if (doc.profile !== undefined) {
     const value = doc.profile.trim();
-    if (value === "." || value === ".." || PROTOTYPE_KEYS.has(value.replace(/\.json$/i, "").toLowerCase())) {
+    const stemLower = value.replace(/\.json$/i, "").toLowerCase();
+    if (value === "." || value === ".." || PROTOTYPE_KEYS.has(stemLower) || !value.includes("/") && !value.includes("\\") && RESERVED_SIDECAR_STEMS.has(stemLower)) {
       throw new Error("Invalid project profile");
     }
     if (value.startsWith("~/") || value.startsWith("~\\")) {
       const homeBase = resolve(homedir());
       const resolvedHomeTarget = resolve(homeBase, value.slice(2));
       const relHome = relative(homeBase, resolvedHomeTarget);
-      if (!relHome || relHome.startsWith("..") || isAbsolute(relHome)) {
+      if (!relHome || relHome.startsWith("..") || isAbsolute(relHome) || !hasSafeDirChain(dirname(resolvedHomeTarget))) {
         throw new Error("Invalid project profile: home-relative path traversal");
       }
       return { selector: value, source: "project-config", ...settings };
@@ -2098,10 +2189,13 @@ function projectProfileSelector(cwd) {
     if (!isAbsolute(value) && (value.includes("/") || value.includes("\\"))) {
       const resolvedTarget = resolve(resolvedCwd, value);
       const rel = relative(resolvedCwd, resolvedTarget);
-      if (!rel || rel.startsWith("..") || isAbsolute(rel)) {
+      if (!rel || rel.startsWith("..") || isAbsolute(rel) || !hasSafeDirChain(dirname(resolvedTarget))) {
         throw new Error("Invalid project profile: relative path must stay within project directory");
       }
       return { selector: resolvedTarget, source: "project-config", ...settings };
+    }
+    if (isAbsolute(value) && !hasSafeDirChain(dirname(value))) {
+      throw new Error("Invalid project profile: symlinked parent directory");
     }
     return { selector: value, source: "project-config", ...settings };
   }
@@ -3015,9 +3109,9 @@ function fireZcodeWake(msg, cfg) {
 
 // src/session-bind.ts
 import { createHash } from "node:crypto";
-import { closeSync, lstatSync as lstatSync4, mkdirSync, openSync, readFileSync as readFileSync5, readSync, readdirSync as readdirSync2, unlinkSync as unlinkSync2 } from "node:fs";
+import { closeSync, lstatSync as lstatSync4, mkdirSync, openSync, readFileSync as readFileSync5, readSync, readdirSync as readdirSync2, readlinkSync as readlinkSync2, unlinkSync as unlinkSync2 } from "node:fs";
 import { homedir as homedir3, tmpdir } from "node:os";
-import { join as join5 } from "node:path";
+import { isAbsolute as isAbsolute2, join as join5, parse as parse2, resolve as resolve3 } from "node:path";
 import { spawnSync } from "node:child_process";
 
 // src/profile-store.ts
@@ -3032,7 +3126,7 @@ import {
   readdirSync,
   readFileSync as readFileSync4
 } from "fs";
-import { dirname, join as join4, resolve as resolve2 } from "path";
+import { dirname as dirname2, join as join4, resolve as resolve2 } from "path";
 var defaultWarn = (m) => process.stderr.write(m);
 var MAX_PROFILE_JSON_BYTES = 64 * 1024;
 var CONTROL_CHAR_GLOBAL_RE = /[\x00-\x1f\x7f]/g;
@@ -3063,7 +3157,7 @@ function isAllowedDarwinSystemSymlink(dirPath) {
   }
 }
 function hasSafeAncestorDirs(targetPath) {
-  let cur = dirname(resolve2(targetPath));
+  let cur = dirname2(resolve2(targetPath));
   for (let depth = 0;depth < 64; depth += 1) {
     const st = safeLstat2(cur);
     if (st) {
@@ -3074,7 +3168,7 @@ function hasSafeAncestorDirs(targetPath) {
         return false;
       }
     }
-    const parent = dirname(cur);
+    const parent = dirname2(cur);
     if (parent === cur)
       break;
     cur = parent;
@@ -3082,7 +3176,7 @@ function hasSafeAncestorDirs(targetPath) {
   return true;
 }
 function safeWriteProfile(path, data, warn = defaultWarn) {
-  const parentDir = dirname(path);
+  const parentDir = dirname2(path);
   const parentStat = safeLstat2(parentDir);
   if (!parentStat || parentStat.isSymbolicLink() || !parentStat.isDirectory() || !hasSafeAncestorDirs(path)) {
     throw new Error(`Refusing to write profile into invalid or symlinked parent directory: ${sanitizeWarnPart(parentDir)}`);
@@ -3198,8 +3292,9 @@ function isPidAlive(pid) {
 }
 function resolveLockDir(homeDir, env = process.env) {
   const explicit = env.AGENTSCHAT_LOCK_DIR?.trim();
-  if (explicit)
+  if (explicit && explicit.length <= 4096 && !explicit.startsWith("-") && !CONTROL_CHAR_RE.test(explicit) && isAbsolute2(explicit)) {
     return explicit;
+  }
   const hash = createHash("sha256").update(homeDir || ".").digest("hex").slice(0, 12);
   const baseTmp = process.platform === "win32" ? tmpdir() : "/tmp";
   return join5(baseTmp, `agentschat-locks-${hash}`);
@@ -3209,6 +3304,16 @@ var LOCK_KEY_MAX_CHARS = 128;
 var SESSION_BINDS_MAX_BYTES = 1024 * 1024;
 var MAX_SESSION_BINDS_ENTRIES = 1024;
 var CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
+var RESERVED_BIND_SIDECARS = new Set([
+  "session-binds",
+  "agy-binds",
+  "grok-binds",
+  "cursor",
+  "read-cursors",
+  "wake-pids",
+  "config",
+  "codex-bots"
+]);
 function safeLstat3(path) {
   try {
     return lstatSync4(path);
@@ -3234,16 +3339,52 @@ function isSafeTargetFileOrMissing(path) {
     return Boolean(e && typeof e === "object" && e.code === "ENOENT");
   }
 }
-function isSafeDirOrMissing(dirPath) {
+function isAllowedDarwinSystemLink2(dirPath) {
+  if (process.platform !== "darwin")
+    return false;
+  if (dirPath !== "/var" && dirPath !== "/tmp" && dirPath !== "/etc")
+    return false;
   try {
-    const st = lstatSync4(dirPath);
-    return !st.isSymbolicLink() && st.isDirectory();
-  } catch (e) {
-    return Boolean(e && typeof e === "object" && e.code === "ENOENT");
+    return readlinkSync2(dirPath) === `private${dirPath}`;
+  } catch {
+    return false;
   }
+}
+function isSafeDirOrMissing(dirPath) {
+  if (!dirPath || CONTROL_CHAR_RE.test(dirPath))
+    return false;
+  const abs = resolve3(dirPath);
+  const root = parse2(abs).root;
+  const segments = abs.slice(root.length).split(/[\\/]+/).filter(Boolean);
+  let cur = root;
+  for (let i = 0;i < segments.length; i++) {
+    cur = join5(cur, segments[i]);
+    try {
+      const st = lstatSync4(cur);
+      if (st.isSymbolicLink()) {
+        if (isAllowedDarwinSystemLink2(cur))
+          continue;
+        return false;
+      }
+      if (!st.isDirectory())
+        return false;
+    } catch (e) {
+      if (e && typeof e === "object" && e.code === "ENOENT")
+        return true;
+      return false;
+    }
+  }
+  return true;
 }
 function isValidBindToken(value) {
   return value.length > 0 && value.length <= 256 && !CONTROL_CHAR_RE.test(value);
+}
+function isValidBoundProfileName(value) {
+  if (!isValidBindToken(value) || value === "." || value === ".." || value.includes("/") || value.includes("\\")) {
+    return false;
+  }
+  const stem = value.replace(/\.json$/i, "").toLowerCase();
+  return Boolean(stem) && !isUnsafeBindKey(value) && !isUnsafeBindKey(stem) && !RESERVED_BIND_SIDECARS.has(stem);
 }
 function lockFilePath(lockDir, agentId) {
   const trimmed = String(agentId || "").trim();
@@ -3258,11 +3399,11 @@ function lockFilePath(lockDir, agentId) {
   return join5(lockDir, `${safe}.lock`);
 }
 function readAgentLock(lockDir, agentId) {
-  if (!agentId)
+  if (!agentId || !isSafeDirOrMissing(lockDir))
     return null;
   const file = lockFilePath(lockDir, agentId);
   const raw = readBoundedRegularJson(file, LOCK_FILE_MAX_BYTES);
-  if (!raw || typeof raw !== "object" || Array.isArray(raw) || typeof raw.pid !== "number" || typeof raw.agentId !== "string") {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw) || Object.prototype.hasOwnProperty.call(raw, "__proto__") || typeof raw.pid !== "number" || typeof raw.agentId !== "string") {
     return null;
   }
   return raw;
@@ -3270,7 +3411,7 @@ function readAgentLock(lockDir, agentId) {
 function checkAgentLock(opts) {
   const { lockDir, agentId } = opts;
   const currentPid = opts.currentPid ?? process.pid;
-  if (!agentId)
+  if (!agentId || !isSafeDirOrMissing(lockDir))
     return { locked: false };
   const file = lockFilePath(lockDir, agentId);
   const record = readAgentLock(lockDir, agentId);
@@ -3324,7 +3465,7 @@ function acquireAgentLock(opts) {
   }
 }
 function releaseAgentLock(opts) {
-  if (!opts.agentId)
+  if (!opts.agentId || !isSafeDirOrMissing(opts.lockDir))
     return false;
   const currentPid = opts.currentPid ?? process.pid;
   const file = lockFilePath(opts.lockDir, opts.agentId);
@@ -3364,17 +3505,17 @@ function parseSessionBinds(raw) {
     if (count >= MAX_SESSION_BINDS_ENTRIES)
       break;
     const key = k.trim();
-    if (!isValidBindToken(key) || isUnsafeBindKey(key))
+    if (!isValidBindToken(key) || key === "." || key === ".." || isUnsafeBindKey(key))
       continue;
     if (typeof v === "string") {
       const val = v.trim();
-      if (isValidBindToken(val) && !isUnsafeBindKey(val)) {
+      if (isValidBoundProfileName(val)) {
         out[key] = val;
         count += 1;
       }
     } else if (v && typeof v === "object" && typeof v.profile === "string") {
       const val = v.profile.trim();
-      if (isValidBindToken(val) && !isUnsafeBindKey(val)) {
+      if (isValidBoundProfileName(val)) {
         out[key] = val;
         count += 1;
       }
@@ -3416,8 +3557,9 @@ function resolveAgentIdForProfileName(configDir, name) {
 function saveSessionBind(configDir, sessionId, profileName) {
   const sid = sessionId.trim();
   const prof = profileName.trim();
-  if (!isValidBindToken(sid) || !isValidBindToken(prof) || isUnsafeBindKey(sid) || isUnsafeBindKey(prof))
+  if (!isValidBindToken(sid) || sid === "." || sid === ".." || isUnsafeBindKey(sid) || !isValidBoundProfileName(prof)) {
     return;
+  }
   if (!isSafeDirOrMissing(configDir))
     return;
   const path = join5(configDir, DEFAULT_SESSION_BINDS_FILENAME);
@@ -3466,7 +3608,9 @@ function saveSessionBind(configDir, sessionId, profileName) {
 }
 function removeSessionBind(configDir, sessionId) {
   const sid = sessionId.trim();
-  if (!isValidBindToken(sid) || isUnsafeBindKey(sid))
+  if (!isValidBindToken(sid) || sid === "." || sid === ".." || isUnsafeBindKey(sid))
+    return false;
+  if (!isSafeDirOrMissing(configDir))
     return false;
   let removed = false;
   for (const filename of [DEFAULT_SESSION_BINDS_FILENAME, LEGACY_AGY_BINDS_FILENAME]) {
@@ -3501,29 +3645,40 @@ function findBoundSessionForProfile(configDir, profileName, filter) {
   }
   return matches.length > 0 ? matches[matches.length - 1] : null;
 }
+function isSafeDetectedSessionId(sid) {
+  return isValidBindToken(sid) && sid !== "." && sid !== ".." && !sid.includes("/") && !sid.includes("\\") && !isUnsafeBindKey(sid);
+}
+function cleanDetectedWorkspacePath(raw) {
+  if (typeof raw !== "string")
+    return;
+  const s = raw.trim();
+  if (!s || s.length > 4096 || s.startsWith("-") || CONTROL_CHAR_RE.test(s))
+    return;
+  return s;
+}
 function detectRuntimeSession(env = process.env, meta) {
   const zcodeCtx = meta?.["com.zcode/request-context"];
   const metaSessionId = typeof meta?.session_id === "string" && meta.session_id.trim() || typeof zcodeCtx?.session_id === "string" && zcodeCtx.session_id.trim() || "";
-  if (metaSessionId) {
-    const workspacePath = typeof meta?.workspace_path === "string" && meta.workspace_path.trim() || typeof zcodeCtx?.workspace_path === "string" && zcodeCtx.workspace_path.trim() || undefined;
+  if (isSafeDetectedSessionId(metaSessionId)) {
+    const workspacePath = cleanDetectedWorkspacePath(meta?.workspace_path) || cleanDetectedWorkspacePath(zcodeCtx?.workspace_path);
     return { sessionId: metaSessionId, runtime: "zcode", ...workspacePath ? { workspacePath } : {} };
   }
-  const zcodeEnvSid = env.ZCODE_SESSION_ID?.trim();
-  if (zcodeEnvSid) {
-    const workspacePath = env.ZCODE_PROJECT_DIR?.trim() || undefined;
+  const zcodeEnvSid = env.ZCODE_SESSION_ID?.trim() || "";
+  if (isSafeDetectedSessionId(zcodeEnvSid)) {
+    const workspacePath = cleanDetectedWorkspacePath(env.ZCODE_PROJECT_DIR);
     return { sessionId: zcodeEnvSid, runtime: "zcode", ...workspacePath ? { workspacePath } : {} };
   }
-  const agySid = env.ANTIGRAVITY_CONVERSATION_ID?.trim();
-  if (agySid) {
+  const agySid = env.ANTIGRAVITY_CONVERSATION_ID?.trim() || "";
+  if (isSafeDetectedSessionId(agySid)) {
     return { sessionId: agySid, runtime: "antigravity" };
   }
   const claudeSid = (env.CLAUDE_CODE_SESSION_ID || env.CLAUDE_SESSION_ID || "").trim();
-  if (claudeSid) {
-    const workspacePath = env.CLAUDE_PROJECT_DIR?.trim() || undefined;
+  if (isSafeDetectedSessionId(claudeSid)) {
+    const workspacePath = cleanDetectedWorkspacePath(env.CLAUDE_PROJECT_DIR);
     return { sessionId: claudeSid, runtime: "claude-code", ...workspacePath ? { workspacePath } : {} };
   }
   const explicitSid = (env.AGENTSCHAT_SESSION_ID || env.AGENTCHAT_SESSION_ID || "").trim();
-  if (explicitSid) {
+  if (isSafeDetectedSessionId(explicitSid)) {
     return { sessionId: explicitSid, runtime: "custom" };
   }
   const hasExplicitAgyEnv = env.__CFBundleIdentifier === "com.google.antigravity" || Boolean(env.AGY_BROWSER_WS_URL) || Boolean(env.ANTIGRAVITY_LS_ADDRESS) || Boolean(env.ANTIGRAVITY_CSRF_TOKEN);
@@ -3801,7 +3956,7 @@ function detectAntigravityCallerSession(opts) {
   const home = process.env.HOME || process.env.USERPROFILE || homedir3();
   const brainDir = opts?.brainDir?.trim() || process.env.AGENTSCHAT_AGY_BRAIN_DIR?.trim() || join5(home, ".gemini", "antigravity", "brain");
   const brainStat = safeLstat3(brainDir);
-  if (!brainStat || brainStat.isSymbolicLink() || !brainStat.isDirectory())
+  if (!brainStat || brainStat.isSymbolicLink() || !brainStat.isDirectory() || !isSafeDirOrMissing(brainDir))
     return null;
   const nowMs = opts?.nowMs ?? Date.now();
   const maxAgeMs = opts?.maxAgeMs ?? 30000;
@@ -4146,7 +4301,7 @@ async function detectDshCallerSession(opts) {
     } catch {}
   }
   const homeStat = safeLstat3(dshHome);
-  if (!homeStat || homeStat.isSymbolicLink() || !homeStat.isDirectory())
+  if (!homeStat || homeStat.isSymbolicLink() || !homeStat.isDirectory() || !isSafeDirOrMissing(dshHome))
     return null;
   const newestByLog = newestSessionLog(dshHome, nowMs, 30000);
   if (newestByLog)
@@ -4155,19 +4310,29 @@ async function detectDshCallerSession(opts) {
 }
 
 // src/session-route.ts
-import { lstatSync as lstatSync6, readFileSync as readFileSync7 } from "node:fs";
+import { lstatSync as lstatSync6, readFileSync as readFileSync7, readlinkSync as readlinkSync4 } from "node:fs";
 import { homedir as homedir4 } from "node:os";
-import { isAbsolute as isAbsolute2, join as join7 } from "node:path";
+import { isAbsolute as isAbsolute4, join as join7, parse as parse4, resolve as resolve5 } from "node:path";
 
 // src/session-bind.ts
-import { closeSync as closeSync2, lstatSync as lstatSync5, mkdirSync as mkdirSync2, openSync as openSync2, readFileSync as readFileSync6, readSync as readSync2, readdirSync as readdirSync3, unlinkSync as unlinkSync3 } from "node:fs";
-import { join as join6 } from "node:path";
+import { closeSync as closeSync2, lstatSync as lstatSync5, mkdirSync as mkdirSync2, openSync as openSync2, readFileSync as readFileSync6, readSync as readSync2, readdirSync as readdirSync3, readlinkSync as readlinkSync3, unlinkSync as unlinkSync3 } from "node:fs";
+import { isAbsolute as isAbsolute3, join as join6, parse as parse3, resolve as resolve4 } from "node:path";
 var DEFAULT_SESSION_BINDS_FILENAME2 = "session-binds.json";
 var LEGACY_AGY_BINDS_FILENAME2 = "agy-binds.json";
 var LOCK_FILE_MAX_BYTES2 = 64 * 1024;
 var SESSION_BINDS_MAX_BYTES2 = 1024 * 1024;
 var MAX_SESSION_BINDS_ENTRIES2 = 1024;
 var CONTROL_CHAR_RE2 = /[\x00-\x1f\x7f]/;
+var RESERVED_BIND_SIDECARS2 = new Set([
+  "session-binds",
+  "agy-binds",
+  "grok-binds",
+  "cursor",
+  "read-cursors",
+  "wake-pids",
+  "config",
+  "codex-bots"
+]);
 function readBoundedRegularJson2(path, maxBytes) {
   try {
     const st = lstatSync5(path);
@@ -4178,16 +4343,52 @@ function readBoundedRegularJson2(path, maxBytes) {
     return null;
   }
 }
-function isSafeDirOrMissing2(dirPath) {
+function isAllowedDarwinSystemLink3(dirPath) {
+  if (process.platform !== "darwin")
+    return false;
+  if (dirPath !== "/var" && dirPath !== "/tmp" && dirPath !== "/etc")
+    return false;
   try {
-    const st = lstatSync5(dirPath);
-    return !st.isSymbolicLink() && st.isDirectory();
-  } catch (e) {
-    return Boolean(e && typeof e === "object" && e.code === "ENOENT");
+    return readlinkSync3(dirPath) === `private${dirPath}`;
+  } catch {
+    return false;
   }
+}
+function isSafeDirOrMissing2(dirPath) {
+  if (!dirPath || CONTROL_CHAR_RE2.test(dirPath))
+    return false;
+  const abs = resolve4(dirPath);
+  const root = parse3(abs).root;
+  const segments = abs.slice(root.length).split(/[\\/]+/).filter(Boolean);
+  let cur = root;
+  for (let i = 0;i < segments.length; i++) {
+    cur = join6(cur, segments[i]);
+    try {
+      const st = lstatSync5(cur);
+      if (st.isSymbolicLink()) {
+        if (isAllowedDarwinSystemLink3(cur))
+          continue;
+        return false;
+      }
+      if (!st.isDirectory())
+        return false;
+    } catch (e) {
+      if (e && typeof e === "object" && e.code === "ENOENT")
+        return true;
+      return false;
+    }
+  }
+  return true;
 }
 function isValidBindToken2(value) {
   return value.length > 0 && value.length <= 256 && !CONTROL_CHAR_RE2.test(value);
+}
+function isValidBoundProfileName2(value) {
+  if (!isValidBindToken2(value) || value === "." || value === ".." || value.includes("/") || value.includes("\\")) {
+    return false;
+  }
+  const stem = value.replace(/\.json$/i, "").toLowerCase();
+  return Boolean(stem) && !isUnsafeBindKey2(value) && !isUnsafeBindKey2(stem) && !RESERVED_BIND_SIDECARS2.has(stem);
 }
 function isUnsafeBindKey2(key) {
   const lower = key.toLowerCase();
@@ -4202,17 +4403,17 @@ function parseSessionBinds2(raw) {
     if (count >= MAX_SESSION_BINDS_ENTRIES2)
       break;
     const key = k.trim();
-    if (!isValidBindToken2(key) || isUnsafeBindKey2(key))
+    if (!isValidBindToken2(key) || key === "." || key === ".." || isUnsafeBindKey2(key))
       continue;
     if (typeof v === "string") {
       const val = v.trim();
-      if (isValidBindToken2(val) && !isUnsafeBindKey2(val)) {
+      if (isValidBoundProfileName2(val)) {
         out[key] = val;
         count += 1;
       }
     } else if (v && typeof v === "object" && typeof v.profile === "string") {
       const val = v.profile.trim();
-      if (isValidBindToken2(val) && !isUnsafeBindKey2(val)) {
+      if (isValidBoundProfileName2(val)) {
         out[key] = val;
         count += 1;
       }
@@ -4239,11 +4440,21 @@ var DSH_HEALTH_MAX_BYTES2 = 256 * 1024;
 var MAX_PROFILE_BYTES = 64 * 1024;
 var MAX_DIR_PATH_LENGTH = 4096;
 var RESERVED_PROFILE_KEY = /^(?:__proto__|constructor|prototype)$/i;
+var RESERVED_ROUTE_SIDECARS = new Set([
+  "session-binds",
+  "agy-binds",
+  "grok-binds",
+  "cursor",
+  "read-cursors",
+  "wake-pids",
+  "config",
+  "codex-bots"
+]);
 function isSafeAbsoluteDirEnv(raw) {
   if (typeof raw !== "string")
     return false;
   const s = raw.trim();
-  return s.length > 0 && s.length <= MAX_DIR_PATH_LENGTH && !s.startsWith("-") && !/[\x00-\x1f\x7f]/.test(s) && isAbsolute2(s);
+  return s.length > 0 && s.length <= MAX_DIR_PATH_LENGTH && !s.startsWith("-") && !/[\x00-\x1f\x7f]/.test(s) && isAbsolute4(s);
 }
 function agentschatConfigDir(env = process.env) {
   if (isSafeAbsoluteDirEnv(env.AGENTSCHAT_CONFIG_DIR)) {
@@ -4264,10 +4475,38 @@ function isSafeRegularProfileFile(path) {
     return false;
   }
 }
+function isAllowedDarwinSystemLink4(dirPath) {
+  if (process.platform !== "darwin")
+    return false;
+  if (dirPath !== "/var" && dirPath !== "/tmp" && dirPath !== "/etc")
+    return false;
+  try {
+    return readlinkSync4(dirPath) === `private${dirPath}`;
+  } catch {
+    return false;
+  }
+}
 function isSafeRealDir(path) {
   try {
     const st = lstatSync6(path);
-    return !st.isSymbolicLink() && st.isDirectory();
+    if (st.isSymbolicLink() || !st.isDirectory())
+      return false;
+    const abs = resolve5(path);
+    const root = parse4(abs).root;
+    const segments = abs.slice(root.length).split(/[\\/]+/).filter(Boolean);
+    let cur = root;
+    for (let i = 0;i < segments.length; i++) {
+      cur = join7(cur, segments[i]);
+      const anc = lstatSync6(cur);
+      if (anc.isSymbolicLink()) {
+        if (isAllowedDarwinSystemLink4(cur))
+          continue;
+        return false;
+      }
+      if (!anc.isDirectory())
+        return false;
+    }
+    return true;
   } catch {
     return false;
   }
@@ -4277,8 +4516,9 @@ function profilePathForName(configDir, name) {
     return;
   }
   const base = name.replace(/\.json$/i, "").replace(/[^a-zA-Z0-9_-]/g, "_");
-  if (!base || base.length > 128 || RESERVED_PROFILE_KEY.test(base))
+  if (!base || base.length > 128 || RESERVED_PROFILE_KEY.test(base) || RESERVED_ROUTE_SIDECARS.has(base.toLowerCase())) {
     return;
+  }
   const profilesDir = join7(configDir, "profiles");
   if (isSafeRealDir(profilesDir)) {
     const nested = join7(profilesDir, `${base}.json`);
@@ -4371,7 +4611,14 @@ class HeartbeatMonitor {
     this.reconnecting = false;
   }
   tick() {
-    const state = this.deps.getReadyState();
+    let state;
+    try {
+      state = this.deps.getReadyState();
+    } catch {
+      this.connectingSince = null;
+      this.safeReconnect("readyState failed");
+      return;
+    }
     if (state === WS_OPEN) {
       this.connectingSince = null;
       if (Date.now() - this.lastPong > this.pongTimeout) {
@@ -4561,7 +4808,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { readFileSync as readFileSync12, existsSync as existsSync2, writeFileSync as writeFileSync6, mkdirSync as mkdirSync4, readdirSync as readdirSync5 } from "fs";
 import { homedir as homedir6 } from "os";
-import { join as join13, dirname as dirname6 } from "path";
+import { join as join13, dirname as dirname7 } from "path";
 import { fileURLToPath } from "url";
 
 // src/profile-store.ts
@@ -4576,7 +4823,7 @@ import {
   readdirSync as readdirSync4,
   readFileSync as readFileSync8
 } from "fs";
-import { dirname as dirname2, join as join8, resolve as resolve3 } from "path";
+import { dirname as dirname3, join as join8, resolve as resolve6 } from "path";
 var defaultWarn2 = (m) => process.stderr.write(m);
 var MAX_PROFILE_JSON_BYTES2 = 64 * 1024;
 var CONTROL_CHAR_GLOBAL_RE2 = /[\x00-\x1f\x7f]/g;
@@ -4607,7 +4854,7 @@ function isAllowedDarwinSystemSymlink2(dirPath) {
   }
 }
 function hasSafeAncestorDirs2(targetPath) {
-  let cur = dirname2(resolve3(targetPath));
+  let cur = dirname3(resolve6(targetPath));
   for (let depth = 0;depth < 64; depth += 1) {
     const st = safeLstat4(cur);
     if (st) {
@@ -4618,7 +4865,7 @@ function hasSafeAncestorDirs2(targetPath) {
         return false;
       }
     }
-    const parent = dirname2(cur);
+    const parent = dirname3(cur);
     if (parent === cur)
       break;
     cur = parent;
@@ -4626,7 +4873,7 @@ function hasSafeAncestorDirs2(targetPath) {
   return true;
 }
 function safeWriteProfile2(path, data, warn = defaultWarn2) {
-  const parentDir = dirname2(path);
+  const parentDir = dirname3(path);
   const parentStat = safeLstat4(parentDir);
   if (!parentStat || parentStat.isSymbolicLink() || !parentStat.isDirectory() || !hasSafeAncestorDirs2(path)) {
     throw new Error(`Refusing to write profile into invalid or symlinked parent directory: ${sanitizeWarnPart2(parentDir)}`);
@@ -4748,7 +4995,7 @@ function findDefaultProfileCollision(configDir, defaultProfilePath) {
   if (!cfgStat || cfgStat.isSymbolicLink() || !cfgStat.isDirectory() || !hasSafeAncestorDirs2(join8(configDir, "probe"))) {
     return null;
   }
-  const resolvedDefault = resolve3(defaultProfilePath);
+  const resolvedDefault = resolve6(defaultProfilePath);
   for (const dir of [join8(configDir, "profiles"), configDir]) {
     const dirStat = safeLstat4(dir);
     if (!dirStat || dirStat.isSymbolicLink() || !dirStat.isDirectory())
@@ -4763,7 +5010,7 @@ function findDefaultProfileCollision(configDir, defaultProfilePath) {
       if (NON_PROFILE_JSON_FILES2.has(file.toLowerCase()))
         continue;
       const candidatePath = join8(dir, file);
-      if (resolve3(candidatePath) === resolvedDefault)
+      if (resolve6(candidatePath) === resolvedDefault)
         continue;
       const baseName = file.replace(/\.json$/i, "");
       if (baseName.toLowerCase() === "profile")
@@ -4925,7 +5172,7 @@ function expectedAgentIdViolation(expected, liveAgentId) {
 // src/read-cursor.ts
 import { randomBytes } from "crypto";
 import { chmodSync as chmodSync3, lstatSync as lstatSync8, readFileSync as readFileSync9, realpathSync as realpathSync3, renameSync as renameSync3, unlinkSync as unlinkSync5, writeFileSync as writeFileSync3 } from "fs";
-import { dirname as dirname3, isAbsolute as isAbsolute3, join as join9, sep } from "path";
+import { dirname as dirname4, isAbsolute as isAbsolute5, join as join9, sep } from "path";
 var MAX_CURSOR_BYTES = 4 * 1024 * 1024;
 var MAX_CURSOR_ENTRIES = 50000;
 var RESERVED_PROTO_KEY = /^(?:__proto__|constructor|prototype)$/i;
@@ -4934,7 +5181,7 @@ function scrubDiag(value) {
   return redactSecrets2(String(value ?? "")).replace(/\b(?:Bearer|Basic)\s+[^\s"'<>\\]+/gi, "[REDACTED]").replace(/(?:agent_key_|sk-|whsec_|gh[pousr]_|github_pat_|AIza|AKIA|ASIA)[A-Za-z0-9+/=_-]{12,}/g, "[REDACTED]").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
 }
 function hasSafeAncestorDirs3(targetFile) {
-  let dir = dirname3(isAbsolute3(targetFile) ? targetFile : `${process.cwd()}${sep}${targetFile}`);
+  let dir = dirname4(isAbsolute5(targetFile) ? targetFile : `${process.cwd()}${sep}${targetFile}`);
   while (true) {
     let st;
     try {
@@ -4952,7 +5199,7 @@ function hasSafeAncestorDirs3(targetFile) {
     if (!isDarwinRootLink && (st.isSymbolicLink() || !st.isDirectory())) {
       return false;
     }
-    const parent = dirname3(dir);
+    const parent = dirname4(dir);
     if (parent === dir)
       break;
     dir = parent;
@@ -5020,7 +5267,7 @@ function loadCursor(file, warn) {
 }
 function persistCursor(file, cursor, warn) {
   try {
-    const parentStat = lstatSync8(dirname3(file));
+    const parentStat = lstatSync8(dirname4(file));
     if (parentStat.isSymbolicLink() || !parentStat.isDirectory() || !hasSafeAncestorDirs3(file)) {
       warn(`[agentchat] WARNING: failed to persist read cursor to ${scrubDiag(file)}: parent is not a real directory
 `);
@@ -5090,16 +5337,17 @@ function flushCursor(state, persist) {
 // src/rest-cli.ts
 import { randomBytes as randomBytes3 } from "node:crypto";
 import { lstatSync as lstatSync10, mkdirSync as mkdirSync3, readFileSync as readFileSync11, renameSync as renameSync5, unlinkSync as unlinkSync7, writeFileSync as writeFileSync5 } from "node:fs";
-import { dirname as dirname5, join as join12 } from "node:path";
+import { dirname as dirname6, join as join12 } from "node:path";
 
 // src/mentions.ts
 var MAX_MENTION_ID_CHARS2 = 128;
 var MAX_MENTION_CONTENT_CHARS2 = 1e5;
+var PROTOTYPE_MENTION_IDS2 = new Set(["__proto__", "constructor", "prototype"]);
 function matchesMention2(content, agentId) {
   if (typeof content !== "string" || typeof agentId !== "string")
     return false;
   const trimmedId = agentId.trim();
-  if (!content || !trimmedId || trimmedId.length > MAX_MENTION_ID_CHARS2 || /[\x00-\x1f\x7f]/.test(trimmedId)) {
+  if (!content || !trimmedId || trimmedId.length > MAX_MENTION_ID_CHARS2 || trimmedId === "." || trimmedId === ".." || /[\/\\\s\x00-\x1f\x7f]/.test(trimmedId) || PROTOTYPE_MENTION_IDS2.has(trimmedId.toLowerCase())) {
     return false;
   }
   const hay = content.length > MAX_MENTION_CONTENT_CHARS2 ? content.slice(0, MAX_MENTION_CONTENT_CHARS2) : content;
@@ -5114,7 +5362,7 @@ function matchesMention2(content, agentId) {
 // src/read-cursor.ts
 import { randomBytes as randomBytes2 } from "crypto";
 import { chmodSync as chmodSync4, lstatSync as lstatSync9, readFileSync as readFileSync10, realpathSync as realpathSync4, renameSync as renameSync4, unlinkSync as unlinkSync6, writeFileSync as writeFileSync4 } from "fs";
-import { dirname as dirname4, isAbsolute as isAbsolute4, join as join10, sep as sep2 } from "path";
+import { dirname as dirname5, isAbsolute as isAbsolute6, join as join10, sep as sep2 } from "path";
 var MAX_CURSOR_BYTES2 = 4 * 1024 * 1024;
 var MAX_CURSOR_ENTRIES2 = 50000;
 var RESERVED_PROTO_KEY2 = /^(?:__proto__|constructor|prototype)$/i;
@@ -5123,7 +5371,7 @@ function scrubDiag2(value) {
   return redactSecrets2(String(value ?? "")).replace(/\b(?:Bearer|Basic)\s+[^\s"'<>\\]+/gi, "[REDACTED]").replace(/(?:agent_key_|sk-|whsec_|gh[pousr]_|github_pat_|AIza|AKIA|ASIA)[A-Za-z0-9+/=_-]{12,}/g, "[REDACTED]").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
 }
 function hasSafeAncestorDirs4(targetFile) {
-  let dir = dirname4(isAbsolute4(targetFile) ? targetFile : `${process.cwd()}${sep2}${targetFile}`);
+  let dir = dirname5(isAbsolute6(targetFile) ? targetFile : `${process.cwd()}${sep2}${targetFile}`);
   while (true) {
     let st;
     try {
@@ -5141,7 +5389,7 @@ function hasSafeAncestorDirs4(targetFile) {
     if (!isDarwinRootLink && (st.isSymbolicLink() || !st.isDirectory())) {
       return false;
     }
-    const parent = dirname4(dir);
+    const parent = dirname5(dir);
     if (parent === dir)
       break;
     dir = parent;
@@ -5209,7 +5457,7 @@ function loadCursor2(file, warn) {
 }
 function persistCursor2(file, cursor, warn) {
   try {
-    const parentStat = lstatSync9(dirname4(file));
+    const parentStat = lstatSync9(dirname5(file));
     if (parentStat.isSymbolicLink() || !parentStat.isDirectory() || !hasSafeAncestorDirs4(file)) {
       warn(`[agentchat] WARNING: failed to persist read cursor to ${scrubDiag2(file)}: parent is not a real directory
 `);
@@ -5294,8 +5542,13 @@ function isValidCalendarDateTime2(datePart, timePart, tzPart) {
 function normalizeTimestampForCursor2(ts, mode) {
   if (!ts || typeof ts !== "string" || ts.length > 128)
     return ts;
+  if (/[\x00-\x1f\x7f]/.test(ts))
+    return;
+  if (mode !== "before" && mode !== "after")
+    return ts;
   const padChar = mode === "before" ? "9" : "0";
-  const m = ts.match(ISO_OFFSET_RE2);
+  const trimmed = ts.trim();
+  const m = trimmed.match(ISO_OFFSET_RE2);
   if (m) {
     const datePart = m[1];
     const timePart = m[2];
@@ -5309,8 +5562,10 @@ function normalizeTimestampForCursor2(ts, mode) {
     }
     const wholeUtcMs = Date.parse(`${datePart}T${timePart}${tzPart}`);
     if (Number.isFinite(wholeUtcMs)) {
-      const utcWhole = new Date(wholeUtcMs).toISOString().slice(0, 19);
-      return `${utcWhole}.${frac9}Z`;
+      const iso = new Date(wholeUtcMs).toISOString();
+      if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(iso)) {
+        return `${iso.slice(0, 19)}.${frac9}Z`;
+      }
     }
   }
   return ts;
@@ -5549,14 +5804,14 @@ async function fetchWithDeadline(f, url, init, timeoutMs, parentSignal) {
 function sleepAbortable(ms, signal) {
   if (signal.aborted)
     return Promise.resolve();
-  return new Promise((resolve4) => {
+  return new Promise((resolve7) => {
     const onAbort = () => {
       clearTimeout(t);
-      resolve4();
+      resolve7();
     };
     const t = setTimeout(() => {
       signal.removeEventListener("abort", onAbort);
-      resolve4();
+      resolve7();
     }, ms);
     t.unref?.();
     signal.addEventListener("abort", onAbort, { once: true });
@@ -5575,7 +5830,7 @@ function loadSeenIds(file) {
 }
 function saveSeenIds(file, ids) {
   try {
-    ensureRealDirectory(dirname5(file));
+    ensureRealDirectory(dirname6(file));
     const list = [...ids].slice(-MAX_SEEN_IDS);
     safeWriteProfile(file, list);
   } catch {}
@@ -5603,7 +5858,7 @@ function acquireWakePidFile(wakePidFile, pid = process.pid, killFn = process.kil
   let tmp = "";
   let created = false;
   try {
-    const dirStat = lstatSync10(dirname5(wakePidFile));
+    const dirStat = lstatSync10(dirname6(wakePidFile));
     if (dirStat.isSymbolicLink() || !dirStat.isDirectory())
       return false;
     try {
@@ -5629,7 +5884,7 @@ function acquireWakePidFile(wakePidFile, pid = process.pid, killFn = process.kil
     writeFileSync5(tmp, `${pid}
 `, { mode: 384, flag: "wx" });
     created = true;
-    const recheckDir = lstatSync10(dirname5(wakePidFile), { throwIfNoEntry: false });
+    const recheckDir = lstatSync10(dirname6(wakePidFile), { throwIfNoEntry: false });
     const recheckTarget = lstatSync10(wakePidFile, { throwIfNoEntry: false });
     if (!recheckDir || recheckDir.isSymbolicLink() || !recheckDir.isDirectory() || recheckTarget && (recheckTarget.isSymbolicLink() || !recheckTarget.isFile())) {
       unlinkSync7(tmp);
@@ -5660,7 +5915,7 @@ function releaseWakePidFile(wakePidFile, pid = process.pid) {
 }
 function saveJsonMap(file, data) {
   try {
-    ensureRealDirectory(dirname5(file));
+    ensureRealDirectory(dirname6(file));
     safeWriteProfile(file, data);
   } catch {}
 }
@@ -6332,7 +6587,7 @@ function parseArgs() {
 var cliArgs = parseArgs();
 var isOneShotCli = Boolean(cliArgs.registerOnly || cliArgs.join || cliArgs.send || cliArgs.wakeOnce);
 if (process.argv.includes("--help") || process.argv.includes("-h")) {
-  const localOnboardingPath = join13(dirname6(fileURLToPath(import.meta.url)), "..", "skills", "onboarding.md");
+  const localOnboardingPath = join13(dirname7(fileURLToPath(import.meta.url)), "..", "skills", "onboarding.md");
   console.log(`agentschat-mcp v${package_default.version} \u2014 AgentsChat MCP and host bridges
 
 Usage: claude mcp add agentschat -- npx -y agentschat-mcp@latest --profile <Bot> [options]
@@ -6718,7 +6973,7 @@ if (identity.mode === "profile") {
 `);
     process.exit(1);
   }
-  mkdirSync4(dirname6(profileFile), { recursive: true });
+  mkdirSync4(dirname7(profileFile), { recursive: true });
   safeWriteProfile2(profileFile, profile);
   process.stderr.write(`[agentchat] Profile saved: ${profileFile}
 `);
@@ -9820,7 +10075,7 @@ async function registerAndConnectProfile(displayName, bindSessionId) {
     };
     const targetFile = nameToPath(cleanName);
     validateIdentityProfile(newProfile, targetFile);
-    mkdirSync4(dirname6(targetFile), { recursive: true });
+    mkdirSync4(dirname7(targetFile), { recursive: true });
     safeWriteProfile2(targetFile, newProfile);
     applyIdentityFromProfile(newProfile, targetFile, bindSessionId);
     const claimEntry = `${REST_URL}/chat/${encodeURIComponent(data.id)}?claim=1`;
@@ -10641,7 +10896,7 @@ ${idx}` }] };
               isError: true
             };
           }
-          mkdirSync4(dirname6(pMd), { recursive: true });
+          mkdirSync4(dirname7(pMd), { recursive: true });
           writeFileSync6(pMd, body);
           writeFileSync6(pMeta, JSON.stringify({ version: currentVersion, name: pSlug, syncedAt: new Date().toISOString() }));
           return { content: [{ type: "text", text: `synced personal skill "${pSlug}" v${currentVersion} \u2192 ${pMd} (was ${cachedVersion === null ? "missing" : `stale v${cachedVersion}`}). Read that file to run it.` }] };
@@ -10694,7 +10949,7 @@ ${idx}` }] };
             isError: true
           };
         }
-        mkdirSync4(dirname6(mdPath), { recursive: true });
+        mkdirSync4(dirname7(mdPath), { recursive: true });
         writeFileSync6(mdPath, body);
         writeFileSync6(metaPath, JSON.stringify({ version: currentVersion, title: doc?.title, doc_id: a.doc_id, chat_id: a.chat_id, syncedAt: new Date().toISOString() }));
         const was = cachedVersion === null ? "missing" : `stale v${cachedVersion}`;

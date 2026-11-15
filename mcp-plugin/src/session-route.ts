@@ -13,14 +13,24 @@
  * `undefined`, which leaves the receiver on its existing fallback. Routing must
  * never turn a delivery problem into a lost message.
  */
-import { lstatSync, readFileSync } from "node:fs";
+import { lstatSync, readFileSync, readlinkSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { isAbsolute, join, parse, resolve } from "node:path";
 import { loadSessionBinds } from "./session-bind.ts";
 
 const MAX_PROFILE_BYTES = 64 * 1024;
 const MAX_DIR_PATH_LENGTH = 4096;
 const RESERVED_PROFILE_KEY = /^(?:__proto__|constructor|prototype)$/i;
+const RESERVED_ROUTE_SIDECARS = new Set([
+  "session-binds",
+  "agy-binds",
+  "grok-binds",
+  "cursor",
+  "read-cursors",
+  "wake-pids",
+  "config",
+  "codex-bots",
+]);
 
 export interface AgentSessionRoute {
   /** Harness session the wake should be delivered to. */
@@ -81,10 +91,34 @@ function isSafeRegularProfileFile(path: string): boolean {
   }
 }
 
+function isAllowedDarwinSystemLink(dirPath: string): boolean {
+  if (process.platform !== "darwin") return false;
+  if (dirPath !== "/var" && dirPath !== "/tmp" && dirPath !== "/etc") return false;
+  try {
+    return readlinkSync(dirPath) === `private${dirPath}`;
+  } catch {
+    return false;
+  }
+}
+
 function isSafeRealDir(path: string): boolean {
   try {
     const st = lstatSync(path);
-    return !st.isSymbolicLink() && st.isDirectory();
+    if (st.isSymbolicLink() || !st.isDirectory()) return false;
+    const abs = resolve(path);
+    const root = parse(abs).root;
+    const segments = abs.slice(root.length).split(/[\\/]+/).filter(Boolean);
+    let cur = root;
+    for (let i = 0; i < segments.length; i++) {
+      cur = join(cur, segments[i]!);
+      const anc = lstatSync(cur);
+      if (anc.isSymbolicLink()) {
+        if (isAllowedDarwinSystemLink(cur)) continue;
+        return false;
+      }
+      if (!anc.isDirectory()) return false;
+    }
+    return true;
   } catch {
     return false;
   }
@@ -105,7 +139,9 @@ function profilePathForName(configDir: string, name: string): string | undefined
     return undefined;
   }
   const base = name.replace(/\.json$/i, "").replace(/[^a-zA-Z0-9_-]/g, "_");
-  if (!base || base.length > 128 || RESERVED_PROFILE_KEY.test(base)) return undefined;
+  if (!base || base.length > 128 || RESERVED_PROFILE_KEY.test(base) || RESERVED_ROUTE_SIDECARS.has(base.toLowerCase())) {
+    return undefined;
+  }
   const profilesDir = join(configDir, "profiles");
   if (isSafeRealDir(profilesDir)) {
     const nested = join(profilesDir, `${base}.json`);

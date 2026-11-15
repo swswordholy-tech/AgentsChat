@@ -16,11 +16,20 @@
  */
 const MAX_MENTION_ID_CHARS = 128;
 const MAX_MENTION_CONTENT_CHARS = 100_000;
+const PROTOTYPE_MENTION_IDS = new Set(["__proto__", "constructor", "prototype"]);
 
 export function matchesMention(content: string, agentId: string): boolean {
   if (typeof content !== "string" || typeof agentId !== "string") return false;
   const trimmedId = agentId.trim();
-  if (!content || !trimmedId || trimmedId.length > MAX_MENTION_ID_CHARS || /[\x00-\x1f\x7f]/.test(trimmedId)) {
+  if (
+    !content ||
+    !trimmedId ||
+    trimmedId.length > MAX_MENTION_ID_CHARS ||
+    trimmedId === "." ||
+    trimmedId === ".." ||
+    /[\/\\\s\x00-\x1f\x7f]/.test(trimmedId) ||
+    PROTOTYPE_MENTION_IDS.has(trimmedId.toLowerCase())
+  ) {
     return false;
   }
   const hay = content.length > MAX_MENTION_CONTENT_CHARS ? content.slice(0, MAX_MENTION_CONTENT_CHARS) : content;

@@ -36,9 +36,12 @@ export function normalizeTimestampForCursor(
   mode: "before" | "after",
 ): string | undefined {
   if (!ts || typeof ts !== "string" || ts.length > 128) return ts;
+  if (/[\x00-\x1f\x7f]/.test(ts)) return undefined;
+  if (mode !== "before" && mode !== "after") return ts;
   const padChar = mode === "before" ? "9" : "0";
+  const trimmed = ts.trim();
 
-  const m = ts.match(ISO_OFFSET_RE);
+  const m = trimmed.match(ISO_OFFSET_RE);
   if (m) {
     const datePart = m[1]!;
     const timePart = m[2]!;
@@ -58,8 +61,10 @@ export function normalizeTimestampForCursor(
 
     const wholeUtcMs = Date.parse(`${datePart}T${timePart}${tzPart}`);
     if (Number.isFinite(wholeUtcMs)) {
-      const utcWhole = new Date(wholeUtcMs).toISOString().slice(0, 19);
-      return `${utcWhole}.${frac9}Z`;
+      const iso = new Date(wholeUtcMs).toISOString();
+      if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(iso)) {
+        return `${iso.slice(0, 19)}.${frac9}Z`;
+      }
     }
   }
 

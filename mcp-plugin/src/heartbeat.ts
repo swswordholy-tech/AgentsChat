@@ -79,7 +79,14 @@ export class HeartbeatMonitor {
 
   /** Exposed for testing — runs one heartbeat cycle */
   tick() {
-    const state = this.deps.getReadyState();
+    let state: number;
+    try {
+      state = this.deps.getReadyState();
+    } catch {
+      this.connectingSince = null;
+      this.safeReconnect("readyState failed");
+      return;
+    }
 
     if (state === WS_OPEN) {
       this.connectingSince = null;

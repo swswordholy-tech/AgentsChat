@@ -2323,9 +2323,9 @@ async function verifyLoopTick(raw, config, owner, list, opts) {
 
 // src/session-bind.ts
 import { createHash as createHash3 } from "node:crypto";
-import { closeSync, lstatSync as lstatSync9, mkdirSync as mkdirSync5, openSync, readFileSync as readFileSync8, readSync, readdirSync as readdirSync4, unlinkSync as unlinkSync3 } from "node:fs";
+import { closeSync, lstatSync as lstatSync9, mkdirSync as mkdirSync5, openSync, readFileSync as readFileSync8, readSync, readdirSync as readdirSync4, readlinkSync as readlinkSync2, unlinkSync as unlinkSync3 } from "node:fs";
 import { homedir as homedir5, tmpdir } from "node:os";
-import { join as join9 } from "node:path";
+import { isAbsolute as isAbsolute4, join as join9, parse as parse2, resolve as resolve5 } from "node:path";
 
 // src/profile-store.ts
 import {
@@ -2503,8 +2503,9 @@ function isPidAlive(pid) {
 }
 function resolveLockDir(homeDir, env = process.env) {
   const explicit = env.AGENTSCHAT_LOCK_DIR?.trim();
-  if (explicit)
+  if (explicit && explicit.length <= 4096 && !explicit.startsWith("-") && !CONTROL_CHAR_RE.test(explicit) && isAbsolute4(explicit)) {
     return explicit;
+  }
   const hash = createHash3("sha256").update(homeDir || ".").digest("hex").slice(0, 12);
   const baseTmp = process.platform === "win32" ? tmpdir() : "/tmp";
   return join9(baseTmp, `agentschat-locks-${hash}`);
@@ -2512,6 +2513,17 @@ function resolveLockDir(homeDir, env = process.env) {
 var LOCK_FILE_MAX_BYTES = 64 * 1024;
 var LOCK_KEY_MAX_CHARS = 128;
 var SESSION_BINDS_MAX_BYTES = 1024 * 1024;
+var CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
+var RESERVED_BIND_SIDECARS = new Set([
+  "session-binds",
+  "agy-binds",
+  "grok-binds",
+  "cursor",
+  "read-cursors",
+  "wake-pids",
+  "config",
+  "codex-bots"
+]);
 function readBoundedRegularJson(path, maxBytes) {
   try {
     const st = lstatSync9(path);
@@ -2530,13 +2542,42 @@ function isSafeTargetFileOrMissing(path) {
     return Boolean(e && typeof e === "object" && e.code === "ENOENT");
   }
 }
-function isSafeDirOrMissing(dirPath) {
+function isAllowedDarwinSystemLink(dirPath) {
+  if (process.platform !== "darwin")
+    return false;
+  if (dirPath !== "/var" && dirPath !== "/tmp" && dirPath !== "/etc")
+    return false;
   try {
-    const st = lstatSync9(dirPath);
-    return !st.isSymbolicLink() && st.isDirectory();
-  } catch (e) {
-    return Boolean(e && typeof e === "object" && e.code === "ENOENT");
+    return readlinkSync2(dirPath) === `private${dirPath}`;
+  } catch {
+    return false;
   }
+}
+function isSafeDirOrMissing(dirPath) {
+  if (!dirPath || CONTROL_CHAR_RE.test(dirPath))
+    return false;
+  const abs = resolve5(dirPath);
+  const root = parse2(abs).root;
+  const segments = abs.slice(root.length).split(/[\\/]+/).filter(Boolean);
+  let cur = root;
+  for (let i = 0;i < segments.length; i++) {
+    cur = join9(cur, segments[i]);
+    try {
+      const st = lstatSync9(cur);
+      if (st.isSymbolicLink()) {
+        if (isAllowedDarwinSystemLink(cur))
+          continue;
+        return false;
+      }
+      if (!st.isDirectory())
+        return false;
+    } catch (e) {
+      if (e && typeof e === "object" && e.code === "ENOENT")
+        return true;
+      return false;
+    }
+  }
+  return true;
 }
 function lockFilePath(lockDir, agentId) {
   const trimmed = String(agentId || "").trim();
@@ -2551,11 +2592,11 @@ function lockFilePath(lockDir, agentId) {
   return join9(lockDir, `${safe}.lock`);
 }
 function readAgentLock(lockDir, agentId) {
-  if (!agentId)
+  if (!agentId || !isSafeDirOrMissing(lockDir))
     return null;
   const file = lockFilePath(lockDir, agentId);
   const raw = readBoundedRegularJson(file, LOCK_FILE_MAX_BYTES);
-  if (!raw || typeof raw !== "object" || Array.isArray(raw) || typeof raw.pid !== "number" || typeof raw.agentId !== "string") {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw) || Object.prototype.hasOwnProperty.call(raw, "__proto__") || typeof raw.pid !== "number" || typeof raw.agentId !== "string") {
     return null;
   }
   return raw;
@@ -2583,7 +2624,7 @@ function acquireAgentLock(opts) {
   }
 }
 function releaseAgentLock(opts) {
-  if (!opts.agentId)
+  if (!opts.agentId || !isSafeDirOrMissing(opts.lockDir))
     return false;
   const currentPid = opts.currentPid ?? process.pid;
   const file = lockFilePath(opts.lockDir, opts.agentId);
@@ -3025,7 +3066,14 @@ class HeartbeatMonitor {
     this.reconnecting = false;
   }
   tick() {
-    const state = this.deps.getReadyState();
+    let state;
+    try {
+      state = this.deps.getReadyState();
+    } catch {
+      this.connectingSince = null;
+      this.safeReconnect("readyState failed");
+      return;
+    }
     if (state === WS_OPEN) {
       this.connectingSince = null;
       if (Date.now() - this.lastPong > this.pongTimeout) {
@@ -3115,8 +3163,13 @@ function isValidCalendarDateTime(datePart, timePart, tzPart) {
 function normalizeTimestampForCursor(ts, mode) {
   if (!ts || typeof ts !== "string" || ts.length > 128)
     return ts;
+  if (/[\x00-\x1f\x7f]/.test(ts))
+    return;
+  if (mode !== "before" && mode !== "after")
+    return ts;
   const padChar = mode === "before" ? "9" : "0";
-  const m = ts.match(ISO_OFFSET_RE);
+  const trimmed = ts.trim();
+  const m = trimmed.match(ISO_OFFSET_RE);
   if (m) {
     const datePart = m[1];
     const timePart = m[2];
@@ -3130,8 +3183,10 @@ function normalizeTimestampForCursor(ts, mode) {
     }
     const wholeUtcMs = Date.parse(`${datePart}T${timePart}${tzPart}`);
     if (Number.isFinite(wholeUtcMs)) {
-      const utcWhole = new Date(wholeUtcMs).toISOString().slice(0, 19);
-      return `${utcWhole}.${frac9}Z`;
+      const iso = new Date(wholeUtcMs).toISOString();
+      if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(iso)) {
+        return `${iso.slice(0, 19)}.${frac9}Z`;
+      }
     }
   }
   return ts;
@@ -3438,13 +3493,13 @@ class AgentsChatTransport {
       if (this.pending.size >= 256)
         throw new Error("AgentsChat pending message limit reached");
       const id = randomUUID2();
-      await new Promise((resolve5, reject) => {
+      await new Promise((resolve6, reject) => {
         const timer = setTimeout(() => {
           this.pending.delete(id);
           reject(new Error("AgentsChat acknowledgement timed out"));
         }, 15000);
         timer.unref?.();
-        this.pending.set(id, { resolve: resolve5, reject, timer });
+        this.pending.set(id, { resolve: resolve6, reject, timer });
         try {
           this.socket.send(JSON.stringify({
             type: "message",
@@ -3686,7 +3741,7 @@ async function main() {
   }
   if ((values.bot || values["managed-worker"]) && (values["state-root"] || values["codex-home-mode"]))
     throw new Error("For managed bots, configure state_root/codex_home_mode in the bot registry");
-  const snapshot = values["managed-worker"] ? await new Promise((resolve5, reject) => {
+  const snapshot = values["managed-worker"] ? await new Promise((resolve6, reject) => {
     if (!process.connected) {
       reject(new Error("Managed worker needs parent IPC"));
       return;
@@ -3699,7 +3754,7 @@ async function main() {
         reject(new Error("Invalid parent configuration"));
         return;
       }
-      resolve5(config);
+      resolve6(config);
     });
   }) : undefined;
   const c = snapshot ?? (values.bot ? loadBots(values.registry).find((b) => b.name === values.bot) : resolveConfig({ cwd: values.cwd, profile: values.profile, codexBin: values["codex-bin"], stateRoot: values["state-root"], codexHomeMode: values["codex-home-mode"] }));

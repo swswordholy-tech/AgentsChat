@@ -201,6 +201,9 @@ class MessageDedup {
   }
 }
 
+// src/mentions.ts
+var PROTOTYPE_MENTION_IDS = new Set(["__proto__", "constructor", "prototype"]);
+
 // connector/identities.ts
 function validIdentityId(value) {
   return typeof value === "string" && value.length > 0 && !/\s|[\x00-\x1f\x7f]/.test(value) && !["__proto__", "constructor", "prototype"].includes(value.toLowerCase());
@@ -832,8 +835,13 @@ function isValidCalendarDateTime(datePart, timePart, tzPart) {
 function normalizeTimestampForCursor(ts, mode) {
   if (!ts || typeof ts !== "string" || ts.length > 128)
     return ts;
+  if (/[\x00-\x1f\x7f]/.test(ts))
+    return;
+  if (mode !== "before" && mode !== "after")
+    return ts;
   const padChar = mode === "before" ? "9" : "0";
-  const m = ts.match(ISO_OFFSET_RE);
+  const trimmed = ts.trim();
+  const m = trimmed.match(ISO_OFFSET_RE);
   if (m) {
     const datePart = m[1];
     const timePart = m[2];
@@ -847,8 +855,10 @@ function normalizeTimestampForCursor(ts, mode) {
     }
     const wholeUtcMs = Date.parse(`${datePart}T${timePart}${tzPart}`);
     if (Number.isFinite(wholeUtcMs)) {
-      const utcWhole = new Date(wholeUtcMs).toISOString().slice(0, 19);
-      return `${utcWhole}.${frac9}Z`;
+      const iso = new Date(wholeUtcMs).toISOString();
+      if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(iso)) {
+        return `${iso.slice(0, 19)}.${frac9}Z`;
+      }
     }
   }
   return ts;
@@ -975,7 +985,14 @@ class HeartbeatMonitor {
     this.reconnecting = false;
   }
   tick() {
-    const state = this.deps.getReadyState();
+    let state;
+    try {
+      state = this.deps.getReadyState();
+    } catch {
+      this.connectingSince = null;
+      this.safeReconnect("readyState failed");
+      return;
+    }
     if (state === WS_OPEN) {
       this.connectingSince = null;
       if (Date.now() - this.lastPong > this.pongTimeout) {

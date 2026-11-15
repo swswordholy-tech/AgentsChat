@@ -4,7 +4,7 @@
 import { chmodSync as chmodSync3, lstatSync as lstatSync7, mkdirSync as mkdirSync4, readFileSync as readFileSync7, renameSync as renameSync3, unlinkSync as unlinkSync4, writeFileSync as writeFileSync3 } from "node:fs";
 import { randomBytes as randomBytes3 } from "node:crypto";
 import { spawn } from "node:child_process";
-import { dirname as dirname4, join as join6, resolve as resolve2 } from "node:path";
+import { dirname as dirname4, join as join6, resolve as resolve4 } from "node:path";
 import { homedir as homedir5 } from "node:os";
 
 // muse/src/policy.ts
@@ -883,13 +883,13 @@ function appendWakeQueue(queueFile, payload, maxLines = MAX_WAKE_QUEUE_LINES) {
 }
 
 // src/session-route.ts
-import { lstatSync as lstatSync4, readFileSync as readFileSync4 } from "node:fs";
+import { lstatSync as lstatSync4, readFileSync as readFileSync4, readlinkSync as readlinkSync2 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
-import { isAbsolute as isAbsolute2, join as join3 } from "node:path";
+import { isAbsolute as isAbsolute3, join as join3, parse as parse2, resolve as resolve2 } from "node:path";
 
 // src/session-bind.ts
-import { closeSync, lstatSync as lstatSync3, mkdirSync as mkdirSync2, openSync, readFileSync as readFileSync3, readSync, readdirSync, unlinkSync as unlinkSync2 } from "node:fs";
-import { join as join2 } from "node:path";
+import { closeSync, lstatSync as lstatSync3, mkdirSync as mkdirSync2, openSync, readFileSync as readFileSync3, readSync, readdirSync, readlinkSync, unlinkSync as unlinkSync2 } from "node:fs";
+import { isAbsolute as isAbsolute2, join as join2, parse, resolve } from "node:path";
 
 // src/profile-store.ts
 var MAX_PROFILE_JSON_BYTES = 64 * 1024;
@@ -917,6 +917,16 @@ var LOCK_FILE_MAX_BYTES = 64 * 1024;
 var SESSION_BINDS_MAX_BYTES = 1024 * 1024;
 var MAX_SESSION_BINDS_ENTRIES = 1024;
 var CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
+var RESERVED_BIND_SIDECARS = new Set([
+  "session-binds",
+  "agy-binds",
+  "grok-binds",
+  "cursor",
+  "read-cursors",
+  "wake-pids",
+  "config",
+  "codex-bots"
+]);
 function readBoundedRegularJson(path, maxBytes) {
   try {
     const st = lstatSync3(path);
@@ -927,16 +937,52 @@ function readBoundedRegularJson(path, maxBytes) {
     return null;
   }
 }
-function isSafeDirOrMissing(dirPath) {
+function isAllowedDarwinSystemLink(dirPath) {
+  if (process.platform !== "darwin")
+    return false;
+  if (dirPath !== "/var" && dirPath !== "/tmp" && dirPath !== "/etc")
+    return false;
   try {
-    const st = lstatSync3(dirPath);
-    return !st.isSymbolicLink() && st.isDirectory();
-  } catch (e) {
-    return Boolean(e && typeof e === "object" && e.code === "ENOENT");
+    return readlinkSync(dirPath) === `private${dirPath}`;
+  } catch {
+    return false;
   }
+}
+function isSafeDirOrMissing(dirPath) {
+  if (!dirPath || CONTROL_CHAR_RE.test(dirPath))
+    return false;
+  const abs = resolve(dirPath);
+  const root = parse(abs).root;
+  const segments = abs.slice(root.length).split(/[\\/]+/).filter(Boolean);
+  let cur = root;
+  for (let i = 0;i < segments.length; i++) {
+    cur = join2(cur, segments[i]);
+    try {
+      const st = lstatSync3(cur);
+      if (st.isSymbolicLink()) {
+        if (isAllowedDarwinSystemLink(cur))
+          continue;
+        return false;
+      }
+      if (!st.isDirectory())
+        return false;
+    } catch (e) {
+      if (e && typeof e === "object" && e.code === "ENOENT")
+        return true;
+      return false;
+    }
+  }
+  return true;
 }
 function isValidBindToken(value) {
   return value.length > 0 && value.length <= 256 && !CONTROL_CHAR_RE.test(value);
+}
+function isValidBoundProfileName(value) {
+  if (!isValidBindToken(value) || value === "." || value === ".." || value.includes("/") || value.includes("\\")) {
+    return false;
+  }
+  const stem = value.replace(/\.json$/i, "").toLowerCase();
+  return Boolean(stem) && !isUnsafeBindKey(value) && !isUnsafeBindKey(stem) && !RESERVED_BIND_SIDECARS.has(stem);
 }
 function isUnsafeBindKey(key) {
   const lower = key.toLowerCase();
@@ -951,17 +997,17 @@ function parseSessionBinds(raw) {
     if (count >= MAX_SESSION_BINDS_ENTRIES)
       break;
     const key = k.trim();
-    if (!isValidBindToken(key) || isUnsafeBindKey(key))
+    if (!isValidBindToken(key) || key === "." || key === ".." || isUnsafeBindKey(key))
       continue;
     if (typeof v === "string") {
       const val = v.trim();
-      if (isValidBindToken(val) && !isUnsafeBindKey(val)) {
+      if (isValidBoundProfileName(val)) {
         out[key] = val;
         count += 1;
       }
     } else if (v && typeof v === "object" && typeof v.profile === "string") {
       const val = v.profile.trim();
-      if (isValidBindToken(val) && !isUnsafeBindKey(val)) {
+      if (isValidBoundProfileName(val)) {
         out[key] = val;
         count += 1;
       }
@@ -988,11 +1034,21 @@ var DSH_HEALTH_MAX_BYTES = 256 * 1024;
 var MAX_PROFILE_BYTES2 = 64 * 1024;
 var MAX_DIR_PATH_LENGTH = 4096;
 var RESERVED_PROFILE_KEY = /^(?:__proto__|constructor|prototype)$/i;
+var RESERVED_ROUTE_SIDECARS = new Set([
+  "session-binds",
+  "agy-binds",
+  "grok-binds",
+  "cursor",
+  "read-cursors",
+  "wake-pids",
+  "config",
+  "codex-bots"
+]);
 function isSafeAbsoluteDirEnv(raw) {
   if (typeof raw !== "string")
     return false;
   const s = raw.trim();
-  return s.length > 0 && s.length <= MAX_DIR_PATH_LENGTH && !s.startsWith("-") && !/[\x00-\x1f\x7f]/.test(s) && isAbsolute2(s);
+  return s.length > 0 && s.length <= MAX_DIR_PATH_LENGTH && !s.startsWith("-") && !/[\x00-\x1f\x7f]/.test(s) && isAbsolute3(s);
 }
 function agentschatConfigDir(env = process.env) {
   if (isSafeAbsoluteDirEnv(env.AGENTSCHAT_CONFIG_DIR)) {
@@ -1013,10 +1069,38 @@ function isSafeRegularProfileFile(path) {
     return false;
   }
 }
+function isAllowedDarwinSystemLink2(dirPath) {
+  if (process.platform !== "darwin")
+    return false;
+  if (dirPath !== "/var" && dirPath !== "/tmp" && dirPath !== "/etc")
+    return false;
+  try {
+    return readlinkSync2(dirPath) === `private${dirPath}`;
+  } catch {
+    return false;
+  }
+}
 function isSafeRealDir(path) {
   try {
     const st = lstatSync4(path);
-    return !st.isSymbolicLink() && st.isDirectory();
+    if (st.isSymbolicLink() || !st.isDirectory())
+      return false;
+    const abs = resolve2(path);
+    const root = parse2(abs).root;
+    const segments = abs.slice(root.length).split(/[\\/]+/).filter(Boolean);
+    let cur = root;
+    for (let i = 0;i < segments.length; i++) {
+      cur = join3(cur, segments[i]);
+      const anc = lstatSync4(cur);
+      if (anc.isSymbolicLink()) {
+        if (isAllowedDarwinSystemLink2(cur))
+          continue;
+        return false;
+      }
+      if (!anc.isDirectory())
+        return false;
+    }
+    return true;
   } catch {
     return false;
   }
@@ -1026,8 +1110,9 @@ function profilePathForName(configDir, name) {
     return;
   }
   const base = name.replace(/\.json$/i, "").replace(/[^a-zA-Z0-9_-]/g, "_");
-  if (!base || base.length > 128 || RESERVED_PROFILE_KEY.test(base))
+  if (!base || base.length > 128 || RESERVED_PROFILE_KEY.test(base) || RESERVED_ROUTE_SIDECARS.has(base.toLowerCase())) {
     return;
+  }
   const profilesDir = join3(configDir, "profiles");
   if (isSafeRealDir(profilesDir)) {
     const nested = join3(profilesDir, `${base}.json`);
@@ -1151,12 +1236,12 @@ function resolveWindowsCliSpawn(cmd, args, opts) {
 // dsh/src/patch.ts
 import { randomBytes as randomBytes2 } from "node:crypto";
 import { chmodSync as chmodSync2, lstatSync as lstatSync6, mkdirSync as mkdirSync3, readFileSync as readFileSync6, renameSync as renameSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2 } from "node:fs";
-import { dirname as dirname3, isAbsolute as isAbsolute3, join as join5, resolve } from "node:path";
+import { dirname as dirname3, isAbsolute as isAbsolute4, join as join5, resolve as resolve3 } from "node:path";
 import { homedir as homedir4 } from "node:os";
 var FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 var DARWIN_ROOT_LINKS = new Set(["/var", "/tmp", "/etc"]);
 function checkParentDirectory(path) {
-  let parent = dirname3(resolve(path));
+  let parent = dirname3(resolve3(path));
   for (;; ) {
     if (!(process.platform === "darwin" && DARWIN_ROOT_LINKS.has(parent))) {
       try {
@@ -1186,7 +1271,7 @@ function isBlockedDshHost(hostname) {
 }
 function resolveDshPatchPath(opts = {}) {
   const home = opts.dshHome ?? process.env.DSH_HOME ?? join5(homedir4(), ".dsh");
-  if (!home || home.length > 4096 || home.startsWith("-") || !isAbsolute3(home) || /[\x00-\x1f\x7f]/.test(home)) {
+  if (!home || home.length > 4096 || home.startsWith("-") || !isAbsolute4(home) || /[\x00-\x1f\x7f]/.test(home)) {
     throw new Error("Invalid DSH home path");
   }
   if (opts.dshProfile !== undefined) {
@@ -1381,7 +1466,7 @@ function has(name, argv) {
 var FORBIDDEN_KEYS2 = new Set(["__proto__", "constructor", "prototype"]);
 var DARWIN_ROOT_LINKS2 = new Set(["/var", "/tmp", "/etc"]);
 function checkParentDirectory2(path) {
-  let parent = dirname4(resolve2(path));
+  let parent = dirname4(resolve4(path));
   for (;; ) {
     if (!(process.platform === "darwin" && DARWIN_ROOT_LINKS2.has(parent))) {
       try {
@@ -1592,7 +1677,7 @@ async function runDshHeadlessResponder(prompt, opts = {}) {
   }
   const t = opts.timeoutMs ?? 120000;
   const timeoutMs = Number.isFinite(t) && t > 0 ? Math.min(Math.floor(t), 2147483647) : 120000;
-  return new Promise((resolve3) => {
+  return new Promise((resolve5) => {
     const resolved = resolveWindowsCliSpawn(dshBin, ["--profile", dshProfile, prompt], { env: process.env });
     const child = spawn(resolved.cmd, resolved.args, {
       stdio: ["ignore", "pipe", "pipe"],
@@ -1639,17 +1724,17 @@ async function runDshHeadlessResponder(prompt, opts = {}) {
     child.on("error", (err) => {
       clearTimers();
       console.error(`[dsh] failed to spawn ${dshBin}: ${redact(err.message)}`);
-      resolve3(null);
+      resolve5(null);
     });
     child.on("close", (code) => {
       clearTimers();
       if (code !== 0) {
         console.error(`[dsh] exited with code ${code}: ${redact(stderr.trim().slice(0, 300))}`);
-        resolve3(null);
+        resolve5(null);
         return;
       }
       const trimmed = stdout.trim();
-      resolve3(trimmed.length > 0 ? trimmed : null);
+      resolve5(trimmed.length > 0 ? trimmed : null);
     });
   });
 }
@@ -1837,7 +1922,7 @@ DeepSeek Harness (dsh) integration for AgentsChat:
     const bindTimer = setInterval(() => void syncBoundDshClients(), 3000);
     bindTimer.unref?.();
     console.log(`DSH wake daemon listening on ${wakeChannels.join(", ") || "(no channels — pass --channel <id>)"}, queue=${queueFile}.`);
-    await new Promise((resolve3) => {
+    await new Promise((resolve5) => {
       const shutdown = () => {
         for (const t of activeTyping)
           t.stopAll();
@@ -1846,13 +1931,13 @@ DeepSeek Harness (dsh) integration for AgentsChat:
             c.disconnect();
           } catch {}
         }
-        resolve3();
+        resolve5();
       };
       process.once("SIGINT", shutdown);
       process.once("SIGTERM", shutdown);
       process.once("SIGHUP", shutdown);
       if (primaryClient) {
-        primaryClient.waitUntilClosed().then(resolve3);
+        primaryClient.waitUntilClosed().then(resolve5);
       }
     });
     clearInterval(bindTimer);

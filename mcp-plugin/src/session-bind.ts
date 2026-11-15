@@ -14,9 +14,9 @@
  *    crashed/closed processes automatically release their lock (never deadlocks).
  */
 import { createHash } from "node:crypto";
-import { closeSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, unlinkSync, type Stats } from "node:fs";
+import { closeSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, readlinkSync, unlinkSync, type Stats } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, parse, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { safeWriteProfile } from "./profile-store.ts";
 
@@ -61,7 +61,9 @@ export function isPidAlive(pid: unknown): boolean {
 /** Deterministic per-HOME lock directory in tmpdir (cleared on OS reboot, isolated in tests). */
 export function resolveLockDir(homeDir: string, env: Record<string, string | undefined> = process.env): string {
   const explicit = env.AGENTSCHAT_LOCK_DIR?.trim();
-  if (explicit) return explicit;
+  if (explicit && explicit.length <= 4096 && !explicit.startsWith("-") && !CONTROL_CHAR_RE.test(explicit) && isAbsolute(explicit)) {
+    return explicit;
+  }
   const hash = createHash("sha256").update(homeDir || ".").digest("hex").slice(0, 12);
   const baseTmp = process.platform === "win32" ? tmpdir() : "/tmp";
   return join(baseTmp, `agentschat-locks-${hash}`);
@@ -72,6 +74,16 @@ const LOCK_KEY_MAX_CHARS = 128;
 const SESSION_BINDS_MAX_BYTES = 1024 * 1024;
 const MAX_SESSION_BINDS_ENTRIES = 1024;
 const CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
+const RESERVED_BIND_SIDECARS = new Set([
+  "session-binds",
+  "agy-binds",
+  "grok-binds",
+  "cursor",
+  "read-cursors",
+  "wake-pids",
+  "config",
+  "codex-bots",
+]);
 
 function safeLstat(path: string): Stats | null {
   try {
@@ -100,17 +112,49 @@ function isSafeTargetFileOrMissing(path: string): boolean {
   }
 }
 
-function isSafeDirOrMissing(dirPath: string): boolean {
+function isAllowedDarwinSystemLink(dirPath: string): boolean {
+  if (process.platform !== "darwin") return false;
+  if (dirPath !== "/var" && dirPath !== "/tmp" && dirPath !== "/etc") return false;
   try {
-    const st = lstatSync(dirPath);
-    return !st.isSymbolicLink() && st.isDirectory();
-  } catch (e: any) {
-    return Boolean(e && typeof e === "object" && e.code === "ENOENT");
+    return readlinkSync(dirPath) === `private${dirPath}`;
+  } catch {
+    return false;
   }
+}
+
+function isSafeDirOrMissing(dirPath: string): boolean {
+  if (!dirPath || CONTROL_CHAR_RE.test(dirPath)) return false;
+  const abs = resolve(dirPath);
+  const root = parse(abs).root;
+  const segments = abs.slice(root.length).split(/[\\/]+/).filter(Boolean);
+  let cur = root;
+  for (let i = 0; i < segments.length; i++) {
+    cur = join(cur, segments[i]!);
+    try {
+      const st = lstatSync(cur);
+      if (st.isSymbolicLink()) {
+        if (isAllowedDarwinSystemLink(cur)) continue;
+        return false;
+      }
+      if (!st.isDirectory()) return false;
+    } catch (e: any) {
+      if (e && typeof e === "object" && e.code === "ENOENT") return true;
+      return false;
+    }
+  }
+  return true;
 }
 
 function isValidBindToken(value: string): boolean {
   return value.length > 0 && value.length <= 256 && !CONTROL_CHAR_RE.test(value);
+}
+
+function isValidBoundProfileName(value: string): boolean {
+  if (!isValidBindToken(value) || value === "." || value === ".." || value.includes("/") || value.includes("\\")) {
+    return false;
+  }
+  const stem = value.replace(/\.json$/i, "").toLowerCase();
+  return Boolean(stem) && !isUnsafeBindKey(value) && !isUnsafeBindKey(stem) && !RESERVED_BIND_SIDECARS.has(stem);
 }
 
 export function lockFilePath(lockDir: string, agentId: string): string {
@@ -127,10 +171,17 @@ export function lockFilePath(lockDir: string, agentId: string): string {
 }
 
 export function readAgentLock(lockDir: string, agentId: string): AgentLockRecord | null {
-  if (!agentId) return null;
+  if (!agentId || !isSafeDirOrMissing(lockDir)) return null;
   const file = lockFilePath(lockDir, agentId);
   const raw = readBoundedRegularJson(file, LOCK_FILE_MAX_BYTES) as Record<string, unknown> | null;
-  if (!raw || typeof raw !== "object" || Array.isArray(raw) || typeof raw.pid !== "number" || typeof raw.agentId !== "string") {
+  if (
+    !raw ||
+    typeof raw !== "object" ||
+    Array.isArray(raw) ||
+    Object.prototype.hasOwnProperty.call(raw, "__proto__") ||
+    typeof raw.pid !== "number" ||
+    typeof raw.agentId !== "string"
+  ) {
     return null;
   }
   return raw as unknown as AgentLockRecord;
@@ -151,7 +202,7 @@ export function checkAgentLock(opts: {
 }): AgentLockCheck {
   const { lockDir, agentId } = opts;
   const currentPid = opts.currentPid ?? process.pid;
-  if (!agentId) return { locked: false };
+  if (!agentId || !isSafeDirOrMissing(lockDir)) return { locked: false };
   const file = lockFilePath(lockDir, agentId);
   const record = readAgentLock(lockDir, agentId);
   if (!record) {
@@ -214,7 +265,7 @@ export function releaseAgentLock(opts: {
   currentPid?: number;
   currentSessionId?: string | null;
 }): boolean {
-  if (!opts.agentId) return false;
+  if (!opts.agentId || !isSafeDirOrMissing(opts.lockDir)) return false;
   const currentPid = opts.currentPid ?? process.pid;
   const file = lockFilePath(opts.lockDir, opts.agentId);
   const existing = readAgentLock(opts.lockDir, opts.agentId);
@@ -253,16 +304,16 @@ export function parseSessionBinds(raw: unknown): Record<string, string> {
   for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
     if (count >= MAX_SESSION_BINDS_ENTRIES) break;
     const key = k.trim();
-    if (!isValidBindToken(key) || isUnsafeBindKey(key)) continue;
+    if (!isValidBindToken(key) || key === "." || key === ".." || isUnsafeBindKey(key)) continue;
     if (typeof v === "string") {
       const val = v.trim();
-      if (isValidBindToken(val) && !isUnsafeBindKey(val)) {
+      if (isValidBoundProfileName(val)) {
         out[key] = val;
         count += 1;
       }
     } else if (v && typeof v === "object" && typeof (v as any).profile === "string") {
       const val = (v as any).profile.trim();
-      if (isValidBindToken(val) && !isUnsafeBindKey(val)) {
+      if (isValidBoundProfileName(val)) {
         out[key] = val;
         count += 1;
       }
@@ -305,7 +356,9 @@ function resolveAgentIdForProfileName(configDir: string, name: string): string |
 export function saveSessionBind(configDir: string, sessionId: string, profileName: string): void {
   const sid = sessionId.trim();
   const prof = profileName.trim();
-  if (!isValidBindToken(sid) || !isValidBindToken(prof) || isUnsafeBindKey(sid) || isUnsafeBindKey(prof)) return;
+  if (!isValidBindToken(sid) || sid === "." || sid === ".." || isUnsafeBindKey(sid) || !isValidBoundProfileName(prof)) {
+    return;
+  }
   if (!isSafeDirOrMissing(configDir)) return;
   const path = join(configDir, DEFAULT_SESSION_BINDS_FILENAME);
   if (!isSafeTargetFileOrMissing(path)) return;
@@ -354,7 +407,8 @@ export function saveSessionBind(configDir: string, sessionId: string, profileNam
 
 export function removeSessionBind(configDir: string, sessionId: string): boolean {
   const sid = sessionId.trim();
-  if (!isValidBindToken(sid) || isUnsafeBindKey(sid)) return false;
+  if (!isValidBindToken(sid) || sid === "." || sid === ".." || isUnsafeBindKey(sid)) return false;
+  if (!isSafeDirOrMissing(configDir)) return false;
   let removed = false;
   for (const filename of [DEFAULT_SESSION_BINDS_FILENAME, LEGACY_AGY_BINDS_FILENAME]) {
     const path = join(configDir, filename);
@@ -390,6 +444,17 @@ export function findBoundSessionForProfile(
   return matches.length > 0 ? matches[matches.length - 1]! : null;
 }
 
+function isSafeDetectedSessionId(sid: string): boolean {
+  return isValidBindToken(sid) && sid !== "." && sid !== ".." && !sid.includes("/") && !sid.includes("\\") && !isUnsafeBindKey(sid);
+}
+
+function cleanDetectedWorkspacePath(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const s = raw.trim();
+  if (!s || s.length > 4096 || s.startsWith("-") || CONTROL_CHAR_RE.test(s)) return undefined;
+  return s;
+}
+
 /** Detect session ID from environment variables or MCP request `_meta` (ZCode). */
 export function detectRuntimeSession(
   env: Record<string, string | undefined> = process.env,
@@ -401,37 +466,36 @@ export function detectRuntimeSession(
     (typeof meta?.session_id === "string" && meta.session_id.trim()) ||
     (typeof zcodeCtx?.session_id === "string" && zcodeCtx.session_id.trim()) ||
     "";
-  if (metaSessionId) {
+  if (isSafeDetectedSessionId(metaSessionId)) {
     const workspacePath =
-      (typeof meta?.workspace_path === "string" && meta.workspace_path.trim()) ||
-      (typeof zcodeCtx?.workspace_path === "string" && zcodeCtx.workspace_path.trim()) ||
-      undefined;
+      cleanDetectedWorkspacePath(meta?.workspace_path) ||
+      cleanDetectedWorkspacePath(zcodeCtx?.workspace_path);
     return { sessionId: metaSessionId, runtime: "zcode", ...(workspacePath ? { workspacePath } : {}) };
   }
 
   // 2. ZCode environment variable
-  const zcodeEnvSid = env.ZCODE_SESSION_ID?.trim();
-  if (zcodeEnvSid) {
-    const workspacePath = env.ZCODE_PROJECT_DIR?.trim() || undefined;
+  const zcodeEnvSid = env.ZCODE_SESSION_ID?.trim() || "";
+  if (isSafeDetectedSessionId(zcodeEnvSid)) {
+    const workspacePath = cleanDetectedWorkspacePath(env.ZCODE_PROJECT_DIR);
     return { sessionId: zcodeEnvSid, runtime: "zcode", ...(workspacePath ? { workspacePath } : {}) };
   }
 
   // 3. Antigravity explicit environment variable
-  const agySid = env.ANTIGRAVITY_CONVERSATION_ID?.trim();
-  if (agySid) {
+  const agySid = env.ANTIGRAVITY_CONVERSATION_ID?.trim() || "";
+  if (isSafeDetectedSessionId(agySid)) {
     return { sessionId: agySid, runtime: "antigravity" };
   }
 
   // 4. Claude Code environment variable
   const claudeSid = (env.CLAUDE_CODE_SESSION_ID || env.CLAUDE_SESSION_ID || "").trim();
-  if (claudeSid) {
-    const workspacePath = env.CLAUDE_PROJECT_DIR?.trim() || undefined;
+  if (isSafeDetectedSessionId(claudeSid)) {
+    const workspacePath = cleanDetectedWorkspacePath(env.CLAUDE_PROJECT_DIR);
     return { sessionId: claudeSid, runtime: "claude-code", ...(workspacePath ? { workspacePath } : {}) };
   }
 
   // 5. Explicit generic session ID override
   const explicitSid = (env.AGENTSCHAT_SESSION_ID || env.AGENTCHAT_SESSION_ID || "").trim();
-  if (explicitSid) {
+  if (isSafeDetectedSessionId(explicitSid)) {
     return { sessionId: explicitSid, runtime: "custom" };
   }
 
@@ -830,7 +894,7 @@ export function detectAntigravityCallerSession(opts?: {
     process.env.AGENTSCHAT_AGY_BRAIN_DIR?.trim() ||
     join(home, ".gemini", "antigravity", "brain");
   const brainStat = safeLstat(brainDir);
-  if (!brainStat || brainStat.isSymbolicLink() || !brainStat.isDirectory()) return null;
+  if (!brainStat || brainStat.isSymbolicLink() || !brainStat.isDirectory() || !isSafeDirOrMissing(brainDir)) return null;
 
   const nowMs = opts?.nowMs ?? Date.now();
   const maxAgeMs = opts?.maxAgeMs ?? 30_000;
@@ -1243,7 +1307,7 @@ export async function detectDshCallerSession(opts?: {
   // just ran a tool call. DSH writes one directory per session under
   // `<dshHome>/sessions/<project>/session-<uuid>/`.
   const homeStat = safeLstat(dshHome);
-  if (!homeStat || homeStat.isSymbolicLink() || !homeStat.isDirectory()) return null;
+  if (!homeStat || homeStat.isSymbolicLink() || !homeStat.isDirectory() || !isSafeDirOrMissing(dshHome)) return null;
   const newestByLog = newestSessionLog(dshHome, nowMs, 30_000);
   if (newestByLog) return newestByLog;
   return null;
