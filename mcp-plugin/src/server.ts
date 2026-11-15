@@ -2546,26 +2546,97 @@ const TOOL_INPUT_SCHEMAS: Map<string, any> = new Map(
  * a newly-joined member's display_name would be resolvable.
  */
 const MEMBER_CACHE_TTL_MS = 5 * 60_000;
+const MEMBER_CACHE_MAX_ENTRIES = 512;
+const RESERVED_MCP_ROUTE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 const memberCache = new Map<string, { at: number; members: { agent_id: string; display_name?: string }[]; sameOwnerDirect?: boolean }>();
+
+function isSafeChannelRouteId(raw: unknown): raw is string {
+  if (typeof raw !== "string") return false;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 256) return false;
+  if (/[\x00-\x1f\x7f-\x9f\\?#]/.test(trimmed)) return false;
+  if (/%2f|%5c|%00|%2e%2e/i.test(trimmed)) return false;
+  if (/^(?:ac_|sk-|mcp_(?:at|rt|code)_|agent_key_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-)/i.test(trimmed)) {
+    return false;
+  }
+  const segments = trimmed.split("/");
+  for (const seg of segments) {
+    if (!seg || seg === "." || seg === ".." || RESERVED_MCP_ROUTE_KEYS.has(seg.toLowerCase())) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isSafeProposalRouteId(raw: unknown): raw is string {
+  if (typeof raw !== "string") return false;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 128) return false;
+  if (trimmed === "." || trimmed.includes("..") || RESERVED_MCP_ROUTE_KEYS.has(trimmed.toLowerCase())) {
+    return false;
+  }
+  if (/[\x00-\x1f\x7f-\x9f/\\?#%]/.test(trimmed)) return false;
+  return true;
+}
+
+function scrubMcpHandlerError(raw: unknown, maxLen = 180): string {
+  const base = redactSecrets(String((raw as { message?: unknown })?.message || raw || "error").slice(0, 4096));
+  return base
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]")
+    .replace(/\bBasic\s+[A-Za-z0-9+/=_-]{8,}/gi, "Basic [REDACTED]")
+    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/gi, "$1[REDACTED]@")
+    .replace(/[\x00-\x1f\x7f-\x9f]+/g, " ")
+    .trim()
+    .slice(0, Math.max(1, maxLen));
+}
+
+function parseSafeJsonObject(raw: string): any {
+  const parsed = JSON.parse(raw);
+  if (parsed && typeof parsed === "object" && Object.prototype.hasOwnProperty.call(parsed, "__proto__")) {
+    throw new Error("Invalid JSON response object");
+  }
+  return parsed;
+}
+
+function setBoundedMemberCache(
+  key: string,
+  entry: { at: number; members: { agent_id: string; display_name?: string }[]; sameOwnerDirect?: boolean },
+): void {
+  if (!memberCache.has(key) && memberCache.size >= MEMBER_CACHE_MAX_ENTRIES) {
+    for (const [k, v] of memberCache.entries()) {
+      if (entry.at - v.at >= MEMBER_CACHE_TTL_MS) memberCache.delete(k);
+    }
+    if (memberCache.size >= MEMBER_CACHE_MAX_ENTRIES) {
+      const oldest = memberCache.keys().next().value;
+      if (oldest !== undefined) memberCache.delete(oldest);
+    }
+  }
+  memberCache.set(key, entry);
+}
 
 function memberCacheKey(chatId: string): string {
   return `${AGENT_ID || "anon"}:${chatId}`;
 }
 
 async function fetchChannelMembers(chatId: string): Promise<{ agent_id: string; display_name?: string }[]> {
+  const normalizedChatId = typeof chatId === "string" ? chatId.trim() : "";
+  if (!isSafeChannelRouteId(normalizedChatId)) return [];
   const now = Date.now();
-  const key = memberCacheKey(chatId);
+  const key = memberCacheKey(normalizedChatId);
   const hit = memberCache.get(key);
   if (hit && now - hit.at < MEMBER_CACHE_TTL_MS) return hit.members;
   try {
-    const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chatId)}/members`, {
+    const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(normalizedChatId)}/members`, {
       headers: { "Authorization": `Bearer ${TOKEN}` },
     });
     if (!r.ok) return hit?.members || [];
     const body = await r.json() as any;
+    if (body && typeof body === "object" && Object.prototype.hasOwnProperty.call(body, "__proto__")) {
+      return hit?.members || [];
+    }
     const members = Array.isArray(body?.members) ? body.members : [];
     const sameOwnerDirect = body?.same_owner_direct === true;
-    memberCache.set(key, { at: now, members, sameOwnerDirect });
+    setBoundedMemberCache(key, { at: now, members, sameOwnerDirect });
     return members;
   } catch {
     return hit?.members || [];
@@ -2664,16 +2735,19 @@ HANDLERS.set("okr_reparent_objective", async (args) => {
     });
     const text = await r.text();
     if (!r.ok) {
-      return { content: [{ type: "text", text: `okr_reparent_objective failed (${r.status}): ${text.slice(0, 200)}` }], isError: true };
+      return { content: [{ type: "text", text: `okr_reparent_objective failed (${r.status}): ${scrubMcpHandlerError(text, 200)}` }], isError: true };
     }
     return { content: [{ type: "text", text: `Reparented: ${text}` }] };
   } catch (e: any) {
-    return { content: [{ type: "text", text: `okr_reparent_objective network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    return { content: [{ type: "text", text: `okr_reparent_objective network error: ${scrubMcpHandlerError(e, 120)}` }], isError: true };
   }
 });
 
 async function setLoopPaused(args: any, action: "pause" | "resume") {
-  const loopId = String(args?.loop_id || "");
+  const loopId = String(args?.loop_id || "").trim();
+  if (!isSafeLoopIdentifier(loopId)) {
+    return { content: [{ type: "text", text: `${action}_loop needs a valid loop_id.` }], isError: true };
+  }
   try {
     const r = await apiFetch(`${REST_URL}/api/loops/${encodeURIComponent(loopId)}/${action}`, {
       method: "POST",
@@ -2681,9 +2755,9 @@ async function setLoopPaused(args: any, action: "pause" | "resume") {
     });
     const text = await r.text();
     if (!r.ok) {
-      return { content: [{ type: "text", text: `${action}_loop failed (${r.status}): ${text.slice(0, 200)}` }], isError: true };
+      return { content: [{ type: "text", text: `${action}_loop failed (${r.status}): ${scrubMcpHandlerError(text, 200)}` }], isError: true };
     }
-    JSON.parse(text);
+    parseSafeJsonObject(text);
     const verified = await apiFetch(`${REST_URL}/api/loops/mine`, {
       headers: { "Authorization": `Bearer ${TOKEN}` },
     });
@@ -2711,7 +2785,7 @@ async function setLoopPaused(args: any, action: "pause" | "resume") {
       }],
     };
   } catch (e: any) {
-    return { content: [{ type: "text", text: `${action}_loop error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    return { content: [{ type: "text", text: `${action}_loop error: ${scrubMcpHandlerError(e, 120)}` }], isError: true };
   }
 }
 
@@ -2728,9 +2802,9 @@ HANDLERS.set("create_loop", async (args) => {
     });
     const text = await r.text();
     if (!r.ok) {
-      return { content: [{ type: "text", text: `create_loop failed (${r.status}): ${text.slice(0, 220)}` }], isError: true };
+      return { content: [{ type: "text", text: `create_loop failed (${r.status}): ${scrubMcpHandlerError(text, 220)}` }], isError: true };
     }
-    const createdPayload = JSON.parse(text) as any;
+    const createdPayload = parseSafeJsonObject(text) as any;
     const createdLoopId = String(createdPayload?.loop?.loop_id || "").trim();
     if (!isSafeLoopIdentifier(createdLoopId)) {
       return {
@@ -2787,7 +2861,7 @@ HANDLERS.set("create_loop", async (args) => {
       }],
     };
   } catch (e: any) {
-    return { content: [{ type: "text", text: `create_loop error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    return { content: [{ type: "text", text: `create_loop error: ${scrubMcpHandlerError(e, 120)}` }], isError: true };
   }
 });
 
@@ -2798,7 +2872,9 @@ const LOOP_INTERVAL_MIN_MS = 60_000;
 const LOOP_INTERVAL_MAX_MS = 86_400_000;
 
 function isSafeLoopIdentifier(loopId: string): boolean {
-  return /^[A-Za-z0-9_.:-]{1,128}$/.test(loopId) && !loopId.includes("..");
+  if (!/^[A-Za-z0-9_.:-]{1,128}$/.test(loopId)) return false;
+  if (loopId === "." || loopId.includes("..")) return false;
+  return !RESERVED_MCP_ROUTE_KEYS.has(loopId.toLowerCase());
 }
 
 HANDLERS.set("set_loop_interval", async (args) => {
@@ -2821,9 +2897,9 @@ HANDLERS.set("set_loop_interval", async (args) => {
     });
     const text = await r.text();
     if (!r.ok) {
-      return { content: [{ type: "text", text: `set_loop_interval failed (${r.status}): ${text.slice(0, 200)}` }], isError: true };
+      return { content: [{ type: "text", text: `set_loop_interval failed (${r.status}): ${scrubMcpHandlerError(text, 200)}` }], isError: true };
     }
-    JSON.parse(text);
+    parseSafeJsonObject(text);
     const verified = await apiFetch(`${REST_URL}/api/loops/mine`, {
       headers: { "Authorization": `Bearer ${TOKEN}` },
     });
@@ -2855,7 +2931,7 @@ HANDLERS.set("set_loop_interval", async (args) => {
       }],
     };
   } catch (e: any) {
-    return { content: [{ type: "text", text: `set_loop_interval error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    return { content: [{ type: "text", text: `set_loop_interval error: ${scrubMcpHandlerError(e, 120)}` }], isError: true };
   }
 });
 
@@ -2871,9 +2947,9 @@ HANDLERS.set("stop_loop", async (args) => {
     });
     const text = await r.text();
     if (!r.ok) {
-      return { content: [{ type: "text", text: `stop_loop failed (${r.status}): ${text.slice(0, 200)}` }], isError: true };
+      return { content: [{ type: "text", text: `stop_loop failed (${r.status}): ${scrubMcpHandlerError(text, 200)}` }], isError: true };
     }
-    JSON.parse(text);
+    parseSafeJsonObject(text);
     const verified = await apiFetch(`${REST_URL}/api/loops/mine`, {
       headers: { "Authorization": `Bearer ${TOKEN}` },
     });
@@ -2898,7 +2974,7 @@ HANDLERS.set("stop_loop", async (args) => {
       }],
     };
   } catch (e: any) {
-    return { content: [{ type: "text", text: `stop_loop error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    return { content: [{ type: "text", text: `stop_loop error: ${scrubMcpHandlerError(e, 120)}` }], isError: true };
   }
 });
 
@@ -2918,11 +2994,11 @@ HANDLERS.set("delete_memory", async (args) => {
     const text = await r.text();
     if (!r.ok) {
       return {
-        content: [{ type: "text", text: `delete_memory failed (${r.status}): ${text.slice(0, 240)}` }],
+        content: [{ type: "text", text: `delete_memory failed (${r.status}): ${scrubMcpHandlerError(text, 240)}` }],
         isError: true,
       };
     }
-    const resp = JSON.parse(text) as any;
+    const resp = parseSafeJsonObject(text) as any;
     const deleted = Boolean(resp?.deleted);
     if (!deleted && !checked.value.allow_missing) {
       return {
@@ -2944,7 +3020,7 @@ HANDLERS.set("delete_memory", async (args) => {
       }],
     };
   } catch (e: any) {
-    return { content: [{ type: "text", text: `delete_memory network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    return { content: [{ type: "text", text: `delete_memory network error: ${scrubMcpHandlerError(e, 120)}` }], isError: true };
   }
 });
 
@@ -2962,19 +3038,20 @@ HANDLERS.set("okr_update_kr", async (args) => {
     });
     const text = await r.text();
     if (!r.ok) {
-      return { content: [{ type: "text", text: `okr_update_kr failed (${r.status}): ${text.slice(0, 160)}` }], isError: true };
+      return { content: [{ type: "text", text: `okr_update_kr failed (${r.status}): ${scrubMcpHandlerError(text, 160)}` }], isError: true };
     }
     return { content: [{ type: "text", text: `Updated: ${text}` }] };
   } catch (e: any) {
-    return { content: [{ type: "text", text: `okr_update_kr network error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    return { content: [{ type: "text", text: `okr_update_kr network error: ${scrubMcpHandlerError(e, 120)}` }], isError: true };
   }
 });
 
 function redactCloudAgentDisplayName(name: string): string {
-  const safe = redactSecrets(name)
+  const preScrubbed = name
     .replace(/\bsk-(?:ant|proj|live|test)-[A-Za-z0-9_-]{12,}\b/g, "[REDACTED]")
     .replace(/\bgh[pousr]_[A-Za-z0-9]{20,}\b/g, "[REDACTED]")
     .replace(/\bAIza[0-9A-Za-z_-]{30,}\b/g, "[REDACTED]");
+  const safe = redactSecrets(preScrubbed);
   return redactParticipantPii(safe).slice(0, 128);
 }
 
@@ -3009,7 +3086,7 @@ function projectWakeHealthPayload(channelId: string, data: any): { channel_id: s
 
 HANDLERS.set("cloud_agent_wake_health", async (args) => {
   const channelId = String(args?.channel_id || "").trim();
-  if (!channelId || /[\x00-\x1f\x7f]/.test(channelId)) {
+  if (!isSafeChannelRouteId(channelId)) {
     return { content: [{ type: "text", text: "cloud_agent_wake_health needs channel_id." }], isError: true };
   }
   const reqHeaders = {
@@ -3031,7 +3108,7 @@ HANDLERS.set("cloud_agent_wake_health", async (args) => {
       const rpc = await r.json() as any;
       if (!rpc?.error && !rpc?.result?.isError) {
         let data = rpc?.result?.structuredContent;
-        if (!data && typeof rpc?.result?.content?.[0]?.text === "string") data = JSON.parse(rpc.result.content[0].text);
+        if (!data && typeof rpc?.result?.content?.[0]?.text === "string") data = parseSafeJsonObject(rpc.result.content[0].text);
         const projected = projectWakeHealthPayload(channelId, data);
         if (!projected) return { content: [{ type: "text", text: "cloud_agent_wake_health returned an invalid response" }], isError: true };
         return { content: [{ type: "text", text: JSON.stringify(projected) }] };
@@ -3039,23 +3116,29 @@ HANDLERS.set("cloud_agent_wake_health", async (args) => {
       rpcErrorCode = rpc?.error?.code ?? "remote_error";
       rpcErrorMsg = typeof rpc?.error?.message === "string" ? rpc.error.message : "";
     }
-    // Fallback to REST /api/channels/:id/cloud-wake-health when /mcp predates the tool (-32601/-32602 Unknown tool or 404/405).
+    // Fallback to REST /api/channels/:id/wake-health (with legacy /cloud-wake-health fallback)
+    // when /mcp predates the tool (-32601/-32602 Unknown tool or 404/405).
     const canFallback = (!r.ok && (r.status === 404 || r.status === 405)) ||
       ((rpcErrorCode === -32601 || rpcErrorCode === -32602) && !/denied|forbidden|invalid cloud wake health/i.test(rpcErrorMsg));
     if (canFallback) {
-      const restRes = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(channelId)}/cloud-wake-health`, {
+      let restRes = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(channelId)}/wake-health`, {
         headers: reqHeaders,
       }, 5000, true);
+      if (restRes.status === 404 || restRes.status === 405) {
+        restRes = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(channelId)}/cloud-wake-health`, {
+          headers: reqHeaders,
+        }, 5000, true);
+      }
       if (restRes.ok) {
         const projected = projectWakeHealthPayload(channelId, await restRes.json());
         if (projected) return { content: [{ type: "text", text: JSON.stringify(projected) }] };
       }
     }
     if (!r.ok) return { content: [{ type: "text", text: `cloud_agent_wake_health failed (${r.status})` }], isError: true };
-    const safeDetail = rpcErrorMsg ? `: ${redactSecrets(redactParticipantPii(rpcErrorMsg)).slice(0, 80)}` : "";
+    const safeDetail = rpcErrorMsg ? `: ${scrubMcpHandlerError(redactParticipantPii(rpcErrorMsg), 80)}` : "";
     return { content: [{ type: "text", text: `cloud_agent_wake_health failed (${rpcErrorCode}${safeDetail})` }], isError: true };
   } catch (e: any) {
-    return { content: [{ type: "text", text: `cloud_agent_wake_health error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    return { content: [{ type: "text", text: `cloud_agent_wake_health error: ${scrubMcpHandlerError(e, 120)}` }], isError: true };
   }
 });
 
@@ -3088,7 +3171,7 @@ function sanitizeProposalItem(p: any): any {
 
 HANDLERS.set("list_pins", async (args) => {
   const chatId = String(args?.chat_id || "").trim();
-  if (!chatId || /[\x00-\x1f\x7f]/.test(chatId) || /^(?:ac_|sk-)/i.test(chatId)) {
+  if (!isSafeChannelRouteId(chatId)) {
     return { content: [{ type: "text", text: "list_pins needs a valid chat_id." }], isError: true };
   }
   try {
@@ -3101,9 +3184,9 @@ HANDLERS.set("list_pins", async (args) => {
     });
     const text = await r.text();
     if (!r.ok) {
-      return { content: [{ type: "text", text: `list_pins failed (${r.status}): ${redactSecrets(text).slice(0, 180)}` }], isError: true };
+      return { content: [{ type: "text", text: `list_pins failed (${r.status}): ${scrubMcpHandlerError(text, 180)}` }], isError: true };
     }
-    const body = JSON.parse(text) as any;
+    const body = parseSafeJsonObject(text) as any;
     const seen = new Set<string>();
     const pinnedMessages: string[] = [];
     if (Array.isArray(body?.pinned_messages)) {
@@ -3126,14 +3209,14 @@ HANDLERS.set("list_pins", async (args) => {
       }],
     };
   } catch (e: any) {
-    return { content: [{ type: "text", text: `list_pins error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    return { content: [{ type: "text", text: `list_pins error: ${scrubMcpHandlerError(e, 120)}` }], isError: true };
   }
 });
 
 HANDLERS.set("list_proposals", async (args) => {
   const chatId = String(args?.chat_id || "").trim();
   const statusFilter = String(args?.status || "all").trim().toLowerCase();
-  if (!chatId || /[\x00-\x1f\x7f]/.test(chatId)) {
+  if (!isSafeChannelRouteId(chatId)) {
     return { content: [{ type: "text", text: "list_proposals needs chat_id." }], isError: true };
   }
   if (!["all", "pending", "passed", "rejected"].includes(statusFilter)) {
@@ -3148,23 +3231,23 @@ HANDLERS.set("list_proposals", async (args) => {
     });
     const text = await r.text();
     if (!r.ok) {
-      return { content: [{ type: "text", text: `list_proposals failed (${r.status}): ${redactSecrets(text).slice(0, 180)}` }], isError: true };
+      return { content: [{ type: "text", text: `list_proposals failed (${r.status}): ${scrubMcpHandlerError(text, 180)}` }], isError: true };
     }
-    const body = JSON.parse(text) as any;
+    const body = parseSafeJsonObject(text) as any;
     let proposals = (Array.isArray(body?.proposals) ? body.proposals : []).map(sanitizeProposalItem).filter(Boolean);
     if (statusFilter !== "all") {
       proposals = proposals.filter((p: any) => p.status === statusFilter);
     }
     return { content: [{ type: "text", text: JSON.stringify({ channel_id: chatId, count: proposals.length, proposals, untrusted: true }) }] };
   } catch (e: any) {
-    return { content: [{ type: "text", text: `list_proposals error: ${String(e?.message || e).slice(0, 120)}` }], isError: true };
+    return { content: [{ type: "text", text: `list_proposals error: ${scrubMcpHandlerError(e, 120)}` }], isError: true };
   }
 });
 
 HANDLERS.set("propose", async (args) => {
   const { chat_id, title, content, code_diff, consensus_rule, expires_at } = (args || {}) as any;
   const chatId = typeof chat_id === "string" ? chat_id.trim() : "";
-  if (!chatId || /[\x00-\x1f\x7f]/.test(chatId) || typeof title !== "string" || !title.trim() || typeof content !== "string") {
+  if (!isSafeChannelRouteId(chatId) || typeof title !== "string" || !title.trim() || typeof content !== "string") {
     return { content: [{ type: "text", text: "Error: chat_id, non-empty title, and content (strings) required" }], isError: true };
   }
   const rule = consensus_rule || "majority";
@@ -3201,7 +3284,7 @@ HANDLERS.set("propose", async (args) => {
       }
       if (r.status !== 404 && r.status !== 405 && r.status !== 501) {
         const errText = await r.text();
-        return { content: [{ type: "text", text: `propose failed (${r.status}): ${redactSecrets(errText).slice(0, 180)}` }], isError: true };
+        return { content: [{ type: "text", text: `propose failed (${r.status}): ${scrubMcpHandlerError(errText, 180)}` }], isError: true };
       }
     } catch {
       // Network/pre-deploy fallback to WebSocket below when open.
@@ -3222,18 +3305,22 @@ HANDLERS.set("propose", async (args) => {
 
 HANDLERS.set("vote", async (args) => {
   const { chat_id, channel_id, proposal_id, decision, reason } = (args || {}) as any;
-  if (typeof proposal_id !== "string" || !proposal_id.trim() || typeof decision !== "string") {
+  if (!isSafeProposalRouteId(proposal_id) || typeof decision !== "string") {
     return { content: [{ type: "text", text: "Error: proposal_id and decision (strings) required" }], isError: true };
   }
   if (!["approve", "reject", "abstain"].includes(decision)) {
     return { content: [{ type: "text", text: "Error: decision must be approve, reject, or abstain" }], isError: true };
   }
+  const propId = proposal_id.trim();
   const chatId = typeof chat_id === "string" && chat_id.trim()
     ? chat_id.trim()
     : (typeof channel_id === "string" && channel_id.trim() ? channel_id.trim() : "");
-  if (chatId && !/[\x00-\x1f\x7f]/.test(chatId) && TOKEN) {
+  if (chatId && !isSafeChannelRouteId(chatId)) {
+    return { content: [{ type: "text", text: "Error: invalid chat_id" }], isError: true };
+  }
+  if (chatId && TOKEN) {
     try {
-      const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chatId)}/proposals/${encodeURIComponent(proposal_id.trim())}/votes`, {
+      const r = await apiFetch(`${REST_URL}/api/channels/${encodeURIComponent(chatId)}/proposals/${encodeURIComponent(propId)}/votes`, {
         method: "POST",
         headers: {
           "Authorization": `Bearer ${TOKEN}`,
@@ -3248,13 +3335,13 @@ HANDLERS.set("vote", async (args) => {
       });
       if (r.ok) {
         const data = await r.json() as any;
-        return { content: [{ type: "text", text: JSON.stringify({ ok: true, transport: "rest", proposal_id: data?.proposal_id ?? proposal_id.trim(), vote_result: data?.vote_result }) }] };
+        return { content: [{ type: "text", text: JSON.stringify({ ok: true, transport: "rest", proposal_id: data?.proposal_id ?? propId, vote_result: data?.vote_result }) }] };
       }
       const errText = await r.text();
       // Only fall back to WS when the server build predates the REST route (404 with HTML/route missing, not Proposal not found JSON).
       const isProposal404 = r.status === 404 && /proposal not found|channel not found/i.test(errText);
       if ((r.status !== 404 && r.status !== 405 && r.status !== 501) || isProposal404) {
-        return { content: [{ type: "text", text: `vote failed (${r.status}): ${redactSecrets(errText).slice(0, 180)}` }], isError: true };
+        return { content: [{ type: "text", text: `vote failed (${r.status}): ${scrubMcpHandlerError(errText, 180)}` }], isError: true };
       }
     } catch {
       // Fall back to WS below if open.
@@ -3262,10 +3349,10 @@ HANDLERS.set("vote", async (args) => {
   }
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({
-      type: "vote", proposal_id: proposal_id.trim(), voter_id: AGENT_ID,
+      type: "vote", proposal_id: propId, voter_id: AGENT_ID,
       voter_type: "agent", decision, reason,
     }));
-    return { content: [{ type: "text", text: `Vote '${decision}' dispatched for proposal ${proposal_id.trim().slice(0, 8)}; server may reject (invalid proposal_id or expired)` }] };
+    return { content: [{ type: "text", text: `Vote '${decision}' dispatched for proposal ${propId.slice(0, 8)}; server may reject (invalid proposal_id or expired)` }] };
   }
   return { content: [{ type: "text", text: "Not connected" }], isError: true };
 });

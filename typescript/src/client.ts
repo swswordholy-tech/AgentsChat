@@ -1,6 +1,29 @@
 // AgentsChat TypeScript SDK — WebSocket client
 
-import { redactError, validateToken, validateTransportUrl, validatePathSegment } from "./security";
+import { redactError, validateToken, validateTransportUrl, isValidTransportUrl, validatePathSegment } from "./security";
+
+const MAX_WS_FRAME_BYTES = 4 * 1024 * 1024;
+const WS_TEXT_ENCODER = new TextEncoder();
+const WS_TEXT_DECODER = new TextDecoder();
+
+function decodeBoundedWsFrame(rawData: unknown): string | null {
+  if (typeof rawData === "string") {
+    if (rawData.length > MAX_WS_FRAME_BYTES) return null;
+    if (rawData.length * 3 > MAX_WS_FRAME_BYTES && WS_TEXT_ENCODER.encode(rawData).byteLength > MAX_WS_FRAME_BYTES) {
+      return null;
+    }
+    return rawData;
+  }
+  if (rawData instanceof ArrayBuffer) {
+    if (rawData.byteLength > MAX_WS_FRAME_BYTES) return null;
+    return WS_TEXT_DECODER.decode(rawData);
+  }
+  if (ArrayBuffer.isView(rawData)) {
+    if (rawData.byteLength > MAX_WS_FRAME_BYTES) return null;
+    return WS_TEXT_DECODER.decode(rawData);
+  }
+  return null;
+}
 
 import type {
   AgentPresence,
@@ -147,7 +170,9 @@ export class AgentChatClient {
       };
       socket.onmessage = (event) => {
         if (this.ws !== socket) return;
-        this.handleMessage(String(event.data));
+        const decoded = decodeBoundedWsFrame(event.data);
+        if (decoded === null) return;
+        this.handleMessage(decoded);
       };
       socket.onclose = () => {
         if (this.ws !== socket) return;
@@ -554,7 +579,7 @@ export class AgentChatClient {
 
       case "please_reconnect":
       case "shard_moved": {
-        const targetUrl = typeof data.target_url === "string" && data.target_url ? data.target_url : undefined;
+        const targetUrl = isValidTransportUrl(data.target_url, true) ? data.target_url : undefined;
         this.stopHeartbeat();
         const prev = this.ws;
         this.ws = null;

@@ -6764,7 +6764,7 @@ export class AgentChatREST {
     opts?: { bearerToken?: string },
   ): Promise<import("./types").CloudAgentChannelMutationResponse> {
     validatePathSegment(agentId, "cloud agent ID");
-    validatePathSegment(channelId, "channel ID");
+    validatePathSegment(channelId, "group channel ID");
     const safeAgent = agentId?.trim() ?? "";
     if (!isSafeCloudRoomAgentId(safeAgent)) {
       throw new Error("Invalid cloud agent ID");
@@ -6786,7 +6786,7 @@ export class AgentChatREST {
     opts?: { bearerToken?: string },
   ): Promise<import("./types").CloudAgentChannelMutationResponse> {
     validatePathSegment(agentId, "cloud agent ID");
-    validatePathSegment(channelId, "channel ID");
+    validatePathSegment(channelId, "group channel ID");
     const safeAgent = agentId?.trim() ?? "";
     if (!isSafeCloudRoomAgentId(safeAgent)) {
       throw new Error("Invalid cloud agent ID");
@@ -7187,7 +7187,7 @@ export class AgentChatREST {
     opts?: { bearerToken?: string },
   ): Promise<import("./types").CloudAgentLoopObjectivesResponse> {
     validatePathSegment(agentId, "cloud agent ID");
-    validatePathSegment(channelId, "channel ID");
+    validatePathSegment(channelId, "group channel ID");
     const safeAgent = this.assertCloudAgentId(agentId);
     const trimmedChannel = typeof channelId === "string" ? channelId.trim() : "";
     if (
