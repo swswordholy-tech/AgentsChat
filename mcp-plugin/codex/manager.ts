@@ -80,10 +80,12 @@ export function start(w: Worker, spawnWorker = spawn) {
     if (child.connected) try { child.send(w.config, () => {}); } catch {}
   });
   let buffer = "";
+  const escapedAgentId = w.config.agentId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const connectedRe = new RegExp(`(?:^|[\\r\\n])AgentsChat connected as ${escapedAgentId}(?![A-Za-z0-9_.-])`);
   child.stderr?.on("data", data => {
     buffer = (buffer + String(data)).slice(-8192);
-    if (buffer.includes(`AgentsChat connected as ${w.config.agentId}`)) { w.status = "connected"; w.failures = 0; buffer = ""; save(); }
-    else if (buffer.includes("disconnected")) { w.status = "reconnecting"; buffer = ""; save(); }
+    if (connectedRe.test(buffer)) { w.status = "connected"; w.failures = 0; buffer = ""; save(); }
+    else if (/(?:^|[\r\n]).*\bdisconnected\b/i.test(buffer)) { w.status = "reconnecting"; buffer = ""; save(); }
   });
   child.stdout?.resume();
   const failed = () => { if (w.child !== child) return; killGroup(child); w.child = undefined; w.status = "retrying"; w.next = Date.now() + Math.min(60_000, 1000 * 2 ** Math.min(++w.failures, 6)); save(); };
@@ -127,7 +129,10 @@ async function main() {
       if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 1_048_576) throw new Error("Unsafe status file");
       const raw = readFileSync(statusFile, "utf8"), status = JSON.parse(raw);
       if (!status || typeof status !== "object" || Array.isArray(status) ||
-        Object.prototype.hasOwnProperty.call(status, "__proto__")) throw new Error("Invalid status file");
+        Object.prototype.hasOwnProperty.call(status, "__proto__") ||
+        (status.pid !== undefined && (typeof status.pid !== "number" || !Number.isSafeInteger(status.pid) || status.pid <= 0)) ||
+        !Array.isArray(status.bots) ||
+        status.bots.some((b: unknown) => !b || typeof b !== "object" || Array.isArray(b) || Object.prototype.hasOwnProperty.call(b, "__proto__"))) throw new Error("Invalid status file");
       console.log(raw);
     } catch { console.error("Bot manager status unavailable; status file is missing, unsafe, or unreadable"); process.exitCode = 1; }
     return;

@@ -10,15 +10,21 @@ export type PermissionMode = "full-access" | "read-only";
 // App Server advertises model-specific, nonempty effort names via model/list.
 export type ReasoningEffort = string;
 const CONTROL_CHAR_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+const PROTO_KEY_RE = /^(?:__proto__|constructor|prototype)$/i;
+const RESERVED_OBJECT_STEMS = new Set([
+  "__proto__", "constructor", "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype).map(k => k.toLowerCase()),
+]);
+const WINDOWS_DEVICE_STEM_RE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
 export function reasoningEffort(value: unknown): ReasoningEffort | undefined {
   if (value === undefined) return undefined;
-  if (typeof value !== "string" || !value.trim() || CONTROL_CHAR_RE.test(value))
+  if (typeof value !== "string" || !value.trim() || value.trim().length > 64 || CONTROL_CHAR_RE.test(value) || PROTO_KEY_RE.test(value.trim()))
     throw new Error("effort must be a nonempty model-supported reasoning effort name");
   return value.trim();
 }
 export function modelName(value: unknown): string | undefined {
   if (value === undefined) return undefined;
-  if (typeof value !== "string" || !value.trim() || CONTROL_CHAR_RE.test(value))
+  if (typeof value !== "string" || !value.trim() || value.trim().length > 256 || CONTROL_CHAR_RE.test(value) || PROTO_KEY_RE.test(value.trim()))
     throw new Error("model must be a nonempty model ID");
   return value.trim();
 }
@@ -41,8 +47,11 @@ export interface BridgeConfig {
 export interface IdentitySettings { state_root?: string; codex_home_mode?: CodexHomeMode; permissions?: PermissionMode; effort?: ReasoningEffort; model?: string; profile?: string; agent_id?: string; channels?: string[]; senders?: string[]; api_url?: string; ws_url?: string }
 const MAX_CONFIG_BYTES = 1_048_576;
 export function reservedProfileStem(selector: string): boolean {
-  return ["__proto__", "constructor", "prototype", "grok-binds", "session-binds", "agy-binds",
-    "cursor", "read-cursors", "wake-pids", "config", "codex-bots"].includes(selector.replace(/\.json$/i, "").toLowerCase());
+  const stem = selector.replace(/\.json$/i, "").toLowerCase();
+  return RESERVED_OBJECT_STEMS.has(stem) || WINDOWS_DEVICE_STEM_RE.test(stem) || [
+    "grok-binds", "session-binds", "agy-binds",
+    "cursor", "read-cursors", "wake-pids", "config", "codex-bots",
+  ].includes(stem);
 }
 function checkSingleAncestorDir(path: string): void {
   const stat = lstatSync(path, { throwIfNoEntry: false });

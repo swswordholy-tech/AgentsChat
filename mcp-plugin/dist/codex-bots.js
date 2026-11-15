@@ -968,17 +968,25 @@ function blockedServerHost(url) {
 
 // codex/config.ts
 var CONTROL_CHAR_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+var PROTO_KEY_RE = /^(?:__proto__|constructor|prototype)$/i;
+var RESERVED_OBJECT_STEMS = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase())
+]);
+var WINDOWS_DEVICE_STEM_RE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
 function reasoningEffort(value) {
   if (value === undefined)
     return;
-  if (typeof value !== "string" || !value.trim() || CONTROL_CHAR_RE.test(value))
+  if (typeof value !== "string" || !value.trim() || value.trim().length > 64 || CONTROL_CHAR_RE.test(value) || PROTO_KEY_RE.test(value.trim()))
     throw new Error("effort must be a nonempty model-supported reasoning effort name");
   return value.trim();
 }
 function modelName(value) {
   if (value === undefined)
     return;
-  if (typeof value !== "string" || !value.trim() || CONTROL_CHAR_RE.test(value))
+  if (typeof value !== "string" || !value.trim() || value.trim().length > 256 || CONTROL_CHAR_RE.test(value) || PROTO_KEY_RE.test(value.trim()))
     throw new Error("model must be a nonempty model ID");
   return value.trim();
 }
@@ -998,10 +1006,8 @@ function codexHomeMode(value) {
 }
 var MAX_CONFIG_BYTES = 1048576;
 function reservedProfileStem(selector) {
-  return [
-    "__proto__",
-    "constructor",
-    "prototype",
+  const stem = selector.replace(/\.json$/i, "").toLowerCase();
+  return RESERVED_OBJECT_STEMS.has(stem) || WINDOWS_DEVICE_STEM_RE.test(stem) || [
     "grok-binds",
     "session-binds",
     "agy-binds",
@@ -1010,7 +1016,7 @@ function reservedProfileStem(selector) {
     "wake-pids",
     "config",
     "codex-bots"
-  ].includes(selector.replace(/\.json$/i, "").toLowerCase());
+  ].includes(stem);
 }
 function checkSingleAncestorDir(path) {
   const stat = lstatSync(path, { throwIfNoEntry: false });
@@ -1249,8 +1255,9 @@ function loadBots(file = defaultRegistry(), home = homedir2()) {
     if (!object(x) || Object.getOwnPropertyNames(x).some((k) => !keys.includes(k)))
       throw new Error("Unknown or invalid bot registry field");
   };
-  const text = (x) => typeof x === "string" && x.trim().length > 0 && !/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(x);
-  const reserved = (s) => ["__proto__", "constructor", "prototype"].includes(s.toLowerCase());
+  const text = (x, max = 4096) => typeof x === "string" && x.trim().length > 0 && x.length <= max && !/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(x);
+  const reservedNames = new Set(["__proto__", "constructor", "prototype", ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase())]);
+  const reserved = (s) => reservedNames.has(s.toLowerCase());
   fields(doc, ["version", "default_workdir", "codex_bin", "bots"]);
   if (doc.version !== 1 || !Array.isArray(doc.bots) || doc.bots.length > 128)
     throw new Error("Registry requires version 1 and bots array");
@@ -1496,14 +1503,16 @@ function start(w, spawnWorker = spawn) {
       } catch {}
   });
   let buffer = "";
+  const escapedAgentId = w.config.agentId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const connectedRe = new RegExp(`(?:^|[\\r\\n])AgentsChat connected as ${escapedAgentId}(?![A-Za-z0-9_.-])`);
   child.stderr?.on("data", (data) => {
     buffer = (buffer + String(data)).slice(-8192);
-    if (buffer.includes(`AgentsChat connected as ${w.config.agentId}`)) {
+    if (connectedRe.test(buffer)) {
       w.status = "connected";
       w.failures = 0;
       buffer = "";
       save();
-    } else if (buffer.includes("disconnected")) {
+    } else if (/(?:^|[\r\n]).*\bdisconnected\b/i.test(buffer)) {
       w.status = "reconnecting";
       buffer = "";
       save();
@@ -1583,7 +1592,7 @@ Watch polls external Codex processes every 5 seconds.`);
       if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 1048576)
         throw new Error("Unsafe status file");
       const raw = readFileSync3(statusFile, "utf8"), status = JSON.parse(raw);
-      if (!status || typeof status !== "object" || Array.isArray(status) || Object.prototype.hasOwnProperty.call(status, "__proto__"))
+      if (!status || typeof status !== "object" || Array.isArray(status) || Object.prototype.hasOwnProperty.call(status, "__proto__") || status.pid !== undefined && (typeof status.pid !== "number" || !Number.isSafeInteger(status.pid) || status.pid <= 0) || !Array.isArray(status.bots) || status.bots.some((b) => !b || typeof b !== "object" || Array.isArray(b) || Object.prototype.hasOwnProperty.call(b, "__proto__")))
         throw new Error("Invalid status file");
       console.log(raw);
     } catch {

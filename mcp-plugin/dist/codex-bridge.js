@@ -1029,17 +1029,25 @@ async function getBotOwner(base, agentId, token, request = fetch) {
 
 // codex/config.ts
 var CONTROL_CHAR_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+var PROTO_KEY_RE = /^(?:__proto__|constructor|prototype)$/i;
+var RESERVED_OBJECT_STEMS = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase())
+]);
+var WINDOWS_DEVICE_STEM_RE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
 function reasoningEffort(value) {
   if (value === undefined)
     return;
-  if (typeof value !== "string" || !value.trim() || CONTROL_CHAR_RE.test(value))
+  if (typeof value !== "string" || !value.trim() || value.trim().length > 64 || CONTROL_CHAR_RE.test(value) || PROTO_KEY_RE.test(value.trim()))
     throw new Error("effort must be a nonempty model-supported reasoning effort name");
   return value.trim();
 }
 function modelName(value) {
   if (value === undefined)
     return;
-  if (typeof value !== "string" || !value.trim() || CONTROL_CHAR_RE.test(value))
+  if (typeof value !== "string" || !value.trim() || value.trim().length > 256 || CONTROL_CHAR_RE.test(value) || PROTO_KEY_RE.test(value.trim()))
     throw new Error("model must be a nonempty model ID");
   return value.trim();
 }
@@ -1059,10 +1067,8 @@ function codexHomeMode(value) {
 }
 var MAX_CONFIG_BYTES = 1048576;
 function reservedProfileStem(selector) {
-  return [
-    "__proto__",
-    "constructor",
-    "prototype",
+  const stem = selector.replace(/\.json$/i, "").toLowerCase();
+  return RESERVED_OBJECT_STEMS.has(stem) || WINDOWS_DEVICE_STEM_RE.test(stem) || [
     "grok-binds",
     "session-binds",
     "agy-binds",
@@ -1071,7 +1077,7 @@ function reservedProfileStem(selector) {
     "wake-pids",
     "config",
     "codex-bots"
-  ].includes(selector.replace(/\.json$/i, "").toLowerCase());
+  ].includes(stem);
 }
 function checkSingleAncestorDir(path) {
   const stat = lstatSync(path, { throwIfNoEntry: false });
@@ -1293,8 +1299,9 @@ function resolveConfig(opts, env = process.env, home = homedir()) {
 // codex/runtime-home.ts
 import { homedir as homedir2 } from "node:os";
 import { delimiter, isAbsolute as isAbsolute2, join as join2, relative, resolve as resolve2, sep } from "node:path";
+var RUNTIME_CTRL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
 function executablePath(bin) {
-  if (!bin || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(bin))
+  if (!bin || RUNTIME_CTRL_RE.test(bin))
     return;
   const exts = process.platform === "win32" && !/\.[A-Za-z0-9]+$/.test(bin) ? ["", ...(process.env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";").filter(Boolean)] : [""];
   const bases = isAbsolute2(bin) || bin.includes("/") || bin.includes("\\") ? [resolve2(bin)] : (process.env.PATH ?? "").split(delimiter).filter(Boolean).map((dir) => join2(dir, bin));
@@ -1353,12 +1360,20 @@ function assertIndependentTree(home, allowedAuthOrigin, codexExecutable) {
 function prepareRuntimeHome(stateDir, source = process.env.CODEX_HOME || join2(homedir2(), ".codex"), mode = "linked", codexBin = "codex") {
   if (mode !== "linked" && mode !== "isolated" && mode !== "auth-only")
     throw new Error("Invalid Codex home mode");
+  if (typeof stateDir !== "string" || !stateDir.trim() || stateDir.length > 4096 || RUNTIME_CTRL_RE.test(stateDir)) {
+    throw new Error("Invalid bot state directory");
+  }
   if (mode === "isolated") {
     const home2 = join2(stateDir, "codex-home-isolated");
     prepareHomeDirectory(stateDir, home2);
     assertIndependentTree(home2, undefined, executablePath(codexBin));
     return { home: realpathSync2(home2) };
   }
+  if (typeof source !== "string" || !source.trim() || source.length > 4096 || RUNTIME_CTRL_RE.test(source)) {
+    throw new Error("Invalid Codex source home");
+  }
+  assertDirectoryLeaf(source, "Source Codex home");
+  assertDirectoryAncestors(source);
   if (mode === "auth-only") {
     const legacyHome2 = realpathSync2(source);
     const origin = join2(legacyHome2, "auth.json");
@@ -1777,8 +1792,9 @@ function loadBots(file = defaultRegistry(), home = homedir3()) {
     if (!object(x) || Object.getOwnPropertyNames(x).some((k) => !keys.includes(k)))
       throw new Error("Unknown or invalid bot registry field");
   };
-  const text = (x) => typeof x === "string" && x.trim().length > 0 && !/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(x);
-  const reserved = (s) => ["__proto__", "constructor", "prototype"].includes(s.toLowerCase());
+  const text = (x, max = 4096) => typeof x === "string" && x.trim().length > 0 && x.length <= max && !/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(x);
+  const reservedNames = new Set(["__proto__", "constructor", "prototype", ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase())]);
+  const reserved = (s) => reservedNames.has(s.toLowerCase());
   fields(doc, ["version", "default_workdir", "codex_bin", "bots"]);
   if (doc.version !== 1 || !Array.isArray(doc.bots) || doc.bots.length > 128)
     throw new Error("Registry requires version 1 and bots array");
@@ -1928,6 +1944,10 @@ class ThreadBusyError extends Error {
     this.name = "ThreadBusyError";
   }
 }
+var APP_SERVER_CTRL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+function validThreadId(id) {
+  return typeof id === "string" && id.trim().length > 0 && id.length <= 256 && !APP_SERVER_CTRL_RE.test(id);
+}
 
 class AppServer {
   bin;
@@ -1965,8 +1985,19 @@ class AppServer {
     return this.runtime?.home;
   }
   async start() {
-    if (this.model !== undefined && (typeof this.model !== "string" || !this.model.trim() || this.model.length > 256 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(this.model)))
+    if (this.model !== undefined && (typeof this.model !== "string" || !this.model.trim() || this.model.length > 256 || APP_SERVER_CTRL_RE.test(this.model)))
       throw new Error("Invalid app-server model");
+    if (this.runtime) {
+      if (typeof this.runtime.home !== "string" || !this.runtime.home.trim() || this.runtime.home.length > 4096 || APP_SERVER_CTRL_RE.test(this.runtime.home) || this.runtime.legacyHome !== undefined && (typeof this.runtime.legacyHome !== "string" || !this.runtime.legacyHome.trim() || this.runtime.legacyHome.length > 4096 || APP_SERVER_CTRL_RE.test(this.runtime.legacyHome))) {
+        throw new Error("Invalid app-server runtime home");
+      }
+    }
+    if (this.toolIdentity) {
+      const { profileFile, agentId, apiUrl, wsUrl } = this.toolIdentity;
+      if ([profileFile, agentId, apiUrl, wsUrl].some((v) => typeof v !== "string" || !v.trim() || v.length > 4096 || APP_SERVER_CTRL_RE.test(v)) || agentId.length > 256) {
+        throw new Error("Invalid app-server tool identity");
+      }
+    }
     const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^AGENTS?CHAT_|^RELAY_/.test(k)));
     env.AGENTSCHAT_LOCK_OWNER_PID = String(process.pid);
     env.AGENTSCHAT_TOOL_ONLY = "1";
@@ -2130,9 +2161,9 @@ class AppServer {
     }
   }
   async thread(cwd, existing, ephemeral = false, permissions = this.permissions) {
-    if (typeof cwd !== "string" || !cwd.trim() || cwd.length > 4096 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(cwd))
+    if (typeof cwd !== "string" || !cwd.trim() || cwd.length > 4096 || APP_SERVER_CTRL_RE.test(cwd))
       throw new Error("Invalid app-server cwd");
-    if (existing !== undefined && (typeof existing !== "string" || !existing.trim() || existing.length > 256 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(existing)))
+    if (existing !== undefined && !validThreadId(existing))
       throw new Error("Invalid app-server thread ID");
     const configured = existing ? this.threadPermissions.get(existing) : undefined;
     if (configured !== undefined && configured !== permissions) {
@@ -2161,6 +2192,8 @@ class AppServer {
     return r.thread.id;
   }
   async readThread(thread) {
+    if (!validThreadId(thread))
+      throw new Error("Invalid app-server thread ID");
     const result = await this.request("thread/read", { threadId: thread, includeTurns: true });
     if (result.thread?.id !== thread || !Array.isArray(result.thread.turns))
       throw new Error("Original thread history unavailable");
@@ -2169,6 +2202,8 @@ class AppServer {
     return { id: thread, createdAt: result.thread.createdAt, turns: result.thread.turns };
   }
   async readLegacyThread(thread) {
+    if (!validThreadId(thread))
+      throw new Error("Invalid app-server thread ID");
     if (!this.runtime?.legacyHome)
       return this.readThread(thread);
     const reader = new AppServer(this.bin, undefined, undefined, this.permissions, { home: this.runtime.legacyHome });
@@ -2180,6 +2215,10 @@ class AppServer {
     }
   }
   async nameThread(thread, name) {
+    if (!validThreadId(thread))
+      throw new Error("Invalid app-server thread ID");
+    if (typeof name !== "string" || !name.trim() || name.length > 256 || APP_SERVER_CTRL_RE.test(name))
+      throw new Error("Invalid app-server thread name");
     await this.request("thread/name/set", { threadId: thread, name });
   }
   async generate(thread, text, effort = this.effort) {

@@ -9,6 +9,11 @@ export class ThreadBusyError extends Error {
   constructor() { super("This conversation has another active writer; waiting to resume the same task"); this.name = "ThreadBusyError"; }
 }
 
+const APP_SERVER_CTRL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+function validThreadId(id: unknown): id is string {
+  return typeof id === "string" && id.trim().length > 0 && id.length <= 256 && !APP_SERVER_CTRL_RE.test(id);
+}
+
 /** Official JSON-RPC stdio client. One active generation per bridge. */
 export class AppServer {
   onFatal?: () => void;
@@ -30,7 +35,19 @@ export class AppServer {
   get namespace() { return this.runtime?.home; }
   async start() {
     if (this.model !== undefined && (typeof this.model !== "string" || !this.model.trim() ||
-      this.model.length > 256 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(this.model))) throw new Error("Invalid app-server model");
+      this.model.length > 256 || APP_SERVER_CTRL_RE.test(this.model))) throw new Error("Invalid app-server model");
+    if (this.runtime) {
+      if (typeof this.runtime.home !== "string" || !this.runtime.home.trim() || this.runtime.home.length > 4096 || APP_SERVER_CTRL_RE.test(this.runtime.home) ||
+        (this.runtime.legacyHome !== undefined && (typeof this.runtime.legacyHome !== "string" || !this.runtime.legacyHome.trim() || this.runtime.legacyHome.length > 4096 || APP_SERVER_CTRL_RE.test(this.runtime.legacyHome)))) {
+        throw new Error("Invalid app-server runtime home");
+      }
+    }
+    if (this.toolIdentity) {
+      const { profileFile, agentId, apiUrl, wsUrl } = this.toolIdentity;
+      if ([profileFile, agentId, apiUrl, wsUrl].some(v => typeof v !== "string" || !v.trim() || v.length > 4096 || APP_SERVER_CTRL_RE.test(v)) || agentId.length > 256) {
+        throw new Error("Invalid app-server tool identity");
+      }
+    }
     const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^AGENTS?CHAT_|^RELAY_/.test(k)));
     env.AGENTSCHAT_LOCK_OWNER_PID = String(process.pid);
     env.AGENTSCHAT_TOOL_ONLY = "1";
@@ -166,9 +183,9 @@ export class AppServer {
     }
   }
   async thread(cwd: string, existing?: string, ephemeral = false, permissions: PermissionMode = this.permissions): Promise<string> {
-    if (typeof cwd !== "string" || !cwd.trim() || cwd.length > 4096 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(cwd))
+    if (typeof cwd !== "string" || !cwd.trim() || cwd.length > 4096 || APP_SERVER_CTRL_RE.test(cwd))
       throw new Error("Invalid app-server cwd");
-    if (existing !== undefined && (typeof existing !== "string" || !existing.trim() || existing.length > 256 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(existing)))
+    if (existing !== undefined && !validThreadId(existing))
       throw new Error("Invalid app-server thread ID");
     // Loaded-thread resume ignores MCP and developer-instruction overrides.
     // Keep the original runtime policy; a different permission needs a new thread.
@@ -197,6 +214,7 @@ export class AppServer {
     return r.thread.id;
   }
   async readThread(thread: string): Promise<ThreadHistory> {
+    if (!validThreadId(thread)) throw new Error("Invalid app-server thread ID");
     const result = await this.request("thread/read", {threadId:thread, includeTurns:true});
     if (result.thread?.id !== thread || !Array.isArray(result.thread.turns)) throw new Error("Original thread history unavailable");
     if (result.thread.turns.some((turn: any) => !Array.isArray(turn.items) || (turn.itemsView && turn.itemsView !== "full")))
@@ -204,11 +222,15 @@ export class AppServer {
     return {id:thread, createdAt:result.thread.createdAt, turns:result.thread.turns};
   }
   async readLegacyThread(thread: string): Promise<ThreadHistory> {
+    if (!validThreadId(thread)) throw new Error("Invalid app-server thread ID");
     if (!this.runtime?.legacyHome) return this.readThread(thread);
     const reader = new AppServer(this.bin, undefined, undefined, this.permissions, {home:this.runtime.legacyHome});
     try { await reader.start(); return await reader.readThread(thread); } finally { reader.close(); }
   }
   async nameThread(thread: string, name: string): Promise<void> {
+    if (!validThreadId(thread)) throw new Error("Invalid app-server thread ID");
+    if (typeof name !== "string" || !name.trim() || name.length > 256 || APP_SERVER_CTRL_RE.test(name))
+      throw new Error("Invalid app-server thread name");
     await this.request("thread/name/set", {threadId:thread, name});
   }
   async generate(thread: string, text: string, effort: ReasoningEffort | undefined = this.effort): Promise<string> {

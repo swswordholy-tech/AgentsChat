@@ -3,8 +3,10 @@ import { assertDirectoryAncestors, type CodexHomeMode } from "./config.ts";
 import { homedir } from "node:os";
 import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
 
+const RUNTIME_CTRL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+
 function executablePath(bin: string): string | undefined {
-  if (!bin || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(bin)) return undefined;
+  if (!bin || RUNTIME_CTRL_RE.test(bin)) return undefined;
   const exts = process.platform === "win32" && !/\.[A-Za-z0-9]+$/.test(bin)
     ? ["", ...(process.env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";").filter(Boolean)]
     : [""];
@@ -60,6 +62,9 @@ function assertIndependentTree(home: string, allowedAuthOrigin?: string, codexEx
 /** Reuse operator configuration, never the desktop's databases, sessions or writer locks. */
 export function prepareRuntimeHome(stateDir: string, source = process.env.CODEX_HOME || join(homedir(), ".codex"), mode: CodexHomeMode = "linked", codexBin = "codex") {
   if (mode !== "linked" && mode !== "isolated" && mode !== "auth-only") throw new Error("Invalid Codex home mode");
+  if (typeof stateDir !== "string" || !stateDir.trim() || stateDir.length > 4096 || RUNTIME_CTRL_RE.test(stateDir)) {
+    throw new Error("Invalid bot state directory");
+  }
   // Isolated mode deliberately never inspects, copies or links source configuration.
   // Authentication must be set up independently by the operator, with permission.
   if (mode === "isolated") {
@@ -68,6 +73,11 @@ export function prepareRuntimeHome(stateDir: string, source = process.env.CODEX_
     assertIndependentTree(home, undefined, executablePath(codexBin));
     return { home: realpathSync(home) };
   }
+  if (typeof source !== "string" || !source.trim() || source.length > 4096 || RUNTIME_CTRL_RE.test(source)) {
+    throw new Error("Invalid Codex source home");
+  }
+  assertDirectoryLeaf(source, "Source Codex home");
+  assertDirectoryAncestors(source);
   if (mode === "auth-only") {
     const legacyHome = realpathSync(source);
     const origin = join(legacyHome, "auth.json");
