@@ -65,7 +65,8 @@ export function toWireEvent(msg: AgentsChatMessage, platform = "agentschat"): Wi
   const content = typeof msg.content === "string" ? msg.content : "";
   if (content === "__typing__") return null;
 
-  const chatId = msg.channel_id ?? "";
+  const metadata = (value: string | undefined) => typeof value === "string" ? value.replace(/[\x00-\x1f\x7f]/g, "") : undefined;
+  const chatId = metadata(msg.channel_id) ?? "";
   if (!chatId) return null;
 
   const isDm = /^dm[-:]/i.test(chatId);
@@ -73,15 +74,15 @@ export function toWireEvent(msg: AgentsChatMessage, platform = "agentschat"): Wi
   return {
     text: content,
     message_type: "text",
-    message_id: msg.id,
-    reply_to_message_id: msg.reply_to ?? msg.parent_id,
+    message_id: metadata(msg.id),
+    reply_to_message_id: metadata(msg.reply_to ?? msg.parent_id),
     source: {
       platform,
       chat_id: chatId,
       chat_type: isDm ? "dm" : "group",
-      chat_name: msg.channel_id ?? null,
-      user_id: msg.sender_id,
-      user_name: msg.sender_name ?? msg.sender_id,
+      chat_name: chatId,
+      user_id: metadata(msg.sender_id),
+      user_name: metadata(msg.sender_name ?? msg.sender_id),
       thread_id: null,
       // scope_id intentionally omitted: agentschat has no guild/scope concept.
     },

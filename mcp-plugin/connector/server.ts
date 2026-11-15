@@ -16,6 +16,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import { verifyUpgradeToken, CLOSE_UNAUTHORIZED } from "./auth.ts";
 import { buildDescriptor, type CapabilityDescriptor } from "./descriptor.ts";
 import { toWireEvent, serverLoopTick, matchesLiveLoop, type AgentsChatMessage } from "./normalize.ts";
+import { redactSecrets } from "../src/redact.ts";
 import { MessageDedup } from "../src/dedup.ts";
 import { IdentityTable, routeInboundTargets, hermesSourceProfile, type Identity } from "./identities.ts";
 
@@ -182,10 +183,11 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
         let frame: any;
         try {
           frame = JSON.parse(line);
+          if (frame && typeof frame === "object" && Object.prototype.hasOwnProperty.call(frame, "__proto__")) continue;
         } catch {
           continue;
         }
-        await handleFrame(conn, frame).catch((e) => log(`[connector] frame error: ${e}`));
+        await handleFrame(conn, frame).catch((e) => log(`[connector] frame error: ${redactSecrets(String(e))}`));
       }
     });
     ws.on("close", () => {
@@ -257,7 +259,7 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
       return { success: false, error: `no usable identity for outbound (botId=${requested ?? "?"})` };
     }
     if (typeof chatId !== "string" || chatId !== chatId.trim() || chatId.length < 1 || chatId.length > 128 ||
-        /[\x00-\x1f\x7f/\\]/.test(chatId) || chatId === "." || chatId.includes("..") ||
+        /[\s\x00-\x1f\x7f/\\]/.test(chatId) || chatId === "." || chatId.includes("..") ||
         ["__proto__", "constructor", "prototype"].includes(chatId.toLowerCase())) {
       return { success: false, error: "invalid chat_id" };
     }

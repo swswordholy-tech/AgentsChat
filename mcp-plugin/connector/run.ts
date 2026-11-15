@@ -32,11 +32,11 @@
  */
 
 import WS from "ws";
-import { lstatSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { lstatSync, readFileSync, realpathSync } from "node:fs";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { startConnector, PlatformHttpError, PlatformNetworkError } from "./server.ts";
-import { requireIdentity, type Identity } from "./identities.ts";
+import { requireIdentity, validIdentityId, type Identity } from "./identities.ts";
 import { redactSecrets } from "../src/redact.ts";
 import { flushCursor, loadCursor, persistCursor } from "../src/read-cursor.ts";
 import { normalizeTimestampForCursor } from "../src/timestamps.ts";
@@ -46,7 +46,7 @@ import { ingestAgentsChatFrame } from "./ingest.ts";
 import { HeartbeatMonitor, WS_CLOSED } from "../src/heartbeat.ts";
 import { resolveDrainReconnectDelay, withTimeoutController } from "../src/reconnect.ts";
 
-const log = (m: string) => process.stderr.write(`[agentschat-connector] ${m}\n`);
+const log = (m: string) => process.stderr.write(`[agentschat-connector] ${redactSecrets(m)}\n`);
 
 function need(name: string): string {
   const v = process.env[name];
@@ -55,6 +55,60 @@ function need(name: string): string {
     process.exit(1);
   }
   return v;
+}
+
+/** URL has already canonicalized IPv4 shorthand and IPv6 spellings. */
+function isUnsafeConnectorHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/\.$/, "").replace(/^\[|\]$/g, "");
+  if (["metadata", "instance-data", "metadata.google.internal", "metadata.goog"].includes(host) || host.endsWith(".metadata.goog")) return true;
+  const unsafeV4 = (ip: string) => ip === "0.0.0.0" || ip.startsWith("169.254.") || ip === "100.100.100.200";
+  if (!host.includes(":")) return unsafeV4(host);
+  const halves = host.split("::");
+  const left = halves[0] ? halves[0].split(":") : [];
+  const right = halves[1] ? halves[1].split(":") : [];
+  const words = [...left, ...Array(8 - left.length - right.length).fill("0"), ...right].map(v => parseInt(v, 16));
+  if (words.every(v => v === 0) || (words[0] & 0xffc0) === 0xfe80 ||
+      host === "fd00:ec2::254") return true;
+  if (words.slice(0, 5).every(v => v === 0) && words[5] === 0xffff) {
+    return unsafeV4(`${words[6] >>> 8}.${words[6] & 255}.${words[7] >>> 8}.${words[7] & 255}`);
+  }
+  return false;
+}
+
+/** Reject symlink traversal, except verified Darwin system aliases in ancestors. */
+export function assertSafeConnectorAncestors(target: string, directoryLeaf = false): void {
+  // Preserve dot segments until every traversed component has been checked.
+  const absolute = (isAbsolute(target) ? target : `${process.cwd()}/${target}`).replace(/\/+$/, "") || "/";
+  let dir = directoryLeaf ? absolute : dirname(absolute);
+  let leaf = directoryLeaf;
+  for (;;) {
+    const stat = lstatSync(dir);
+    let systemAlias = false;
+    if (!leaf && process.platform === "darwin" && ["/tmp", "/var", "/etc"].includes(dir) && stat.isSymbolicLink()) {
+      const privateRoot = lstatSync("/private");
+      const privateDir = lstatSync(`/private${dir}`);
+      systemAlias = realpathSync(dir) === `/private${dir}` &&
+        !privateRoot.isSymbolicLink() && privateRoot.isDirectory() &&
+        !privateDir.isSymbolicLink() && privateDir.isDirectory();
+    }
+    if (!systemAlias && (stat.isSymbolicLink() || !stat.isDirectory())) throw new Error("unsafe connector directory");
+    const parent = dirname(dir);
+    if (parent === dir) return;
+    dir = parent;
+    leaf = false;
+  }
+}
+
+/** Recheck the cursor directory on every read/write; failures preserve dirty state. */
+export function loadConnectorCursor(file: string, warn: (message: string) => void): Map<string, string> {
+  try { assertSafeConnectorAncestors(dirname(file), true); }
+  catch { warn("[connector] unsafe cursor directory; cursor not loaded"); return new Map(); }
+  return loadCursor(file, warn);
+}
+export function persistConnectorCursor(file: string, map: Map<string, string>, warn: (message: string) => void): boolean {
+  try { assertSafeConnectorAncestors(dirname(file), true); }
+  catch { warn("[connector] unsafe cursor directory; cursor not persisted"); return false; }
+  return persistCursor(file, map, warn);
 }
 
 /** Validate startup addresses before opening listeners or sending credentials. */
@@ -70,7 +124,7 @@ export function readConnectorConfig(env: NodeJS.ProcessEnv = process.env) {
     let url: URL;
     try { url = new URL(raw); } catch { throw new Error(`invalid ${name}`); }
     const loopback = ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname);
-    if (!(protocols as readonly string[]).includes(url.protocol) || url.username || url.password || url.port === "0" ||
+    if (!(protocols as readonly string[]).includes(url.protocol) || url.username || url.password || url.port === "0" || isUnsafeConnectorHost(url.hostname) ||
         (name === "AGENTCHAT_API_URL" && (url.search || url.hash || raw.includes("?") || raw.includes("#"))) ||
         ((url.protocol === "http:" || url.protocol === "ws:") && !loopback && env.AGENTSCHAT_ALLOW_INSECURE_HTTP !== "1")) {
       throw new Error(`invalid ${name}`);
@@ -96,7 +150,11 @@ export async function readBoundedJson(response: Response): Promise<unknown> {
       text += decoder.decode(value, { stream: true });
     }
     text += decoder.decode();
-    return JSON.parse(text);
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === "object" && Object.prototype.hasOwnProperty.call(parsed, "__proto__")) {
+      throw new Error("invalid JSON response");
+    }
+    return parsed;
   } catch (error) {
     void reader.cancel().catch(() => {});
     throw error;
@@ -150,6 +208,7 @@ export function loadIdentities(): Identity[] {
   if (file) {
     let raw: string;
     try {
+      assertSafeConnectorAncestors(file);
       const stat = lstatSync(file);
       if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 1_048_576) {
         throw new Error("Unsafe identities file");
@@ -248,6 +307,8 @@ function stopHeartbeat(botId: string) {
 // stdio MCP (`last-seen-msg-ts-<agent>.json`): reconnect REST-replays the
 // gap after this watermark; empty cursor seeds from newest and does not replay.
 const CURSOR_DIR = process.env.AGENTCHAT_CURSOR_DIR || process.cwd();
+try { assertSafeConnectorAncestors(CURSOR_DIR, true); }
+catch { throw new Error("unsafe connector cursor directory"); }
 const cursorFlushMs = clampTimerMs(process.env.AGENTSCHAT_MCP_CURSOR_FLUSH_MS, 5_000, 500);
 
 type CursorStore = {
@@ -262,14 +323,14 @@ function cursorFor(id: Pick<Identity, "botId">): CursorStore {
   let s = cursors.get(id.botId);
   if (s) return s;
   const file = safeCursorBotFile(CURSOR_DIR, id.botId);
-  s = { file, map: loadCursor(file, (m) => log(m.trimEnd())), state: { dirty: false }, timer: null };
+  s = { file, map: loadConnectorCursor(file, (m) => log(m.trimEnd())), state: { dirty: false }, timer: null };
   cursors.set(id.botId, s);
   return s;
 }
 
 function flushOne(s: CursorStore) {
   if (s.timer) { clearTimeout(s.timer); s.timer = null; }
-  flushCursor(s.state, () => persistCursor(s.file, s.map, (m) => log(m.trimEnd())));
+  flushCursor(s.state, () => persistConnectorCursor(s.file, s.map, (m) => log(m.trimEnd())));
 }
 
 function scheduleSave(s: CursorStore) {
@@ -280,7 +341,7 @@ function scheduleSave(s: CursorStore) {
 }
 
 function advanceCursor(id: Pick<Identity, "botId">, channelId: string | undefined, timestamp: string | undefined) {
-  if (typeof channelId !== "string" || typeof timestamp !== "string" || !timestamp) return;
+  if (!validIdentityId(channelId) || typeof timestamp !== "string" || !timestamp) return;
   const s = cursorFor(id);
   const prev = s.map.get(channelId) || "";
   const currentTs = normalizeTimestampForCursor(timestamp, "after") || timestamp;
@@ -292,6 +353,7 @@ function advanceCursor(id: Pick<Identity, "botId">, channelId: string | undefine
 }
 
 function joinChannel(ws: WS, id: Identity, channelId: string, name?: string) {
+  if (!validIdentityId(channelId)) return;
   try {
     ws.send(JSON.stringify({ type: "join_channel", channel_id: channelId, agent_id: id.agentId }));
     log(`joined channel ${channelId}${name ? ` (${name})` : ""}`);
@@ -321,7 +383,7 @@ async function joinMemberships(ws: WS, id: Identity) {
     const joined: string[] = [];
     for (const ch of channels) {
       const channelId = ch?.id || ch?.channel_id;
-      if (!channelId) continue;
+      if (!validIdentityId(channelId)) continue;
       joinChannel(ws, id, channelId, ch?.name);
       joined.push(channelId);
     }
@@ -344,6 +406,7 @@ async function joinMemberships(ws: WS, id: Identity) {
 async function backfillIdentity(id: Identity, channelIds: string[]) {
   const s = cursorFor(id);
   for (const channelId of channelIds) {
+    if (!validIdentityId(channelId)) continue;
     if (!currentIdentity(id)) return;
     try {
       const after = s.map.get(channelId);
@@ -439,6 +502,7 @@ function connectIdentity(id: Identity) {
     if (!currentIdentity(id) || socketsByBot.get(id.botId) !== ws) return;
     let data: any;
     try { data = JSON.parse(String(raw)); } catch { return; }
+    if (!data || typeof data !== "object" || Array.isArray(data) || Object.prototype.hasOwnProperty.call(data, "__proto__")) return;
     if (data.type === "pong") {
       hb.receivedPong();
       return;
@@ -457,7 +521,7 @@ function connectIdentity(id: Identity) {
       try { ws.close(); } catch {}
       return;
     }
-    if (data.type === "channel_created" && data.channel_id) {
+    if (data.type === "channel_created" && validIdentityId(data.channel_id)) {
       hb.receivedPong();
       joinChannel(ws, id, data.channel_id, data.name);
       return;

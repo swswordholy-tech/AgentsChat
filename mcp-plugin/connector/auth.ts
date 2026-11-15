@@ -60,6 +60,7 @@ export function verifySignature(payload: string, sigHex: string, secrets: readon
  * `base64url(f"{payload}:{exp}:{sig}")`, unpadded; `exp` is unix-seconds, 0 = never.
  */
 export function makeToken(payload: string, secret: string, ttlSeconds = 0): string {
+  if (typeof payload !== "string" || /[\x00-\x1f\x7f]/.test(payload)) throw new Error("invalid token payload");
   if (!Number.isFinite(ttlSeconds) || ttlSeconds < 0) {
     throw new RangeError("ttlSeconds must be finite and non-negative");
   }
