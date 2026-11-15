@@ -5,7 +5,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 // connector/run.ts
 import WS from "ws";
 import { lstatSync as lstatSync2, readFileSync as readFileSync2, realpathSync as realpathSync2 } from "node:fs";
-import { dirname as dirname2, isAbsolute as isAbsolute2, resolve } from "node:path";
+import { dirname as dirname2, isAbsolute as isAbsolute2, resolve as resolve2 } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // connector/server.ts
@@ -658,17 +658,71 @@ function peekPayload(token) {
 
 // src/read-cursor.ts
 import { randomBytes } from "crypto";
-import { chmodSync, lstatSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "fs";
-import { dirname, isAbsolute, join, sep } from "path";
+import {
+  chmodSync,
+  copyFileSync,
+  lstatSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync
+} from "fs";
+import { dirname, isAbsolute, join, parse, resolve, sep } from "path";
 var MAX_CURSOR_BYTES = 4 * 1024 * 1024;
 var MAX_CURSOR_ENTRIES = 50000;
 var RESERVED_PROTO_KEY = /^(?:__proto__|constructor|prototype)$/i;
 var tmpCounter = 0;
 function scrubDiag(value) {
-  return redactSecrets(String(value ?? "")).replace(/\b(?:Bearer|Basic)\s+[^\s"'<>\\]+/gi, "[REDACTED]").replace(/(?:agent_key_|sk-|whsec_|gh[pousr]_|github_pat_|AIza|AKIA|ASIA)[A-Za-z0-9+/=_-]{12,}/g, "[REDACTED]").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
+  return redactSecrets(String(value ?? "")).replace(/\b(https?:\/\/)([^/\s@]*@)/gi, "$1[REDACTED]@").replace(/\b(?:Bearer|Basic)\s+[^\s"'<>\\]+/gi, "[REDACTED]").replace(/(?:ac_|mcp_at_|mcp_rt_|mcp_|agent_key_|sk-|rk_live_|rk_test_|whsec_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|AIza|AKIA|ASIA)[A-Za-z0-9+/=._-]{8,}/g, "[REDACTED]").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
+}
+function isDarwinCanonicalRootLink(dir, st) {
+  if (process.platform !== "darwin" || dir !== "/var" && dir !== "/tmp" && dir !== "/etc" || !st.isSymbolicLink()) {
+    return false;
+  }
+  try {
+    return realpathSync(dir) === `/private${dir}` && !lstatSync("/private").isSymbolicLink() && lstatSync("/private").isDirectory() && !lstatSync(`/private${dir}`).isSymbolicLink() && lstatSync(`/private${dir}`).isDirectory();
+  } catch {
+    return false;
+  }
+}
+function hasSafeRawDotDotAncestors(rawDirPath) {
+  const absRaw = isAbsolute(rawDirPath) ? rawDirPath : `${process.cwd()}${sep}${rawDirPath}`;
+  const root = parse(absRaw).root;
+  const segments = absRaw.slice(root.length).split(/[\\/]+/).filter(Boolean);
+  if (!segments.includes(".."))
+    return true;
+  let cur = root;
+  for (const seg of segments) {
+    if (seg === ".")
+      continue;
+    if (seg === "..") {
+      cur = dirname(cur);
+      continue;
+    }
+    const next = join(cur, seg);
+    try {
+      const st = lstatSync(next);
+      if (st.isSymbolicLink() && !isDarwinCanonicalRootLink(next, st)) {
+        return false;
+      }
+    } catch (err) {
+      if (err?.code !== "ENOENT")
+        return false;
+    }
+    cur = next;
+  }
+  return true;
 }
 function hasSafeAncestorDirs(targetFile) {
-  let dir = dirname(isAbsolute(targetFile) ? targetFile : `${process.cwd()}${sep}${targetFile}`);
+  if (typeof targetFile !== "string" || !targetFile || /[\x00-\x1f\x7f]/.test(targetFile)) {
+    return false;
+  }
+  const rawParent = dirname(isAbsolute(targetFile) ? targetFile : `${process.cwd()}${sep}${targetFile}`);
+  if (!hasSafeRawDotDotAncestors(rawParent)) {
+    return false;
+  }
+  let dir = resolve(rawParent);
   while (true) {
     let st;
     try {
@@ -676,13 +730,7 @@ function hasSafeAncestorDirs(targetFile) {
     } catch {
       return false;
     }
-    const isDarwinRootLink = process.platform === "darwin" && (dir === "/var" || dir === "/tmp" || dir === "/etc") && st.isSymbolicLink() && (() => {
-      try {
-        return realpathSync(dir) === `/private${dir}` && !lstatSync("/private").isSymbolicLink() && lstatSync("/private").isDirectory() && !lstatSync(`/private${dir}`).isSymbolicLink() && lstatSync(`/private${dir}`).isDirectory();
-      } catch {
-        return false;
-      }
-    })();
+    const isDarwinRootLink = isDarwinCanonicalRootLink(dir, st);
     if (!isDarwinRootLink && (st.isSymbolicLink() || !st.isDirectory())) {
       return false;
     }
@@ -743,7 +791,7 @@ function loadCursor(file, warn) {
     return new Map;
   }
 }
-function persistCursor(file, cursor, warn) {
+function persistCursor(file, cursor, warn, fsOps) {
   try {
     const parentStat = lstatSync(dirname(file));
     if (parentStat.isSymbolicLink() || !parentStat.isDirectory() || !hasSafeAncestorDirs(file)) {
@@ -782,17 +830,44 @@ function persistCursor(file, cursor, warn) {
   for (const [k, v] of boundedEntries) {
     payloadObj[k] = v;
   }
+  const renameFn = fsOps?.renameSync ?? renameSync;
+  const copyFn = fsOps?.copyFileSync ?? copyFileSync;
   const tmp = `${file}.${process.pid}.${Date.now()}.${++tmpCounter}.${randomBytes(4).toString("hex")}.tmp`;
   try {
     writeFileSync(tmp, JSON.stringify(payloadObj), { mode: 384, flag: "wx" });
     if (process.platform !== "win32") {
       chmodSync(tmp, 384);
     }
+    if (!hasSafeAncestorDirs(file)) {
+      throw new Error("parent is not a real directory");
+    }
     const current = lstatSync(file, { throwIfNoEntry: false });
     if (current && (current.isSymbolicLink() || !current.isFile())) {
       throw new Error("target was replaced by a symlink or non-file");
     }
-    renameSync(tmp, file);
+    try {
+      renameFn(tmp, file);
+    } catch (renameErr) {
+      const code = renameErr?.code;
+      if (code === "EPERM" || code === "EACCES") {
+        if (!hasSafeAncestorDirs(file)) {
+          throw new Error("parent is not a real directory");
+        }
+        const recheck = lstatSync(file, { throwIfNoEntry: false });
+        if (recheck && (recheck.isSymbolicLink() || !recheck.isFile())) {
+          throw new Error("target was replaced by a symlink or non-file");
+        }
+        copyFn(tmp, file);
+        if (process.platform !== "win32") {
+          chmodSync(file, 384);
+        }
+        try {
+          unlinkSync(tmp);
+        } catch {}
+        return true;
+      }
+      throw renameErr;
+    }
     return true;
   } catch (e) {
     try {
@@ -1298,7 +1373,7 @@ function clampTimerMs(raw, fallback, minMs) {
   return Math.min(2147483647, Math.max(minMs, Math.floor(Number.isFinite(value) && value > 0 ? value : fallback)));
 }
 function isConnectorEntrypoint(entry, moduleUrl, isMain = false) {
-  return isMain || Boolean(entry && resolve(entry) === fileURLToPath(moduleUrl));
+  return isMain || Boolean(entry && resolve2(entry) === fileURLToPath(moduleUrl));
 }
 async function main() {
   const { API, WS_URL, PORT, HOST } = readConnectorConfig();

@@ -10,10 +10,10 @@
  *   npx -y agentschat-mcp@latest --dsh --listen [--channel <id> ...] [--dsh-profile <headless>] [--auto-reply <text>]
  *   npx -y agentschat-mcp@latest --dsh --send <channel-id> --text <text>
  */
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { MuseBridge } from "../../muse/src/bridge.ts";
 import { MuseAgentChatClient } from "../../muse/src/client.ts";
@@ -24,7 +24,7 @@ import { appendWakeQueue, buildWakePayload, fireWake } from "../../muse/src/wake
 import { agentschatConfigDir, resolveSessionForAgent } from "../../src/session-route.ts";
 import { loadSessionBinds } from "../../src/session-bind.ts";
 import { resolveWindowsCliSpawn } from "../../src/wake.ts";
-import { applyDshCordisPatchFile, isBlockedDshHost } from "./patch.ts";
+import { applyDshCordisPatchFile, checkParentDirectory, isBlockedDshHost } from "./patch.ts";
 
 export const DSH_PROFILE_PATH = join(homedir(), ".agentschat", "dsh.json");
 const DEFAULT_WS_URL = "wss://agents-chat.com/ws";
@@ -51,26 +51,25 @@ function has(name: string, argv: string[]): boolean {
 
 const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
-const DARWIN_ROOT_LINKS = new Set(["/var", "/tmp", "/etc"]);
-
-function checkParentDirectory(path: string): void {
-  let parent = dirname(resolve(path));
-  for (;;) {
-    if (!(process.platform === "darwin" && DARWIN_ROOT_LINKS.has(parent))) {
-      try {
-        const stat = lstatSync(parent);
-        if (stat.isSymbolicLink() || !stat.isDirectory()) {
-          throw new Error(`Refusing symlinked or non-directory parent: ${parent}`);
-        }
-      } catch (err: any) {
-        if (err?.code !== "ENOENT") throw err;
-      }
-    }
-    const next = dirname(parent);
-    if (next === parent) break;
-    parent = next;
-  }
-}
+const RESERVED_DSH_PROFILE_BASENAMES = new Set([
+  "profile",
+  "session-binds",
+  "session-binds_meta",
+  "agy-binds",
+  "agy-binds_meta",
+  "grok-binds",
+  "grok-binds_meta",
+  "agy-session-binds",
+  "identity-guard",
+  "cursor",
+  "read-cursors",
+  "mention-timestamps",
+  "wake-pids",
+  "config",
+  "codex-bots",
+  "dsh",
+  "muse",
+]);
 
 /** Bound actual response bytes, regardless of Content-Length. */
 async function readRegistrationText(res: Response): Promise<string> {
@@ -97,8 +96,15 @@ async function readRegistrationText(res: Response): Promise<string> {
 }
 
 function isSafeAgentId(value: unknown): boolean {
-  return typeof value === "string" && !!value && value !== "." && value !== ".." &&
-    !FORBIDDEN_KEYS.has(value.toLowerCase()) && !/[\s\x00-\x1f\x7f/\\]/.test(value);
+  return (
+    typeof value === "string" &&
+    !!value &&
+    value.length <= 128 &&
+    value !== "." &&
+    value !== ".." &&
+    !FORBIDDEN_KEYS.has(value.toLowerCase()) &&
+    !/[\s\x00-\x1f\x7f/\\]/.test(value)
+  );
 }
 
 function validateChannelId(value: string | undefined): string {
@@ -131,8 +137,16 @@ function validateHttpOrWsUrl(raw: string, allowedProtocols: string[], label: str
   } catch {
     throw new Error(`Invalid ${label} URL`);
   }
-  if (isBlockedDshHost(parsed.hostname) || parsed.username || parsed.password || parsed.port === "0" ||
-      ((parsed.protocol === "http:" || parsed.protocol === "https:") && (parsed.search || parsed.hash))) throw new Error(`Invalid ${label} URL`);
+  if (
+    isBlockedDshHost(parsed.hostname) ||
+    parsed.username ||
+    parsed.password ||
+    parsed.port === "0" ||
+    parsed.search ||
+    parsed.hash
+  ) {
+    throw new Error(`Invalid ${label} URL`);
+  }
   if (!allowedProtocols.includes(parsed.protocol)) {
     throw new Error(`Unsupported ${label} protocol: ${parsed.protocol}`);
   }
@@ -148,6 +162,7 @@ export function loadDshConfig(
 ): DshBridgeConfig {
   let profile: Record<string, unknown> = {};
   try {
+    checkParentDirectory(profilePath);
     const lst = lstatSync(profilePath);
     if (!lst.isSymbolicLink() && lst.isFile() && lst.size <= 256 * 1024) {
       const parsed = JSON.parse(readFileSync(profilePath, "utf8"));
@@ -255,7 +270,23 @@ export async function registerOnly(name: string, restUrl: string, profilePath = 
     } catch (err: any) {
       if (err?.code !== "ENOENT") throw err;
     }
-    renameSync(tmp, profilePath);
+    try {
+      renameSync(tmp, profilePath);
+    } catch (renameErr: any) {
+      if (renameErr?.code !== "EPERM" && renameErr?.code !== "EACCES") {
+        throw renameErr;
+      }
+      checkParentDirectory(profilePath);
+      try {
+        const lst = lstatSync(profilePath);
+        if (lst.isSymbolicLink() || !lst.isFile()) throw new Error(`Refusing to overwrite non-regular file ${profilePath}`);
+      } catch (err: any) {
+        if (err?.code !== "ENOENT") throw err;
+      }
+      copyFileSync(tmp, profilePath);
+      try { unlinkSync(tmp); } catch {}
+      created = false;
+    }
     if (process.platform !== "win32") {
       try { chmodSync(profilePath, 0o600); } catch {}
     }
@@ -489,14 +520,27 @@ DeepSeek Harness (dsh) integration for AgentsChat:
         const cfgDir = agentschatConfigDir();
         const binds = loadSessionBinds(cfgDir);
         for (const [sid, profName] of Object.entries(binds)) {
-          if (!sid.startsWith("session-") || FORBIDDEN_KEYS.has(sid.toLowerCase()) || !profName || typeof profName !== "string") continue;
+          if (
+            !sid.startsWith("session-") ||
+            sid.length > 128 ||
+            sid.includes("..") ||
+            /[\s\x00-\x1f\x7f/\\]/.test(sid) ||
+            FORBIDDEN_KEYS.has(sid.toLowerCase()) ||
+            !profName ||
+            typeof profName !== "string"
+          ) {
+            continue;
+          }
           const base = profName.replace(/\.json$/i, "").replace(/[^a-zA-Z0-9_-]/g, "_");
-          if (!base || FORBIDDEN_KEYS.has(base.toLowerCase())) continue;
+          if (!base || base.length > 64 || FORBIDDEN_KEYS.has(base.toLowerCase()) || RESERVED_DSH_PROFILE_BASENAMES.has(base.toLowerCase())) {
+            continue;
+          }
           let extraClient: MuseAgentChatClient | null = null;
           try {
             const candidates = [join(cfgDir, "profiles", `${base}.json`), join(cfgDir, `${base}.json`)];
             const profPath = candidates.find((p) => {
               try {
+                checkParentDirectory(p);
                 const lst = lstatSync(p);
                 return !lst.isSymbolicLink() && lst.isFile() && lst.size <= 256 * 1024;
               } catch {
@@ -663,7 +707,7 @@ const invokedDirectly =
 
 if (invokedDirectly) {
   main().catch((err: unknown) => {
-    console.error("DSH AgentsChat error:", err instanceof Error ? err.message : String(err));
+    console.error("DSH AgentsChat error:", logText(err instanceof Error ? err.message : String(err)));
     process.exit(1);
   });
 }

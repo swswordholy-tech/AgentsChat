@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 
 // dsh/src/cli.ts
-import { chmodSync as chmodSync3, lstatSync as lstatSync7, mkdirSync as mkdirSync4, readFileSync as readFileSync7, renameSync as renameSync3, unlinkSync as unlinkSync4, writeFileSync as writeFileSync3 } from "node:fs";
+import { chmodSync as chmodSync3, copyFileSync as copyFileSync2, lstatSync as lstatSync7, mkdirSync as mkdirSync4, readFileSync as readFileSync7, renameSync as renameSync3, unlinkSync as unlinkSync4, writeFileSync as writeFileSync3 } from "node:fs";
 import { randomBytes as randomBytes3 } from "node:crypto";
 import { spawn } from "node:child_process";
-import { dirname as dirname5, join as join6, resolve as resolve5 } from "node:path";
+import { dirname as dirname6, join as join6 } from "node:path";
 import { homedir as homedir5 } from "node:os";
 
 // muse/src/policy.ts
@@ -941,9 +941,9 @@ class MuseAgentChatClient {
 }
 
 // src/session-route.ts
-import { lstatSync as lstatSync4, readFileSync as readFileSync4, readlinkSync as readlinkSync2 } from "node:fs";
+import { lstatSync as lstatSync4, readFileSync as readFileSync4, readlinkSync as readlinkSync2, realpathSync as realpathSync2 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
-import { isAbsolute as isAbsolute3, join as join3, parse as parse2, resolve as resolve2 } from "node:path";
+import { dirname as dirname3, isAbsolute as isAbsolute3, join as join3, parse as parse2, resolve as resolve2, sep as sep2 } from "node:path";
 
 // src/session-bind.ts
 import { closeSync, lstatSync as lstatSync3, mkdirSync as mkdirSync2, openSync, readFileSync as readFileSync3, readSync, readdirSync, readlinkSync, unlinkSync as unlinkSync2 } from "node:fs";
@@ -1094,16 +1094,30 @@ var DSH_HEALTH_MAX_BYTES = 256 * 1024;
 // src/session-route.ts
 var MAX_PROFILE_BYTES2 = 64 * 1024;
 var MAX_DIR_PATH_LENGTH = 4096;
+var MAX_SESSION_ID_LENGTH = 256;
 var RESERVED_PROFILE_KEY = /^(?:__proto__|constructor|prototype)$/i;
 var RESERVED_ROUTE_SIDECARS = new Set([
+  "profile",
   "session-binds",
+  "session-binds_meta",
+  "session-binds-meta",
   "agy-binds",
+  "agy-binds_meta",
+  "agy-binds-meta",
+  "agy-session-binds",
+  "agy-session-binds_meta",
   "grok-binds",
+  "grok-binds_meta",
+  "grok-binds-meta",
+  "identity-guard",
   "cursor",
   "read-cursors",
+  "mention-timestamps",
   "wake-pids",
   "config",
-  "codex-bots"
+  "codex-bots",
+  "dsh",
+  "muse"
 ]);
 function isSafeAbsoluteDirEnv(raw) {
   if (typeof raw !== "string")
@@ -1130,19 +1144,53 @@ function isSafeRegularProfileFile(path) {
     return false;
   }
 }
+function isSafeSessionId(sessionId) {
+  return sessionId.length > 0 && sessionId.length <= MAX_SESSION_ID_LENGTH && sessionId !== "." && sessionId !== ".." && !RESERVED_PROFILE_KEY.test(sessionId) && !/[\x00-\x1f\x7f]/.test(sessionId);
+}
 function isAllowedDarwinSystemLink2(dirPath) {
   if (process.platform !== "darwin")
     return false;
   if (dirPath !== "/var" && dirPath !== "/tmp" && dirPath !== "/etc")
     return false;
   try {
-    return readlinkSync2(dirPath) === `private${dirPath}`;
+    return readlinkSync2(dirPath) === `private${dirPath}` && realpathSync2(dirPath) === `/private${dirPath}` && !lstatSync4("/private").isSymbolicLink() && lstatSync4("/private").isDirectory() && !lstatSync4(`/private${dirPath}`).isSymbolicLink() && lstatSync4(`/private${dirPath}`).isDirectory();
   } catch {
     return false;
   }
 }
+function hasSafeRawDotDotSegments(rawPath) {
+  const absRaw = isAbsolute3(rawPath) ? rawPath : `${process.cwd()}${sep2}${rawPath}`;
+  const root = parse2(absRaw).root;
+  const segments = absRaw.slice(root.length).split(/[\\/]+/).filter(Boolean);
+  if (!segments.includes(".."))
+    return true;
+  let cur = root;
+  for (const seg of segments) {
+    if (seg === ".")
+      continue;
+    if (seg === "..") {
+      cur = dirname3(cur);
+      continue;
+    }
+    const next = join3(cur, seg);
+    try {
+      const st = lstatSync4(next);
+      if (st.isSymbolicLink() && !isAllowedDarwinSystemLink2(next)) {
+        return false;
+      }
+    } catch (err) {
+      if (err?.code !== "ENOENT")
+        return false;
+    }
+    cur = next;
+  }
+  return true;
+}
 function isSafeRealDir(path) {
   try {
+    if (!path || /[\x00-\x1f\x7f]/.test(path) || !hasSafeRawDotDotSegments(path)) {
+      return false;
+    }
     const st = lstatSync4(path);
     if (st.isSymbolicLink() || !st.isDirectory())
       return false;
@@ -1209,6 +1257,8 @@ function resolveSessionForAgent(agentId, opts = {}) {
     return;
   }
   for (const [sessionId, profileName] of Object.entries(binds).reverse()) {
+    if (!isSafeSessionId(sessionId))
+      continue;
     if (opts.filter && !opts.filter(sessionId))
       continue;
     const path = profilePathForName(configDir, profileName);
@@ -1224,7 +1274,7 @@ function resolveSessionForAgent(agentId, opts = {}) {
 // src/wake.ts
 import { existsSync as existsSync2, lstatSync as lstatSync5, readFileSync as readFileSync5, readlinkSync as readlinkSync3 } from "node:fs";
 import { homedir as homedir3 } from "node:os";
-import { dirname as dirname3, join as join4, parse as parse3, resolve as resolve3, win32 as pathWin32 } from "node:path";
+import { dirname as dirname4, join as join4, parse as parse3, resolve as resolve3, win32 as pathWin32 } from "node:path";
 var GROK_GATEWAY_PATH_CANDIDATES = [
   join4(process.env.HOME || process.env.USERPROFILE || homedir3(), ".grok", "gateway.json"),
   "/home/box/sand-data/gateway.json"
@@ -1296,15 +1346,62 @@ function resolveWindowsCliSpawn(cmd, args, opts) {
 
 // dsh/src/patch.ts
 import { randomBytes as randomBytes2 } from "node:crypto";
-import { chmodSync as chmodSync2, lstatSync as lstatSync6, mkdirSync as mkdirSync3, readFileSync as readFileSync6, renameSync as renameSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2 } from "node:fs";
-import { dirname as dirname4, isAbsolute as isAbsolute4, join as join5, resolve as resolve4 } from "node:path";
+import { chmodSync as chmodSync2, copyFileSync, lstatSync as lstatSync6, mkdirSync as mkdirSync3, readFileSync as readFileSync6, realpathSync as realpathSync3, renameSync as renameSync2, statSync, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2 } from "node:fs";
+import { dirname as dirname5, isAbsolute as isAbsolute4, join as join5, resolve as resolve4 } from "node:path";
 import { homedir as homedir4 } from "node:os";
 var FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 var DARWIN_ROOT_LINKS = new Set(["/var", "/tmp", "/etc"]);
+function isAllowedDarwinSystemLink3(dirPath) {
+  if (process.platform !== "darwin" || !DARWIN_ROOT_LINKS.has(dirPath))
+    return false;
+  try {
+    const real = realpathSync3(dirPath);
+    return real === `/private${dirPath}` && statSync(real).isDirectory();
+  } catch {
+    return false;
+  }
+}
+function checkRawDotDotAncestors(rawPath) {
+  const trimmed = rawPath.trim();
+  if (!trimmed || !isAbsolute4(trimmed))
+    return;
+  const normalizedSep = process.platform === "win32" ? trimmed.replace(/\//g, "\\") : trimmed;
+  const sepChar = process.platform === "win32" ? "\\" : "/";
+  const parts = normalizedSep.split(sepChar);
+  if (!parts.includes(".."))
+    return;
+  const winDrive = process.platform === "win32" && /^[A-Za-z]:$/.test(parts[0] || "");
+  let current = winDrive ? `${parts[0]}\\` : sepChar;
+  for (let i = 1;i < parts.length; i++) {
+    const seg = parts[i];
+    if (!seg || seg === ".")
+      continue;
+    if (seg === "..") {
+      current = dirname5(current);
+      continue;
+    }
+    const candidate = current.endsWith(sepChar) ? `${current}${seg}` : `${current}${sepChar}${seg}`;
+    if (i < parts.length - 1 || parts.slice(i + 1).includes("..")) {
+      if (!isAllowedDarwinSystemLink3(candidate)) {
+        try {
+          const stat = lstatSync6(candidate);
+          if (stat.isSymbolicLink() || !stat.isDirectory()) {
+            throw new Error(`Refusing symlinked or non-directory parent: ${candidate}`);
+          }
+        } catch (err) {
+          if (err?.code !== "ENOENT")
+            throw err;
+        }
+      }
+    }
+    current = candidate;
+  }
+}
 function checkParentDirectory(path) {
-  let parent = dirname4(resolve4(path));
+  checkRawDotDotAncestors(path);
+  let parent = dirname5(resolve4(path));
   for (;; ) {
-    if (!(process.platform === "darwin" && DARWIN_ROOT_LINKS.has(parent))) {
+    if (!isAllowedDarwinSystemLink3(parent)) {
       try {
         const stat = lstatSync6(parent);
         if (stat.isSymbolicLink() || !stat.isDirectory()) {
@@ -1315,20 +1412,35 @@ function checkParentDirectory(path) {
           throw err;
       }
     }
-    const next = dirname4(parent);
+    const next = dirname5(parent);
     if (next === parent)
       break;
     parent = next;
   }
 }
-function isBlockedDshHost(hostname) {
-  const host = hostname.toLowerCase().replace(/\.$/, "").replace(/^\[|\]$/g, "");
-  if (host === "metadata.google.internal" || host === "metadata.goog" || /^169\.254\./.test(host))
+function isBlockedNormalizedHost(host) {
+  if (!host)
     return true;
-  if (/^::ffff:(?:0:)?a9fe:[0-9a-f]{1,4}$/.test(host))
+  if (host === "0.0.0.0" || host === "::" || host === "0:0:0:0:0:0:0:0" || host === "100.100.100.200" || host === "fd00:ec2::254" || host === "fd00:ec2:0:0:0:0:0:254" || host === "metadata" || host === "instance-data" || host === "metadata.google.internal" || host.endsWith(".metadata.google.internal") || host === "metadata.goog" || host.endsWith(".metadata.goog") || /^169\.254\./.test(host)) {
     return true;
+  }
+  if (/^::ffff:(?:0:)?(?:a9fe:[0-9a-f]{1,4}|169\.254\.\d{1,3}\.\d{1,3}|6464:64c8|100\.100\.100\.200|0:0|0\.0\.0\.0)$/.test(host) || /^(?:0:){5}ffff:(?:a9fe:[0-9a-f]{1,4}|169\.254\.\d{1,3}\.\d{1,3}|6464:64c8|100\.100\.100\.200|0:0|0\.0\.0\.0)$/.test(host)) {
+    return true;
+  }
   const first = host.split(":")[0];
   return host.includes(":") && /^[0-9a-f]{1,4}$/.test(first) && (parseInt(first, 16) & 65472) === 65152;
+}
+function isBlockedDshHost(hostname) {
+  const raw = hostname.trim().toLowerCase().replace(/\.$/, "").replace(/^\[|\]$/g, "");
+  if (isBlockedNormalizedHost(raw))
+    return true;
+  try {
+    const bracketed = raw.includes(":") ? `[${raw}]` : raw;
+    const canonical = new URL(`http://${bracketed}`).hostname.toLowerCase().replace(/\.$/, "").replace(/^\[|\]$/g, "");
+    if (canonical && canonical !== raw && isBlockedNormalizedHost(canonical))
+      return true;
+  } catch {}
+  return false;
 }
 function resolveDshPatchPath(opts = {}) {
   const home = opts.dshHome ?? process.env.DSH_HOME ?? join5(homedir4(), ".dsh");
@@ -1459,6 +1571,10 @@ ${renderMcpAgentsChatEntry("    ", opts)}
   };
 }
 function applyDshCordisPatchFile(opts = {}) {
+  const rawHome = opts.dshHome ?? process.env.DSH_HOME;
+  if (rawHome) {
+    checkRawDotDotAncestors(`${rawHome}/_`);
+  }
   const patchPath = resolveDshPatchPath(opts);
   checkParentDirectory(patchPath);
   let existed = false;
@@ -1480,22 +1596,47 @@ function applyDshCordisPatchFile(opts = {}) {
   const existing = existed ? readFileSync6(patchPath, "utf8") : "";
   const { content, changed } = mergeDshCordisPatch(existing, opts);
   if (changed) {
-    mkdirSync3(dirname4(patchPath), { recursive: true });
+    mkdirSync3(dirname5(patchPath), { recursive: true });
     checkParentDirectory(patchPath);
     const tmp = `${patchPath}.${process.pid}.${randomBytes2(4).toString("hex")}.tmp`;
     let created = false;
     try {
       writeFileSync2(tmp, content, { encoding: "utf8", mode, flag: "wx" });
       created = true;
+      checkParentDirectory(patchPath);
       try {
-        if (lstatSync6(patchPath).isSymbolicLink()) {
-          throw new Error(`Refusing to overwrite symlinked DSH patch file: ${patchPath}`);
+        const cur = lstatSync6(patchPath);
+        if (cur.isSymbolicLink() || !cur.isFile()) {
+          throw new Error(`Refusing to overwrite symlinked or non-regular DSH patch file: ${patchPath}`);
         }
       } catch (err) {
         if (err?.code !== "ENOENT")
           throw err;
       }
-      renameSync2(tmp, patchPath);
+      const doRename = opts.fsOps?.renameSync ?? renameSync2;
+      const doCopy = opts.fsOps?.copyFileSync ?? copyFileSync;
+      try {
+        doRename(tmp, patchPath);
+      } catch (renameErr) {
+        if (renameErr?.code !== "EPERM" && renameErr?.code !== "EACCES") {
+          throw renameErr;
+        }
+        checkParentDirectory(patchPath);
+        try {
+          const cur = lstatSync6(patchPath);
+          if (cur.isSymbolicLink() || !cur.isFile()) {
+            throw new Error(`Refusing to overwrite symlinked or non-regular DSH patch file: ${patchPath}`);
+          }
+        } catch (err) {
+          if (err?.code !== "ENOENT")
+            throw err;
+        }
+        doCopy(tmp, patchPath);
+        try {
+          unlinkSync3(tmp);
+        } catch {}
+        created = false;
+      }
       if (process.platform !== "win32") {
         try {
           chmodSync2(patchPath, mode);
@@ -1525,27 +1666,25 @@ function has(name, argv) {
   return argv.includes(name);
 }
 var FORBIDDEN_KEYS2 = new Set(["__proto__", "constructor", "prototype"]);
-var DARWIN_ROOT_LINKS2 = new Set(["/var", "/tmp", "/etc"]);
-function checkParentDirectory2(path) {
-  let parent = dirname5(resolve5(path));
-  for (;; ) {
-    if (!(process.platform === "darwin" && DARWIN_ROOT_LINKS2.has(parent))) {
-      try {
-        const stat = lstatSync7(parent);
-        if (stat.isSymbolicLink() || !stat.isDirectory()) {
-          throw new Error(`Refusing symlinked or non-directory parent: ${parent}`);
-        }
-      } catch (err) {
-        if (err?.code !== "ENOENT")
-          throw err;
-      }
-    }
-    const next = dirname5(parent);
-    if (next === parent)
-      break;
-    parent = next;
-  }
-}
+var RESERVED_DSH_PROFILE_BASENAMES = new Set([
+  "profile",
+  "session-binds",
+  "session-binds_meta",
+  "agy-binds",
+  "agy-binds_meta",
+  "grok-binds",
+  "grok-binds_meta",
+  "agy-session-binds",
+  "identity-guard",
+  "cursor",
+  "read-cursors",
+  "mention-timestamps",
+  "wake-pids",
+  "config",
+  "codex-bots",
+  "dsh",
+  "muse"
+]);
 async function readRegistrationText(res) {
   if (!res.body)
     throw new Error("Empty registration response");
@@ -1572,7 +1711,7 @@ async function readRegistrationText(res) {
   }
 }
 function isSafeAgentId2(value) {
-  return typeof value === "string" && !!value && value !== "." && value !== ".." && !FORBIDDEN_KEYS2.has(value.toLowerCase()) && !/[\s\x00-\x1f\x7f/\\]/.test(value);
+  return typeof value === "string" && !!value && value.length <= 128 && value !== "." && value !== ".." && !FORBIDDEN_KEYS2.has(value.toLowerCase()) && !/[\s\x00-\x1f\x7f/\\]/.test(value);
 }
 function validateChannelId(value) {
   if (!value || value.startsWith("--") || !isSafeAgentId2(value) || Object.getOwnPropertyNames(Object.prototype).some((key) => key.toLowerCase() === value.toLowerCase()))
@@ -1600,8 +1739,9 @@ function validateHttpOrWsUrl(raw, allowedProtocols, label) {
   } catch {
     throw new Error(`Invalid ${label} URL`);
   }
-  if (isBlockedDshHost(parsed.hostname) || parsed.username || parsed.password || parsed.port === "0" || (parsed.protocol === "http:" || parsed.protocol === "https:") && (parsed.search || parsed.hash))
+  if (isBlockedDshHost(parsed.hostname) || parsed.username || parsed.password || parsed.port === "0" || parsed.search || parsed.hash) {
     throw new Error(`Invalid ${label} URL`);
+  }
   if (!allowedProtocols.includes(parsed.protocol)) {
     throw new Error(`Unsupported ${label} protocol: ${parsed.protocol}`);
   }
@@ -1613,6 +1753,7 @@ function validateHttpOrWsUrl(raw, allowedProtocols, label) {
 function loadDshConfig(env = process.env, profilePath = DSH_PROFILE_PATH) {
   let profile = {};
   try {
+    checkParentDirectory(profilePath);
     const lst = lstatSync7(profilePath);
     if (!lst.isSymbolicLink() && lst.isFile() && lst.size <= 256 * 1024) {
       const parsed = JSON.parse(readFileSync7(profilePath, "utf8"));
@@ -1658,7 +1799,7 @@ async function registerOnly(name, restUrl, profilePath = DSH_PROFILE_PATH) {
   if (!cleanName || cleanName.length > 64 || /[\x00-\x1f\x7f]/.test(cleanName)) {
     throw new Error("Invalid --name value");
   }
-  checkParentDirectory2(profilePath);
+  checkParentDirectory(profilePath);
   const safeRestUrl = validateHttpOrWsUrl(restUrl, ["http:", "https:"], "AgentChat REST");
   console.log("Terms notice: https://agents-chat.com/terms (notice only, no acceptance prompt)");
   const res = await fetch(`${safeRestUrl.replace(/\/+$/, "")}/api/account/register`, {
@@ -1692,15 +1833,15 @@ async function registerOnly(name, restUrl, profilePath = DSH_PROFILE_PATH) {
     if (err?.code !== "ENOENT")
       throw err;
   }
-  checkParentDirectory2(profilePath);
-  mkdirSync4(dirname5(profilePath), { recursive: true, mode: 448 });
-  checkParentDirectory2(profilePath);
+  checkParentDirectory(profilePath);
+  mkdirSync4(dirname6(profilePath), { recursive: true, mode: 448 });
+  checkParentDirectory(profilePath);
   const tmp = `${profilePath}.${process.pid}.${randomBytes3(4).toString("hex")}.tmp`;
   let created = false;
   try {
     writeFileSync3(tmp, JSON.stringify({ agentId, token }, null, 2), { mode: 384, flag: "wx" });
     created = true;
-    checkParentDirectory2(profilePath);
+    checkParentDirectory(profilePath);
     try {
       const lst = lstatSync7(profilePath);
       if (lst.isSymbolicLink() || !lst.isFile())
@@ -1709,7 +1850,27 @@ async function registerOnly(name, restUrl, profilePath = DSH_PROFILE_PATH) {
       if (err?.code !== "ENOENT")
         throw err;
     }
-    renameSync3(tmp, profilePath);
+    try {
+      renameSync3(tmp, profilePath);
+    } catch (renameErr) {
+      if (renameErr?.code !== "EPERM" && renameErr?.code !== "EACCES") {
+        throw renameErr;
+      }
+      checkParentDirectory(profilePath);
+      try {
+        const lst = lstatSync7(profilePath);
+        if (lst.isSymbolicLink() || !lst.isFile())
+          throw new Error(`Refusing to overwrite non-regular file ${profilePath}`);
+      } catch (err) {
+        if (err?.code !== "ENOENT")
+          throw err;
+      }
+      copyFileSync2(tmp, profilePath);
+      try {
+        unlinkSync4(tmp);
+      } catch {}
+      created = false;
+    }
     if (process.platform !== "win32") {
       try {
         chmodSync3(profilePath, 384);
@@ -1738,7 +1899,7 @@ async function runDshHeadlessResponder(prompt, opts = {}) {
   }
   const t = opts.timeoutMs ?? 120000;
   const timeoutMs = Number.isFinite(t) && t > 0 ? Math.min(Math.floor(t), 2147483647) : 120000;
-  return new Promise((resolve6) => {
+  return new Promise((resolve5) => {
     const resolved = resolveWindowsCliSpawn(dshBin, ["--profile", dshProfile, prompt], { env: process.env });
     const child = spawn(resolved.cmd, resolved.args, {
       stdio: ["ignore", "pipe", "pipe"],
@@ -1785,17 +1946,17 @@ async function runDshHeadlessResponder(prompt, opts = {}) {
     child.on("error", (err) => {
       clearTimers();
       console.error(`[dsh] failed to spawn ${dshBin}: ${redact(err.message)}`);
-      resolve6(null);
+      resolve5(null);
     });
     child.on("close", (code) => {
       clearTimers();
       if (code !== 0) {
         console.error(`[dsh] exited with code ${code}: ${redact(stderr.trim().slice(0, 300))}`);
-        resolve6(null);
+        resolve5(null);
         return;
       }
       const trimmed = stdout.trim();
-      resolve6(trimmed.length > 0 ? trimmed : null);
+      resolve5(trimmed.length > 0 ? trimmed : null);
     });
   });
 }
@@ -1916,16 +2077,19 @@ DeepSeek Harness (dsh) integration for AgentsChat:
         const cfgDir = agentschatConfigDir();
         const binds = loadSessionBinds(cfgDir);
         for (const [sid, profName] of Object.entries(binds)) {
-          if (!sid.startsWith("session-") || FORBIDDEN_KEYS2.has(sid.toLowerCase()) || !profName || typeof profName !== "string")
+          if (!sid.startsWith("session-") || sid.length > 128 || sid.includes("..") || /[\s\x00-\x1f\x7f/\\]/.test(sid) || FORBIDDEN_KEYS2.has(sid.toLowerCase()) || !profName || typeof profName !== "string") {
             continue;
+          }
           const base = profName.replace(/\.json$/i, "").replace(/[^a-zA-Z0-9_-]/g, "_");
-          if (!base || FORBIDDEN_KEYS2.has(base.toLowerCase()))
+          if (!base || base.length > 64 || FORBIDDEN_KEYS2.has(base.toLowerCase()) || RESERVED_DSH_PROFILE_BASENAMES.has(base.toLowerCase())) {
             continue;
+          }
           let extraClient = null;
           try {
             const candidates = [join6(cfgDir, "profiles", `${base}.json`), join6(cfgDir, `${base}.json`)];
             const profPath = candidates.find((p) => {
               try {
+                checkParentDirectory(p);
                 const lst = lstatSync7(p);
                 return !lst.isSymbolicLink() && lst.isFile() && lst.size <= 256 * 1024;
               } catch {
@@ -1983,7 +2147,7 @@ DeepSeek Harness (dsh) integration for AgentsChat:
     const bindTimer = setInterval(() => void syncBoundDshClients(), 3000);
     bindTimer.unref?.();
     console.log(`DSH wake daemon listening on ${wakeChannels.join(", ") || "(no channels — pass --channel <id>)"}, queue=${queueFile}.`);
-    await new Promise((resolve6) => {
+    await new Promise((resolve5) => {
       const shutdown = () => {
         for (const t of activeTyping)
           t.stopAll();
@@ -1992,13 +2156,13 @@ DeepSeek Harness (dsh) integration for AgentsChat:
             c.disconnect();
           } catch {}
         }
-        resolve6();
+        resolve5();
       };
       process.once("SIGINT", shutdown);
       process.once("SIGTERM", shutdown);
       process.once("SIGHUP", shutdown);
       if (primaryClient) {
-        primaryClient.waitUntilClosed().then(resolve6);
+        primaryClient.waitUntilClosed().then(resolve5);
       }
     });
     clearInterval(bindTimer);
@@ -2086,7 +2250,7 @@ ${ctx.context}`,
 var invokedDirectly = process.argv[1]?.endsWith("dsh/src/cli.ts") || process.argv[1]?.endsWith("dist/dsh.js") || process.argv.includes("--dsh");
 if (invokedDirectly) {
   main().catch((err) => {
-    console.error("DSH AgentsChat error:", err instanceof Error ? err.message : String(err));
+    console.error("DSH AgentsChat error:", logText(err instanceof Error ? err.message : String(err)));
     process.exit(1);
   });
 }

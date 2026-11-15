@@ -1,7 +1,12 @@
 import { randomBytes } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
+
+export interface DshPatchFsOps {
+  renameSync?: typeof renameSync;
+  copyFileSync?: typeof copyFileSync;
+}
 
 export interface DshPatchOptions {
   dshHome?: string;
@@ -9,15 +14,60 @@ export interface DshPatchOptions {
   agentsChatProfile?: string;
   apiUrl?: string;
   packageSpec?: string;
+  fsOps?: DshPatchFsOps;
 }
 
 const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 const DARWIN_ROOT_LINKS = new Set(["/var", "/tmp", "/etc"]);
 
-function checkParentDirectory(path: string): void {
+function isAllowedDarwinSystemLink(dirPath: string): boolean {
+  if (process.platform !== "darwin" || !DARWIN_ROOT_LINKS.has(dirPath)) return false;
+  try {
+    const real = realpathSync(dirPath);
+    return real === `/private${dirPath}` && statSync(real).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function checkRawDotDotAncestors(rawPath: string): void {
+  const trimmed = rawPath.trim();
+  if (!trimmed || !isAbsolute(trimmed)) return;
+  const normalizedSep = process.platform === "win32" ? trimmed.replace(/\//g, "\\") : trimmed;
+  const sepChar = process.platform === "win32" ? "\\" : "/";
+  const parts = normalizedSep.split(sepChar);
+  if (!parts.includes("..")) return;
+  const winDrive = process.platform === "win32" && /^[A-Za-z]:$/.test(parts[0] || "");
+  let current = winDrive ? `${parts[0]}\\` : sepChar;
+  for (let i = 1; i < parts.length; i++) {
+    const seg = parts[i]!;
+    if (!seg || seg === ".") continue;
+    if (seg === "..") {
+      current = dirname(current);
+      continue;
+    }
+    const candidate = current.endsWith(sepChar) ? `${current}${seg}` : `${current}${sepChar}${seg}`;
+    if (i < parts.length - 1 || parts.slice(i + 1).includes("..")) {
+      if (!isAllowedDarwinSystemLink(candidate)) {
+        try {
+          const stat = lstatSync(candidate);
+          if (stat.isSymbolicLink() || !stat.isDirectory()) {
+            throw new Error(`Refusing symlinked or non-directory parent: ${candidate}`);
+          }
+        } catch (err: any) {
+          if (err?.code !== "ENOENT") throw err;
+        }
+      }
+    }
+    current = candidate;
+  }
+}
+
+export function checkParentDirectory(path: string): void {
+  checkRawDotDotAncestors(path);
   let parent = dirname(resolve(path));
   for (;;) {
-    if (!(process.platform === "darwin" && DARWIN_ROOT_LINKS.has(parent))) {
+    if (!isAllowedDarwinSystemLink(parent)) {
       try {
         const stat = lstatSync(parent);
         if (stat.isSymbolicLink() || !stat.isDirectory()) {
@@ -33,13 +83,51 @@ function checkParentDirectory(path: string): void {
   }
 }
 
+function isBlockedNormalizedHost(host: string): boolean {
+  if (!host) return true;
+  if (
+    host === "0.0.0.0" ||
+    host === "::" ||
+    host === "0:0:0:0:0:0:0:0" ||
+    host === "100.100.100.200" ||
+    host === "fd00:ec2::254" ||
+    host === "fd00:ec2:0:0:0:0:0:254" ||
+    host === "metadata" ||
+    host === "instance-data" ||
+    host === "metadata.google.internal" ||
+    host.endsWith(".metadata.google.internal") ||
+    host === "metadata.goog" ||
+    host.endsWith(".metadata.goog") ||
+    /^169\.254\./.test(host)
+  ) {
+    return true;
+  }
+  if (
+    /^::ffff:(?:0:)?(?:a9fe:[0-9a-f]{1,4}|169\.254\.\d{1,3}\.\d{1,3}|6464:64c8|100\.100\.100\.200|0:0|0\.0\.0\.0)$/.test(
+      host,
+    ) ||
+    /^(?:0:){5}ffff:(?:a9fe:[0-9a-f]{1,4}|169\.254\.\d{1,3}\.\d{1,3}|6464:64c8|100\.100\.100\.200|0:0|0\.0\.0\.0)$/.test(
+      host,
+    )
+  ) {
+    return true;
+  }
+  const first = host.split(":")[0];
+  return host.includes(":") && /^[0-9a-f]{1,4}$/.test(first!) && (parseInt(first!, 16) & 0xffc0) === 0xfe80;
+}
+
 /** URL.hostname is canonicalized by WHATWG URL, including IPv4-in-IPv6. */
 export function isBlockedDshHost(hostname: string): boolean {
-  const host = hostname.toLowerCase().replace(/\.$/, "").replace(/^\[|\]$/g, "");
-  if (host === "metadata.google.internal" || host === "metadata.goog" || /^169\.254\./.test(host)) return true;
-  if (/^::ffff:(?:0:)?a9fe:[0-9a-f]{1,4}$/.test(host)) return true;
-  const first = host.split(":")[0];
-  return host.includes(":") && /^[0-9a-f]{1,4}$/.test(first) && (parseInt(first, 16) & 0xffc0) === 0xfe80;
+  const raw = hostname.trim().toLowerCase().replace(/\.$/, "").replace(/^\[|\]$/g, "");
+  if (isBlockedNormalizedHost(raw)) return true;
+  try {
+    const bracketed = raw.includes(":") ? `[${raw}]` : raw;
+    const canonical = new URL(`http://${bracketed}`).hostname.toLowerCase().replace(/\.$/, "").replace(/^\[|\]$/g, "");
+    if (canonical && canonical !== raw && isBlockedNormalizedHost(canonical)) return true;
+  } catch {
+    // Non-parseable host handled by caller's URL parser.
+  }
+  return false;
 }
 
 export function resolveDshPatchPath(opts: DshPatchOptions = {}): string {
@@ -207,6 +295,10 @@ export function applyDshCordisPatchFile(opts: DshPatchOptions = {}): {
   patchPath: string;
   changed: boolean;
 } {
+  const rawHome = opts.dshHome ?? process.env.DSH_HOME;
+  if (rawHome) {
+    checkRawDotDotAncestors(`${rawHome}/_`);
+  }
   const patchPath = resolveDshPatchPath(opts);
   checkParentDirectory(patchPath);
   let existed = false;
@@ -234,14 +326,38 @@ export function applyDshCordisPatchFile(opts: DshPatchOptions = {}): {
     try {
       writeFileSync(tmp, content, { encoding: "utf8", mode, flag: "wx" });
       created = true;
+      checkParentDirectory(patchPath);
       try {
-        if (lstatSync(patchPath).isSymbolicLink()) {
-          throw new Error(`Refusing to overwrite symlinked DSH patch file: ${patchPath}`);
+        const cur = lstatSync(patchPath);
+        if (cur.isSymbolicLink() || !cur.isFile()) {
+          throw new Error(`Refusing to overwrite symlinked or non-regular DSH patch file: ${patchPath}`);
         }
       } catch (err: any) {
         if (err?.code !== "ENOENT") throw err;
       }
-      renameSync(tmp, patchPath);
+      const doRename = opts.fsOps?.renameSync ?? renameSync;
+      const doCopy = opts.fsOps?.copyFileSync ?? copyFileSync;
+      try {
+        doRename(tmp, patchPath);
+      } catch (renameErr: any) {
+        if (renameErr?.code !== "EPERM" && renameErr?.code !== "EACCES") {
+          throw renameErr;
+        }
+        checkParentDirectory(patchPath);
+        try {
+          const cur = lstatSync(patchPath);
+          if (cur.isSymbolicLink() || !cur.isFile()) {
+            throw new Error(`Refusing to overwrite symlinked or non-regular DSH patch file: ${patchPath}`);
+          }
+        } catch (err: any) {
+          if (err?.code !== "ENOENT") throw err;
+        }
+        doCopy(tmp, patchPath);
+        try {
+          unlinkSync(tmp);
+        } catch {}
+        created = false;
+      }
       if (process.platform !== "win32") {
         try {
           chmodSync(patchPath, mode);
