@@ -135,7 +135,7 @@ test("grant document and entries reject own prototype keys and cap total grants"
 test("every grant routing ID rejects whitespace, paths, reserved keys and overlength while preserving email/Apple owner_ids",()=>{
  const {c,grant,tick,save}=fixture();
  for(const field of ["loop_id","channel_id","agent_id"] as const) {
-  for(const value of [" "+grant[field],grant[field]+" ",".","..","a.b","a/b","a\\b","a b","__PrOtO__","CoNsTrUcToR","PrOtOtYpE","a".repeat(129),"loop_"+"a".repeat(124)]) {
+  for(const value of [" "+grant[field],grant[field]+" ",".","..","a/b","a\\b","a b","__PrOtO__","CoNsTrUcToR","PrOtOtYpE","a".repeat(129),"loop_"+"a".repeat(124)]) {
    const changed={...grant,[field]:value};save([changed]);
    expect(authorizedLoopTick({...tick,channel_id:changed.channel_id,sender_id:changed.agent_id,meta:{...tick.meta,loop_id:changed.loop_id}},{...c,agentId:changed.agent_id})).toBeNull();
   }

@@ -224,3 +224,36 @@ test("GUI CLI rejects unsafe parent directories before creating the outbox", () 
     }
   }
 });
+
+test("conversation listing rejects own prototype channels before backend startup", () => {
+  const f = fixture();
+  for (const args of [["--conversations"], ["--read-conversation", "valid"]]) {
+    const result = f.run(args, { channels: JSON.parse('{"valid":{"thread":"thread"},"__proto__":{}}') });
+    expect(result.status).toBe(1); expect(result.stderr).toContain("Invalid conversation channels");
+    expect(result.events).not.toContain("start"); expect(result.events).not.toContain("read");
+  }
+});
+
+test("conversation reads reject ancestor links before reading state or starting backend", () => {
+  const f = fixture(), moved = join(f.root, "moved");
+  const result = f.run(["--conversations"], { beforeSpawn() {
+    mkdirSync(moved); mkdirSync(join(moved, "state"));
+    writeFileSync(join(moved, "state/state.json"), '{"channels":{"private-marker":{"thread":"secret"}}}');
+    // stateDir itself stays a directory; its parent is the alias.
+    f.config.stateDir = join(f.root, "alias/state");
+    const harness = join(f.root, "harness.ts");
+    writeFileSync(harness, readFileSync(harness, "utf8").replace(JSON.stringify(f.stateDir), JSON.stringify(f.config.stateDir)));
+    symlinkSync(moved, join(f.root, "alias"));
+  } });
+  expect(result.status).toBe(1); expect(result.stderr).toContain("symlink");
+  expect(result.stdout).not.toContain("private-marker"); expect(result.events).not.toContain("start");
+});
+
+test("GUI message reads reject ancestor links before reading or enqueuing", () => {
+  const f = fixture(), source = join(f.root, "source"), alias = join(f.root, "alias");
+  mkdirSync(source); writeFileSync(join(source, "message"), "private-message"); symlinkSync(source, alias);
+  const result = f.run(["--gui-thread", "target", "--gui-message-file", join(alias, "message")]);
+  expect(result.status).toBe(1); expect(result.stderr).toContain("symlink");
+  expect(result.stdout).not.toContain("private-message");
+  expect(new (require("../codex/gui-channel.ts").GuiChannel)(join(f.root, ".agentschat/codex-gui-outbox"), []).list()).toEqual([]);
+});

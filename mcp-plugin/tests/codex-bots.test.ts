@@ -380,7 +380,7 @@ test("manager status caps regular files at exactly one MiB before reading", () =
  try {
   writeFileSync(file,"x".repeat(1_048_577));
   const rejected=f.run(["--status"]);expect(rejected.status).toBe(1);expect(rejected.events).not.toContain("read-status");expect(rejected.stdout).toBe("");
-  writeFileSync(file,"x".repeat(1_048_576));
+  const valid='{"bots":[]}';writeFileSync(file,valid+" ".repeat(1_048_576-valid.length));
   const accepted=f.run(["--status"]);expect(accepted.status).toBe(0);expect(accepted.events).toEqual(["read-status"]);expect(accepted.stdout.length).toBe(1_048_577);
  } finally {rmSync(f.home,{recursive:true,force:true});}
 });

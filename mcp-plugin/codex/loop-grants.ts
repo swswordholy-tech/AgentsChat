@@ -1,5 +1,6 @@
 import { lstatSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { assertDirectoryAncestors } from "./config.ts";
 import type { BridgeConfig } from "./config.ts";
 
 export interface LoopGrant {
@@ -27,6 +28,7 @@ function grants(
   try {
     const platform = opts?.platform ?? process.platform;
     const getuid = opts && "getuid" in opts ? opts.getuid : process.getuid;
+    assertDirectoryAncestors(config.stateDir);
     const directory = lstatSync(config.stateDir);
     if (directory.isSymbolicLink() || !directory.isDirectory()) return [];
     const file = join(config.stateDir, "loop-grants.json"), stat = lstatSync(file);
@@ -38,7 +40,7 @@ function grants(
     const ownProto = (value: any) => Object.prototype.hasOwnProperty.call(value, "__proto__");
     if (doc?.version !== 1 || ownProto(doc) || !Array.isArray(doc.grants) || doc.grants.length > 256) return [];
     const safeId = (value: unknown): value is string => typeof value === "string" && value.length > 0 &&
-      value.length <= 128 && value.trim() === value && !/[.\/\\\s\x00-\x1f\x7f]/.test(value) &&
+      value.length <= 128 && value.trim() === value && value !== "." && value !== ".." && !/[\/\\\s\x00-\x1f\x7f]/.test(value) &&
       !["__proto__", "constructor", "prototype"].includes(value.toLowerCase());
     const safeOwnerId = (value: unknown): value is string => typeof value === "string" && value.length > 0 &&
       value.length <= 254 && value.trim() === value && value !== "." && !value.includes("..") &&

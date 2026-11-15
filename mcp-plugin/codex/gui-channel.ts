@@ -1,3 +1,4 @@
+import { assertDirectoryAncestors } from "./config.ts";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync, readFileSync, renameSync, readdirSync, rmSync, lstatSync } from "node:fs";
 import { join } from "node:path";
@@ -16,19 +17,22 @@ function payload(result: any): any {
     const text = result.content.find((c: any) => c.type === "text")?.text;
     if (!text) throw new Error("GUI tool returned no receipt");
     if (typeof text !== "string" || text.length > 1_048_576) throw new Error("GUI receipt exceeds size limit");
-    return JSON.parse(text);
+    const parsed = JSON.parse(text);
+    if (parsed && Object.prototype.hasOwnProperty.call(parsed, "__proto__")) throw new Error("Invalid GUI receipt");
+    return parsed;
   }
   return result;
 }
 function validTarget(value: unknown): value is string {
-  return typeof value === "string" && value.trim() === value && value.length >= 1 && value.length <= 256 &&
-    !/[\x00-\x1f\x7f]/.test(value) && !["__proto__", "prototype", "constructor"].includes(value.toLowerCase());
+  return typeof value === "string" && value.trim() === value && value.length >= 1 && value.length <= 256 && value !== "." && value !== ".." &&
+    !/[\/\\\x00-\x1f\x7f]/.test(value) && !["__proto__", "prototype", "constructor"].includes(value.toLowerCase());
 }
 /** Private durable outbox. An authorized GUI host calls dispatch; enqueue is NOT delivery. */
 export class GuiChannel {
   constructor(private directory: string, private allowedThreads: readonly string[]) {
     const existing = lstatSync(directory, { throwIfNoEntry: false });
     if (existing && (existing.isSymbolicLink() || !existing.isDirectory())) throw new Error("GUI outbox must be a real directory, not a symlink");
+    assertDirectoryAncestors(directory);
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     const stat = lstatSync(directory);
     if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("GUI outbox must be a real directory, not a symlink");

@@ -29,6 +29,8 @@ export class AppServer {
   constructor(private bin = "codex", private args = ["app-server", "--listen", "stdio://"], _legacyTurnTimeoutMs?: number, private permissions: PermissionMode = "full-access", private runtime?: {home: string; legacyHome?: string}, private effort?: ReasoningEffort, private model?: string, private toolIdentity?: { profileFile: string; agentId: string; apiUrl: string; wsUrl: string }, private requestTimeoutMs = 30_000) {}
   get namespace() { return this.runtime?.home; }
   async start() {
+    if (this.model !== undefined && (typeof this.model !== "string" || !this.model.trim() ||
+      this.model.length > 256 || /[\x00-\x1f\x7f]/.test(this.model))) throw new Error("Invalid app-server model");
     const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^AGENTS?CHAT_|^RELAY_/.test(k)));
     env.AGENTSCHAT_LOCK_OWNER_PID = String(process.pid);
     env.AGENTSCHAT_TOOL_ONLY = "1";
@@ -82,6 +84,9 @@ export class AppServer {
       if (line.length > 8 * 1024 * 1024) { this.fatal(new Error("Oversized app-server response")); return; }
       let parsed: any;
       try { parsed = JSON.parse(line); } catch { this.fatal(new Error("Invalid app-server response")); return; }
+      if (parsed && Object.prototype.hasOwnProperty.call(parsed, "__proto__")) {
+        this.fatal(new Error("Invalid app-server response")); return;
+      }
       this.receive(parsed);
     });
     await this.request("initialize", { clientInfo: { name: "agentschat_bridge", version: "0.1.0" } });
@@ -161,6 +166,8 @@ export class AppServer {
     }
   }
   async thread(cwd: string, existing?: string, ephemeral = false, permissions: PermissionMode = this.permissions): Promise<string> {
+    if (typeof cwd !== "string" || !cwd.trim() || cwd.length > 4096 || /[\x00-\x1f\x7f]/.test(cwd))
+      throw new Error("Invalid app-server cwd");
     // Loaded-thread resume ignores MCP and developer-instruction overrides.
     // Keep the original runtime policy; a different permission needs a new thread.
     const configured = existing ? this.threadPermissions.get(existing) : undefined;
