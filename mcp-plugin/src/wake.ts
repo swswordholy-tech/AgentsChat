@@ -39,6 +39,10 @@ const MAX_WAKE_TIMER_MS = 2_147_483_647;
 const GROK_GATEWAY_MAX_BYTES = 1_048_576;
 const DIRECT_CHANNEL_RE = /^dm[-:]/i;
 const SAFE_ZCODE_SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const PROTOTYPE_WAKE_KEYS = new Set([
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase()),
+]);
 
 function isAllowedDarwinSystemLink(dirPath: string): boolean {
   if (process.platform !== "darwin") return false;
@@ -106,7 +110,9 @@ function isUnsafeMetadataOrLinkLocalHost(hostname: string): boolean {
   const lower = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
   if (
     !lower ||
+    lower === "0" ||
     lower === "0.0.0.0" ||
+    /^0\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(lower) ||
     lower === "::" ||
     lower === "100.100.100.200" ||
     lower === "fd00:ec2::254" ||
@@ -123,15 +129,24 @@ function isUnsafeMetadataOrLinkLocalHost(hostname: string): boolean {
   if (/^fe[89ab][0-9a-f]:/.test(lower)) return true;
   if (lower.startsWith("::ffff:")) {
     const tail = lower.slice("::ffff:".length);
-    const tailParts = tail.startsWith("0:") ? tail.slice(2) : tail;
-    if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(tailParts) || tailParts === "100.100.100.200" || tailParts === "0.0.0.0") {
+    const tailParts = /^0:(?:[0-9a-f]{1,4}:|\d{1,3}\.)/.test(tail) ? tail.slice(2) : tail;
+    if (
+      /^169\.254\.\d{1,3}\.\d{1,3}$/.test(tailParts) ||
+      /^0\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(tailParts) ||
+      tailParts === "100.100.100.200" ||
+      tailParts === "0.0.0.0"
+    ) {
       return true;
     }
     const hexMatch = tailParts.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
     if (hexMatch) {
       const hi = parseInt(hexMatch[1]!, 16);
       const lo = parseInt(hexMatch[2]!, 16);
-      if ((((hi >> 8) & 0xff) === 169 && (hi & 0xff) === 254) || (hi === 0x6464 && lo === 0x64c8) || (hi === 0 && lo === 0)) {
+      if (
+        (((hi >> 8) & 0xff) === 169 && (hi & 0xff) === 254) ||
+        (hi === 0x6464 && lo === 0x64c8) ||
+        ((hi >> 8) & 0xff) === 0
+      ) {
         return true;
       }
     }
@@ -246,13 +261,32 @@ export function formatWakeAttachments(attachments: unknown): string {
     const a = raw as WakeAttachment;
     const safeUrl = sanitizeWakeAttachmentUrl(a.url);
     if (!safeUrl) continue;
-    const t = typeof a.type === "string" ? a.type.replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 32) : "file";
-    const dim = typeof a.width === "number" && typeof a.height === "number" ? ` ${a.width}×${a.height}` : "";
-    const dur = typeof a.duration_ms === "number" && Number.isFinite(a.duration_ms) ? ` ${(a.duration_ms / 1000).toFixed(1)}s` : "";
+    const cleanedType =
+      typeof a.type === "string" ? a.type.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g, "").trim().slice(0, 32) : "";
+    const t = cleanedType || "file";
+    const dim =
+      typeof a.width === "number" &&
+      Number.isFinite(a.width) &&
+      a.width >= 0 &&
+      typeof a.height === "number" &&
+      Number.isFinite(a.height) &&
+      a.height >= 0
+        ? ` ${a.width}×${a.height}`
+        : "";
+    const dur =
+      typeof a.duration_ms === "number" && Number.isFinite(a.duration_ms) && a.duration_ms >= 0
+        ? ` ${(a.duration_ms / 1000).toFixed(1)}s`
+        : "";
     const icon = t === "image" ? "🖼" : t === "video" ? "🎬" : t === "audio" ? "🔊" : "📎";
     let desc = `${icon} ${t}${dim}${dur}: ${safeUrl}`;
-    if (typeof a.transcript === "string" && a.transcript.trim()) {
-      desc += ` (transcript: "${redactSecrets(a.transcript.trim().slice(0, 300))}")`;
+    if (typeof a.transcript === "string") {
+      const safeTranscript = a.transcript
+        .replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029"]+/g, " ")
+        .trim()
+        .slice(0, 300);
+      if (safeTranscript) {
+        desc += ` (transcript: "${redactSecrets(safeTranscript)}")`;
+      }
     }
     lines.push(desc);
   }
@@ -345,11 +379,19 @@ export function signWakeBody(body: string, secret: string): string {
 
 /** Constant-time check that `sigHex` signs `body` under ANY of `secrets` (rotation). */
 export function verifyWakeSignature(body: string, sigHex: string, secrets: readonly string[]): boolean {
-  if (typeof sigHex !== "string" || !/^[0-9a-f]{64}$/i.test(sigHex)) return false;
+  if (typeof body !== "string" || typeof sigHex !== "string" || !/^[0-9a-f]{64}$/i.test(sigHex)) return false;
+  if (!Array.isArray(secrets) || secrets.length === 0) return false;
   const sigBuf = Buffer.from(sigHex, "hex");
   if (sigBuf.length !== 32) return false;
   for (const secret of secrets) {
-    if (!secret) continue;
+    if (
+      typeof secret !== "string" ||
+      !secret ||
+      secret.length > 8192 ||
+      /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(secret)
+    ) {
+      continue;
+    }
     const expected = Buffer.from(signWakeBody(body, secret), "hex");
     if (expected.length !== sigBuf.length) continue;
     if (timingSafeEqual(sigBuf, expected)) return true;
@@ -403,7 +445,14 @@ export async function fireWake(msg: WakeMessage, cfg: WakeConfig): Promise<void>
   if (!payload.timestamp) payload.timestamp = new Date().toISOString();
   const body = JSON.stringify(payload);
   const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (cfg.secret) headers[WAKE_SIG_HEADER] = signWakeBody(body, cfg.secret);
+  if (
+    typeof cfg.secret === "string" &&
+    cfg.secret.length > 0 &&
+    cfg.secret.length <= 8192 &&
+    !/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(cfg.secret)
+  ) {
+    headers[WAKE_SIG_HEADER] = signWakeBody(body, cfg.secret);
+  }
 
   const timeoutMs = clampWakeTimerMs(cfg.timeoutMs, 5000);
   const doPost = async (): Promise<void> => {
@@ -482,18 +531,21 @@ export function buildGrokPrompt(msg: WakeMessage, agentId: string, contextPrefix
  * rotate it are picked up automatically, and it never touches argv/env/channel.
  */
 export function grokBearerFromGatewayConfig(cfg: any): string | null {
-  if (!cfg || typeof cfg !== "object" || Object.prototype.hasOwnProperty.call(cfg, "__proto__")) return null;
+  if (!cfg || typeof cfg !== "object" || Array.isArray(cfg) || Object.prototype.hasOwnProperty.call(cfg, "__proto__")) {
+    return null;
+  }
   const candidate =
     typeof cfg.token === "string" && cfg.token
       ? cfg.token.trim()
       : cfg.auth &&
           typeof cfg.auth === "object" &&
+          !Array.isArray(cfg.auth) &&
           !Object.prototype.hasOwnProperty.call(cfg.auth, "__proto__") &&
           typeof cfg.auth.bearer === "string" &&
           cfg.auth.bearer
         ? cfg.auth.bearer.trim()
         : "";
-  if (!candidate || candidate.length > 4096 || /[\x00-\x1f\x7f]/.test(candidate)) return null;
+  if (!candidate || candidate.length > 4096 || /[\x00-\x20\x7f-\x9f\u2028\u2029]/.test(candidate)) return null;
   return candidate;
 }
 
@@ -951,8 +1003,9 @@ export function fireZcodeWake(msg: WakeMessage, cfg: ZcodeWakeConfig): Promise<b
         typeof cfg.profileName === "string" &&
         cfg.profileName.trim().length > 0 &&
         cfg.profileName.trim().length <= 128 &&
+        !cfg.profileName.includes("..") &&
         !/[\x00-\x1f\x7f-\x9f\u2028\u2029/\\]/.test(cfg.profileName.trim()) &&
-        !["__proto__", "constructor", "prototype"].includes(cfg.profileName.trim().toLowerCase())
+        !PROTOTYPE_WAKE_KEYS.has(cfg.profileName.trim().toLowerCase())
           ? cfg.profileName.trim()
           : undefined;
       const env: Record<string, string | undefined> = {

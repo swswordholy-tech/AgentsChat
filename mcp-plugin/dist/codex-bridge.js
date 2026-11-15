@@ -1831,6 +1831,10 @@ import { createInterface } from "node:readline";
 import { existsSync as existsSync2, lstatSync as lstatSync5, readFileSync as readFileSync4, readlinkSync as readlinkSync2 } from "node:fs";
 import { homedir as homedir4 } from "node:os";
 import { dirname as dirname3, isAbsolute as isAbsolute4, join as join5, parse as parse2, resolve as resolve4, win32 as pathWin32 } from "node:path";
+var PROTOTYPE_WAKE_KEYS = new Set([
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase())
+]);
 var GROK_GATEWAY_PATH_CANDIDATES = [
   join5(process.env.HOME || process.env.USERPROFILE || homedir4(), ".grok", "gateway.json"),
   "/home/box/sand-data/gateway.json"

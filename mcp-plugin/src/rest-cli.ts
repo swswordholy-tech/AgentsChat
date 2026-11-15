@@ -75,10 +75,23 @@ const MAX_STATE_FILE_BYTES = 1_048_576;
 const MAX_HTTP_JSON_BYTES = 4 * 1024 * 1024;
 const MAX_PID_FILE_BYTES = 64 * 1024;
 const DIRECT_CHANNEL_RE = /^dm[-:]/i;
-const PROTOTYPE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+const CANONICAL_CURSOR_TS_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{9}Z$/;
+const PROTOTYPE_KEYS = new Set([
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase()),
+]);
 const CLI_CHANNEL_CREDENTIAL_PREFIX_RE =
   /^(?:ac_|mcp_(?:at|rt|code)_|agent_key_|whsec_|mr_|sk-|sk_|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|AIza|AKIA|ASIA)/i;
 const CLI_ENCODED_TRAVERSAL_RE = /(?:%2f|%5c|%00|%2e%2e)/i;
+
+export function canonicalRestCursorTimestamp(
+  raw: unknown,
+  mode: "before" | "after" = "after",
+): string | undefined {
+  if (typeof raw !== "string" || !raw) return undefined;
+  const norm = normalizeTimestampForCursor(raw, mode);
+  return norm && CANONICAL_CURSOR_TS_RE.test(norm) ? norm : undefined;
+}
 
 function isLoopbackHost(hostname: string): boolean {
   const h = hostname.toLowerCase();
@@ -89,7 +102,9 @@ function isUnsafeMetadataOrLinkLocalHost(hostname: string): boolean {
   const lower = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
   if (
     !lower ||
+    lower === "0" ||
     lower === "0.0.0.0" ||
+    /^0\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(lower) ||
     lower === "::" ||
     lower === "100.100.100.200" ||
     lower === "fd00:ec2::254" ||
@@ -106,9 +121,10 @@ function isUnsafeMetadataOrLinkLocalHost(hostname: string): boolean {
   if (/^fe[89ab][0-9a-f]:/.test(lower)) return true;
   if (lower.startsWith("::ffff:")) {
     const tail = lower.slice("::ffff:".length);
-    const tailParts = tail.startsWith("0:") ? tail.slice(2) : tail;
+    const tailParts = /^0:(?:[0-9a-f]{1,4}:|\d{1,3}\.)/.test(tail) ? tail.slice(2) : tail;
     if (
       /^169\.254\.\d{1,3}\.\d{1,3}$/.test(tailParts) ||
+      /^0\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(tailParts) ||
       tailParts === "100.100.100.200" ||
       tailParts === "0.0.0.0"
     ) {
@@ -121,7 +137,7 @@ function isUnsafeMetadataOrLinkLocalHost(hostname: string): boolean {
       if (
         (((hi >> 8) & 0xff) === 169 && (hi & 0xff) === 254) ||
         (hi === 0x6464 && lo === 0x64c8) ||
-        (hi === 0 && lo === 0)
+        ((hi >> 8) & 0xff) === 0
       ) {
         return true;
       }
@@ -542,20 +558,20 @@ export function advanceChannelReadCursor(opts: {
   warn?: Warn;
 }): void {
   const { configDir, agentId, channelId, timestamp } = opts;
-  if (!agentId || !isSafeCliChannelId(channelId) || !timestamp) return;
+  const nextNorm = canonicalRestCursorTimestamp(timestamp, "after");
+  if (!agentId || !isSafeCliChannelId(channelId) || !nextNorm) return;
   const warn = opts.warn ?? ((m: string) => process.stderr.write(m));
   ensureRealDirectory(configDir);
 
   const lastSeenFile = cursorFileForAgent(configDir, agentId);
   const cursor = loadCursor(lastSeenFile, warn);
   const prev = cursor.get(channelId) || "";
-  const nextNorm = normalizeTimestampForCursor(timestamp, "after") || timestamp;
-  const prevNorm = normalizeTimestampForCursor(prev, "after") || prev;
+  const prevNorm = canonicalRestCursorTimestamp(prev, "after");
   cursor.set(CURSOR_LAST_ACTIVE_KEY, timestamp);
   if (opts.maxIdleMs !== undefined && Number.isFinite(opts.maxIdleMs) && opts.maxIdleMs >= 0) {
     cursor.set(CURSOR_MAX_IDLE_KEY, String(Math.round(opts.maxIdleMs)));
   }
-  if (!prev || nextNorm > prevNorm) {
+  if (!prevNorm || nextNorm > prevNorm) {
     cursor.set(channelId, timestamp);
   }
   persistCursor(lastSeenFile, cursor, warn);
@@ -564,8 +580,8 @@ export function advanceChannelReadCursor(opts: {
   const readCursors = loadJsonMap(readCursorsFile);
   const scopedKey = `${agentId}:${channelId}`;
   const prevRead = readCursors[scopedKey] || readCursors[channelId] || "";
-  const prevReadNorm = normalizeTimestampForCursor(prevRead, "after") || prevRead;
-  if (!prevRead || nextNorm > prevReadNorm) {
+  const prevReadNorm = canonicalRestCursorTimestamp(prevRead, "after");
+  if (!prevReadNorm || nextNorm > prevReadNorm) {
     readCursors[scopedKey] = timestamp;
     readCursors[channelId] = timestamp;
     saveJsonMap(readCursorsFile, readCursors);
@@ -687,7 +703,7 @@ export async function sendRestMessage(opts: {
     const data = (await readBoundedResponseJson(res).catch(() => ({}))) as Record<string, unknown>;
     if (res.ok) {
       const serverTs =
-        typeof data.timestamp === "string" && data.timestamp.trim()
+        typeof data.timestamp === "string" && canonicalRestCursorTimestamp(data.timestamp.trim(), "after")
           ? data.timestamp.trim()
           : undefined;
       const cursorTs = serverTs ?? new Date().toISOString();
@@ -802,13 +818,17 @@ export async function wakeOnce(opts: {
   }
 
   const cursor = loadCursor(lastSeenFile, warn);
+  const fallbackNowIso = () => {
+    const candidate = nowIso();
+    return canonicalRestCursorTimestamp(candidate, "after") ? candidate : new Date().toISOString();
+  };
   let cursorDirty = false;
-  if (!cursor.get(CURSOR_INIT_KEY)) {
-    cursor.set(CURSOR_INIT_KEY, nowIso());
+  if (!canonicalRestCursorTimestamp(cursor.get(CURSOR_INIT_KEY), "after")) {
+    cursor.set(CURSOR_INIT_KEY, fallbackNowIso());
     cursorDirty = true;
   }
-  if (!cursor.get(CURSOR_LAST_ACTIVE_KEY)) {
-    cursor.set(CURSOR_LAST_ACTIVE_KEY, nowIso());
+  if (!canonicalRestCursorTimestamp(cursor.get(CURSOR_LAST_ACTIVE_KEY), "after")) {
+    cursor.set(CURSOR_LAST_ACTIVE_KEY, fallbackNowIso());
     cursorDirty = true;
   }
   if (opts.maxIdleMs !== undefined && Number.isFinite(opts.maxIdleMs) && opts.maxIdleMs >= 0) {
@@ -830,7 +850,9 @@ export async function wakeOnce(opts: {
         ? savedMaxIdleMs
         : DEFAULT_MAX_IDLE_MS;
   const initTs = cursor.get(CURSOR_INIT_KEY)!;
-  const initTsNorm = normalizeTimestampForCursor(initTs, "after") || initTs;
+  const initTsNorm =
+    canonicalRestCursorTimestamp(initTs, "after") ??
+    normalizeTimestampForCursor(new Date().toISOString(), "after")!;
 
   const seenSet = new Set<string>(loadSeenIds(seenIdsFile));
   const headers = {
@@ -858,7 +880,8 @@ export async function wakeOnce(opts: {
     if (DIRECT_CHANNEL_RE.test(channelId)) return "";
     const mentionMap = loadJsonMap(mentionTsFile);
     const mentionKey = `${agentId}:${channelId}`;
-    const lastTs = mentionMap[mentionKey] || mentionMap[channelId] || "";
+    const rawLastTs = mentionMap[mentionKey] || mentionMap[channelId] || "";
+    const lastTs = canonicalRestCursorTimestamp(rawLastTs, "after") ? rawLastTs : "";
     const params = `limit=50${lastTs ? "&after=" + encodeURIComponent(lastTs) : ""}`;
     let prefix = "";
     try {
@@ -888,32 +911,48 @@ export async function wakeOnce(opts: {
         await res.body?.cancel().catch(() => {});
       }
     } catch {}
-    if (triggerTs) {
-      mentionMap[mentionKey] = triggerTs;
-      mentionMap[channelId] = triggerTs;
-      saveJsonMap(mentionTsFile, mentionMap);
+    const triggerNorm = canonicalRestCursorTimestamp(triggerTs, "after");
+    if (triggerNorm) {
+      const prevNorm = canonicalRestCursorTimestamp(rawLastTs, "after");
+      if (!prevNorm || triggerNorm > prevNorm) {
+        mentionMap[mentionKey] = triggerTs;
+        mentionMap[channelId] = triggerTs;
+        saveJsonMap(mentionTsFile, mentionMap);
+      }
     }
     return prefix;
   }
 
   async function finalizeWake(channelId: string, batch: any[]): Promise<WakeOnceEvent> {
     const lastMsg = batch[batch.length - 1]!;
+    let maxValidBatchTs = "";
+    let maxValidBatchNorm = "";
     for (const m of batch) {
       if (typeof m.id === "string") seenSet.add(m.id);
+      const mNorm = canonicalRestCursorTimestamp(m.timestamp, "after");
+      if (mNorm && mNorm > maxValidBatchNorm) {
+        maxValidBatchNorm = mNorm;
+        maxValidBatchTs = String(m.timestamp);
+      }
     }
     saveSeenIds(seenIdsFile, seenSet);
 
-    if (typeof lastMsg.timestamp === "string" && lastMsg.timestamp) {
-      cursor.set(channelId, lastMsg.timestamp);
-      cursor.set(CURSOR_LAST_ACTIVE_KEY, nowIso());
+    cursor.set(CURSOR_LAST_ACTIVE_KEY, fallbackNowIso());
+    if (maxValidBatchNorm) {
+      const prevNorm = canonicalRestCursorTimestamp(cursor.get(channelId), "after");
+      if (!prevNorm || maxValidBatchNorm > prevNorm) {
+        cursor.set(channelId, maxValidBatchTs);
+      }
       persistCursor(lastSeenFile, cursor, warn);
       advanceChannelReadCursor({
         configDir,
         agentId,
         channelId,
-        timestamp: lastMsg.timestamp,
+        timestamp: maxValidBatchTs,
         warn,
       });
+    } else {
+      persistCursor(lastSeenFile, cursor, warn);
     }
 
     const contextPrefix = await buildGroupContextPrefix(
@@ -969,14 +1008,15 @@ export async function wakeOnce(opts: {
       ? rawMessages.filter((m) => m && typeof m === "object" && m.content !== "__typing__")
       : [];
     list.sort((a, b) => {
-      const ta = normalizeTimestampForCursor(a.timestamp, "after") || String(a.timestamp || "");
-      const tb = normalizeTimestampForCursor(b.timestamp, "after") || String(b.timestamp || "");
+      const ta = canonicalRestCursorTimestamp(a.timestamp, "after") ?? "";
+      const tb = canonicalRestCursorTimestamp(b.timestamp, "after") ?? "";
       return ta.localeCompare(tb);
     });
 
     const existingAfter = cursor.get(channelId);
-    if (!existingAfter) {
-      // First time seeing this channel:
+    const afterNorm = canonicalRestCursorTimestamp(existingAfter, "after");
+    if (!afterNorm) {
+      // First time seeing this channel (or self-healing a corrupted cursor on disk):
       // Any message strictly older than `__init_ts__` is pre-existing history and only seeds the cursor.
       // Any addressed message at/after `__init_ts__` (e.g. first DM after claiming!) is live and must fire.
       const liveBatch: any[] = [];
@@ -986,7 +1026,7 @@ export async function wakeOnce(opts: {
         const msgId = String(m.id || "");
         if (msgId && seenSet.has(msgId)) continue;
         const msgTs = String(m.timestamp || "");
-        const msgTsNorm = normalizeTimestampForCursor(msgTs, "after") || msgTs;
+        const msgTsNorm = canonicalRestCursorTimestamp(msgTs, "after");
         if (msgTsNorm && msgTsNorm < initTsNorm) {
           if (msgId) seenSet.add(msgId);
           if (msgTsNorm > newestPreExistingNorm) {
@@ -1012,21 +1052,22 @@ export async function wakeOnce(opts: {
       return null;
     }
 
-    const afterNorm = normalizeTimestampForCursor(existingAfter, "after") || existingAfter;
     const addressedBatch: any[] = [];
     let latestUnaddressedTs = "";
+    let latestUnaddressedNorm = "";
 
     for (const m of list) {
       const msgId = String(m.id || "");
       if (msgId && seenSet.has(msgId)) continue;
       const msgTs = String(m.timestamp || "");
-      const msgTsNorm = normalizeTimestampForCursor(msgTs, "after") || msgTs;
+      const msgTsNorm = canonicalRestCursorTimestamp(msgTs, "after");
       if (msgTsNorm && msgTsNorm <= afterNorm) continue;
 
       if (isMessageAddressedToAgent({ ...m, channel_id: channelId }, agentId, displayName)) {
         addressedBatch.push({ ...m, channel_id: channelId });
-      } else if ( addressedBatch.length === 0 && msgTs ) {
+      } else if (addressedBatch.length === 0 && msgTsNorm && msgTsNorm > latestUnaddressedNorm) {
         latestUnaddressedTs = msgTs;
+        latestUnaddressedNorm = msgTsNorm;
       }
     }
 
@@ -1211,12 +1252,12 @@ export async function wakeOnce(opts: {
             continue;
           }
           const existingAfter = cursor.get(ch.id);
-          if (existingAfter && ch.last_message_at && initialSyncedChannels.has(ch.id)) {
-            const lastAtNorm = normalizeTimestampForCursor(ch.last_message_at, "after") || ch.last_message_at;
-            const afterNorm = normalizeTimestampForCursor(existingAfter, "after") || existingAfter;
-            if (lastAtNorm <= afterNorm) continue;
+          const existingAfterNorm = canonicalRestCursorTimestamp(existingAfter, "after");
+          if (existingAfterNorm && ch.last_message_at && initialSyncedChannels.has(ch.id)) {
+            const lastAtNorm = canonicalRestCursorTimestamp(ch.last_message_at, "after");
+            if (lastAtNorm && lastAtNorm <= existingAfterNorm) continue;
           }
-          const qs = existingAfter
+          const qs = existingAfterNorm && existingAfter
             ? `?after=${encodeURIComponent(existingAfter)}&limit=50`
             : `?limit=20`;
           const msgRes = await fetchWithDeadline(

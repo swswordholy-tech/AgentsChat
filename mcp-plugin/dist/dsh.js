@@ -1407,6 +1407,10 @@ function resolveSessionForAgent(agentId, opts = {}) {
 import { existsSync as existsSync2, lstatSync as lstatSync5, readFileSync as readFileSync5, readlinkSync as readlinkSync3 } from "node:fs";
 import { homedir as homedir3 } from "node:os";
 import { dirname as dirname4, isAbsolute as isAbsolute4, join as join4, parse as parse3, resolve as resolve3, win32 as pathWin32 } from "node:path";
+var PROTOTYPE_WAKE_KEYS = new Set([
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase())
+]);
 var GROK_GATEWAY_PATH_CANDIDATES = [
   join4(process.env.HOME || process.env.USERPROFILE || homedir3(), ".grok", "gateway.json"),
   "/home/box/sand-data/gateway.json"

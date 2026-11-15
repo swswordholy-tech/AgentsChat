@@ -2626,6 +2626,10 @@ var MAX_WAKE_TIMER_MS = 2147483647;
 var GROK_GATEWAY_MAX_BYTES = 1048576;
 var DIRECT_CHANNEL_RE = /^dm[-:]/i;
 var SAFE_ZCODE_SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+var PROTOTYPE_WAKE_KEYS = new Set([
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase())
+]);
 function isAllowedDarwinSystemLink2(dirPath) {
   if (process.platform !== "darwin")
     return false;
@@ -2699,7 +2703,7 @@ function hasSafeWakeDirChain(dirPath) {
 }
 function isUnsafeMetadataOrLinkLocalHost2(hostname) {
   const lower = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
-  if (!lower || lower === "0.0.0.0" || lower === "::" || lower === "100.100.100.200" || lower === "fd00:ec2::254" || lower === "metadata.google.internal" || lower.endsWith(".metadata.google.internal") || lower === "metadata" || lower === "metadata.goog" || lower.endsWith(".metadata.goog") || lower === "instance-data") {
+  if (!lower || lower === "0" || lower === "0.0.0.0" || /^0\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(lower) || lower === "::" || lower === "100.100.100.200" || lower === "fd00:ec2::254" || lower === "metadata.google.internal" || lower.endsWith(".metadata.google.internal") || lower === "metadata" || lower === "metadata.goog" || lower.endsWith(".metadata.goog") || lower === "instance-data") {
     return true;
   }
   if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(lower))
@@ -2708,15 +2712,15 @@ function isUnsafeMetadataOrLinkLocalHost2(hostname) {
     return true;
   if (lower.startsWith("::ffff:")) {
     const tail = lower.slice("::ffff:".length);
-    const tailParts = tail.startsWith("0:") ? tail.slice(2) : tail;
-    if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(tailParts) || tailParts === "100.100.100.200" || tailParts === "0.0.0.0") {
+    const tailParts = /^0:(?:[0-9a-f]{1,4}:|\d{1,3}\.)/.test(tail) ? tail.slice(2) : tail;
+    if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(tailParts) || /^0\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(tailParts) || tailParts === "100.100.100.200" || tailParts === "0.0.0.0") {
       return true;
     }
     const hexMatch = tailParts.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
     if (hexMatch) {
       const hi = parseInt(hexMatch[1], 16);
       const lo = parseInt(hexMatch[2], 16);
-      if ((hi >> 8 & 255) === 169 && (hi & 255) === 254 || hi === 25700 && lo === 25800 || hi === 0 && lo === 0) {
+      if ((hi >> 8 & 255) === 169 && (hi & 255) === 254 || hi === 25700 && lo === 25800 || (hi >> 8 & 255) === 0) {
         return true;
       }
     }
@@ -2782,13 +2786,17 @@ function formatWakeAttachments(attachments) {
     const safeUrl = sanitizeWakeAttachmentUrl(a.url);
     if (!safeUrl)
       continue;
-    const t = typeof a.type === "string" ? a.type.replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 32) : "file";
-    const dim = typeof a.width === "number" && typeof a.height === "number" ? ` ${a.width}×${a.height}` : "";
-    const dur = typeof a.duration_ms === "number" && Number.isFinite(a.duration_ms) ? ` ${(a.duration_ms / 1000).toFixed(1)}s` : "";
+    const cleanedType = typeof a.type === "string" ? a.type.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g, "").trim().slice(0, 32) : "";
+    const t = cleanedType || "file";
+    const dim = typeof a.width === "number" && Number.isFinite(a.width) && a.width >= 0 && typeof a.height === "number" && Number.isFinite(a.height) && a.height >= 0 ? ` ${a.width}×${a.height}` : "";
+    const dur = typeof a.duration_ms === "number" && Number.isFinite(a.duration_ms) && a.duration_ms >= 0 ? ` ${(a.duration_ms / 1000).toFixed(1)}s` : "";
     const icon = t === "image" ? "\uD83D\uDDBC" : t === "video" ? "\uD83C\uDFAC" : t === "audio" ? "\uD83D\uDD0A" : "\uD83D\uDCCE";
     let desc = `${icon} ${t}${dim}${dur}: ${safeUrl}`;
-    if (typeof a.transcript === "string" && a.transcript.trim()) {
-      desc += ` (transcript: "${redactSecrets2(a.transcript.trim().slice(0, 300))}")`;
+    if (typeof a.transcript === "string") {
+      const safeTranscript = a.transcript.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029"]+/g, " ").trim().slice(0, 300);
+      if (safeTranscript) {
+        desc += ` (transcript: "${redactSecrets2(safeTranscript)}")`;
+      }
     }
     lines.push(desc);
   }
@@ -2889,8 +2897,9 @@ async function fireWake(msg, cfg) {
     payload.timestamp = new Date().toISOString();
   const body = JSON.stringify(payload);
   const headers = { "Content-Type": "application/json" };
-  if (cfg.secret)
+  if (typeof cfg.secret === "string" && cfg.secret.length > 0 && cfg.secret.length <= 8192 && !/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(cfg.secret)) {
     headers[WAKE_SIG_HEADER] = signWakeBody(body, cfg.secret);
+  }
   const timeoutMs = clampWakeTimerMs(cfg.timeoutMs, 5000);
   const doPost = async () => {
     const f = cfg.fetchImpl ?? fetch;
@@ -2935,10 +2944,11 @@ function buildGrokPrompt(msg, agentId, contextPrefix = "") {
   return { agentId, prompt };
 }
 function grokBearerFromGatewayConfig(cfg) {
-  if (!cfg || typeof cfg !== "object" || Object.prototype.hasOwnProperty.call(cfg, "__proto__"))
+  if (!cfg || typeof cfg !== "object" || Array.isArray(cfg) || Object.prototype.hasOwnProperty.call(cfg, "__proto__")) {
     return null;
-  const candidate = typeof cfg.token === "string" && cfg.token ? cfg.token.trim() : cfg.auth && typeof cfg.auth === "object" && !Object.prototype.hasOwnProperty.call(cfg.auth, "__proto__") && typeof cfg.auth.bearer === "string" && cfg.auth.bearer ? cfg.auth.bearer.trim() : "";
-  if (!candidate || candidate.length > 4096 || /[\x00-\x1f\x7f]/.test(candidate))
+  }
+  const candidate = typeof cfg.token === "string" && cfg.token ? cfg.token.trim() : cfg.auth && typeof cfg.auth === "object" && !Array.isArray(cfg.auth) && !Object.prototype.hasOwnProperty.call(cfg.auth, "__proto__") && typeof cfg.auth.bearer === "string" && cfg.auth.bearer ? cfg.auth.bearer.trim() : "";
+  if (!candidate || candidate.length > 4096 || /[\x00-\x20\x7f-\x9f\u2028\u2029]/.test(candidate))
     return null;
   return candidate;
 }
@@ -3230,7 +3240,7 @@ function fireZcodeWake(msg, cfg) {
           rawArgs.push("--cwd", wsPath);
         }
       }
-      const safeProfileName = typeof cfg.profileName === "string" && cfg.profileName.trim().length > 0 && cfg.profileName.trim().length <= 128 && !/[\x00-\x1f\x7f-\x9f\u2028\u2029/\\]/.test(cfg.profileName.trim()) && !["__proto__", "constructor", "prototype"].includes(cfg.profileName.trim().toLowerCase()) ? cfg.profileName.trim() : undefined;
+      const safeProfileName = typeof cfg.profileName === "string" && cfg.profileName.trim().length > 0 && cfg.profileName.trim().length <= 128 && !cfg.profileName.includes("..") && !/[\x00-\x1f\x7f-\x9f\u2028\u2029/\\]/.test(cfg.profileName.trim()) && !PROTOTYPE_WAKE_KEYS.has(cfg.profileName.trim().toLowerCase()) ? cfg.profileName.trim() : undefined;
       const env = {
         ...process.env,
         AGENTSCHAT_TOOL_ONLY: "1",
@@ -6198,9 +6208,13 @@ function normalizeTimestampForCursor2(ts, mode) {
 import { homedir as homedir5 } from "node:os";
 import { dirname as dirname8, isAbsolute as isAbsolute8, join as join11, parse as parse8, resolve as resolve10, win32 as pathWin322 } from "node:path";
 var DIRECT_CHANNEL_RE2 = /^dm[-:]/i;
+var PROTOTYPE_WAKE_KEYS2 = new Set([
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase())
+]);
 function isUnsafeMetadataOrLinkLocalHost3(hostname) {
   const lower = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
-  if (!lower || lower === "0.0.0.0" || lower === "::" || lower === "100.100.100.200" || lower === "fd00:ec2::254" || lower === "metadata.google.internal" || lower.endsWith(".metadata.google.internal") || lower === "metadata" || lower === "metadata.goog" || lower.endsWith(".metadata.goog") || lower === "instance-data") {
+  if (!lower || lower === "0" || lower === "0.0.0.0" || /^0\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(lower) || lower === "::" || lower === "100.100.100.200" || lower === "fd00:ec2::254" || lower === "metadata.google.internal" || lower.endsWith(".metadata.google.internal") || lower === "metadata" || lower === "metadata.goog" || lower.endsWith(".metadata.goog") || lower === "instance-data") {
     return true;
   }
   if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(lower))
@@ -6209,15 +6223,15 @@ function isUnsafeMetadataOrLinkLocalHost3(hostname) {
     return true;
   if (lower.startsWith("::ffff:")) {
     const tail = lower.slice("::ffff:".length);
-    const tailParts = tail.startsWith("0:") ? tail.slice(2) : tail;
-    if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(tailParts) || tailParts === "100.100.100.200" || tailParts === "0.0.0.0") {
+    const tailParts = /^0:(?:[0-9a-f]{1,4}:|\d{1,3}\.)/.test(tail) ? tail.slice(2) : tail;
+    if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(tailParts) || /^0\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(tailParts) || tailParts === "100.100.100.200" || tailParts === "0.0.0.0") {
       return true;
     }
     const hexMatch = tailParts.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
     if (hexMatch) {
       const hi = parseInt(hexMatch[1], 16);
       const lo = parseInt(hexMatch[2], 16);
-      if ((hi >> 8 & 255) === 169 && (hi & 255) === 254 || hi === 25700 && lo === 25800 || hi === 0 && lo === 0) {
+      if ((hi >> 8 & 255) === 169 && (hi & 255) === 254 || hi === 25700 && lo === 25800 || (hi >> 8 & 255) === 0) {
         return true;
       }
     }
@@ -6262,13 +6276,17 @@ function formatWakeAttachments2(attachments) {
     const safeUrl = sanitizeWakeAttachmentUrl2(a.url);
     if (!safeUrl)
       continue;
-    const t = typeof a.type === "string" ? a.type.replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 32) : "file";
-    const dim = typeof a.width === "number" && typeof a.height === "number" ? ` ${a.width}×${a.height}` : "";
-    const dur = typeof a.duration_ms === "number" && Number.isFinite(a.duration_ms) ? ` ${(a.duration_ms / 1000).toFixed(1)}s` : "";
+    const cleanedType = typeof a.type === "string" ? a.type.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g, "").trim().slice(0, 32) : "";
+    const t = cleanedType || "file";
+    const dim = typeof a.width === "number" && Number.isFinite(a.width) && a.width >= 0 && typeof a.height === "number" && Number.isFinite(a.height) && a.height >= 0 ? ` ${a.width}×${a.height}` : "";
+    const dur = typeof a.duration_ms === "number" && Number.isFinite(a.duration_ms) && a.duration_ms >= 0 ? ` ${(a.duration_ms / 1000).toFixed(1)}s` : "";
     const icon = t === "image" ? "\uD83D\uDDBC" : t === "video" ? "\uD83C\uDFAC" : t === "audio" ? "\uD83D\uDD0A" : "\uD83D\uDCCE";
     let desc = `${icon} ${t}${dim}${dur}: ${safeUrl}`;
-    if (typeof a.transcript === "string" && a.transcript.trim()) {
-      desc += ` (transcript: "${redactSecrets2(a.transcript.trim().slice(0, 300))}")`;
+    if (typeof a.transcript === "string") {
+      const safeTranscript = a.transcript.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029"]+/g, " ").trim().slice(0, 300);
+      if (safeTranscript) {
+        desc += ` (transcript: "${redactSecrets2(safeTranscript)}")`;
+      }
     }
     lines.push(desc);
   }
@@ -6355,16 +6373,26 @@ var MAX_STATE_FILE_BYTES = 1048576;
 var MAX_HTTP_JSON_BYTES = 4 * 1024 * 1024;
 var MAX_PID_FILE_BYTES = 64 * 1024;
 var DIRECT_CHANNEL_RE3 = /^dm[-:]/i;
-var PROTOTYPE_KEYS2 = new Set(["__proto__", "constructor", "prototype"]);
+var CANONICAL_CURSOR_TS_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{9}Z$/;
+var PROTOTYPE_KEYS2 = new Set([
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase())
+]);
 var CLI_CHANNEL_CREDENTIAL_PREFIX_RE = /^(?:ac_|mcp_(?:at|rt|code)_|agent_key_|whsec_|mr_|sk-|sk_|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|AIza|AKIA|ASIA)/i;
 var CLI_ENCODED_TRAVERSAL_RE = /(?:%2f|%5c|%00|%2e%2e)/i;
+function canonicalRestCursorTimestamp(raw, mode = "after") {
+  if (typeof raw !== "string" || !raw)
+    return;
+  const norm = normalizeTimestampForCursor2(raw, mode);
+  return norm && CANONICAL_CURSOR_TS_RE.test(norm) ? norm : undefined;
+}
 function isLoopbackHost2(hostname) {
   const h = hostname.toLowerCase();
   return h === "127.0.0.1" || h === "localhost" || h === "[::1]" || h === "::1";
 }
 function isUnsafeMetadataOrLinkLocalHost4(hostname) {
   const lower = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
-  if (!lower || lower === "0.0.0.0" || lower === "::" || lower === "100.100.100.200" || lower === "fd00:ec2::254" || lower === "metadata.google.internal" || lower.endsWith(".metadata.google.internal") || lower === "metadata" || lower === "metadata.goog" || lower.endsWith(".metadata.goog") || lower === "instance-data") {
+  if (!lower || lower === "0" || lower === "0.0.0.0" || /^0\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(lower) || lower === "::" || lower === "100.100.100.200" || lower === "fd00:ec2::254" || lower === "metadata.google.internal" || lower.endsWith(".metadata.google.internal") || lower === "metadata" || lower === "metadata.goog" || lower.endsWith(".metadata.goog") || lower === "instance-data") {
     return true;
   }
   if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(lower))
@@ -6373,15 +6401,15 @@ function isUnsafeMetadataOrLinkLocalHost4(hostname) {
     return true;
   if (lower.startsWith("::ffff:")) {
     const tail = lower.slice("::ffff:".length);
-    const tailParts = tail.startsWith("0:") ? tail.slice(2) : tail;
-    if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(tailParts) || tailParts === "100.100.100.200" || tailParts === "0.0.0.0") {
+    const tailParts = /^0:(?:[0-9a-f]{1,4}:|\d{1,3}\.)/.test(tail) ? tail.slice(2) : tail;
+    if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(tailParts) || /^0\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(tailParts) || tailParts === "100.100.100.200" || tailParts === "0.0.0.0") {
       return true;
     }
     const hexMatch = tailParts.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
     if (hexMatch) {
       const hi = parseInt(hexMatch[1], 16);
       const lo = parseInt(hexMatch[2], 16);
-      if ((hi >> 8 & 255) === 169 && (hi & 255) === 254 || hi === 25700 && lo === 25800 || hi === 0 && lo === 0) {
+      if ((hi >> 8 & 255) === 169 && (hi & 255) === 254 || hi === 25700 && lo === 25800 || (hi >> 8 & 255) === 0) {
         return true;
       }
     }
@@ -6724,20 +6752,20 @@ function saveJsonMap(file, data) {
 }
 function advanceChannelReadCursor(opts) {
   const { configDir, agentId, channelId, timestamp } = opts;
-  if (!agentId || !isSafeCliChannelId(channelId) || !timestamp)
+  const nextNorm = canonicalRestCursorTimestamp(timestamp, "after");
+  if (!agentId || !isSafeCliChannelId(channelId) || !nextNorm)
     return;
   const warn = opts.warn ?? ((m) => process.stderr.write(m));
   ensureRealDirectory(configDir);
   const lastSeenFile = cursorFileForAgent2(configDir, agentId);
   const cursor = loadCursor2(lastSeenFile, warn);
   const prev = cursor.get(channelId) || "";
-  const nextNorm = normalizeTimestampForCursor2(timestamp, "after") || timestamp;
-  const prevNorm = normalizeTimestampForCursor2(prev, "after") || prev;
+  const prevNorm = canonicalRestCursorTimestamp(prev, "after");
   cursor.set(CURSOR_LAST_ACTIVE_KEY, timestamp);
   if (opts.maxIdleMs !== undefined && Number.isFinite(opts.maxIdleMs) && opts.maxIdleMs >= 0) {
     cursor.set(CURSOR_MAX_IDLE_KEY, String(Math.round(opts.maxIdleMs)));
   }
-  if (!prev || nextNorm > prevNorm) {
+  if (!prevNorm || nextNorm > prevNorm) {
     cursor.set(channelId, timestamp);
   }
   persistCursor2(lastSeenFile, cursor, warn);
@@ -6745,8 +6773,8 @@ function advanceChannelReadCursor(opts) {
   const readCursors = loadJsonMap(readCursorsFile);
   const scopedKey = `${agentId}:${channelId}`;
   const prevRead = readCursors[scopedKey] || readCursors[channelId] || "";
-  const prevReadNorm = normalizeTimestampForCursor2(prevRead, "after") || prevRead;
-  if (!prevRead || nextNorm > prevReadNorm) {
+  const prevReadNorm = canonicalRestCursorTimestamp(prevRead, "after");
+  if (!prevReadNorm || nextNorm > prevReadNorm) {
     readCursors[scopedKey] = timestamp;
     readCursors[channelId] = timestamp;
     saveJsonMap(readCursorsFile, readCursors);
@@ -6829,7 +6857,7 @@ async function sendRestMessage(opts) {
     }, opts.timeoutMs ?? DEFAULT_HTTP_TIMEOUT_MS);
     const data = await readBoundedResponseJson(res).catch(() => ({}));
     if (res.ok) {
-      const serverTs = typeof data.timestamp === "string" && data.timestamp.trim() ? data.timestamp.trim() : undefined;
+      const serverTs = typeof data.timestamp === "string" && canonicalRestCursorTimestamp(data.timestamp.trim(), "after") ? data.timestamp.trim() : undefined;
       const cursorTs = serverTs ?? new Date().toISOString();
       advanceChannelReadCursor({
         configDir: opts.configDir,
@@ -6914,13 +6942,17 @@ async function wakeOnce(opts) {
     wrotePidFile = acquireWakePidFile(wakePidFile);
   }
   const cursor = loadCursor2(lastSeenFile, warn);
+  const fallbackNowIso = () => {
+    const candidate = nowIso();
+    return canonicalRestCursorTimestamp(candidate, "after") ? candidate : new Date().toISOString();
+  };
   let cursorDirty = false;
-  if (!cursor.get(CURSOR_INIT_KEY)) {
-    cursor.set(CURSOR_INIT_KEY, nowIso());
+  if (!canonicalRestCursorTimestamp(cursor.get(CURSOR_INIT_KEY), "after")) {
+    cursor.set(CURSOR_INIT_KEY, fallbackNowIso());
     cursorDirty = true;
   }
-  if (!cursor.get(CURSOR_LAST_ACTIVE_KEY)) {
-    cursor.set(CURSOR_LAST_ACTIVE_KEY, nowIso());
+  if (!canonicalRestCursorTimestamp(cursor.get(CURSOR_LAST_ACTIVE_KEY), "after")) {
+    cursor.set(CURSOR_LAST_ACTIVE_KEY, fallbackNowIso());
     cursorDirty = true;
   }
   if (opts.maxIdleMs !== undefined && Number.isFinite(opts.maxIdleMs) && opts.maxIdleMs >= 0) {
@@ -6937,7 +6969,7 @@ async function wakeOnce(opts) {
   const savedMaxIdleMs = savedMaxIdleRaw !== undefined ? Number(savedMaxIdleRaw) : undefined;
   const maxIdleMs = opts.maxIdleMs !== undefined ? opts.maxIdleMs : savedMaxIdleMs !== undefined && Number.isFinite(savedMaxIdleMs) && savedMaxIdleMs >= 0 ? savedMaxIdleMs : DEFAULT_MAX_IDLE_MS;
   const initTs = cursor.get(CURSOR_INIT_KEY);
-  const initTsNorm = normalizeTimestampForCursor2(initTs, "after") || initTs;
+  const initTsNorm = canonicalRestCursorTimestamp(initTs, "after") ?? normalizeTimestampForCursor2(new Date().toISOString(), "after");
   const seenSet = new Set(loadSeenIds(seenIdsFile));
   const headers = {
     Authorization: `Bearer ${token}`,
@@ -6962,7 +6994,8 @@ async function wakeOnce(opts) {
       return "";
     const mentionMap = loadJsonMap(mentionTsFile);
     const mentionKey = `${agentId}:${channelId}`;
-    const lastTs = mentionMap[mentionKey] || mentionMap[channelId] || "";
+    const rawLastTs = mentionMap[mentionKey] || mentionMap[channelId] || "";
+    const lastTs = canonicalRestCursorTimestamp(rawLastTs, "after") ? rawLastTs : "";
     const params = `limit=50${lastTs ? "&after=" + encodeURIComponent(lastTs) : ""}`;
     let prefix = "";
     try {
@@ -6984,31 +7017,47 @@ ${context}
         await res.body?.cancel().catch(() => {});
       }
     } catch {}
-    if (triggerTs) {
-      mentionMap[mentionKey] = triggerTs;
-      mentionMap[channelId] = triggerTs;
-      saveJsonMap(mentionTsFile, mentionMap);
+    const triggerNorm = canonicalRestCursorTimestamp(triggerTs, "after");
+    if (triggerNorm) {
+      const prevNorm = canonicalRestCursorTimestamp(rawLastTs, "after");
+      if (!prevNorm || triggerNorm > prevNorm) {
+        mentionMap[mentionKey] = triggerTs;
+        mentionMap[channelId] = triggerTs;
+        saveJsonMap(mentionTsFile, mentionMap);
+      }
     }
     return prefix;
   }
   async function finalizeWake(channelId, batch) {
     const lastMsg = batch[batch.length - 1];
+    let maxValidBatchTs = "";
+    let maxValidBatchNorm = "";
     for (const m of batch) {
       if (typeof m.id === "string")
         seenSet.add(m.id);
+      const mNorm = canonicalRestCursorTimestamp(m.timestamp, "after");
+      if (mNorm && mNorm > maxValidBatchNorm) {
+        maxValidBatchNorm = mNorm;
+        maxValidBatchTs = String(m.timestamp);
+      }
     }
     saveSeenIds(seenIdsFile, seenSet);
-    if (typeof lastMsg.timestamp === "string" && lastMsg.timestamp) {
-      cursor.set(channelId, lastMsg.timestamp);
-      cursor.set(CURSOR_LAST_ACTIVE_KEY, nowIso());
+    cursor.set(CURSOR_LAST_ACTIVE_KEY, fallbackNowIso());
+    if (maxValidBatchNorm) {
+      const prevNorm = canonicalRestCursorTimestamp(cursor.get(channelId), "after");
+      if (!prevNorm || maxValidBatchNorm > prevNorm) {
+        cursor.set(channelId, maxValidBatchTs);
+      }
       persistCursor2(lastSeenFile, cursor, warn);
       advanceChannelReadCursor({
         configDir,
         agentId,
         channelId,
-        timestamp: lastMsg.timestamp,
+        timestamp: maxValidBatchTs,
         warn
       });
+    } else {
+      persistCursor2(lastSeenFile, cursor, warn);
     }
     const contextPrefix = await buildGroupContextPrefix(channelId, String(lastMsg.id || ""), String(lastMsg.timestamp || ""));
     const allSameOwnerDirect = batch.every((m) => m?.same_owner_direct === true);
@@ -7045,12 +7094,13 @@ ${context}
   async function inspectChannelMessages(channelId, rawMessages) {
     const list = Array.isArray(rawMessages) ? rawMessages.filter((m) => m && typeof m === "object" && m.content !== "__typing__") : [];
     list.sort((a, b) => {
-      const ta = normalizeTimestampForCursor2(a.timestamp, "after") || String(a.timestamp || "");
-      const tb = normalizeTimestampForCursor2(b.timestamp, "after") || String(b.timestamp || "");
+      const ta = canonicalRestCursorTimestamp(a.timestamp, "after") ?? "";
+      const tb = canonicalRestCursorTimestamp(b.timestamp, "after") ?? "";
       return ta.localeCompare(tb);
     });
     const existingAfter = cursor.get(channelId);
-    if (!existingAfter) {
+    const afterNorm = canonicalRestCursorTimestamp(existingAfter, "after");
+    if (!afterNorm) {
       const liveBatch = [];
       let newestPreExisting = "";
       let newestPreExistingNorm = "";
@@ -7059,7 +7109,7 @@ ${context}
         if (msgId && seenSet.has(msgId))
           continue;
         const msgTs = String(m.timestamp || "");
-        const msgTsNorm = normalizeTimestampForCursor2(msgTs, "after") || msgTs;
+        const msgTsNorm = canonicalRestCursorTimestamp(msgTs, "after");
         if (msgTsNorm && msgTsNorm < initTsNorm) {
           if (msgId)
             seenSet.add(msgId);
@@ -7085,21 +7135,22 @@ ${context}
       saveSeenIds(seenIdsFile, seenSet);
       return null;
     }
-    const afterNorm = normalizeTimestampForCursor2(existingAfter, "after") || existingAfter;
     const addressedBatch = [];
     let latestUnaddressedTs = "";
+    let latestUnaddressedNorm = "";
     for (const m of list) {
       const msgId = String(m.id || "");
       if (msgId && seenSet.has(msgId))
         continue;
       const msgTs = String(m.timestamp || "");
-      const msgTsNorm = normalizeTimestampForCursor2(msgTs, "after") || msgTs;
+      const msgTsNorm = canonicalRestCursorTimestamp(msgTs, "after");
       if (msgTsNorm && msgTsNorm <= afterNorm)
         continue;
       if (isMessageAddressedToAgent({ ...m, channel_id: channelId }, agentId, displayName)) {
         addressedBatch.push({ ...m, channel_id: channelId });
-      } else if (addressedBatch.length === 0 && msgTs) {
+      } else if (addressedBatch.length === 0 && msgTsNorm && msgTsNorm > latestUnaddressedNorm) {
         latestUnaddressedTs = msgTs;
+        latestUnaddressedNorm = msgTsNorm;
       }
     }
     if (addressedBatch.length > 0) {
@@ -7273,13 +7324,13 @@ ${context}
             continue;
           }
           const existingAfter = cursor.get(ch.id);
-          if (existingAfter && ch.last_message_at && initialSyncedChannels.has(ch.id)) {
-            const lastAtNorm = normalizeTimestampForCursor2(ch.last_message_at, "after") || ch.last_message_at;
-            const afterNorm = normalizeTimestampForCursor2(existingAfter, "after") || existingAfter;
-            if (lastAtNorm <= afterNorm)
+          const existingAfterNorm = canonicalRestCursorTimestamp(existingAfter, "after");
+          if (existingAfterNorm && ch.last_message_at && initialSyncedChannels.has(ch.id)) {
+            const lastAtNorm = canonicalRestCursorTimestamp(ch.last_message_at, "after");
+            if (lastAtNorm && lastAtNorm <= existingAfterNorm)
               continue;
           }
-          const qs = existingAfter ? `?after=${encodeURIComponent(existingAfter)}&limit=50` : `?limit=20`;
+          const qs = existingAfterNorm && existingAfter ? `?after=${encodeURIComponent(existingAfter)}&limit=50` : `?limit=20`;
           const msgRes = await fetchWithDeadline(f, `${baseUrl}/api/channels/${encodeURIComponent(ch.id)}/messages${qs}`, { headers }, requestTimeoutMs, abortCtrl.signal);
           if (!msgRes.ok) {
             await msgRes.body?.cancel().catch(() => {});
