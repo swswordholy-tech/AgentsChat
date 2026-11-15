@@ -46,7 +46,15 @@ import { ingestAgentsChatFrame } from "./ingest.ts";
 import { HeartbeatMonitor, WS_CLOSED } from "../src/heartbeat.ts";
 import { resolveDrainReconnectDelay, withTimeoutController } from "../src/reconnect.ts";
 
-const log = (m: string) => process.stderr.write(`[agentschat-connector] ${redactSecrets(m)}\n`);
+const CONNECTOR_CTRL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+const CONNECTOR_LOG_STRIP_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g;
+const GATEWAY_PROTO_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+const CONNECTOR_PROTO_KEYS = new Set([
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase()),
+]);
+const log = (m: string) =>
+  process.stderr.write(`[agentschat-connector] ${redactSecrets(m).replace(CONNECTOR_LOG_STRIP_RE, " ")}\n`);
 
 function need(name: string): string {
   const v = process.env[name];
@@ -67,7 +75,8 @@ function isUnsafeConnectorHost(hostname: string): boolean {
   ) {
     return true;
   }
-  const unsafeV4 = (ip: string) => ip === "0.0.0.0" || ip.startsWith("169.254.") || ip === "100.100.100.200";
+  const unsafeV4 = (ip: string) =>
+    ip === "0.0.0.0" || ip.startsWith("0.") || ip.startsWith("169.254.") || ip === "100.100.100.200";
   if (!host.includes(":")) return unsafeV4(host);
   const halves = host.split("::");
   const left = halves[0] ? halves[0].split(":") : [];
@@ -130,6 +139,7 @@ export function readConnectorConfig(env: NodeJS.ProcessEnv = process.env) {
     ["AGENTCHAT_API_URL", API, ["http:", "https:"]],
     ["AGENTCHAT_WS_URL", WS_URL, ["ws:", "wss:"]],
   ] as const) {
+    if (CONNECTOR_CTRL_RE.test(raw)) throw new Error(`invalid ${name}`);
     let url: URL;
     try { url = new URL(raw); } catch { throw new Error(`invalid ${name}`); }
     const loopback = ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname);
@@ -195,7 +205,24 @@ export function parseIdentitiesJson(raw: string, source: string): Identity[] {
       if (it?.[k] !== undefined && (typeof it[k] !== "string" || !it[k].trim())) invalid.push(k);
     }
     for (const k of ["botId", "agentId", "token", "gatewayId", "secret", "profile"]) {
-      if (typeof it[k] === "string" && /[\x00-\x1f\x7f]/.test(it[k])) invalid.push(k);
+      if (typeof it[k] === "string" && CONNECTOR_CTRL_RE.test(it[k])) invalid.push(k);
+    }
+    if (typeof it.botId === "string" && !validIdentityId(it.botId)) invalid.push("botId");
+    if (it.agentId !== undefined && (typeof it.agentId !== "string" || !validIdentityId(it.agentId))) invalid.push("agentId");
+    if (typeof it.gatewayId === "string" && (it.gatewayId.length > 256 || GATEWAY_PROTO_KEYS.has(it.gatewayId.trim().toLowerCase()))) {
+      invalid.push("gatewayId");
+    }
+    if (
+      it.profile !== undefined &&
+      (typeof it.profile !== "string" ||
+        it.profile.trim().length > 128 ||
+        it.profile.trim() === "." ||
+        it.profile.includes("..") ||
+        /[/\\]/.test(it.profile.trim()) ||
+        /(?:%2f|%5c|%00|%2e%2e)/i.test(it.profile.trim()) ||
+        CONNECTOR_PROTO_KEYS.has(it.profile.trim().toLowerCase()))
+    ) {
+      invalid.push("profile");
     }
     if (invalid.length) throw new Error(`${source} entry ${index}: missing or invalid string fields: ${invalid.join(", ")}`);
     if (seen.has(it.botId)) throw new Error(`${source} entry ${index}: duplicate botId`);
@@ -365,7 +392,10 @@ function joinChannel(ws: WS, id: Identity, channelId: string, name?: string) {
   if (!validIdentityId(channelId)) return;
   try {
     ws.send(JSON.stringify({ type: "join_channel", channel_id: channelId, agent_id: id.agentId }));
-    log(`joined channel ${channelId}${name ? ` (${name})` : ""}`);
+    const safeName = typeof name === "string"
+      ? redactSecrets(name).replace(CONNECTOR_LOG_STRIP_RE, " ").trim().slice(0, 128)
+      : "";
+    log(`joined channel ${channelId}${safeName ? ` (${safeName})` : ""}`);
   } catch (e: any) {
     log(`join ${channelId} failed: ${e?.message ?? e}`);
   }

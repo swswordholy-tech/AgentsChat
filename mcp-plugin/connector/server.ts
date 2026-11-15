@@ -11,6 +11,7 @@
  * All connector frames are newline-terminated (relay wire contract v1).
  */
 
+import { createHash, timingSafeEqual } from "node:crypto";
 import { createServer, type Server as HttpServer, type IncomingMessage } from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
 import { verifyUpgradeToken, CLOSE_UNAUTHORIZED } from "./auth.ts";
@@ -19,6 +20,23 @@ import { toWireEvent, serverLoopTick, matchesLiveLoop, type AgentsChatMessage } 
 import { redactSecrets } from "../src/redact.ts";
 import { MessageDedup } from "../src/dedup.ts";
 import { IdentityTable, routeInboundTargets, hermesSourceProfile, type Identity } from "./identities.ts";
+
+const CONNECTOR_LOG_CTRL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g;
+
+function safeSecretEqual(a: unknown, b: unknown): boolean {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const da = createHash("sha256").update(a, "utf8").digest();
+  const db = createHash("sha256").update(b, "utf8").digest();
+  return timingSafeEqual(da, db) && a.length === b.length;
+}
+
+function sanitizeConnectorLogField(value: unknown, maxLen = 128): string {
+  const cleaned = redactSecrets(String(value ?? ""))
+    .replace(CONNECTOR_LOG_CTRL_RE, " ")
+    .trim()
+    .slice(0, maxLen);
+  return cleaned || "?";
+}
 
 /** What the connector needs from agentschat to fulfil outbound ops, per identity. */
 export interface AgentsChatHooks {
@@ -107,10 +125,11 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
     legacy ? { allowEmptyCredentials: true } : undefined,
   );
   function safeLabel(value: string) {
+    let scrubbed = redactSecrets(String(value ?? "")).replace(CONNECTOR_LOG_CTRL_RE, " ");
     for (const id of table.all()) for (const secret of [id.token, id.secret]) {
-      if (secret) value = value.split(secret).join("[redacted]");
+      if (secret) scrubbed = scrubbed.split(secret).join("[redacted]");
     }
-    return JSON.stringify(value.slice(0, 128));
+    return JSON.stringify(scrubbed.slice(0, 128));
   }
   // Normalize hooks to the per-identity shape. Legacy single-tenant hooks take
   // (chatId, ...); wrap them to ignore the botId. Per-identity hooks take botId first.
@@ -206,7 +225,7 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
       // registered identity (fail closed — never front an identity we can't send as).
       const identity = legacy ? table.all()[0] : table.forBot(botId);
       const reason = frame.platform !== "agentschat" ? "unsupported_platform" : !identity ? "unknown_identity"
-        : !legacy && (identity.gatewayId !== conn.gatewayId || identity.secret !== conn.secret) ? "credential_mismatch" : null;
+        : !legacy && (identity.gatewayId !== conn.gatewayId || !safeSecretEqual(identity.secret, conn.secret)) ? "credential_mismatch" : null;
       const labels = `gatewayId=${safeLabel(conn.gatewayId)} platform=${safeLabel(frame.platform === "agentschat" ? "agentschat" : "(unsupported)")} botId=${safeLabel(identity ? botId : "(unknown)")}`;
       if (reason) {
         log(`[connector] hello rejected ${labels} reason=${reason}`);
@@ -252,10 +271,10 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
       : typeof frame.botId === "string" && frame.botId ? frame.botId : null;
     if (legacy && requested && requested === conn.legacyAlias) requested = "default";
     let identity = requested && conn.fronted.has(requested) ? table.forBot(requested) : null;
-    if (identity && ((!legacy && (identity.gatewayId !== conn.gatewayId || identity.secret !== conn.secret)) ||
+    if (identity && ((!legacy && (identity.gatewayId !== conn.gatewayId || !safeSecretEqual(identity.secret, conn.secret))) ||
         (frame.platform !== undefined && frame.platform !== "agentschat"))) identity = null;
     if (!identity) {
-      const safeReq = redactSecrets(String(requested ?? "?")).replace(/[\x00-\x1f\x7f-\x9f]+/g, "").slice(0, 128);
+      const safeReq = sanitizeConnectorLogField(requested ?? "?", 128);
       log(`[connector] outbound failed: no usable identity for botId=${safeReq}`);
       return { success: false, error: `no usable identity for outbound (botId=${safeReq})` };
     }
@@ -285,7 +304,7 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
         return info ?? {};
       }
       default: {
-        const safeOp = redactSecrets(String(op)).replace(/[\x00-\x1f\x7f-\x9f]+/g, "").slice(0, 64);
+        const safeOp = sanitizeConnectorLogField(op, 64);
         log(`[connector] outbound failed: unsupported op ${safeOp}`);
         return { success: false, error: `unsupported op: ${safeOp}` };
       }
@@ -349,7 +368,11 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
             content: msg.content,
           });
       if (!targets.length) {
-        log(`[connector] inbound unaddressed (channel=${(msg as any).channel_id ?? "?"} mentions=${JSON.stringify((msg as any).mentioned_ids ?? [])}) — dropped`);
+        const safeChan = sanitizeConnectorLogField((msg as any).channel_id ?? "?", 128);
+        const rawMentions = Array.isArray((msg as any).mentioned_ids)
+          ? (msg as any).mentioned_ids.slice(0, 16).map((m: unknown) => sanitizeConnectorLogField(m, 64))
+          : [];
+        log(`[connector] inbound unaddressed (channel=${safeChan} mentions=${JSON.stringify(rawMentions)}) — dropped`);
         return;
       }
       await Promise.all(targets.map(target => {
@@ -450,7 +473,7 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
       for (const conn of sockets) {
         for (const botId of conn.fronted) {
           const id = table.forBot(botId);
-          if (!id || id.gatewayId !== conn.gatewayId || id.secret !== conn.secret) conn.fronted.delete(botId);
+          if (!id || id.gatewayId !== conn.gatewayId || !safeSecretEqual(id.secret, conn.secret)) conn.fronted.delete(botId);
         }
       }
       // Rebuild upgrade-auth secrets in place so the upgrade handler sees them.

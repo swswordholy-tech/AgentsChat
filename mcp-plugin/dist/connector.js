@@ -9,6 +9,7 @@ import { dirname as dirname2, isAbsolute as isAbsolute2, resolve as resolve2 } f
 import { fileURLToPath } from "node:url";
 
 // connector/server.ts
+import { createHash, timingSafeEqual as timingSafeEqual2 } from "node:crypto";
 import { createServer } from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
 
@@ -135,9 +136,15 @@ function toWireEvent(msg, platform = "agentschat") {
     }
   };
 }
+var LOOP_TICK_CTRL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+function hasOwnProto(value) {
+  return Boolean(value && typeof value === "object" && Object.prototype.hasOwnProperty.call(value, "__proto__"));
+}
 function serverLoopTick(msg) {
+  if (!msg || typeof msg !== "object" || hasOwnProto(msg))
+    return null;
   const meta = msg.meta;
-  if (!meta || meta.kind !== "loop_tick" || typeof msg.id !== "string" || !msg.id || typeof msg.channel_id !== "string" || !msg.channel_id || typeof msg.sender_id !== "string" || !msg.sender_id || msg.sender_type !== "agent" || msg.content_type !== "text" || typeof msg.timestamp !== "string" || !Number.isFinite(Date.parse(msg.timestamp)) || typeof meta.loop_id !== "string" || !/^loop_[a-zA-Z0-9_-]+$/.test(meta.loop_id) || typeof meta.prompt !== "string" || !meta.prompt.trim() || meta.prompt.length > 4000 || !Number.isSafeInteger(meta.interval_ms) || meta.interval_ms < 60000 || meta.interval_ms > 86400000 || !Number.isSafeInteger(meta.next_tick_ms) || meta.next_tick_ms <= meta.interval_ms || meta.expires_at !== null || msg.content !== `(loop tick — ${meta.prompt})`)
+  if (!meta || typeof meta !== "object" || Array.isArray(meta) || hasOwnProto(meta) || meta.kind !== "loop_tick" || typeof msg.id !== "string" || !msg.id || LOOP_TICK_CTRL_RE.test(msg.id) || typeof msg.channel_id !== "string" || !msg.channel_id || LOOP_TICK_CTRL_RE.test(msg.channel_id) || typeof msg.sender_id !== "string" || !msg.sender_id || LOOP_TICK_CTRL_RE.test(msg.sender_id) || msg.sender_type !== "agent" || msg.content_type !== "text" || typeof msg.timestamp !== "string" || !Number.isFinite(Date.parse(msg.timestamp)) || typeof meta.loop_id !== "string" || !/^loop_[a-zA-Z0-9_-]+$/.test(meta.loop_id) || typeof meta.prompt !== "string" || !meta.prompt.trim() || meta.prompt.length > 4000 || !Number.isSafeInteger(meta.interval_ms) || meta.interval_ms < 60000 || meta.interval_ms > 86400000 || !Number.isSafeInteger(meta.next_tick_ms) || meta.next_tick_ms <= meta.interval_ms || meta.expires_at !== null || msg.content !== `(loop tick — ${meta.prompt})`)
     return null;
   return meta;
 }
@@ -145,10 +152,12 @@ function matchesLiveLoop(msg, agentId, response) {
   const tick = serverLoopTick(msg);
   if (!tick || msg.sender_id !== agentId)
     return false;
+  if (!response || typeof response !== "object" || Array.isArray(response) || hasOwnProto(response))
+    return false;
   const rows = response?.loops;
   if (!Array.isArray(rows))
     return false;
-  const matches = rows.filter((row2) => row2?.loop_id === tick.loop_id);
+  const matches = rows.filter((row2) => row2 && typeof row2 === "object" && !Array.isArray(row2) && !hasOwnProto(row2) && row2.loop_id === tick.loop_id);
   if (matches.length !== 1)
     return false;
   const row = matches[0];
@@ -219,8 +228,22 @@ class MessageDedup {
 var PROTOTYPE_MENTION_IDS = new Set(["__proto__", "constructor", "prototype"]);
 
 // connector/identities.ts
+var GATEWAY_PROTO_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+var IDENTITY_PROTO_KEYS = new Set([
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase())
+]);
+var IDENTITY_CTRL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
 function validIdentityId(value) {
-  return typeof value === "string" && value.length > 0 && value.length <= 128 && value !== "." && value !== ".." && !value.includes("..") && !/(?:%2f|%5c|%00|%2e%2e)/i.test(value) && !/[/\\\s\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(value) && !["__proto__", "constructor", "prototype"].includes(value.toLowerCase());
+  return typeof value === "string" && value.length > 0 && value.length <= 128 && value !== "." && value !== ".." && !value.includes("..") && !/(?:%2f|%5c|%00|%2e%2e)/i.test(value) && !/[/\\\s\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(value) && !IDENTITY_PROTO_KEYS.has(value.toLowerCase());
+}
+function validOptionalProfile(profile) {
+  if (profile === undefined)
+    return true;
+  if (typeof profile !== "string" || IDENTITY_CTRL_RE.test(profile))
+    return false;
+  const trimmed = profile.trim();
+  return trimmed.length > 0 && trimmed.length <= 128 && trimmed !== "." && !trimmed.includes("..") && !/[/\\]/.test(trimmed) && !/(?:%2f|%5c|%00|%2e%2e)/i.test(trimmed) && !IDENTITY_PROTO_KEYS.has(trimmed.toLowerCase());
 }
 function validateIdentities(identities, allowEmptyCredentials = false) {
   const bots = new Set;
@@ -232,8 +255,16 @@ function validateIdentities(identities, allowEmptyCredentials = false) {
     if ([id.token, id.gatewayId, id.secret].some((value) => typeof value !== "string" || !value.trim() && !(allowEmptyCredentials && value === ""))) {
       throw new Error("missing identity credentials");
     }
-    if (!allowEmptyCredentials && (/[\x00-\x1f\x7f]/.test(id.gatewayId) || ["__proto__", "constructor", "prototype"].includes(id.gatewayId.toLowerCase()))) {
-      throw new Error("invalid identity gatewayId");
+    if (!allowEmptyCredentials) {
+      if (IDENTITY_CTRL_RE.test(id.gatewayId) || id.gatewayId.length > 256 || GATEWAY_PROTO_KEYS.has(id.gatewayId.trim().toLowerCase())) {
+        throw new Error("invalid identity gatewayId");
+      }
+      if (IDENTITY_CTRL_RE.test(id.token) || IDENTITY_CTRL_RE.test(id.secret)) {
+        throw new Error("invalid identity credentials");
+      }
+    }
+    if (!validOptionalProfile(id.profile)) {
+      throw new Error("invalid identity profile");
     }
     if (bots.has(id.botId.trim()) || agents.has(id.agentId.trim())) {
       throw new Error("duplicate identity botId or agentId — ambiguous routing");
@@ -301,14 +332,27 @@ function routeInboundTargets(table, ctx) {
 }
 function hermesSourceProfile(id, frontedCount) {
   const named = typeof id.profile === "string" ? id.profile.trim() : "";
-  if (named)
+  if (named && validOptionalProfile(id.profile))
     return named;
-  if (frontedCount > 1)
+  if (frontedCount > 1 && validIdentityId(id.botId))
     return id.botId;
   return;
 }
 
 // connector/server.ts
+var CONNECTOR_LOG_CTRL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g;
+function safeSecretEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string")
+    return false;
+  const da = createHash("sha256").update(a, "utf8").digest();
+  const db = createHash("sha256").update(b, "utf8").digest();
+  return timingSafeEqual2(da, db) && a.length === b.length;
+}
+function sanitizeConnectorLogField(value, maxLen = 128) {
+  const cleaned = redactSecrets(String(value ?? "")).replace(CONNECTOR_LOG_CTRL_RE, " ").trim().slice(0, maxLen);
+  return cleaned || "?";
+}
+
 class PlatformHttpError extends Error {
   status;
   constructor(status) {
@@ -328,12 +372,13 @@ function startConnector(config) {
   const legacy = !config.identities || config.identities.length === 0;
   const table = new IdentityTable(legacy ? [{ botId: "default", agentId: "default", token: "", gatewayId: "", secret: "" }] : config.identities, legacy ? { allowEmptyCredentials: true } : undefined);
   function safeLabel(value) {
+    let scrubbed = redactSecrets(String(value ?? "")).replace(CONNECTOR_LOG_CTRL_RE, " ");
     for (const id of table.all())
       for (const secret of [id.token, id.secret]) {
         if (secret)
-          value = value.split(secret).join("[redacted]");
+          scrubbed = scrubbed.split(secret).join("[redacted]");
       }
-    return JSON.stringify(value.slice(0, 128));
+    return JSON.stringify(scrubbed.slice(0, 128));
   }
   const hooks = legacy ? {
     sendMessage: (_b, chatId, content, replyTo) => config.agentschat.sendMessage(chatId, content, replyTo),
@@ -419,7 +464,7 @@ function startConnector(config) {
     if (t === "hello") {
       const botId = String(frame.botId ?? "");
       const identity = legacy ? table.all()[0] : table.forBot(botId);
-      const reason = frame.platform !== "agentschat" ? "unsupported_platform" : !identity ? "unknown_identity" : !legacy && (identity.gatewayId !== conn.gatewayId || identity.secret !== conn.secret) ? "credential_mismatch" : null;
+      const reason = frame.platform !== "agentschat" ? "unsupported_platform" : !identity ? "unknown_identity" : !legacy && (identity.gatewayId !== conn.gatewayId || !safeSecretEqual(identity.secret, conn.secret)) ? "credential_mismatch" : null;
       const labels = `gatewayId=${safeLabel(conn.gatewayId)} platform=${safeLabel(frame.platform === "agentschat" ? "agentschat" : "(unsupported)")} botId=${safeLabel(identity ? botId : "(unknown)")}`;
       if (reason) {
         log(`[connector] hello rejected ${labels} reason=${reason}`);
@@ -457,10 +502,10 @@ function startConnector(config) {
     if (legacy && requested && requested === conn.legacyAlias)
       requested = "default";
     let identity = requested && conn.fronted.has(requested) ? table.forBot(requested) : null;
-    if (identity && (!legacy && (identity.gatewayId !== conn.gatewayId || identity.secret !== conn.secret) || frame.platform !== undefined && frame.platform !== "agentschat"))
+    if (identity && (!legacy && (identity.gatewayId !== conn.gatewayId || !safeSecretEqual(identity.secret, conn.secret)) || frame.platform !== undefined && frame.platform !== "agentschat"))
       identity = null;
     if (!identity) {
-      const safeReq = redactSecrets(String(requested ?? "?")).replace(/[\x00-\x1f\x7f-\x9f]+/g, "").slice(0, 128);
+      const safeReq = sanitizeConnectorLogField(requested ?? "?", 128);
       log(`[connector] outbound failed: no usable identity for botId=${safeReq}`);
       return { success: false, error: `no usable identity for outbound (botId=${safeReq})` };
     }
@@ -483,7 +528,7 @@ function startConnector(config) {
         return info ?? {};
       }
       default: {
-        const safeOp = redactSecrets(String(op)).replace(/[\x00-\x1f\x7f-\x9f]+/g, "").slice(0, 64);
+        const safeOp = sanitizeConnectorLogField(op, 64);
         log(`[connector] outbound failed: unsupported op ${safeOp}`);
         return { success: false, error: `unsupported op: ${safeOp}` };
       }
@@ -531,7 +576,9 @@ function startConnector(config) {
         content: msg.content
       });
       if (!targets.length) {
-        log(`[connector] inbound unaddressed (channel=${msg.channel_id ?? "?"} mentions=${JSON.stringify(msg.mentioned_ids ?? [])}) — dropped`);
+        const safeChan = sanitizeConnectorLogField(msg.channel_id ?? "?", 128);
+        const rawMentions = Array.isArray(msg.mentioned_ids) ? msg.mentioned_ids.slice(0, 16).map((m) => sanitizeConnectorLogField(m, 64)) : [];
+        log(`[connector] inbound unaddressed (channel=${safeChan} mentions=${JSON.stringify(rawMentions)}) — dropped`);
         return;
       }
       await Promise.all(targets.map((target) => {
@@ -635,7 +682,7 @@ function startConnector(config) {
       for (const conn of sockets) {
         for (const botId of conn.fronted) {
           const id = table.forBot(botId);
-          if (!id || id.gatewayId !== conn.gatewayId || id.secret !== conn.secret)
+          if (!id || id.gatewayId !== conn.gatewayId || !safeSecretEqual(id.secret, conn.secret))
             conn.fronted.delete(botId);
         }
       }
@@ -1188,7 +1235,14 @@ function withTimeoutController(parentSignal, timeoutMs) {
 }
 
 // connector/run.ts
-var log = (m) => process.stderr.write(`[agentschat-connector] ${redactSecrets(m)}
+var CONNECTOR_CTRL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+var CONNECTOR_LOG_STRIP_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g;
+var GATEWAY_PROTO_KEYS2 = new Set(["__proto__", "constructor", "prototype"]);
+var CONNECTOR_PROTO_KEYS = new Set([
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase())
+]);
+var log = (m) => process.stderr.write(`[agentschat-connector] ${redactSecrets(m).replace(CONNECTOR_LOG_STRIP_RE, " ")}
 `);
 function need(name) {
   const v = process.env[name];
@@ -1203,7 +1257,7 @@ function isUnsafeConnectorHost(hostname) {
   if (["metadata", "instance-data", "metadata.google.internal", "metadata.goog"].includes(host) || host.endsWith(".metadata.google.internal") || host.endsWith(".metadata.goog")) {
     return true;
   }
-  const unsafeV4 = (ip) => ip === "0.0.0.0" || ip.startsWith("169.254.") || ip === "100.100.100.200";
+  const unsafeV4 = (ip) => ip === "0.0.0.0" || ip.startsWith("0.") || ip.startsWith("169.254.") || ip === "100.100.100.200";
   if (!host.includes(":"))
     return unsafeV4(host);
   const halves = host.split("::");
@@ -1266,6 +1320,8 @@ function readConnectorConfig(env = process.env) {
     ["AGENTCHAT_API_URL", API, ["http:", "https:"]],
     ["AGENTCHAT_WS_URL", WS_URL, ["ws:", "wss:"]]
   ]) {
+    if (CONNECTOR_CTRL_RE.test(raw))
+      throw new Error(`invalid ${name}`);
     let url;
     try {
       url = new URL(raw);
@@ -1331,8 +1387,18 @@ function parseIdentitiesJson(raw, source) {
         invalid.push(k);
     }
     for (const k of ["botId", "agentId", "token", "gatewayId", "secret", "profile"]) {
-      if (typeof it[k] === "string" && /[\x00-\x1f\x7f]/.test(it[k]))
+      if (typeof it[k] === "string" && CONNECTOR_CTRL_RE.test(it[k]))
         invalid.push(k);
+    }
+    if (typeof it.botId === "string" && !validIdentityId(it.botId))
+      invalid.push("botId");
+    if (it.agentId !== undefined && (typeof it.agentId !== "string" || !validIdentityId(it.agentId)))
+      invalid.push("agentId");
+    if (typeof it.gatewayId === "string" && (it.gatewayId.length > 256 || GATEWAY_PROTO_KEYS2.has(it.gatewayId.trim().toLowerCase()))) {
+      invalid.push("gatewayId");
+    }
+    if (it.profile !== undefined && (typeof it.profile !== "string" || it.profile.trim().length > 128 || it.profile.trim() === "." || it.profile.includes("..") || /[/\\]/.test(it.profile.trim()) || /(?:%2f|%5c|%00|%2e%2e)/i.test(it.profile.trim()) || CONNECTOR_PROTO_KEYS.has(it.profile.trim().toLowerCase()))) {
+      invalid.push("profile");
     }
     if (invalid.length)
       throw new Error(`${source} entry ${index}: missing or invalid string fields: ${invalid.join(", ")}`);
@@ -1487,7 +1553,8 @@ async function main() {
       return;
     try {
       ws.send(JSON.stringify({ type: "join_channel", channel_id: channelId, agent_id: id.agentId }));
-      log(`joined channel ${channelId}${name ? ` (${name})` : ""}`);
+      const safeName = typeof name === "string" ? redactSecrets(name).replace(CONNECTOR_LOG_STRIP_RE, " ").trim().slice(0, 128) : "";
+      log(`joined channel ${channelId}${safeName ? ` (${safeName})` : ""}`);
     } catch (e) {
       log(`join ${channelId} failed: ${e?.message ?? e}`);
     }

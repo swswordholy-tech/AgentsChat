@@ -100,12 +100,25 @@ export interface ServerLoopTick {
   expires_at: null;
 }
 
+const LOOP_TICK_CTRL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+
+function hasOwnProto(value: unknown): boolean {
+  return Boolean(
+    value &&
+      typeof value === "object" &&
+      Object.prototype.hasOwnProperty.call(value, "__proto__"),
+  );
+}
+
 /** Shape check only. Delivery must additionally verify the bot's live server record. */
 export function serverLoopTick(msg: AgentsChatMessage): ServerLoopTick | null {
+  if (!msg || typeof msg !== "object" || hasOwnProto(msg)) return null;
   const meta = msg.meta as Partial<ServerLoopTick> | undefined;
-  if (!meta || meta.kind !== "loop_tick" ||
-    typeof msg.id !== "string" || !msg.id || typeof msg.channel_id !== "string" || !msg.channel_id ||
-    typeof msg.sender_id !== "string" || !msg.sender_id || msg.sender_type !== "agent" || msg.content_type !== "text" ||
+  if (!meta || typeof meta !== "object" || Array.isArray(meta) || hasOwnProto(meta) || meta.kind !== "loop_tick" ||
+    typeof msg.id !== "string" || !msg.id || LOOP_TICK_CTRL_RE.test(msg.id) ||
+    typeof msg.channel_id !== "string" || !msg.channel_id || LOOP_TICK_CTRL_RE.test(msg.channel_id) ||
+    typeof msg.sender_id !== "string" || !msg.sender_id || LOOP_TICK_CTRL_RE.test(msg.sender_id) ||
+    msg.sender_type !== "agent" || msg.content_type !== "text" ||
     typeof msg.timestamp !== "string" || !Number.isFinite(Date.parse(msg.timestamp)) ||
     typeof meta.loop_id !== "string" || !/^loop_[a-zA-Z0-9_-]+$/.test(meta.loop_id) ||
     typeof meta.prompt !== "string" || !meta.prompt.trim() || meta.prompt.length > 4000 ||
@@ -119,9 +132,12 @@ export function serverLoopTick(msg: AgentsChatMessage): ServerLoopTick | null {
 export function matchesLiveLoop(msg: AgentsChatMessage, agentId: string, response: unknown): boolean {
   const tick = serverLoopTick(msg);
   if (!tick || msg.sender_id !== agentId) return false;
+  if (!response || typeof response !== "object" || Array.isArray(response) || hasOwnProto(response)) return false;
   const rows = (response as {loops?: any[]})?.loops;
   if (!Array.isArray(rows)) return false;
-  const matches = rows.filter(row => row?.loop_id === tick.loop_id);
+  const matches = rows.filter(
+    row => row && typeof row === "object" && !Array.isArray(row) && !hasOwnProto(row) && row.loop_id === tick.loop_id,
+  );
   if (matches.length !== 1) return false;
   const row = matches[0];
   return row.status === "active" && row.channel_id === msg.channel_id && row.prompt === tick.prompt &&

@@ -35,11 +35,33 @@ export interface Identity {
   profile?: string;
 }
 
+const GATEWAY_PROTO_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+const IDENTITY_PROTO_KEYS = new Set([
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase()),
+]);
+const IDENTITY_CTRL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+
 export function validIdentityId(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= 128 && value !== "." && value !== ".." &&
     !value.includes("..") && !/(?:%2f|%5c|%00|%2e%2e)/i.test(value) &&
     !/[/\\\s\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(value) &&
-    !["__proto__", "constructor", "prototype"].includes(value.toLowerCase());
+    !IDENTITY_PROTO_KEYS.has(value.toLowerCase());
+}
+
+function validOptionalProfile(profile: unknown): boolean {
+  if (profile === undefined) return true;
+  if (typeof profile !== "string" || IDENTITY_CTRL_RE.test(profile)) return false;
+  const trimmed = profile.trim();
+  return (
+    trimmed.length > 0 &&
+    trimmed.length <= 128 &&
+    trimmed !== "." &&
+    !trimmed.includes("..") &&
+    !/[/\\]/.test(trimmed) &&
+    !/(?:%2f|%5c|%00|%2e%2e)/i.test(trimmed) &&
+    !IDENTITY_PROTO_KEYS.has(trimmed.toLowerCase())
+  );
 }
 
 /** Validate the whole candidate set before exposing any credentials or replacing state. */
@@ -54,10 +76,20 @@ function validateIdentities(identities: readonly Identity[], allowEmptyCredentia
       typeof value !== "string" || (!value.trim() && !(allowEmptyCredentials && value === "")))) {
       throw new Error("missing identity credentials");
     }
-    if (!allowEmptyCredentials &&
-        (/[\x00-\x1f\x7f]/.test(id.gatewayId) ||
-         ["__proto__", "constructor", "prototype"].includes(id.gatewayId.toLowerCase()))) {
-      throw new Error("invalid identity gatewayId");
+    if (!allowEmptyCredentials) {
+      if (
+        IDENTITY_CTRL_RE.test(id.gatewayId) ||
+        id.gatewayId.length > 256 ||
+        GATEWAY_PROTO_KEYS.has(id.gatewayId.trim().toLowerCase())
+      ) {
+        throw new Error("invalid identity gatewayId");
+      }
+      if (IDENTITY_CTRL_RE.test(id.token) || IDENTITY_CTRL_RE.test(id.secret)) {
+        throw new Error("invalid identity credentials");
+      }
+    }
+    if (!validOptionalProfile(id.profile)) {
+      throw new Error("invalid identity profile");
     }
     if (bots.has(id.botId.trim()) || agents.has(id.agentId.trim())) {
       throw new Error("duplicate identity botId or agentId — ambiguous routing");
@@ -215,7 +247,7 @@ export function resolveOutbound(table: IdentityTable, botId: string): Identity |
  */
 export function hermesSourceProfile(id: Identity, frontedCount: number): string | undefined {
   const named = typeof id.profile === "string" ? id.profile.trim() : "";
-  if (named) return named;
-  if (frontedCount > 1) return id.botId;
+  if (named && validOptionalProfile(id.profile)) return named;
+  if (frontedCount > 1 && validIdentityId(id.botId)) return id.botId;
   return undefined;
 }
