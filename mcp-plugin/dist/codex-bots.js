@@ -5,7 +5,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 // codex/manager.ts
 import { spawn } from "node:child_process";
 import { mkdirSync as mkdirSync2, openSync, closeSync, readFileSync as readFileSync3, writeFileSync, unlinkSync, lstatSync as lstatSync3, renameSync } from "node:fs";
-import { join as join3, resolve as resolve3 } from "node:path";
+import { join as join3, resolve as resolve3, dirname as dirname3 } from "node:path";
 import { homedir as homedir3 } from "node:os";
 import { createHash as createHash2 } from "node:crypto";
 import { fileURLToPath } from "node:url";
@@ -1307,6 +1307,7 @@ var timer;
 function removeDeadLock(file) {
   let raw;
   try {
+    assertDirectoryAncestors(dirname3(file));
     const stat = lstatSync3(file);
     if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 64 * 1024)
       return;
@@ -1335,6 +1336,7 @@ function save(rootDir = root) {
   const tmp = `${statusFile2}.${process.pid}.${++saveSeq}.tmp`;
   let created = false;
   try {
+    assertDirectoryAncestors(rootDir);
     const dir = lstatSync3(rootDir);
     if (dir.isSymbolicLink() || !dir.isDirectory())
       return;
@@ -1347,6 +1349,7 @@ function save(rootDir = root) {
     }
     writeFileSync(tmp, JSON.stringify({ pid: process.pid, updated_at: new Date().toISOString(), bots: [...workers.values()].map((w) => ({ name: w.config.name, agent_id: w.config.agentId, workdir: w.config.cwd, effort: w.config.effort, model: w.config.model, pid: w.child?.pid, status: w.status })) }, null, 2), { mode: 384, flag: "wx" });
     created = true;
+    assertDirectoryAncestors(rootDir);
     const currentDir = lstatSync3(rootDir);
     const currentFile = lstatSync3(statusFile2, { throwIfNoEntry: false });
     if (currentDir.isSymbolicLink() || !currentDir.isDirectory() || currentFile && (currentFile.isSymbolicLink() || !currentFile.isFile()))
@@ -1471,6 +1474,7 @@ async function tick() {
 }
 function removeOwnedLock(file) {
   try {
+    assertDirectoryAncestors(dirname3(file));
     const stat = lstatSync3(file);
     if (!stat.isSymbolicLink() && stat.isFile() && stat.size <= 64 * 1024 && readFileSync3(file, "utf8").trim() === String(process.pid))
       unlinkSync(file);
@@ -1485,10 +1489,14 @@ Watch polls external Codex processes every 5 seconds.`);
   }
   if (values.status) {
     try {
+      assertDirectoryAncestors(root);
       const stat = lstatSync3(statusFile);
       if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 1048576)
         throw new Error("Unsafe status file");
-      console.log(readFileSync3(statusFile, "utf8"));
+      const raw = readFileSync3(statusFile, "utf8"), status = JSON.parse(raw);
+      if (!status || typeof status !== "object" || Array.isArray(status) || Object.prototype.hasOwnProperty.call(status, "__proto__"))
+        throw new Error("Invalid status file");
+      console.log(raw);
     } catch {
       console.error("Bot manager status unavailable; status file is missing, unsafe, or unreadable");
       process.exitCode = 1;
@@ -1505,6 +1513,7 @@ Watch polls external Codex processes every 5 seconds.`);
     if (stat && (stat.isSymbolicLink() || !stat.isDirectory()))
       throw new Error("Unsafe manager directory");
   }
+  assertDirectoryAncestors(root);
   mkdirSync2(root, { recursive: true, mode: 448 });
   const dir = lstatSync3(root);
   if (dir.isSymbolicLink() || !dir.isDirectory())

@@ -213,10 +213,10 @@ test("Darwin rejects system aliases with unexpected targets before directory cre
   const f = fixture(), platform = Object.getOwnPropertyDescriptor(process, "platform")!;
   const lstat = fs.lstatSync;
   const statSpy = spyOn(fs, "lstatSync").mockImplementation(((path: any, options: any) =>
-    String(path) === "/tmp" ? { isSymbolicLink: () => true, isDirectory: () => false } : lstat(path, options)) as any);
+    ["/tmp", "/var", "/etc"].includes(String(path)) ? { isSymbolicLink: () => true, isDirectory: () => false } : lstat(path, options)) as any);
   const realpath = fs.realpathSync;
   const pathSpy = spyOn(fs, "realpathSync").mockImplementation(((path: any, options: any) =>
-    String(path) === "/tmp" ? "/unexpected" : realpath(path, options)) as any);
+    ["/tmp", "/var", "/etc"].includes(String(path)) ? "/unexpected" : realpath(path, options)) as any);
   Object.defineProperty(process, "platform", { ...platform, value: "darwin" });
   try {
     expect(() => new GuiChannel(join(f.root, "new/outbox"), [])).toThrow("symlink");

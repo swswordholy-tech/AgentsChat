@@ -1499,12 +1499,15 @@ function payload(result) {
       throw new Error("GUI tool returned no receipt");
     if (typeof text !== "string" || text.length > 1048576)
       throw new Error("GUI receipt exceeds size limit");
-    return JSON.parse(text);
+    const parsed = JSON.parse(text);
+    if (parsed && Object.prototype.hasOwnProperty.call(parsed, "__proto__"))
+      throw new Error("Invalid GUI receipt");
+    return parsed;
   }
   return result;
 }
 function validTarget(value) {
-  return typeof value === "string" && value.trim() === value && value.length >= 1 && value.length <= 256 && !/[\x00-\x1f\x7f]/.test(value) && !["__proto__", "prototype", "constructor"].includes(value.toLowerCase());
+  return typeof value === "string" && value.trim() === value && value.length >= 1 && value.length <= 256 && value !== "." && value !== ".." && !/[\/\\\x00-\x1f\x7f]/.test(value) && !["__proto__", "prototype", "constructor"].includes(value.toLowerCase());
 }
 
 class GuiChannel {
@@ -1516,6 +1519,7 @@ class GuiChannel {
     const existing = lstatSync3(directory, { throwIfNoEntry: false });
     if (existing && (existing.isSymbolicLink() || !existing.isDirectory()))
       throw new Error("GUI outbox must be a real directory, not a symlink");
+    assertDirectoryAncestors(directory);
     mkdirSync2(directory, { recursive: true, mode: 448 });
     const stat = lstatSync3(directory);
     if (stat.isSymbolicLink() || !stat.isDirectory())
@@ -1660,7 +1664,7 @@ ${text}`,
 // codex/run.ts
 import { readFileSync as readFileSync11, lstatSync as lstatSync12 } from "node:fs";
 import { homedir as homedir6 } from "node:os";
-import { join as join12 } from "node:path";
+import { join as join12, dirname as dirname5 } from "node:path";
 
 // codex/bots-config.ts
 import { readFileSync as readFileSync3, realpathSync as realpathSync3, mkdirSync as mkdirSync3, lstatSync as lstatSync4 } from "node:fs";
@@ -1869,6 +1873,8 @@ class AppServer {
     return this.runtime?.home;
   }
   async start() {
+    if (this.model !== undefined && (typeof this.model !== "string" || !this.model.trim() || this.model.length > 256 || /[\x00-\x1f\x7f]/.test(this.model)))
+      throw new Error("Invalid app-server model");
     const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^AGENTS?CHAT_|^RELAY_/.test(k)));
     env.AGENTSCHAT_LOCK_OWNER_PID = String(process.pid);
     env.AGENTSCHAT_TOOL_ONLY = "1";
@@ -1924,6 +1930,10 @@ class AppServer {
       try {
         parsed = JSON.parse(line);
       } catch {
+        this.fatal(new Error("Invalid app-server response"));
+        return;
+      }
+      if (parsed && Object.prototype.hasOwnProperty.call(parsed, "__proto__")) {
         this.fatal(new Error("Invalid app-server response"));
         return;
       }
@@ -2028,6 +2038,8 @@ class AppServer {
     }
   }
   async thread(cwd, existing, ephemeral = false, permissions = this.permissions) {
+    if (typeof cwd !== "string" || !cwd.trim() || cwd.length > 4096 || /[\x00-\x1f\x7f]/.test(cwd))
+      throw new Error("Invalid app-server cwd");
     const configured = existing ? this.threadPermissions.get(existing) : undefined;
     if (configured !== undefined && configured !== permissions) {
       throw new Error("Cannot change permissions of a loaded thread; create a new thread");
@@ -2322,6 +2334,7 @@ function grants(config, opts) {
   try {
     const platform = opts?.platform ?? process.platform;
     const getuid = opts && "getuid" in opts ? opts.getuid : process.getuid;
+    assertDirectoryAncestors(config.stateDir);
     const directory = lstatSync7(config.stateDir);
     if (directory.isSymbolicLink() || !directory.isDirectory())
       return [];
@@ -2336,7 +2349,7 @@ function grants(config, opts) {
     const ownProto = (value) => Object.prototype.hasOwnProperty.call(value, "__proto__");
     if (doc?.version !== 1 || ownProto(doc) || !Array.isArray(doc.grants) || doc.grants.length > 256)
       return [];
-    const safeId = (value) => typeof value === "string" && value.length > 0 && value.length <= 128 && value.trim() === value && !/[.\/\\\s\x00-\x1f\x7f]/.test(value) && !["__proto__", "constructor", "prototype"].includes(value.toLowerCase());
+    const safeId = (value) => typeof value === "string" && value.length > 0 && value.length <= 128 && value.trim() === value && value !== "." && value !== ".." && !/[\/\\\s\x00-\x1f\x7f]/.test(value) && !["__proto__", "constructor", "prototype"].includes(value.toLowerCase());
     const safeOwnerId = (value) => typeof value === "string" && value.length > 0 && value.length <= 254 && value.trim() === value && value !== "." && !value.includes("..") && !/[\/\\\s\x00-\x1f\x7f]/.test(value) && !["__proto__", "constructor", "prototype"].includes(value.toLowerCase());
     return doc.grants.filter((g) => g && !ownProto(g) && [g.loop_id, g.channel_id, g.agent_id, g.owner_id, g.prompt].every((v) => typeof v === "string" && v.trim()) && /^loop_[A-Za-z0-9_-]+$/.test(g.loop_id) && [g.loop_id, g.channel_id, g.agent_id].every(safeId) && safeOwnerId(g.owner_id) && g.agent_id === config.agentId && g.prompt.length <= 4000 && Number.isSafeInteger(g.interval_ms) && g.interval_ms >= 60000 && g.interval_ms <= 86400000);
   } catch {
@@ -2723,7 +2736,7 @@ function isPlainObject(value) {
   return value !== null && typeof value === "object" && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
 }
 function safeMessageId(value) {
-  return typeof value === "string" && !!value.trim() && !/[\x00-\x1f\x7f]/.test(value) && !isPrototypeKey(value);
+  return typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value && value !== "." && value !== ".." && !/[\/\\\x00-\x1f\x7f]/.test(value) && !isPrototypeKey(value);
 }
 function validMentions(value) {
   return value === undefined || Array.isArray(value) && value.length <= 128 && [...value].every((id) => typeof id === "string");
@@ -2737,10 +2750,11 @@ function checkStateDir(dir, allowMissing = false) {
     if (!allowMissing || error.code !== "ENOENT")
       throw error;
   }
+  assertDirectoryAncestors(dir);
 }
 var entryStatuses = new Set(["pending", "running", "ready", "sending", "sent", "failed", "uncertain", "blocked", "skipped"]);
 function addressed(m, c) {
-  if (!m || ["id", "channel_id", "sender_id", "content"].some((k) => typeof m[k] !== "string" || !m[k].trim()))
+  if (!isPlainObject(m) || Object.prototype.hasOwnProperty.call(m, "__proto__") || ["id", "channel_id", "sender_id", "content"].some((k) => typeof m[k] !== "string" || !m[k].trim()))
     return false;
   if (![m.id, m.channel_id, m.sender_id].every(safeMessageId) || !validMentions(m.mentions) || !validMentions(m.mentioned_ids))
     return false;
@@ -2816,10 +2830,10 @@ class Bridge {
           throw error;
       }
       this.state = hasState ? JSON.parse(readFileSync9(this.file, "utf8")) : { version: 1, threads: {}, entries: [] };
-      if (this.state?.version !== 1 || !isPlainObject(this.state.threads) || !Array.isArray(this.state.entries) || Object.prototype.hasOwnProperty.call(this.state, "channels") && !isPlainObject(this.state.channels))
+      if (this.state?.version !== 1 || Object.prototype.hasOwnProperty.call(this.state, "__proto__") || !isPlainObject(this.state.threads) || !Array.isArray(this.state.entries) || Object.prototype.hasOwnProperty.call(this.state, "channels") && !isPlainObject(this.state.channels))
         throw new Error("Invalid bridge state");
       for (const e of this.state.entries) {
-        if (!isPlainObject(e) || !entryStatuses.has(e.status) || !isPlainObject(e.message) || ![e.message.id, e.message.channel_id, e.message.sender_id].every(safeMessageId) || typeof e.message.content !== "string" || !validMentions(e.message.mentions) || !validMentions(e.message.mentioned_ids))
+        if (!isPlainObject(e) || Object.prototype.hasOwnProperty.call(e, "__proto__") || !entryStatuses.has(e.status) || !isPlainObject(e.message) || Object.prototype.hasOwnProperty.call(e.message, "__proto__") || ![e.message.id, e.message.channel_id, e.message.sender_id].every(safeMessageId) || typeof e.message.content !== "string" || !validMentions(e.message.mentions) || !validMentions(e.message.mentioned_ids))
           throw new Error("Invalid bridge entry");
         if (e.status === "sending")
           e.status = "uncertain";
@@ -2936,7 +2950,7 @@ class Bridge {
     return this.draining;
   }
   async prepareChannel(chat) {
-    if (isPrototypeKey(chat))
+    if (!safeMessageId(chat))
       throw new Error("Invalid channel ID");
     this.state.channels ??= {};
     let channel = Object.prototype.hasOwnProperty.call(this.state.channels, chat) ? this.state.channels[chat] : undefined;
@@ -3792,6 +3806,7 @@ async function main() {
     }
     if (!values["gui-thread"] || !values["gui-message-file"])
       throw new Error("GUI submission requires --gui-thread and --gui-message-file");
+    assertDirectoryAncestors(dirname5(values["gui-message-file"]));
     const stat = lstatSync12(values["gui-message-file"]);
     if (stat.isSymbolicLink() || !stat.isFile())
       throw new Error("GUI message must be a regular file, not a symlink");
@@ -3841,6 +3856,7 @@ async function main() {
     const dir = lstatSync12(c.stateDir), stateFile = join12(c.stateDir, "state.json");
     if (dir.isSymbolicLink() || !dir.isDirectory())
       throw new Error("Conversation state must use a real directory");
+    assertDirectoryAncestors(c.stateDir);
     const stat = lstatSync12(stateFile);
     if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 16 * 1024 * 1024)
       throw new Error("Unsafe conversation state file");
@@ -3848,7 +3864,7 @@ async function main() {
     if (!isPlainObject2(state) || Object.prototype.hasOwnProperty.call(state, "__proto__"))
       throw new Error("Invalid conversation state");
     const channels = state?.channels === undefined ? {} : state.channels;
-    if (!isPlainObject2(channels))
+    if (!isPlainObject2(channels) || Object.prototype.hasOwnProperty.call(channels, "__proto__"))
       throw new Error("Invalid conversation channels");
     const safeOutput = (value) => {
       const text = JSON.stringify(value);
