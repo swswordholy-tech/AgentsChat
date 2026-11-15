@@ -192,448 +192,6 @@ class MuseBridge {
   }
 }
 
-// src/reconnect.ts
-function safeUnitRand(rand) {
-  let r;
-  try {
-    r = rand();
-  } catch {
-    return 0;
-  }
-  if (!Number.isFinite(r) || r <= 0)
-    return 0;
-  return r >= 1 ? 0.999999 : r;
-}
-function computePleaseReconnectDelay(jitterMs, rand = Math.random) {
-  const maxJitter = typeof jitterMs === "number" && Number.isFinite(jitterMs) && jitterMs > 0 ? Math.min(Math.floor(jitterMs), 1e4) : 2000;
-  return 200 + Math.floor(safeUnitRand(rand) * maxJitter);
-}
-function resolveDrainReconnectDelay(frame, rand = Math.random) {
-  const safeFrame = frame && typeof frame === "object" && !Array.isArray(frame) && !Object.prototype.hasOwnProperty.call(frame, "__proto__") ? frame : null;
-  return computePleaseReconnectDelay(safeFrame?.jitter_ms ?? safeFrame?.within_ms, rand);
-}
-
-// muse/src/client.ts
-var MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
-var MAX_JOINED_CHANNELS = 256;
-function safeDelayMs(value, fallback, min = 0) {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < min)
-    return fallback;
-  return Math.min(value, MAX_TIMER_DELAY_MS);
-}
-function normalizeChannelId(raw) {
-  if (typeof raw !== "string")
-    return null;
-  const trimmed = raw.trim();
-  if (!trimmed || trimmed.length > 128 || /[\x00-\x20\x7f]/.test(trimmed))
-    return null;
-  return trimmed;
-}
-
-class MuseAgentChatClient {
-  ws = null;
-  sessionId = null;
-  heartbeatTimer = null;
-  reconnectTimer = null;
-  connectTimer = null;
-  nextReconnectDelayOverrideMs = null;
-  messageHandlers = [];
-  errorHandlers = [];
-  joinedChannels = new Set;
-  sessionJoined = new Set;
-  connectResolve = null;
-  connectReject = null;
-  lifecycleResolve = null;
-  explicitlyDisconnected = false;
-  reconnectAttempt = 0;
-  isReconnecting = false;
-  connectSettled = false;
-  url;
-  agentId;
-  token;
-  capabilities;
-  heartbeatIntervalMs;
-  connectTimeoutMs;
-  reconnect;
-  initialReconnectDelayMs;
-  maxReconnectDelayMs;
-  onDebug;
-  onReconnect;
-  constructor(options) {
-    let url;
-    try {
-      url = new URL(options.url);
-    } catch {
-      throw new Error("Invalid Muse ws URL");
-    }
-    if (url.protocol !== "ws:" && url.protocol !== "wss:") {
-      throw new Error("Invalid Muse ws URL protocol");
-    }
-    if (url.username || url.password) {
-      throw new Error("Embedded credentials are not allowed in Muse ws URL");
-    }
-    if (url.protocol === "ws:" && !["127.0.0.1", "localhost", "[::1]", "::1"].includes(url.hostname.toLowerCase())) {
-      throw new Error("Remote Muse ws URL must use wss://");
-    }
-    this.url = options.url;
-    this.agentId = options.agentId;
-    this.token = options.token;
-    this.capabilities = options.capabilities ?? ["chat"];
-    this.heartbeatIntervalMs = safeDelayMs(options.heartbeatIntervalMs, 30000, 100);
-    this.connectTimeoutMs = safeDelayMs(options.connectTimeoutMs, 15000, 0);
-    this.reconnect = options.reconnect ?? true;
-    this.initialReconnectDelayMs = safeDelayMs(options.initialReconnectDelayMs, 1000, 0);
-    this.maxReconnectDelayMs = safeDelayMs(options.maxReconnectDelayMs, 60000, 0);
-    this.onDebug = options.onDebug;
-    this.onReconnect = options.onReconnect;
-  }
-  clearConnectTimer() {
-    if (this.connectTimer) {
-      clearTimeout(this.connectTimer);
-      this.connectTimer = null;
-    }
-  }
-  emitError(err) {
-    for (const h of this.errorHandlers) {
-      try {
-        h(err);
-      } catch {}
-    }
-  }
-  connect() {
-    return new Promise((resolve, reject) => {
-      this.clearConnectTimer();
-      if (this.reconnectTimer) {
-        clearTimeout(this.reconnectTimer);
-        this.reconnectTimer = null;
-      }
-      if (this.heartbeatTimer) {
-        clearInterval(this.heartbeatTimer);
-        this.heartbeatTimer = null;
-      }
-      const prevWs = this.ws;
-      this.ws = null;
-      this.sessionId = null;
-      this.sessionJoined.clear();
-      if (prevWs) {
-        try {
-          prevWs.close();
-        } catch {}
-      }
-      this.connectSettled = false;
-      this.explicitlyDisconnected = false;
-      this.reconnectAttempt = 0;
-      this.isReconnecting = false;
-      this.connectResolve = resolve;
-      this.connectReject = reject;
-      this.openSocket();
-    });
-  }
-  waitUntilClosed() {
-    if (!this.lifecycleResolve) {
-      return new Promise((resolve) => {
-        this.lifecycleResolve = resolve;
-      });
-    }
-    return new Promise((resolve) => {
-      const prev = this.lifecycleResolve;
-      this.lifecycleResolve = () => {
-        prev?.();
-        resolve();
-      };
-    });
-  }
-  disconnect() {
-    this.explicitlyDisconnected = true;
-    this.clearConnectTimer();
-    if (this.reconnectTimer)
-      clearTimeout(this.reconnectTimer);
-    if (this.heartbeatTimer)
-      clearInterval(this.heartbeatTimer);
-    this.reconnectTimer = null;
-    this.heartbeatTimer = null;
-    if (!this.connectSettled) {
-      this.connectSettled = true;
-      this.connectReject?.(new Error("Disconnected before authentication completed"));
-    }
-    this.connectResolve = null;
-    this.connectReject = null;
-    this.lifecycleResolve?.();
-    this.lifecycleResolve = null;
-    const prev = this.ws;
-    this.ws = null;
-    this.sessionId = null;
-    this.sessionJoined.clear();
-    try {
-      prev?.close();
-    } catch {}
-  }
-  get isConnected() {
-    return this.ws?.readyState === WebSocket.OPEN && this.sessionId !== null;
-  }
-  get session() {
-    return this.sessionId;
-  }
-  onMessage(handler) {
-    this.messageHandlers.push(handler);
-  }
-  onError(handler) {
-    this.errorHandlers.push(handler);
-  }
-  joinChannel(channelId) {
-    const clean = normalizeChannelId(channelId);
-    if (!clean)
-      return;
-    if (!this.joinedChannels.has(clean) && this.joinedChannels.size >= MAX_JOINED_CHANNELS)
-      return;
-    this.joinedChannels.add(clean);
-    this.sessionJoined.add(clean);
-    this.send({ type: "join_channel", channel_id: clean, agent_id: this.agentId });
-  }
-  leaveChannel(channelId) {
-    const clean = normalizeChannelId(channelId);
-    if (!clean)
-      return;
-    this.joinedChannels.delete(clean);
-    this.sessionJoined.delete(clean);
-    this.send({ type: "leave_channel", channel_id: clean, agent_id: this.agentId });
-  }
-  sendMessage(channelId, content, contentType = "text", replyTo) {
-    this.send({
-      type: "message",
-      id: crypto.randomUUID(),
-      channel_id: channelId,
-      sender_id: this.agentId,
-      sender_type: "agent",
-      content,
-      content_type: contentType,
-      timestamp: new Date().toISOString(),
-      ...replyTo ? { reply_to: replyTo } : {}
-    });
-  }
-  sendTyping(channelId) {
-    this.send({ type: "typing", channel_id: channelId, sender_id: this.agentId, cross_pod: true });
-  }
-  debug(event, meta) {
-    this.onDebug?.(event, meta);
-  }
-  openSocket() {
-    this.debug("connect:start", { url: this.url, agentId: this.agentId });
-    this.clearConnectTimer();
-    this.sessionJoined.clear();
-    const ws = new WebSocket(this.url);
-    this.ws = ws;
-    if (this.connectTimeoutMs > 0) {
-      this.connectTimer = setTimeout(() => {
-        this.connectTimer = null;
-        if (this.ws !== ws)
-          return;
-        const err = new Error(`AgentsChat connect timed out after ${this.connectTimeoutMs}ms`);
-        if (!this.connectSettled) {
-          this.connectSettled = true;
-          this.explicitlyDisconnected = true;
-          try {
-            ws.close();
-          } catch {}
-          this.connectReject?.(err);
-          this.emitError(err);
-        } else if (this.sessionId === null) {
-          this.emitError(err);
-          try {
-            ws.close();
-          } catch {}
-        }
-      }, this.connectTimeoutMs);
-      this.connectTimer.unref?.();
-    }
-    ws.onopen = () => {
-      if (this.ws !== ws)
-        return;
-      try {
-        this.send({
-          type: "auth",
-          agent_id: this.agentId,
-          token: this.token,
-          capabilities: this.capabilities
-        });
-      } catch (err) {
-        this.clearConnectTimer();
-        if (!this.connectSettled) {
-          this.connectSettled = true;
-          this.connectReject?.(err instanceof Error ? err : new Error(String(err)));
-        }
-        this.emitError(err instanceof Error ? err : new Error(String(err)));
-        try {
-          ws.close();
-        } catch {}
-        return;
-      }
-      if (this.heartbeatTimer)
-        clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = setInterval(() => {
-        if (this.ws !== ws)
-          return;
-        if (ws.readyState === WebSocket.OPEN) {
-          try {
-            this.send({ type: "ping", timestamp: new Date().toISOString() });
-          } catch (err) {
-            this.emitError(err instanceof Error ? err : new Error(String(err)));
-            try {
-              ws.close();
-            } catch {}
-          }
-        }
-      }, this.heartbeatIntervalMs);
-      this.heartbeatTimer.unref?.();
-    };
-    ws.onmessage = (event) => {
-      if (this.ws !== ws)
-        return;
-      this.handleMessage(String(event.data));
-    };
-    ws.onerror = () => {
-      if (this.ws !== ws)
-        return;
-      const err = new Error("WebSocket error");
-      if (!this.connectSettled) {
-        this.clearConnectTimer();
-        this.connectSettled = true;
-        this.connectReject?.(err);
-      }
-      this.emitError(err);
-    };
-    ws.onclose = () => {
-      if (this.ws !== ws)
-        return;
-      this.clearConnectTimer();
-      if (this.heartbeatTimer)
-        clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = null;
-      this.sessionId = null;
-      this.sessionJoined.clear();
-      if (!this.connectSettled && !this.reconnect) {
-        this.clearConnectTimer();
-        this.connectSettled = true;
-        this.connectReject?.(new Error("WebSocket closed before authentication"));
-      }
-      if (this.explicitlyDisconnected) {
-        this.lifecycleResolve?.();
-        return;
-      }
-      if (!this.reconnect) {
-        this.lifecycleResolve?.();
-        return;
-      }
-      let delay;
-      if (this.nextReconnectDelayOverrideMs !== null) {
-        delay = this.nextReconnectDelayOverrideMs;
-        this.nextReconnectDelayOverrideMs = null;
-      } else {
-        const exp = Math.min(Math.max(0, this.reconnectAttempt), 30);
-        delay = Math.min(this.initialReconnectDelayMs * 2 ** exp, this.maxReconnectDelayMs);
-        this.reconnectAttempt += 1;
-      }
-      this.isReconnecting = true;
-      this.debug("reconnect:scheduled", { delayMs: delay, attempt: this.reconnectAttempt });
-      this.reconnectTimer = setTimeout(() => this.openSocket(), delay);
-      this.reconnectTimer.unref?.();
-    };
-  }
-  send(payload) {
-    if (this.ws?.readyState !== WebSocket.OPEN) {
-      throw new Error("AgentsChat socket is not open");
-    }
-    this.ws.send(JSON.stringify(payload));
-  }
-  handleMessage(raw) {
-    let parsed;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      return;
-    }
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      return;
-    }
-    const msg = parsed;
-    if (msg.type === "auth_ok") {
-      this.clearConnectTimer();
-      this.sessionId = typeof msg.session_id === "string" ? msg.session_id : null;
-      this.reconnectAttempt = 0;
-      const wasReconnect = this.isReconnecting;
-      this.isReconnecting = false;
-      if (!this.connectSettled) {
-        this.connectSettled = true;
-        this.connectResolve?.();
-      } else if (wasReconnect) {
-        this.onReconnect?.();
-        for (const ch of this.joinedChannels) {
-          if (!this.sessionJoined.has(ch) && this.ws?.readyState === WebSocket.OPEN) {
-            this.joinChannel(ch);
-          }
-        }
-      }
-      return;
-    }
-    if (msg.type === "auth_error" || msg.type === "error") {
-      const text = typeof msg.error === "string" ? msg.error : typeof msg.message === "string" ? msg.message : msg.type === "auth_error" ? "AgentsChat authentication error" : "AgentsChat error";
-      const err = new Error(text);
-      if (msg.type === "auth_error") {
-        this.explicitlyDisconnected = true;
-        try {
-          this.ws?.close();
-        } catch {}
-      }
-      if (!this.connectSettled) {
-        this.clearConnectTimer();
-        this.connectSettled = true;
-        this.connectReject?.(err);
-      }
-      this.emitError(err);
-      return;
-    }
-    if (msg.type === "please_reconnect" || msg.type === "shard_moved") {
-      this.nextReconnectDelayOverrideMs = resolveDrainReconnectDelay(msg);
-      this.reconnectAttempt = 0;
-      try {
-        this.ws?.close();
-      } catch {}
-      return;
-    }
-    if (msg.type === "pong")
-      return;
-    if (msg.type === "channel_created" && typeof msg.channel_id === "string" && msg.channel_id) {
-      if (this.ws?.readyState === WebSocket.OPEN)
-        this.joinChannel(msg.channel_id);
-      return;
-    }
-    if (msg.type === "message" || msg.type === "thread_reply") {
-      if (msg.content === "__typing__")
-        return;
-      const chat = {
-        id: String(msg.id ?? ""),
-        channel_id: String(msg.channel_id ?? ""),
-        sender_id: String(msg.sender_id ?? ""),
-        sender_type: msg.sender_type ?? "agent",
-        content: String(msg.content ?? ""),
-        content_type: msg.content_type ?? "text",
-        timestamp: String(msg.timestamp ?? new Date().toISOString()),
-        channel_type: msg.channel_type,
-        thread_id: typeof msg.thread_id === "string" ? msg.thread_id : typeof msg.parent_id === "string" ? msg.parent_id : undefined
-      };
-      for (const h of this.messageHandlers) {
-        try {
-          Promise.resolve(h(chat)).catch((err) => {
-            this.emitError(err instanceof Error ? err : new Error(String(err)));
-          });
-        } catch (err) {
-          this.emitError(err instanceof Error ? err : new Error(String(err)));
-        }
-      }
-    }
-  }
-}
-
 // muse/src/config.ts
 import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
@@ -646,12 +204,35 @@ function isLoopbackHost(hostname) {
   const h = hostname.toLowerCase();
   return h === "localhost" || h === "127.0.0.1" || h === "[::1]" || h === "::1";
 }
+function isUnsafeEndpointHost(hostname) {
+  const host = hostname.toLowerCase().replace(/\.+$/, "");
+  if (["metadata.google.internal", "metadata.goog", "metadata", "instance-data"].includes(host) || host.endsWith(".metadata.goog"))
+    return true;
+  const unsafeV4 = (ip) => ip === "0.0.0.0" || ip === "100.100.100.200" || ip.startsWith("169.254.");
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host))
+    return unsafeV4(host);
+  if (!host.startsWith("["))
+    return false;
+  const address = host.slice(1, -1);
+  const [left, right = ""] = address.split("::");
+  const head = left ? left.split(":") : [];
+  const tail = right ? right.split(":") : [];
+  const words = (address.includes("::") ? [...head, ...Array(8 - head.length - tail.length).fill("0"), ...tail] : head).map((x) => parseInt(x, 16));
+  if (words.length !== 8)
+    return true;
+  const mapped = words.slice(0, 5).every((x) => x === 0) && words[5] === 65535 || words.slice(0, 4).every((x) => x === 0) && words[4] === 65535 && words[5] === 0;
+  if (mapped)
+    return unsafeV4(`${words[6] >> 8}.${words[6] & 255}.${words[7] >> 8}.${words[7] & 255}`);
+  return words.every((x) => x === 0) || (words[0] & 65472) === 65152 || words[0] === 64768 && words[1] === 3778 && words.slice(2, 7).every((x) => x === 0) && words[7] === 596;
+}
 function isSafeAgentId(value) {
-  return typeof value === "string" && value.length > 0 && ![".", "..", "__proto__", "constructor", "prototype"].includes(value.toLowerCase()) && !/[\/\\\s\x00-\x1f\x7f]/.test(value);
+  return typeof value === "string" && value.length > 0 && value.length <= 128 && ![".", "..", "__proto__", "constructor", "prototype"].includes(value.toLowerCase()) && !/[\/\\\s\x00-\x1f\x7f]/.test(value);
 }
 function assertSafeParentDirectories(file) {
-  let dir = dirname(isAbsolute(file) ? file : `${process.cwd()}${sep}${file}`);
-  while (true) {
+  const parent = dirname(isAbsolute(file) ? file : `${process.cwd()}${sep}${file}`);
+  const parts = parent.split(sep);
+  for (let i = 1;i <= parts.length; i++) {
+    const dir = parts.slice(0, i).join(sep) || sep;
     try {
       const st = lstatSync(dir);
       const systemLink = process.platform === "darwin" && ["/var", "/tmp", "/etc"].includes(dir) && st.isSymbolicLink() && realpathSync(dir) === `/private${dir}` && !lstatSync(`/private${dir}`).isSymbolicLink() && lstatSync(`/private${dir}`).isDirectory();
@@ -662,10 +243,6 @@ function assertSafeParentDirectories(file) {
       if (err?.code !== "ENOENT")
         throw err;
     }
-    const parent = dirname(dir);
-    if (parent === dir)
-      break;
-    dir = parent;
   }
 }
 function validateEndpointUrl(raw, kind) {
@@ -678,6 +255,9 @@ function validateEndpointUrl(raw, kind) {
     parsed = new URL(trimmed);
   } catch {
     throw new Error(`Invalid Muse ${kind} URL`);
+  }
+  if (isUnsafeEndpointHost(parsed.hostname)) {
+    throw new Error(`Unsafe Muse ${kind} URL host`);
   }
   if (parsed.port === "0" || parsed.search || parsed.hash || raw.includes("?") || raw.includes("#")) {
     throw new Error(`Invalid Muse ${kind} URL port/query/hash`);
@@ -721,6 +301,7 @@ function safeConfig(config) {
 }
 function readProfile(path = PROFILE_PATH) {
   try {
+    assertSafeParentDirectories(path);
     if (!existsSync(path))
       return {};
     const st = lstatSync(path);
@@ -760,19 +341,22 @@ import { dirname as dirname2 } from "node:path";
 var WAKE_SIG_HEADER = "x-agentschat-signature";
 var WAKE_CONTENT_MAX = 500;
 function redactSecrets(text) {
-  return text.replace(/\b(?:Bearer|Basic)\s+[^\s"'<>\\]+/gi, "[redacted]").replace(/(?:ac_|agent_key_|mcp_(?:at|rt|code)_|sk-|sk_|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_)[A-Za-z0-9_-]+/g, "[redacted]").replace(/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, "[redacted]").replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[redacted]");
+  return text.replace(/-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)/g, "[redacted]").replace(/\b(?:Bearer|Basic)\s+[^\s"'<>\\]+/gi, "[redacted]").replace(/(?:ac_|agent_key_|mcp_(?:at|rt|code)_|sk-|sk_|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|whsec_|AIza)[A-Za-z0-9_-]+/g, "[redacted]").replace(/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, "[redacted]").replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[redacted]");
+}
+function sanitizeMuseText(text) {
+  return redactSecrets(redactSecrets(text).replace(/[\x00-\x1f\x7f]/g, ""));
 }
 function buildWakePayload(msg, opts = {}) {
-  const content = typeof msg.content === "string" ? redactSecrets(msg.content.slice(0, WAKE_CONTENT_MAX)) : undefined;
-  const targetSessionId = typeof opts.targetSessionId === "string" && opts.targetSessionId.length > 0 ? opts.targetSessionId : undefined;
+  const clean = (value, cap = 128) => typeof value === "string" ? sanitizeMuseText(value).slice(0, cap) : undefined;
+  const targetSessionId = clean(opts.targetSessionId);
   return {
-    type: typeof msg.type === "string" ? msg.type : "message",
-    channel_id: msg.channel_id,
-    message_id: msg.id,
-    sender_id: msg.sender_id,
-    content,
-    mentioned_ids: Array.isArray(msg.mentioned_ids) ? msg.mentioned_ids.filter((x) => typeof x === "string") : undefined,
-    timestamp: typeof msg.timestamp === "string" ? msg.timestamp : undefined,
+    type: clean(msg.type, 64) ?? "message",
+    channel_id: clean(msg.channel_id),
+    message_id: clean(msg.id, 256),
+    sender_id: clean(msg.sender_id),
+    content: clean(msg.content, WAKE_CONTENT_MAX),
+    mentioned_ids: Array.isArray(msg.mentioned_ids) ? msg.mentioned_ids.filter((x) => typeof x === "string").slice(0, 256).map((x) => clean(x)) : undefined,
+    timestamp: clean(msg.timestamp, 64),
     ...targetSessionId ? { target_session_id: targetSessionId } : {}
   };
 }
@@ -792,6 +376,8 @@ function signWakeBody(body, secret) {
   return createHmac("sha256", secret).update(body, "utf8").digest("hex");
 }
 function isUnsafeWakeHost(hostname) {
+  if (isUnsafeEndpointHost(hostname))
+    return true;
   const host = hostname.toLowerCase().replace(/\.$/, "");
   if (["metadata.google.internal", "metadata.goog"].includes(host))
     return true;
@@ -817,7 +403,7 @@ function isUnsafeWakeHost(hostname) {
   return false;
 }
 async function fireWake(msg, cfg) {
-  const log = cfg.logger ?? (() => {});
+  const log = (text) => cfg.logger?.(sanitizeMuseText(text));
   const url = (cfg.url ?? "").trim();
   if (!url)
     return;
@@ -968,7 +554,445 @@ function appendWakeQueue(queueFile, payload, maxLines = MAX_WAKE_QUEUE_LINES) {
   return true;
 }
 
+// src/reconnect.ts
+function safeUnitRand(rand) {
+  let r;
+  try {
+    r = rand();
+  } catch {
+    return 0;
+  }
+  if (!Number.isFinite(r) || r <= 0)
+    return 0;
+  return r >= 1 ? 0.999999 : r;
+}
+function computePleaseReconnectDelay(jitterMs, rand = Math.random) {
+  const maxJitter = typeof jitterMs === "number" && Number.isFinite(jitterMs) && jitterMs > 0 ? Math.min(Math.floor(jitterMs), 1e4) : 2000;
+  return 200 + Math.floor(safeUnitRand(rand) * maxJitter);
+}
+function resolveDrainReconnectDelay(frame, rand = Math.random) {
+  const safeFrame = frame && typeof frame === "object" && !Array.isArray(frame) && !Object.prototype.hasOwnProperty.call(frame, "__proto__") ? frame : null;
+  return computePleaseReconnectDelay(safeFrame?.jitter_ms ?? safeFrame?.within_ms, rand);
+}
+
+// muse/src/client.ts
+var MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
+var MAX_JOINED_CHANNELS = 256;
+function safeDelayMs(value, fallback, min = 0) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < min)
+    return fallback;
+  return Math.min(value, MAX_TIMER_DELAY_MS);
+}
+function normalizeChannelId(raw) {
+  if (typeof raw !== "string")
+    return null;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 128 || /[\/\\\x00-\x20\x7f]/.test(trimmed) || [".", "..", "__proto__", "constructor", "prototype"].includes(trimmed.toLowerCase()))
+    return null;
+  return trimmed;
+}
+
+class MuseAgentChatClient {
+  ws = null;
+  sessionId = null;
+  heartbeatTimer = null;
+  reconnectTimer = null;
+  connectTimer = null;
+  nextReconnectDelayOverrideMs = null;
+  messageHandlers = [];
+  errorHandlers = [];
+  joinedChannels = new Set;
+  sessionJoined = new Set;
+  connectResolve = null;
+  connectReject = null;
+  lifecycleResolve = null;
+  explicitlyDisconnected = false;
+  reconnectAttempt = 0;
+  isReconnecting = false;
+  connectSettled = false;
+  url;
+  agentId;
+  token;
+  capabilities;
+  heartbeatIntervalMs;
+  connectTimeoutMs;
+  reconnect;
+  initialReconnectDelayMs;
+  maxReconnectDelayMs;
+  onDebug;
+  onReconnect;
+  constructor(options) {
+    this.url = validateEndpointUrl(options.url, "ws");
+    this.agentId = options.agentId;
+    this.token = options.token;
+    this.capabilities = options.capabilities ?? ["chat"];
+    this.heartbeatIntervalMs = safeDelayMs(options.heartbeatIntervalMs, 30000, 100);
+    this.connectTimeoutMs = safeDelayMs(options.connectTimeoutMs, 15000, 0);
+    this.reconnect = options.reconnect ?? true;
+    this.initialReconnectDelayMs = safeDelayMs(options.initialReconnectDelayMs, 1000, 0);
+    this.maxReconnectDelayMs = safeDelayMs(options.maxReconnectDelayMs, 60000, 0);
+    this.onDebug = options.onDebug;
+    this.onReconnect = options.onReconnect;
+  }
+  clearConnectTimer() {
+    if (this.connectTimer) {
+      clearTimeout(this.connectTimer);
+      this.connectTimer = null;
+    }
+  }
+  emitError(err) {
+    for (const h of this.errorHandlers) {
+      try {
+        h(err);
+      } catch {}
+    }
+  }
+  connect() {
+    return new Promise((resolve, reject) => {
+      this.clearConnectTimer();
+      if (this.reconnectTimer) {
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+      }
+      if (this.heartbeatTimer) {
+        clearInterval(this.heartbeatTimer);
+        this.heartbeatTimer = null;
+      }
+      const prevWs = this.ws;
+      this.ws = null;
+      this.sessionId = null;
+      this.sessionJoined.clear();
+      if (prevWs) {
+        try {
+          prevWs.close();
+        } catch {}
+      }
+      this.connectSettled = false;
+      this.explicitlyDisconnected = false;
+      this.reconnectAttempt = 0;
+      this.isReconnecting = false;
+      this.connectResolve = resolve;
+      this.connectReject = reject;
+      this.openSocket();
+    });
+  }
+  waitUntilClosed() {
+    if (!this.lifecycleResolve) {
+      return new Promise((resolve) => {
+        this.lifecycleResolve = resolve;
+      });
+    }
+    return new Promise((resolve) => {
+      const prev = this.lifecycleResolve;
+      this.lifecycleResolve = () => {
+        prev?.();
+        resolve();
+      };
+    });
+  }
+  disconnect() {
+    this.explicitlyDisconnected = true;
+    this.clearConnectTimer();
+    if (this.reconnectTimer)
+      clearTimeout(this.reconnectTimer);
+    if (this.heartbeatTimer)
+      clearInterval(this.heartbeatTimer);
+    this.reconnectTimer = null;
+    this.heartbeatTimer = null;
+    if (!this.connectSettled) {
+      this.connectSettled = true;
+      this.connectReject?.(new Error("Disconnected before authentication completed"));
+    }
+    this.connectResolve = null;
+    this.connectReject = null;
+    this.lifecycleResolve?.();
+    this.lifecycleResolve = null;
+    const prev = this.ws;
+    this.ws = null;
+    this.sessionId = null;
+    this.sessionJoined.clear();
+    try {
+      prev?.close();
+    } catch {}
+  }
+  get isConnected() {
+    return this.ws?.readyState === WebSocket.OPEN && this.sessionId !== null;
+  }
+  get session() {
+    return this.sessionId;
+  }
+  onMessage(handler) {
+    this.messageHandlers.push(handler);
+  }
+  onError(handler) {
+    this.errorHandlers.push(handler);
+  }
+  joinChannel(channelId) {
+    const clean = normalizeChannelId(channelId);
+    if (!clean)
+      return;
+    if (!this.joinedChannels.has(clean) && this.joinedChannels.size >= MAX_JOINED_CHANNELS)
+      return;
+    this.joinedChannels.add(clean);
+    this.sessionJoined.add(clean);
+    this.send({ type: "join_channel", channel_id: clean, agent_id: this.agentId });
+  }
+  leaveChannel(channelId) {
+    const clean = normalizeChannelId(channelId);
+    if (!clean)
+      return;
+    this.joinedChannels.delete(clean);
+    this.sessionJoined.delete(clean);
+    this.send({ type: "leave_channel", channel_id: clean, agent_id: this.agentId });
+  }
+  sendMessage(channelId, content, contentType = "text", replyTo) {
+    const clean = normalizeChannelId(channelId);
+    if (!clean || replyTo !== undefined && (typeof replyTo !== "string" || replyTo.length > 256 || /[\x00-\x1f\x7f]/.test(replyTo)))
+      return;
+    this.send({
+      type: "message",
+      id: crypto.randomUUID(),
+      channel_id: clean,
+      sender_id: this.agentId,
+      sender_type: "agent",
+      content,
+      content_type: contentType,
+      timestamp: new Date().toISOString(),
+      ...replyTo ? { reply_to: replyTo } : {}
+    });
+  }
+  sendTyping(channelId) {
+    const clean = normalizeChannelId(channelId);
+    if (!clean)
+      return;
+    this.send({ type: "typing", channel_id: clean, sender_id: this.agentId, cross_pod: true });
+  }
+  debug(event, meta) {
+    this.onDebug?.(event, meta);
+  }
+  openSocket() {
+    this.debug("connect:start", { url: this.url, agentId: this.agentId });
+    this.clearConnectTimer();
+    this.sessionJoined.clear();
+    const ws = new WebSocket(this.url);
+    this.ws = ws;
+    if (this.connectTimeoutMs > 0) {
+      this.connectTimer = setTimeout(() => {
+        this.connectTimer = null;
+        if (this.ws !== ws)
+          return;
+        const err = new Error(`AgentsChat connect timed out after ${this.connectTimeoutMs}ms`);
+        if (!this.connectSettled) {
+          this.connectSettled = true;
+          this.explicitlyDisconnected = true;
+          try {
+            ws.close();
+          } catch {}
+          this.connectReject?.(err);
+          this.emitError(err);
+        } else if (this.sessionId === null) {
+          this.emitError(err);
+          try {
+            ws.close();
+          } catch {}
+        }
+      }, this.connectTimeoutMs);
+      this.connectTimer.unref?.();
+    }
+    ws.onopen = () => {
+      if (this.ws !== ws)
+        return;
+      try {
+        this.send({
+          type: "auth",
+          agent_id: this.agentId,
+          token: this.token,
+          capabilities: this.capabilities
+        });
+      } catch (err) {
+        this.clearConnectTimer();
+        if (!this.connectSettled) {
+          this.connectSettled = true;
+          this.connectReject?.(err instanceof Error ? err : new Error(String(err)));
+        }
+        this.emitError(err instanceof Error ? err : new Error(String(err)));
+        try {
+          ws.close();
+        } catch {}
+        return;
+      }
+      if (this.heartbeatTimer)
+        clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = setInterval(() => {
+        if (this.ws !== ws)
+          return;
+        if (ws.readyState === WebSocket.OPEN) {
+          try {
+            this.send({ type: "ping", timestamp: new Date().toISOString() });
+          } catch (err) {
+            this.emitError(err instanceof Error ? err : new Error(String(err)));
+            try {
+              ws.close();
+            } catch {}
+          }
+        }
+      }, this.heartbeatIntervalMs);
+      this.heartbeatTimer.unref?.();
+    };
+    ws.onmessage = (event) => {
+      if (this.ws !== ws)
+        return;
+      this.handleMessage(String(event.data));
+    };
+    ws.onerror = () => {
+      if (this.ws !== ws)
+        return;
+      const err = new Error("WebSocket error");
+      if (!this.connectSettled) {
+        this.clearConnectTimer();
+        this.connectSettled = true;
+        this.connectReject?.(err);
+      }
+      this.emitError(err);
+    };
+    ws.onclose = () => {
+      if (this.ws !== ws)
+        return;
+      this.clearConnectTimer();
+      if (this.heartbeatTimer)
+        clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+      this.sessionId = null;
+      this.sessionJoined.clear();
+      if (!this.connectSettled && !this.reconnect) {
+        this.clearConnectTimer();
+        this.connectSettled = true;
+        this.connectReject?.(new Error("WebSocket closed before authentication"));
+      }
+      if (this.explicitlyDisconnected) {
+        this.lifecycleResolve?.();
+        return;
+      }
+      if (!this.reconnect) {
+        this.lifecycleResolve?.();
+        return;
+      }
+      let delay;
+      if (this.nextReconnectDelayOverrideMs !== null) {
+        delay = this.nextReconnectDelayOverrideMs;
+        this.nextReconnectDelayOverrideMs = null;
+      } else {
+        const exp = Math.min(Math.max(0, this.reconnectAttempt), 30);
+        delay = Math.min(this.initialReconnectDelayMs * 2 ** exp, this.maxReconnectDelayMs);
+        this.reconnectAttempt += 1;
+      }
+      this.isReconnecting = true;
+      this.debug("reconnect:scheduled", { delayMs: delay, attempt: this.reconnectAttempt });
+      this.reconnectTimer = setTimeout(() => this.openSocket(), delay);
+      this.reconnectTimer.unref?.();
+    };
+  }
+  send(payload) {
+    if (this.ws?.readyState !== WebSocket.OPEN) {
+      throw new Error("AgentsChat socket is not open");
+    }
+    this.ws.send(JSON.stringify(payload));
+  }
+  handleMessage(raw) {
+    if (Buffer.byteLength(raw, "utf8") > 1048576)
+      return;
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || Object.hasOwn(parsed, "__proto__")) {
+      return;
+    }
+    const msg = parsed;
+    if (msg.type === "auth_ok") {
+      this.clearConnectTimer();
+      this.sessionId = typeof msg.session_id === "string" ? msg.session_id : null;
+      this.reconnectAttempt = 0;
+      const wasReconnect = this.isReconnecting;
+      this.isReconnecting = false;
+      if (!this.connectSettled) {
+        this.connectSettled = true;
+        this.connectResolve?.();
+      } else if (wasReconnect) {
+        this.onReconnect?.();
+        for (const ch of this.joinedChannels) {
+          if (!this.sessionJoined.has(ch) && this.ws?.readyState === WebSocket.OPEN) {
+            this.joinChannel(ch);
+          }
+        }
+      }
+      return;
+    }
+    if (msg.type === "auth_error" || msg.type === "error") {
+      const text = typeof msg.error === "string" ? msg.error : typeof msg.message === "string" ? msg.message : msg.type === "auth_error" ? "AgentsChat authentication error" : "AgentsChat error";
+      const err = new Error(sanitizeMuseText(text).slice(0, 1024));
+      if (msg.type === "auth_error") {
+        this.explicitlyDisconnected = true;
+        try {
+          this.ws?.close();
+        } catch {}
+      }
+      if (!this.connectSettled) {
+        this.clearConnectTimer();
+        this.connectSettled = true;
+        this.connectReject?.(err);
+      }
+      this.emitError(err);
+      return;
+    }
+    if (msg.type === "please_reconnect" || msg.type === "shard_moved") {
+      this.nextReconnectDelayOverrideMs = resolveDrainReconnectDelay(msg);
+      this.reconnectAttempt = 0;
+      try {
+        this.ws?.close();
+      } catch {}
+      return;
+    }
+    if (msg.type === "pong")
+      return;
+    if (msg.type === "channel_created" && typeof msg.channel_id === "string" && msg.channel_id) {
+      if (this.ws?.readyState === WebSocket.OPEN)
+        this.joinChannel(msg.channel_id);
+      return;
+    }
+    if (msg.type === "message" || msg.type === "thread_reply") {
+      if (msg.content === "__typing__")
+        return;
+      const chat = {
+        id: String(msg.id ?? ""),
+        channel_id: String(msg.channel_id ?? ""),
+        sender_id: String(msg.sender_id ?? ""),
+        sender_type: msg.sender_type ?? "agent",
+        content: String(msg.content ?? ""),
+        content_type: msg.content_type ?? "text",
+        timestamp: String(msg.timestamp ?? new Date().toISOString()),
+        channel_type: msg.channel_type,
+        thread_id: typeof msg.thread_id === "string" ? msg.thread_id : typeof msg.parent_id === "string" ? msg.parent_id : undefined
+      };
+      for (const h of this.messageHandlers) {
+        try {
+          Promise.resolve(h(chat)).catch((err) => {
+            this.emitError(err instanceof Error ? err : new Error(String(err)));
+          });
+        } catch (err) {
+          this.emitError(err instanceof Error ? err : new Error(String(err)));
+        }
+      }
+    }
+  }
+}
+
 // muse/src/cli.ts
+function safeLogText(text) {
+  return sanitizeMuseText(text);
+}
 var MAX_REGISTRATION_BYTES = 1024 * 1024;
 async function readRegistrationBody(res) {
   if (!res.body)
@@ -1086,7 +1110,7 @@ async function main(argv = process.argv.slice(2)) {
     return;
   }
   const config = loadConfig();
-  console.log("Muse AgentsChat:", JSON.stringify(safeConfig(config)));
+  console.log("Muse AgentsChat:", safeLogText(JSON.stringify(safeConfig(config))));
   const client = new MuseAgentChatClient({
     url: config.wsUrl,
     agentId: config.agentId,
@@ -1124,8 +1148,8 @@ async function main(argv = process.argv.slice(2)) {
       typing.start(m.channel_id);
       const payload = buildWakePayload({ ...m, type: "message" });
       const queued = appendWakeQueue(queueFile, payload);
-      fireWake({ ...m, type: "message" }, { url: wakeUrl, secret: wakeSecret, logger: console.error });
-      console.log(`[wake] ${m.channel_id} ${m.sender_id} ${m.id} queued=${queued}`);
+      fireWake({ ...m, type: "message" }, { url: wakeUrl, secret: wakeSecret, logger: (text) => console.error(safeLogText(text)) });
+      console.log(`[wake] ${safeLogText(m.channel_id)} ${safeLogText(m.sender_id)} ${safeLogText(m.id)} queued=${queued}`);
     });
     client.onReconnect = () => {
       for (const c of uniqueWakeChannels)
@@ -1135,7 +1159,7 @@ async function main(argv = process.argv.slice(2)) {
       await client.connect();
       for (const c of uniqueWakeChannels)
         client.joinChannel(c);
-      console.log(`Wake daemon listening on ${uniqueWakeChannels.join(", ") || "(no channels — pass --channel <id>)"}, queue=${queueFile}. Press Ctrl+C to stop.`);
+      console.log(`Wake daemon listening on ${safeLogText(uniqueWakeChannels.join(", ")) || "(no channels — pass --channel <id>)"}, queue=${safeLogText(queueFile)}. Press Ctrl+C to stop.`);
       await client.waitUntilClosed();
     } finally {
       process.removeListener("SIGINT", shutdownWake);
@@ -1171,7 +1195,7 @@ async function main(argv = process.argv.slice(2)) {
     displayName: config.displayName,
     channels: uniqueChannels,
     responder: async (ctx) => {
-      console.log(`[${ctx.message.channel_id}] ${ctx.message.sender_id}: ${ctx.message.content}`);
+      console.log(`[${safeLogText(ctx.message.channel_id)}] ${safeLogText(ctx.message.sender_id)}: ${safeLogText(ctx.message.content)}`);
       return autoReply ?? null;
     }
   });
@@ -1182,7 +1206,7 @@ async function main(argv = process.argv.slice(2)) {
   client.onReconnect = () => bridge.rejoin();
   try {
     await bridge.start();
-    console.log(`Listening on ${uniqueChannels.join(", ") || "(no channels — pass --channel <id>)"}. Press Ctrl+C to stop.`);
+    console.log(`Listening on ${safeLogText(uniqueChannels.join(", ")) || "(no channels — pass --channel <id>)"}. Press Ctrl+C to stop.`);
     await client.waitUntilClosed();
   } finally {
     process.removeListener("SIGINT", shutdownListen);
@@ -1194,7 +1218,7 @@ var entryPath = (process.argv[1] ?? "").replace(/\\/g, "/");
 var invokedDirectly = entryPath.endsWith("muse/src/cli.ts") || entryPath.endsWith("dist/muse.js") || process.argv.includes("--muse");
 if (invokedDirectly) {
   main().catch((err) => {
-    console.error(err instanceof Error ? err.message : String(err));
+    console.error(safeLogText(err instanceof Error ? err.message : String(err)));
     process.exit(1);
   });
 }

@@ -27,7 +27,7 @@ const secrets = [
   "sk-sensitive", "whsec_sensitive", "rk_live_sensitive", "rk_test_sensitive", "AIzaSensitive1234",
   "glpat-sensitive", ..."baprs".split("").map(x => `xox${x}-sensitive`),
   "Bearer confidential", "Basic confidential", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
-  "abcdefgh.ijklmnop.qrstuvwx", "-----BEGIN RSA PRIVATE KEY-----\nprivate-body\n-----END RSA PRIVATE KEY-----",
+  "-----BEGIN RSA PRIVATE KEY-----\nprivate-body\n-----END RSA PRIVATE KEY-----",
 ];
 function temp(t) {
   const dir = fs.mkdtempSync(join(tmpdir(), "muse126-"));
@@ -214,7 +214,10 @@ test("126: redaction covers each credential family and complete/unterminated PEM
     assert.equal(redactSecrets(`-----BEGIN ${type}PRIVATE KEY-----\nhidden`), "[redacted]");
   }
   assert.equal(sanitizeMuseText("whsec_\x01sensitive"), "[redacted]");
-  assert.equal(redactSecrets("release-v1.0 ordinary 汉字🙂"), "release-v1.0 ordinary 汉字🙂");
+  assert.equal(
+    redactSecrets("staging-api.agentschat.internal release-v1.0 ordinary 汉字🙂"),
+    "staging-api.agentschat.internal release-v1.0 ordinary 汉字🙂",
+  );
 });
 
 test("126: wake structured fields, mentions and content are bounded/sanitized without input mutation", () => {

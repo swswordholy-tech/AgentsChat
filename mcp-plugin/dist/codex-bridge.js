@@ -1348,7 +1348,7 @@ function prepareRuntimeHome(stateDir, source = process.env.CODEX_HOME || join2(h
 // src/onboarding-status.ts
 var DEFAULT_PUBLIC_BASE = "https://agents-chat.com";
 function isForbiddenMetadataOrLinkLocalHost(host) {
-  if (host === "metadata.google.internal" || host.endsWith(".metadata.google.internal") || host === "metadata.goog" || host.endsWith(".metadata.goog") || host === "169.254.169.254") {
+  if (host === "metadata" || host === "instance-data" || host === "metadata.google.internal" || host.endsWith(".metadata.google.internal") || host === "metadata.goog" || host.endsWith(".metadata.goog") || host === "169.254.169.254" || host === "100.100.100.200" || host === "0.0.0.0") {
     return true;
   }
   if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) {
@@ -1358,16 +1358,20 @@ function isForbiddenMetadataOrLinkLocalHost(host) {
   }
   if (host.startsWith("[") && host.endsWith("]")) {
     const inner = host.slice(1, -1).toLowerCase();
-    if (inner === "::" || /^fe[89ab][0-9a-f]*:/i.test(inner))
+    if (inner === "::" || inner === "0:0:0:0:0:0:0:0" || inner === "fd00:ec2::254" || /^fe[89ab][0-9a-f]*:/i.test(inner)) {
       return true;
-    if (/^::ffff:(?:0:)?(?:169\.254\.|a9fe:)/i.test(inner))
+    }
+    if (/^::ffff:(?:0:)?(?:0\.0\.0\.0|0:0|169\.254\.|a9fe:|100\.100\.100\.200$|6464:64c8$)/i.test(inner)) {
       return true;
+    }
   }
   return false;
 }
 function isSafeOnboardingBase(base) {
   try {
     if (!base || base !== base.trim() || /[\x00-\x20\x7f"<>\\]/.test(base))
+      return false;
+    if (/:0(?:\/|$)/.test(base))
       return false;
     const parsed = new URL(base);
     const host = parsed.hostname.toLowerCase().replace(/\.$/, "");
@@ -2412,7 +2416,7 @@ var MAX_PROFILE_JSON_BYTES = 64 * 1024;
 var CONTROL_CHAR_GLOBAL_RE = /[\x00-\x1f\x7f]/g;
 var DARWIN_SYSTEM_SYMLINKS = new Set(["/var", "/tmp", "/etc"]);
 function sanitizeWarnPart(value) {
-  return redactSecrets(String(value ?? "")).replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED]").replace(/\b(?:agent_key_|sk-|whsec_|gh[pousr]_|github_pat_|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g, "[REDACTED]").replace(CONTROL_CHAR_GLOBAL_RE, "?");
+  return redactSecrets(String(value ?? "")).replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED]").replace(/\b(?:agent_key_|sk-|whsec_|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g, "[REDACTED]").replace(CONTROL_CHAR_GLOBAL_RE, "?");
 }
 function safeLstat(target) {
   try {
@@ -2436,7 +2440,33 @@ function isAllowedDarwinSystemSymlink(dirPath) {
     return false;
   }
 }
+function hasSafeRawDotDotAncestors(targetPath) {
+  if (!targetPath.includes(".."))
+    return true;
+  const rawParent = dirname4(targetPath);
+  const parts = rawParent.split(/[\\/]+/);
+  let acc = rawParent.startsWith("/") ? "/" : /^[A-Za-z]:/.test(rawParent) ? parts[0] + "\\" : process.cwd();
+  const startIdx = rawParent.startsWith("/") ? 1 : /^[A-Za-z]:/.test(rawParent) ? 1 : 0;
+  for (let i = startIdx;i < parts.length; i++) {
+    const seg = parts[i];
+    if (!seg || seg === ".")
+      continue;
+    acc = seg === ".." ? dirname4(acc) : join8(acc, seg);
+    const st = safeLstat(acc);
+    if (st) {
+      if (st.isSymbolicLink()) {
+        if (!isAllowedDarwinSystemSymlink(acc))
+          return false;
+      } else if (!st.isDirectory()) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
 function hasSafeAncestorDirs(targetPath) {
+  if (!hasSafeRawDotDotAncestors(targetPath))
+    return false;
   let cur = dirname4(resolve5(targetPath));
   for (let depth = 0;depth < 64; depth += 1) {
     const st = safeLstat(cur);
@@ -2542,6 +2572,7 @@ function safeWriteProfile(path, data, warn = defaultWarn) {
 var NON_PROFILE_JSON_FILES = new Set([
   "session-binds.json",
   "session-binds.meta.json",
+  "agy-session-binds.json",
   "agy-binds.json",
   "agy-binds.meta.json",
   "grok-binds.json",
@@ -2550,9 +2581,11 @@ var NON_PROFILE_JSON_FILES = new Set([
   "identity-guard.json",
   "cursor.json",
   "read-cursors.json",
+  "mention-timestamps.json",
   "wake-pids.json",
   "dsh.json",
-  "config.json"
+  "config.json",
+  "muse.json"
 ]);
 
 // src/session-bind.ts
