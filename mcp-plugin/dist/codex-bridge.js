@@ -2394,7 +2394,7 @@ async function verifyLoopTick(raw, config, owner, list, opts) {
 
 // src/session-bind.ts
 import { createHash as createHash3 } from "node:crypto";
-import { closeSync, lstatSync as lstatSync9, mkdirSync as mkdirSync5, openSync, readFileSync as readFileSync8, readSync, readdirSync as readdirSync4, readlinkSync as readlinkSync3, unlinkSync as unlinkSync3 } from "node:fs";
+import { closeSync, lstatSync as lstatSync9, mkdirSync as mkdirSync5, openSync, readFileSync as readFileSync8, readSync, readdirSync as readdirSync4, readlinkSync as readlinkSync3, realpathSync as realpathSync5, statSync, unlinkSync as unlinkSync3 } from "node:fs";
 import { homedir as homedir5, tmpdir } from "node:os";
 import { isAbsolute as isAbsolute4, join as join9, parse as parse3, resolve as resolve6 } from "node:path";
 
@@ -2603,7 +2603,7 @@ function isPidAlive(pid) {
 }
 function resolveLockDir(homeDir, env = process.env) {
   const explicit = env.AGENTSCHAT_LOCK_DIR?.trim();
-  if (explicit && explicit.length <= 4096 && !explicit.startsWith("-") && !CONTROL_CHAR_RE.test(explicit) && isAbsolute4(explicit)) {
+  if (explicit && explicit.length <= 4096 && !explicit.startsWith("-") && !CONTROL_CHAR_RE.test(explicit) && isAbsolute4(explicit) && isSafeDirOrMissing(explicit)) {
     return explicit;
   }
   const hash = createHash3("sha256").update(homeDir || ".").digest("hex").slice(0, 12);
@@ -2616,20 +2616,35 @@ var SESSION_BINDS_MAX_BYTES = 1024 * 1024;
 var CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
 var RESERVED_BIND_SIDECARS = new Set([
   "session-binds",
+  "session-binds.meta",
+  "session-binds_meta",
   "agy-binds",
+  "agy-binds.meta",
+  "agy-binds_meta",
   "grok-binds",
+  "grok-binds.meta",
+  "grok-binds_meta",
+  "agy-session-binds",
+  "identity-guard",
   "cursor",
   "read-cursors",
+  "mention-timestamps",
   "wake-pids",
   "config",
-  "codex-bots"
+  "codex-bots",
+  "dsh",
+  "muse"
 ]);
 function readBoundedRegularJson(path, maxBytes) {
   try {
     const st = lstatSync9(path);
     if (st.isSymbolicLink() || !st.isFile() || st.size > maxBytes)
       return null;
-    return JSON.parse(readFileSync8(path, "utf8"));
+    const parsed = JSON.parse(readFileSync8(path, "utf8"));
+    if (parsed && typeof parsed === "object" && Object.prototype.hasOwnProperty.call(parsed, "__proto__")) {
+      return null;
+    }
+    return parsed;
   } catch {
     return null;
   }
@@ -2648,13 +2663,48 @@ function isAllowedDarwinSystemLink(dirPath) {
   if (dirPath !== "/var" && dirPath !== "/tmp" && dirPath !== "/etc")
     return false;
   try {
-    return readlinkSync3(dirPath) === `private${dirPath}`;
+    const expected = `/private${dirPath}`;
+    return readlinkSync3(dirPath) === `private${dirPath}` && realpathSync5(dirPath) === expected && !lstatSync9("/private").isSymbolicLink() && lstatSync9("/private").isDirectory() && !lstatSync9(expected).isSymbolicLink() && statSync(expected).isDirectory();
   } catch {
     return false;
   }
 }
+function hasSafeRawDotDotSegments(rawPath) {
+  if (!rawPath.includes(".."))
+    return true;
+  const baseAbs = isAbsolute4(rawPath) ? rawPath : `${process.cwd()}/${rawPath}`;
+  const root = parse3(baseAbs).root;
+  const rawParts = baseAbs.slice(root.length).split(/[\\/]+/).filter(Boolean);
+  let cur = root;
+  for (const part of rawParts) {
+    if (part === ".")
+      continue;
+    if (part === "..") {
+      cur = resolve6(cur, "..");
+      continue;
+    }
+    cur = join9(cur, part);
+    try {
+      const st = lstatSync9(cur);
+      if (st.isSymbolicLink()) {
+        if (isAllowedDarwinSystemLink(cur))
+          continue;
+        return false;
+      }
+      if (!st.isDirectory())
+        return false;
+    } catch (e) {
+      if (e && typeof e === "object" && e.code === "ENOENT")
+        continue;
+      return false;
+    }
+  }
+  return true;
+}
 function isSafeDirOrMissing(dirPath) {
   if (!dirPath || CONTROL_CHAR_RE.test(dirPath))
+    return false;
+  if (!hasSafeRawDotDotSegments(dirPath))
     return false;
   const abs = resolve6(dirPath);
   const root = parse3(abs).root;

@@ -15,7 +15,12 @@ type PendingStart = { promise?: Promise<AgentChatGatewayState>; cancel?: () => v
 const MAX_TRACE_BYTES = 1024 * 1024;
 
 function redact(value: string) {
-  return value.replace(/\b(?:Bearer|Basic)\s+[^\s"'<>\\]+|(?:ac_|sk-|mcp_(?:at|rt|code)_|agent_key_|whsec_|gh[pousr]_|github_pat_|AIza|AKIA)[A-Za-z0-9_-]+/gi, "[REDACTED]");
+  return value
+    .replace(/((?:https?|wss?):\/\/)([^/\s"'<>\\@]+@)/gi, "$1[REDACTED]@")
+    .replace(
+      /\b(?:Bearer|Basic)\s+[^\s"'<>\\]+|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b|(?:ac_|sk-|rk_(?:live|test)_|mcp_(?:at|rt|code)_|agent_key_|whsec_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|AIza|AKIA|ASIA)[A-Za-z0-9_-]+/gi,
+      "[REDACTED]",
+    );
 }
 
 function serializeLogMeta(meta: unknown): string {

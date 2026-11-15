@@ -941,12 +941,12 @@ class MuseAgentChatClient {
 }
 
 // src/session-route.ts
-import { lstatSync as lstatSync4, readFileSync as readFileSync4, readlinkSync as readlinkSync2, realpathSync as realpathSync2 } from "node:fs";
+import { lstatSync as lstatSync4, readFileSync as readFileSync4, readlinkSync as readlinkSync2, realpathSync as realpathSync3 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
 import { dirname as dirname3, isAbsolute as isAbsolute3, join as join3, parse as parse2, resolve as resolve2, sep as sep2 } from "node:path";
 
 // src/session-bind.ts
-import { closeSync, lstatSync as lstatSync3, mkdirSync as mkdirSync2, openSync, readFileSync as readFileSync3, readSync, readdirSync, readlinkSync, unlinkSync as unlinkSync2 } from "node:fs";
+import { closeSync, lstatSync as lstatSync3, mkdirSync as mkdirSync2, openSync, readFileSync as readFileSync3, readSync, readdirSync, readlinkSync, realpathSync as realpathSync2, statSync, unlinkSync as unlinkSync2 } from "node:fs";
 import { isAbsolute as isAbsolute2, join as join2, parse, resolve } from "node:path";
 
 // src/profile-store.ts
@@ -980,20 +980,35 @@ var MAX_SESSION_BINDS_ENTRIES = 1024;
 var CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
 var RESERVED_BIND_SIDECARS = new Set([
   "session-binds",
+  "session-binds.meta",
+  "session-binds_meta",
   "agy-binds",
+  "agy-binds.meta",
+  "agy-binds_meta",
   "grok-binds",
+  "grok-binds.meta",
+  "grok-binds_meta",
+  "agy-session-binds",
+  "identity-guard",
   "cursor",
   "read-cursors",
+  "mention-timestamps",
   "wake-pids",
   "config",
-  "codex-bots"
+  "codex-bots",
+  "dsh",
+  "muse"
 ]);
 function readBoundedRegularJson(path, maxBytes) {
   try {
     const st = lstatSync3(path);
     if (st.isSymbolicLink() || !st.isFile() || st.size > maxBytes)
       return null;
-    return JSON.parse(readFileSync3(path, "utf8"));
+    const parsed = JSON.parse(readFileSync3(path, "utf8"));
+    if (parsed && typeof parsed === "object" && Object.prototype.hasOwnProperty.call(parsed, "__proto__")) {
+      return null;
+    }
+    return parsed;
   } catch {
     return null;
   }
@@ -1004,13 +1019,48 @@ function isAllowedDarwinSystemLink(dirPath) {
   if (dirPath !== "/var" && dirPath !== "/tmp" && dirPath !== "/etc")
     return false;
   try {
-    return readlinkSync(dirPath) === `private${dirPath}`;
+    const expected = `/private${dirPath}`;
+    return readlinkSync(dirPath) === `private${dirPath}` && realpathSync2(dirPath) === expected && !lstatSync3("/private").isSymbolicLink() && lstatSync3("/private").isDirectory() && !lstatSync3(expected).isSymbolicLink() && statSync(expected).isDirectory();
   } catch {
     return false;
   }
 }
+function hasSafeRawDotDotSegments(rawPath) {
+  if (!rawPath.includes(".."))
+    return true;
+  const baseAbs = isAbsolute2(rawPath) ? rawPath : `${process.cwd()}/${rawPath}`;
+  const root = parse(baseAbs).root;
+  const rawParts = baseAbs.slice(root.length).split(/[\\/]+/).filter(Boolean);
+  let cur = root;
+  for (const part of rawParts) {
+    if (part === ".")
+      continue;
+    if (part === "..") {
+      cur = resolve(cur, "..");
+      continue;
+    }
+    cur = join2(cur, part);
+    try {
+      const st = lstatSync3(cur);
+      if (st.isSymbolicLink()) {
+        if (isAllowedDarwinSystemLink(cur))
+          continue;
+        return false;
+      }
+      if (!st.isDirectory())
+        return false;
+    } catch (e) {
+      if (e && typeof e === "object" && e.code === "ENOENT")
+        continue;
+      return false;
+    }
+  }
+  return true;
+}
 function isSafeDirOrMissing(dirPath) {
   if (!dirPath || CONTROL_CHAR_RE.test(dirPath))
+    return false;
+  if (!hasSafeRawDotDotSegments(dirPath))
     return false;
   const abs = resolve(dirPath);
   const root = parse(abs).root;
@@ -1043,7 +1093,8 @@ function isValidBoundProfileName(value) {
     return false;
   }
   const stem = value.replace(/\.json$/i, "").toLowerCase();
-  return Boolean(stem) && !isUnsafeBindKey(value) && !isUnsafeBindKey(stem) && !RESERVED_BIND_SIDECARS.has(stem);
+  const normalizedStem = stem.replace(/[^a-z0-9_-]/g, "_");
+  return Boolean(stem) && !isUnsafeBindKey(value) && !isUnsafeBindKey(stem) && !RESERVED_BIND_SIDECARS.has(stem) && !RESERVED_BIND_SIDECARS.has(normalizedStem);
 }
 function isUnsafeBindKey(key) {
   const lower = key.toLowerCase();
@@ -1153,12 +1204,12 @@ function isAllowedDarwinSystemLink2(dirPath) {
   if (dirPath !== "/var" && dirPath !== "/tmp" && dirPath !== "/etc")
     return false;
   try {
-    return readlinkSync2(dirPath) === `private${dirPath}` && realpathSync2(dirPath) === `/private${dirPath}` && !lstatSync4("/private").isSymbolicLink() && lstatSync4("/private").isDirectory() && !lstatSync4(`/private${dirPath}`).isSymbolicLink() && lstatSync4(`/private${dirPath}`).isDirectory();
+    return readlinkSync2(dirPath) === `private${dirPath}` && realpathSync3(dirPath) === `/private${dirPath}` && !lstatSync4("/private").isSymbolicLink() && lstatSync4("/private").isDirectory() && !lstatSync4(`/private${dirPath}`).isSymbolicLink() && lstatSync4(`/private${dirPath}`).isDirectory();
   } catch {
     return false;
   }
 }
-function hasSafeRawDotDotSegments(rawPath) {
+function hasSafeRawDotDotSegments2(rawPath) {
   const absRaw = isAbsolute3(rawPath) ? rawPath : `${process.cwd()}${sep2}${rawPath}`;
   const root = parse2(absRaw).root;
   const segments = absRaw.slice(root.length).split(/[\\/]+/).filter(Boolean);
@@ -1188,7 +1239,7 @@ function hasSafeRawDotDotSegments(rawPath) {
 }
 function isSafeRealDir(path) {
   try {
-    if (!path || /[\x00-\x1f\x7f]/.test(path) || !hasSafeRawDotDotSegments(path)) {
+    if (!path || /[\x00-\x1f\x7f]/.test(path) || !hasSafeRawDotDotSegments2(path)) {
       return false;
     }
     const st = lstatSync4(path);
@@ -1346,7 +1397,7 @@ function resolveWindowsCliSpawn(cmd, args, opts) {
 
 // dsh/src/patch.ts
 import { randomBytes as randomBytes2 } from "node:crypto";
-import { chmodSync as chmodSync2, copyFileSync, lstatSync as lstatSync6, mkdirSync as mkdirSync3, readFileSync as readFileSync6, realpathSync as realpathSync3, renameSync as renameSync2, statSync, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2 } from "node:fs";
+import { chmodSync as chmodSync2, copyFileSync, lstatSync as lstatSync6, mkdirSync as mkdirSync3, readFileSync as readFileSync6, realpathSync as realpathSync4, renameSync as renameSync2, statSync as statSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2 } from "node:fs";
 import { dirname as dirname5, isAbsolute as isAbsolute4, join as join5, resolve as resolve4 } from "node:path";
 import { homedir as homedir4 } from "node:os";
 var FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
@@ -1355,8 +1406,8 @@ function isAllowedDarwinSystemLink3(dirPath) {
   if (process.platform !== "darwin" || !DARWIN_ROOT_LINKS.has(dirPath))
     return false;
   try {
-    const real = realpathSync3(dirPath);
-    return real === `/private${dirPath}` && statSync(real).isDirectory();
+    const real = realpathSync4(dirPath);
+    return real === `/private${dirPath}` && statSync2(real).isDirectory();
   } catch {
     return false;
   }

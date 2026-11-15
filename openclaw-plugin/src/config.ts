@@ -16,7 +16,11 @@ function readChannelConfig(raw: OpenClawConfig | unknown): AgentChatChannelConfi
 }
 
 function isSafeAccountId(id: string) {
-  return Boolean(id.trim()) && !/^(?:__proto__|constructor|prototype)$/i.test(id.trim());
+  if (typeof id !== "string") return false;
+  const trimmed = id.trim();
+  if (!trimmed || trimmed.length > 128 || trimmed === "." || trimmed === "..") return false;
+  if (/[\x00-\x1f\x7f]/.test(id)) return false;
+  return !/^(?:__proto__|constructor|prototype)$/i.test(trimmed);
 }
 
 function resolveAccountId(raw: unknown, requested?: string | null): string {

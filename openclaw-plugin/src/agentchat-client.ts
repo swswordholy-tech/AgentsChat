@@ -44,7 +44,57 @@ function safeDelay(value: number | undefined, fallback: number) {
 function normalizeChannelId(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const id = value.trim();
-  return id && id.length <= 128 && !/[\x00-\x20\x7f]/.test(id) ? id : undefined;
+  if (
+    !id ||
+    id.length > 128 ||
+    id === "." ||
+    id === ".." ||
+    /^(?:__proto__|constructor|prototype)$/i.test(id) ||
+    /[\x00-\x20\x7f]/.test(id)
+  ) {
+    return undefined;
+  }
+  return id;
+}
+
+function validateClientWsUrl(wsUrl: string): void {
+  if (typeof wsUrl !== "string" || !wsUrl || wsUrl !== wsUrl.trim() || /["<>\\\x00-\x20\x7f]/.test(wsUrl)) {
+    throw new Error("Invalid AgentChat WebSocket URL");
+  }
+  let url: URL;
+  try {
+    url = new URL(wsUrl);
+  } catch {
+    throw new Error("Invalid AgentChat WebSocket URL");
+  }
+  if (!["ws:", "wss:"].includes(url.protocol) || url.username || url.password || url.port === "0") {
+    throw new Error("AgentChat WebSocket URL requires ws/wss without credentials or port 0");
+  }
+  const host = url.hostname.toLowerCase().replace(/\.$/, "");
+  if (
+    host === "0.0.0.0" ||
+    host === "[::]" ||
+    /^\[(?:0+:){7}0+\]$/.test(host) ||
+    host === "100.100.100.200" ||
+    host === "[fd00:ec2::254]" ||
+    /^\[fd00:ec2:(?:0+:){0,5}254\]$/i.test(host) ||
+    host === "metadata" ||
+    host === "instance-data" ||
+    host === "metadata.google.internal" ||
+    host.endsWith(".metadata.google.internal") ||
+    host === "metadata.goog" ||
+    host.endsWith(".metadata.goog") ||
+    /^169\.254\./.test(host) ||
+    /^\[fe[89ab][0-9a-f]:/i.test(host) ||
+    /^\[(?:::(?:ffff:(?:0:)?)?|(?:0+:){2,6}(?:ffff:(?:0+:)?|0+:)?)(?:a9fe:[0-9a-f]+|169\.254\.\d+\.\d+|6464:64c8|100\.100\.100\.200|0+:0+|0\.0\.0\.0)\]$/i.test(
+      host,
+    )
+  ) {
+    throw new Error("AgentChat WebSocket cannot use metadata, unspecified, or link-local hosts");
+  }
+  if (url.protocol !== "wss:" && !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname.toLowerCase())) {
+    throw new Error("AgentChat WebSocket requires wss for remote hosts");
+  }
 }
 const DRAIN_MIN_DELAY_MS = 200;
 const DRAIN_JITTER_MS = 2_000;
@@ -144,6 +194,14 @@ export class AgentChatClient {
       });
 
       this.debug("connect:start", { url: this.url, agentId: this.agentId });
+      try {
+        validateClientWsUrl(this.url);
+      } catch (err) {
+        const urlErr = err instanceof Error ? err : new Error(String(err));
+        this.rejectConnect(urlErr);
+        this.resolveLifecycle();
+        return;
+      }
       this.openSocket();
     });
   }
@@ -178,6 +236,18 @@ export class AgentChatClient {
   }
 
   sendMessage(channelId: string, content: string, threadId?: string | number) {
+    const normalizedChannel = typeof channelId === "string" ? channelId.trim() : "";
+    if (
+      !normalizedChannel ||
+      normalizedChannel.length > 256 ||
+      normalizedChannel === "." ||
+      normalizedChannel === ".." ||
+      /^(?:__proto__|constructor|prototype)$/i.test(normalizedChannel) ||
+      /[\x00-\x1f\x7f]/.test(normalizedChannel)
+    ) {
+      throw new Error("Invalid AgentChat channelId for outbound message");
+    }
+    channelId = normalizedChannel;
     const normalizedThread =
       threadId !== undefined && threadId !== null && String(threadId).trim().length > 0
         ? String(threadId).trim()
@@ -392,8 +462,17 @@ export class AgentChatClient {
       case "message":
       case "thread_reply": {
         if (data.content === "__typing__") break;
-        if (typeof data.channel_id !== "string" || !data.channel_id.trim() ||
-            /[\x00-\x1f\x7f]/.test(data.channel_id) || data.channel_id.includes(":thread:")) break;
+        const trimmedChannel = typeof data.channel_id === "string" ? data.channel_id.trim() : "";
+        if (
+          !trimmedChannel ||
+          trimmedChannel === "." ||
+          trimmedChannel === ".." ||
+          /^(?:__proto__|constructor|prototype)$/i.test(trimmedChannel) ||
+          /[\x00-\x1f\x7f]/.test(data.channel_id as string) ||
+          (data.channel_id as string).includes(":thread:")
+        ) {
+          break;
+        }
         const rawThreadId = data.thread_id ?? data.parent_id ?? data.reply_to ?? data.in_reply_to;
         const threadId =
           (typeof rawThreadId === "string" && rawThreadId.length > 0) || typeof rawThreadId === "number"

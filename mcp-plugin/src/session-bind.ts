@@ -14,7 +14,7 @@
  *    crashed/closed processes automatically release their lock (never deadlocks).
  */
 import { createHash } from "node:crypto";
-import { closeSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, readlinkSync, unlinkSync, type Stats } from "node:fs";
+import { closeSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, readlinkSync, realpathSync, statSync, unlinkSync, type Stats } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, parse, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -61,7 +61,14 @@ export function isPidAlive(pid: unknown): boolean {
 /** Deterministic per-HOME lock directory in tmpdir (cleared on OS reboot, isolated in tests). */
 export function resolveLockDir(homeDir: string, env: Record<string, string | undefined> = process.env): string {
   const explicit = env.AGENTSCHAT_LOCK_DIR?.trim();
-  if (explicit && explicit.length <= 4096 && !explicit.startsWith("-") && !CONTROL_CHAR_RE.test(explicit) && isAbsolute(explicit)) {
+  if (
+    explicit &&
+    explicit.length <= 4096 &&
+    !explicit.startsWith("-") &&
+    !CONTROL_CHAR_RE.test(explicit) &&
+    isAbsolute(explicit) &&
+    isSafeDirOrMissing(explicit)
+  ) {
     return explicit;
   }
   const hash = createHash("sha256").update(homeDir || ".").digest("hex").slice(0, 12);
@@ -74,15 +81,27 @@ const LOCK_KEY_MAX_CHARS = 128;
 const SESSION_BINDS_MAX_BYTES = 1024 * 1024;
 const MAX_SESSION_BINDS_ENTRIES = 1024;
 const CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
+// NOTE: "profile" MUST NEVER be added here — `profile.json` is the default boot identity slot.
 const RESERVED_BIND_SIDECARS = new Set([
   "session-binds",
+  "session-binds.meta",
+  "session-binds_meta",
   "agy-binds",
+  "agy-binds.meta",
+  "agy-binds_meta",
   "grok-binds",
+  "grok-binds.meta",
+  "grok-binds_meta",
+  "agy-session-binds",
+  "identity-guard",
   "cursor",
   "read-cursors",
+  "mention-timestamps",
   "wake-pids",
   "config",
   "codex-bots",
+  "dsh",
+  "muse",
 ]);
 
 function safeLstat(path: string): Stats | null {
@@ -97,7 +116,11 @@ function readBoundedRegularJson(path: string, maxBytes: number): unknown | null 
   try {
     const st = lstatSync(path);
     if (st.isSymbolicLink() || !st.isFile() || st.size > maxBytes) return null;
-    return JSON.parse(readFileSync(path, "utf8"));
+    const parsed = JSON.parse(readFileSync(path, "utf8"));
+    if (parsed && typeof parsed === "object" && Object.prototype.hasOwnProperty.call(parsed, "__proto__")) {
+      return null;
+    }
+    return parsed;
   } catch {
     return null;
   }
@@ -116,14 +139,51 @@ function isAllowedDarwinSystemLink(dirPath: string): boolean {
   if (process.platform !== "darwin") return false;
   if (dirPath !== "/var" && dirPath !== "/tmp" && dirPath !== "/etc") return false;
   try {
-    return readlinkSync(dirPath) === `private${dirPath}`;
+    const expected = `/private${dirPath}`;
+    return (
+      readlinkSync(dirPath) === `private${dirPath}` &&
+      realpathSync(dirPath) === expected &&
+      !lstatSync("/private").isSymbolicLink() &&
+      lstatSync("/private").isDirectory() &&
+      !lstatSync(expected).isSymbolicLink() &&
+      statSync(expected).isDirectory()
+    );
   } catch {
     return false;
   }
 }
 
+function hasSafeRawDotDotSegments(rawPath: string): boolean {
+  if (!rawPath.includes("..")) return true;
+  const baseAbs = isAbsolute(rawPath) ? rawPath : `${process.cwd()}/${rawPath}`;
+  const root = parse(baseAbs).root;
+  const rawParts = baseAbs.slice(root.length).split(/[\\/]+/).filter(Boolean);
+  let cur = root;
+  for (const part of rawParts) {
+    if (part === ".") continue;
+    if (part === "..") {
+      cur = resolve(cur, "..");
+      continue;
+    }
+    cur = join(cur, part);
+    try {
+      const st = lstatSync(cur);
+      if (st.isSymbolicLink()) {
+        if (isAllowedDarwinSystemLink(cur)) continue;
+        return false;
+      }
+      if (!st.isDirectory()) return false;
+    } catch (e: any) {
+      if (e && typeof e === "object" && e.code === "ENOENT") continue;
+      return false;
+    }
+  }
+  return true;
+}
+
 function isSafeDirOrMissing(dirPath: string): boolean {
   if (!dirPath || CONTROL_CHAR_RE.test(dirPath)) return false;
+  if (!hasSafeRawDotDotSegments(dirPath)) return false;
   const abs = resolve(dirPath);
   const root = parse(abs).root;
   const segments = abs.slice(root.length).split(/[\\/]+/).filter(Boolean);
@@ -154,7 +214,14 @@ function isValidBoundProfileName(value: string): boolean {
     return false;
   }
   const stem = value.replace(/\.json$/i, "").toLowerCase();
-  return Boolean(stem) && !isUnsafeBindKey(value) && !isUnsafeBindKey(stem) && !RESERVED_BIND_SIDECARS.has(stem);
+  const normalizedStem = stem.replace(/[^a-z0-9_-]/g, "_");
+  return (
+    Boolean(stem) &&
+    !isUnsafeBindKey(value) &&
+    !isUnsafeBindKey(stem) &&
+    !RESERVED_BIND_SIDECARS.has(stem) &&
+    !RESERVED_BIND_SIDECARS.has(normalizedStem)
+  );
 }
 
 export function lockFilePath(lockDir: string, agentId: string): string {
@@ -336,10 +403,19 @@ export function loadSessionBinds(configDir: string): Record<string, string> {
 }
 
 function resolveAgentIdForProfileName(configDir: string, name: string): string | null {
-  if (!name || name.includes("/") || name.includes("\\") || CONTROL_CHAR_RE.test(name)) return null;
+  if (!name || name === "." || name === ".." || name.includes("/") || name.includes("\\") || CONTROL_CHAR_RE.test(name)) return null;
   if (!isSafeDirOrMissing(configDir)) return null;
+  const stem = name.replace(/\.json$/i, "").toLowerCase();
   const base = name.replace(/\.json$/i, "").replace(/[^a-zA-Z0-9_-]/g, "_");
-  if (!base || base.length > LOCK_KEY_MAX_CHARS || isUnsafeBindKey(base)) return null;
+  if (
+    !base ||
+    base.length > LOCK_KEY_MAX_CHARS ||
+    isUnsafeBindKey(base) ||
+    RESERVED_BIND_SIDECARS.has(stem) ||
+    RESERVED_BIND_SIDECARS.has(base.toLowerCase())
+  ) {
+    return null;
+  }
   const profilesDir = join(configDir, "profiles");
   const candidates = isSafeDirOrMissing(profilesDir)
     ? [join(profilesDir, `${base}.json`), join(configDir, `${base}.json`)]
@@ -1100,6 +1176,7 @@ function isSafeDirEntryName(entry: string): boolean {
 }
 
 function isLoopbackDshHealthUrl(rawUrl: string): boolean {
+  if (!rawUrl || rawUrl !== rawUrl.trim() || CONTROL_CHAR_RE.test(rawUrl)) return false;
   let u: URL;
   try {
     u = new URL(rawUrl);
@@ -1107,11 +1184,12 @@ function isLoopbackDshHealthUrl(rawUrl: string): boolean {
     return false;
   }
   if (u.protocol !== "http:") return false;
-  if (u.username || u.password || u.hash) return false;
+  if (u.username || u.password || u.search || u.hash) return false;
   const host = u.hostname.toLowerCase();
   if (host !== "127.0.0.1" && host !== "localhost" && host !== "[::1]" && host !== "::1") {
     return false;
   }
+  if (/:0+(?:\/|$)/.test(rawUrl)) return false;
   if (u.port) {
     const port = Number(u.port);
     if (!Number.isInteger(port) || port < 1 || port > 65535) return false;
@@ -1120,37 +1198,55 @@ function isLoopbackDshHealthUrl(rawUrl: string): boolean {
 }
 
 async function readBoundedDshHealthJson(res: Response): Promise<unknown> {
+  const contentLength = Number(res.headers?.get?.("content-length") ?? "");
+  if (Number.isFinite(contentLength) && contentLength > DSH_HEALTH_MAX_BYTES) {
+    await res.body?.cancel?.().catch(() => {});
+    throw new Error("DSH /health response exceeded byte cap");
+  }
   const reader = (res as any)?.body?.getReader?.();
+  let parsed: unknown;
   if (!reader) {
-    return await res.json();
-  }
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (value instanceof Uint8Array) {
-        total += value.byteLength;
-        if (total > DSH_HEALTH_MAX_BYTES) {
-          await reader.cancel().catch(() => {});
-          throw new Error("DSH /health response exceeded byte cap");
-        }
-        chunks.push(value);
-      }
+    const text =
+      typeof (res as any)?.text === "function"
+        ? await res.text()
+        : JSON.stringify(await res.json());
+    if (Buffer.byteLength(text, "utf8") > DSH_HEALTH_MAX_BYTES) {
+      throw new Error("DSH /health response exceeded byte cap");
     }
-  } finally {
+    parsed = JSON.parse(text);
+  } else {
+    const chunks: Uint8Array[] = [];
+    let total = 0;
     try {
-      reader.releaseLock?.();
-    } catch {}
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value instanceof Uint8Array) {
+          total += value.byteLength;
+          if (total > DSH_HEALTH_MAX_BYTES) {
+            await reader.cancel().catch(() => {});
+            throw new Error("DSH /health response exceeded byte cap");
+          }
+          chunks.push(value);
+        }
+      }
+    } finally {
+      try {
+        reader.releaseLock?.();
+      } catch {}
+    }
+    const merged = new Uint8Array(total);
+    let offset = 0;
+    for (const c of chunks) {
+      merged.set(c, offset);
+      offset += c.byteLength;
+    }
+    parsed = JSON.parse(Buffer.from(merged).toString("utf8"));
   }
-  const merged = new Uint8Array(total);
-  let offset = 0;
-  for (const c of chunks) {
-    merged.set(c, offset);
-    offset += c.byteLength;
+  if (parsed && typeof parsed === "object" && Object.prototype.hasOwnProperty.call(parsed, "__proto__")) {
+    throw new Error("Invalid DSH /health JSON object");
   }
-  return JSON.parse(Buffer.from(merged).toString("utf8"));
+  return parsed;
 }
 
 /** mtime of a session directory's log, or 0 when it has none. */

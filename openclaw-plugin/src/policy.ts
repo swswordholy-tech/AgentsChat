@@ -23,6 +23,29 @@ function getThreadId(message: ChatMessage): string | number | undefined {
   return value;
 }
 
+function isBlockedMetadataOrLinkLocalHost(rawHost: string): boolean {
+  const host = rawHost.toLowerCase().replace(/\.$/, "");
+  return (
+    host === "0.0.0.0" ||
+    host === "[::]" ||
+    /^\[(?:0+:){7}0+\]$/.test(host) ||
+    host === "100.100.100.200" ||
+    host === "[fd00:ec2::254]" ||
+    /^\[fd00:ec2:(?:0+:){0,5}254\]$/i.test(host) ||
+    host === "metadata" ||
+    host === "instance-data" ||
+    host === "metadata.google.internal" ||
+    host.endsWith(".metadata.google.internal") ||
+    host === "metadata.goog" ||
+    host.endsWith(".metadata.goog") ||
+    /^169\.254\./.test(host) ||
+    /^\[fe[89ab][0-9a-f]:/i.test(host) ||
+    /^\[(?:::(?:ffff:(?:0:)?)?|(?:0+:){2,6}(?:ffff:(?:0+:)?|0+:)?)(?:a9fe:[0-9a-f]+|169\.254\.\d+\.\d+|6464:64c8|100\.100\.100\.200|0+:0+|0\.0\.0\.0)\]$/i.test(
+      host,
+    )
+  );
+}
+
 function deriveRestBaseUrl(wsUrl: string) {
   if (wsUrl !== wsUrl.trim() || /["<>\\\x00-\x20\x7f]/.test(wsUrl)) {
     throw new Error("Invalid AgentChat history WebSocket URL");
@@ -32,10 +55,7 @@ function deriveRestBaseUrl(wsUrl: string) {
     throw new Error("AgentChat history requires a WebSocket URL without credentials");
   }
   // URL canonicalizes numeric IPv4 and IPv4-in-IPv6 spellings before this check.
-  const host = url.hostname.toLowerCase().replace(/\.$/, "");
-  if (["metadata.google.internal", "metadata.goog"].includes(host) ||
-      /^169\.254\./.test(host) || /^\[fe[89ab][0-9a-f]:/i.test(host) ||
-      /^\[::(?:ffff:(?:0:)?)?a9fe:[0-9a-f]+\]$/i.test(host)) {
+  if (isBlockedMetadataOrLinkLocalHost(url.hostname)) {
     throw new Error("AgentChat history cannot use metadata or link-local hosts");
   }
   if (url.protocol !== "wss:" && !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname)) {
@@ -80,8 +100,13 @@ const MAX_HISTORY_BYTES = 512 * 1024;
 
 function scrubHistoryError(error: unknown) {
   return (error instanceof Error ? error.message : String(error))
-    .replace(/\bBearer\s+[^\s"'<>]+/gi, "Bearer [redacted]")
-    .replace(/(?:ac_|mcp_(?:at|rt|code)_|agent_key_|sk-|whsec_|gh[pousr]_|github_pat_|AIza|AKIA)[A-Za-z0-9_-]+/gi, "[redacted]")
+    .replace(/((?:https?|wss?):\/\/)([^/\s"'<>\\@]+@)/gi, "$1[redacted]@")
+    .replace(/\b(Bearer|Basic)\s+[^\s"'<>\\]+/gi, "$1 [redacted]")
+    .replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, "[redacted]")
+    .replace(
+      /(?:ac_|mcp_(?:at|rt|code)_|agent_key_|sk-|rk_(?:live|test)_|whsec_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|AIza|AKIA|ASIA)[A-Za-z0-9_-]+/gi,
+      "[redacted]",
+    )
     .replace(/[\x00-\x1f\x7f]/g, "");
 }
 
@@ -120,11 +145,22 @@ async function fetchChannelHistory(params: {
   channelId: string;
   after?: string;
 }) {
+  const rawChannelId = typeof params.channelId === "string" ? params.channelId.trim() : "";
+  if (
+    !rawChannelId ||
+    rawChannelId.length > 256 ||
+    rawChannelId === "." ||
+    rawChannelId === ".." ||
+    /^(?:__proto__|constructor|prototype)$/i.test(rawChannelId) ||
+    /[\x00-\x1f\x7f]/.test(rawChannelId)
+  ) {
+    throw new Error("Invalid AgentChat channel ID for history fetch");
+  }
   const baseUrl = deriveRestBaseUrl(params.wsUrl);
   const search = new URLSearchParams({ limit: String(HISTORY_LIMIT) });
   if (params.after) search.set("after", params.after);
   const response = await fetch(
-    `${baseUrl}/api/channels/${encodeURIComponent(params.channelId)}/messages?${search.toString()}`,
+    `${baseUrl}/api/channels/${encodeURIComponent(rawChannelId)}/messages?${search.toString()}`,
     {
       redirect: "error",
       headers: params.token ? { Authorization: `Bearer ${params.token}` } : {},

@@ -3211,7 +3211,7 @@ function fireZcodeWake(msg, cfg) {
 
 // src/session-bind.ts
 import { createHash } from "node:crypto";
-import { closeSync, lstatSync as lstatSync4, mkdirSync, openSync, readFileSync as readFileSync5, readSync, readdirSync as readdirSync2, readlinkSync as readlinkSync3, unlinkSync as unlinkSync2 } from "node:fs";
+import { closeSync, lstatSync as lstatSync4, mkdirSync, openSync, readFileSync as readFileSync5, readSync, readdirSync as readdirSync2, readlinkSync as readlinkSync3, realpathSync as realpathSync2, statSync, unlinkSync as unlinkSync2 } from "node:fs";
 import { homedir as homedir3, tmpdir } from "node:os";
 import { isAbsolute as isAbsolute2, join as join5, parse as parse3, resolve as resolve4 } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -3423,7 +3423,7 @@ function isPidAlive(pid) {
 }
 function resolveLockDir(homeDir, env = process.env) {
   const explicit = env.AGENTSCHAT_LOCK_DIR?.trim();
-  if (explicit && explicit.length <= 4096 && !explicit.startsWith("-") && !CONTROL_CHAR_RE.test(explicit) && isAbsolute2(explicit)) {
+  if (explicit && explicit.length <= 4096 && !explicit.startsWith("-") && !CONTROL_CHAR_RE.test(explicit) && isAbsolute2(explicit) && isSafeDirOrMissing(explicit)) {
     return explicit;
   }
   const hash = createHash("sha256").update(homeDir || ".").digest("hex").slice(0, 12);
@@ -3437,13 +3437,24 @@ var MAX_SESSION_BINDS_ENTRIES = 1024;
 var CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
 var RESERVED_BIND_SIDECARS = new Set([
   "session-binds",
+  "session-binds.meta",
+  "session-binds_meta",
   "agy-binds",
+  "agy-binds.meta",
+  "agy-binds_meta",
   "grok-binds",
+  "grok-binds.meta",
+  "grok-binds_meta",
+  "agy-session-binds",
+  "identity-guard",
   "cursor",
   "read-cursors",
+  "mention-timestamps",
   "wake-pids",
   "config",
-  "codex-bots"
+  "codex-bots",
+  "dsh",
+  "muse"
 ]);
 function safeLstat3(path) {
   try {
@@ -3457,7 +3468,11 @@ function readBoundedRegularJson(path, maxBytes) {
     const st = lstatSync4(path);
     if (st.isSymbolicLink() || !st.isFile() || st.size > maxBytes)
       return null;
-    return JSON.parse(readFileSync5(path, "utf8"));
+    const parsed = JSON.parse(readFileSync5(path, "utf8"));
+    if (parsed && typeof parsed === "object" && Object.prototype.hasOwnProperty.call(parsed, "__proto__")) {
+      return null;
+    }
+    return parsed;
   } catch {
     return null;
   }
@@ -3476,13 +3491,48 @@ function isAllowedDarwinSystemLink3(dirPath) {
   if (dirPath !== "/var" && dirPath !== "/tmp" && dirPath !== "/etc")
     return false;
   try {
-    return readlinkSync3(dirPath) === `private${dirPath}`;
+    const expected = `/private${dirPath}`;
+    return readlinkSync3(dirPath) === `private${dirPath}` && realpathSync2(dirPath) === expected && !lstatSync4("/private").isSymbolicLink() && lstatSync4("/private").isDirectory() && !lstatSync4(expected).isSymbolicLink() && statSync(expected).isDirectory();
   } catch {
     return false;
   }
 }
+function hasSafeRawDotDotSegments(rawPath) {
+  if (!rawPath.includes(".."))
+    return true;
+  const baseAbs = isAbsolute2(rawPath) ? rawPath : `${process.cwd()}/${rawPath}`;
+  const root = parse3(baseAbs).root;
+  const rawParts = baseAbs.slice(root.length).split(/[\\/]+/).filter(Boolean);
+  let cur = root;
+  for (const part of rawParts) {
+    if (part === ".")
+      continue;
+    if (part === "..") {
+      cur = resolve4(cur, "..");
+      continue;
+    }
+    cur = join5(cur, part);
+    try {
+      const st = lstatSync4(cur);
+      if (st.isSymbolicLink()) {
+        if (isAllowedDarwinSystemLink3(cur))
+          continue;
+        return false;
+      }
+      if (!st.isDirectory())
+        return false;
+    } catch (e) {
+      if (e && typeof e === "object" && e.code === "ENOENT")
+        continue;
+      return false;
+    }
+  }
+  return true;
+}
 function isSafeDirOrMissing(dirPath) {
   if (!dirPath || CONTROL_CHAR_RE.test(dirPath))
+    return false;
+  if (!hasSafeRawDotDotSegments(dirPath))
     return false;
   const abs = resolve4(dirPath);
   const root = parse3(abs).root;
@@ -3515,7 +3565,8 @@ function isValidBoundProfileName(value) {
     return false;
   }
   const stem = value.replace(/\.json$/i, "").toLowerCase();
-  return Boolean(stem) && !isUnsafeBindKey(value) && !isUnsafeBindKey(stem) && !RESERVED_BIND_SIDECARS.has(stem);
+  const normalizedStem = stem.replace(/[^a-z0-9_-]/g, "_");
+  return Boolean(stem) && !isUnsafeBindKey(value) && !isUnsafeBindKey(stem) && !RESERVED_BIND_SIDECARS.has(stem) && !RESERVED_BIND_SIDECARS.has(normalizedStem);
 }
 function lockFilePath(lockDir, agentId) {
   const trimmed = String(agentId || "").trim();
@@ -3668,13 +3719,15 @@ function loadSessionBinds(configDir) {
   return merged;
 }
 function resolveAgentIdForProfileName(configDir, name) {
-  if (!name || name.includes("/") || name.includes("\\") || CONTROL_CHAR_RE.test(name))
+  if (!name || name === "." || name === ".." || name.includes("/") || name.includes("\\") || CONTROL_CHAR_RE.test(name))
     return null;
   if (!isSafeDirOrMissing(configDir))
     return null;
+  const stem = name.replace(/\.json$/i, "").toLowerCase();
   const base = name.replace(/\.json$/i, "").replace(/[^a-zA-Z0-9_-]/g, "_");
-  if (!base || base.length > LOCK_KEY_MAX_CHARS || isUnsafeBindKey(base))
+  if (!base || base.length > LOCK_KEY_MAX_CHARS || isUnsafeBindKey(base) || RESERVED_BIND_SIDECARS.has(stem) || RESERVED_BIND_SIDECARS.has(base.toLowerCase())) {
     return null;
+  }
   const profilesDir = join5(configDir, "profiles");
   const candidates = isSafeDirOrMissing(profilesDir) ? [join5(profilesDir, `${base}.json`), join5(configDir, `${base}.json`)] : [join5(configDir, `${base}.json`)];
   for (const candidate of candidates) {
@@ -4260,6 +4313,8 @@ function isSafeDirEntryName(entry) {
   return entry.length > 0 && entry.length <= 255 && entry !== "." && entry !== ".." && !entry.includes("/") && !entry.includes("\\") && !CONTROL_CHAR_RE.test(entry);
 }
 function isLoopbackDshHealthUrl(rawUrl) {
+  if (!rawUrl || rawUrl !== rawUrl.trim() || CONTROL_CHAR_RE.test(rawUrl))
+    return false;
   let u;
   try {
     u = new URL(rawUrl);
@@ -4268,12 +4323,14 @@ function isLoopbackDshHealthUrl(rawUrl) {
   }
   if (u.protocol !== "http:")
     return false;
-  if (u.username || u.password || u.hash)
+  if (u.username || u.password || u.search || u.hash)
     return false;
   const host = u.hostname.toLowerCase();
   if (host !== "127.0.0.1" && host !== "localhost" && host !== "[::1]" && host !== "::1") {
     return false;
   }
+  if (/:0+(?:\/|$)/.test(rawUrl))
+    return false;
   if (u.port) {
     const port = Number(u.port);
     if (!Number.isInteger(port) || port < 1 || port > 65535)
@@ -4282,38 +4339,53 @@ function isLoopbackDshHealthUrl(rawUrl) {
   return true;
 }
 async function readBoundedDshHealthJson(res) {
+  const contentLength = Number(res.headers?.get?.("content-length") ?? "");
+  if (Number.isFinite(contentLength) && contentLength > DSH_HEALTH_MAX_BYTES) {
+    await res.body?.cancel?.().catch(() => {});
+    throw new Error("DSH /health response exceeded byte cap");
+  }
   const reader = res?.body?.getReader?.();
+  let parsed;
   if (!reader) {
-    return await res.json();
-  }
-  const chunks = [];
-  let total = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done)
-        break;
-      if (value instanceof Uint8Array) {
-        total += value.byteLength;
-        if (total > DSH_HEALTH_MAX_BYTES) {
-          await reader.cancel().catch(() => {});
-          throw new Error("DSH /health response exceeded byte cap");
-        }
-        chunks.push(value);
-      }
+    const text = typeof res?.text === "function" ? await res.text() : JSON.stringify(await res.json());
+    if (Buffer.byteLength(text, "utf8") > DSH_HEALTH_MAX_BYTES) {
+      throw new Error("DSH /health response exceeded byte cap");
     }
-  } finally {
+    parsed = JSON.parse(text);
+  } else {
+    const chunks = [];
+    let total = 0;
     try {
-      reader.releaseLock?.();
-    } catch {}
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done)
+          break;
+        if (value instanceof Uint8Array) {
+          total += value.byteLength;
+          if (total > DSH_HEALTH_MAX_BYTES) {
+            await reader.cancel().catch(() => {});
+            throw new Error("DSH /health response exceeded byte cap");
+          }
+          chunks.push(value);
+        }
+      }
+    } finally {
+      try {
+        reader.releaseLock?.();
+      } catch {}
+    }
+    const merged = new Uint8Array(total);
+    let offset = 0;
+    for (const c of chunks) {
+      merged.set(c, offset);
+      offset += c.byteLength;
+    }
+    parsed = JSON.parse(Buffer.from(merged).toString("utf8"));
   }
-  const merged = new Uint8Array(total);
-  let offset = 0;
-  for (const c of chunks) {
-    merged.set(c, offset);
-    offset += c.byteLength;
+  if (parsed && typeof parsed === "object" && Object.prototype.hasOwnProperty.call(parsed, "__proto__")) {
+    throw new Error("Invalid DSH /health JSON object");
   }
-  return JSON.parse(Buffer.from(merged).toString("utf8"));
+  return parsed;
 }
 function sessionDirMtime(dir) {
   const dirStat = safeLstat3(dir);
@@ -4441,12 +4513,12 @@ async function detectDshCallerSession(opts) {
 }
 
 // src/session-route.ts
-import { lstatSync as lstatSync6, readFileSync as readFileSync7, readlinkSync as readlinkSync5, realpathSync as realpathSync2 } from "node:fs";
+import { lstatSync as lstatSync6, readFileSync as readFileSync7, readlinkSync as readlinkSync5, realpathSync as realpathSync4 } from "node:fs";
 import { homedir as homedir4 } from "node:os";
 import { dirname as dirname4, isAbsolute as isAbsolute4, join as join7, parse as parse5, resolve as resolve6, sep } from "node:path";
 
 // src/session-bind.ts
-import { closeSync as closeSync2, lstatSync as lstatSync5, mkdirSync as mkdirSync2, openSync as openSync2, readFileSync as readFileSync6, readSync as readSync2, readdirSync as readdirSync3, readlinkSync as readlinkSync4, unlinkSync as unlinkSync3 } from "node:fs";
+import { closeSync as closeSync2, lstatSync as lstatSync5, mkdirSync as mkdirSync2, openSync as openSync2, readFileSync as readFileSync6, readSync as readSync2, readdirSync as readdirSync3, readlinkSync as readlinkSync4, realpathSync as realpathSync3, statSync as statSync2, unlinkSync as unlinkSync3 } from "node:fs";
 import { isAbsolute as isAbsolute3, join as join6, parse as parse4, resolve as resolve5 } from "node:path";
 var DEFAULT_SESSION_BINDS_FILENAME2 = "session-binds.json";
 var LEGACY_AGY_BINDS_FILENAME2 = "agy-binds.json";
@@ -4456,20 +4528,35 @@ var MAX_SESSION_BINDS_ENTRIES2 = 1024;
 var CONTROL_CHAR_RE2 = /[\x00-\x1f\x7f]/;
 var RESERVED_BIND_SIDECARS2 = new Set([
   "session-binds",
+  "session-binds.meta",
+  "session-binds_meta",
   "agy-binds",
+  "agy-binds.meta",
+  "agy-binds_meta",
   "grok-binds",
+  "grok-binds.meta",
+  "grok-binds_meta",
+  "agy-session-binds",
+  "identity-guard",
   "cursor",
   "read-cursors",
+  "mention-timestamps",
   "wake-pids",
   "config",
-  "codex-bots"
+  "codex-bots",
+  "dsh",
+  "muse"
 ]);
 function readBoundedRegularJson2(path, maxBytes) {
   try {
     const st = lstatSync5(path);
     if (st.isSymbolicLink() || !st.isFile() || st.size > maxBytes)
       return null;
-    return JSON.parse(readFileSync6(path, "utf8"));
+    const parsed = JSON.parse(readFileSync6(path, "utf8"));
+    if (parsed && typeof parsed === "object" && Object.prototype.hasOwnProperty.call(parsed, "__proto__")) {
+      return null;
+    }
+    return parsed;
   } catch {
     return null;
   }
@@ -4480,13 +4567,48 @@ function isAllowedDarwinSystemLink4(dirPath) {
   if (dirPath !== "/var" && dirPath !== "/tmp" && dirPath !== "/etc")
     return false;
   try {
-    return readlinkSync4(dirPath) === `private${dirPath}`;
+    const expected = `/private${dirPath}`;
+    return readlinkSync4(dirPath) === `private${dirPath}` && realpathSync3(dirPath) === expected && !lstatSync5("/private").isSymbolicLink() && lstatSync5("/private").isDirectory() && !lstatSync5(expected).isSymbolicLink() && statSync2(expected).isDirectory();
   } catch {
     return false;
   }
 }
+function hasSafeRawDotDotSegments2(rawPath) {
+  if (!rawPath.includes(".."))
+    return true;
+  const baseAbs = isAbsolute3(rawPath) ? rawPath : `${process.cwd()}/${rawPath}`;
+  const root = parse4(baseAbs).root;
+  const rawParts = baseAbs.slice(root.length).split(/[\\/]+/).filter(Boolean);
+  let cur = root;
+  for (const part of rawParts) {
+    if (part === ".")
+      continue;
+    if (part === "..") {
+      cur = resolve5(cur, "..");
+      continue;
+    }
+    cur = join6(cur, part);
+    try {
+      const st = lstatSync5(cur);
+      if (st.isSymbolicLink()) {
+        if (isAllowedDarwinSystemLink4(cur))
+          continue;
+        return false;
+      }
+      if (!st.isDirectory())
+        return false;
+    } catch (e) {
+      if (e && typeof e === "object" && e.code === "ENOENT")
+        continue;
+      return false;
+    }
+  }
+  return true;
+}
 function isSafeDirOrMissing2(dirPath) {
   if (!dirPath || CONTROL_CHAR_RE2.test(dirPath))
+    return false;
+  if (!hasSafeRawDotDotSegments2(dirPath))
     return false;
   const abs = resolve5(dirPath);
   const root = parse4(abs).root;
@@ -4519,7 +4641,8 @@ function isValidBoundProfileName2(value) {
     return false;
   }
   const stem = value.replace(/\.json$/i, "").toLowerCase();
-  return Boolean(stem) && !isUnsafeBindKey2(value) && !isUnsafeBindKey2(stem) && !RESERVED_BIND_SIDECARS2.has(stem);
+  const normalizedStem = stem.replace(/[^a-z0-9_-]/g, "_");
+  return Boolean(stem) && !isUnsafeBindKey2(value) && !isUnsafeBindKey2(stem) && !RESERVED_BIND_SIDECARS2.has(stem) && !RESERVED_BIND_SIDECARS2.has(normalizedStem);
 }
 function isUnsafeBindKey2(key) {
   const lower = key.toLowerCase();
@@ -4629,12 +4752,12 @@ function isAllowedDarwinSystemLink5(dirPath) {
   if (dirPath !== "/var" && dirPath !== "/tmp" && dirPath !== "/etc")
     return false;
   try {
-    return readlinkSync5(dirPath) === `private${dirPath}` && realpathSync2(dirPath) === `/private${dirPath}` && !lstatSync6("/private").isSymbolicLink() && lstatSync6("/private").isDirectory() && !lstatSync6(`/private${dirPath}`).isSymbolicLink() && lstatSync6(`/private${dirPath}`).isDirectory();
+    return readlinkSync5(dirPath) === `private${dirPath}` && realpathSync4(dirPath) === `/private${dirPath}` && !lstatSync6("/private").isSymbolicLink() && lstatSync6("/private").isDirectory() && !lstatSync6(`/private${dirPath}`).isSymbolicLink() && lstatSync6(`/private${dirPath}`).isDirectory();
   } catch {
     return false;
   }
 }
-function hasSafeRawDotDotSegments(rawPath) {
+function hasSafeRawDotDotSegments3(rawPath) {
   const absRaw = isAbsolute4(rawPath) ? rawPath : `${process.cwd()}${sep}${rawPath}`;
   const root = parse5(absRaw).root;
   const segments = absRaw.slice(root.length).split(/[\\/]+/).filter(Boolean);
@@ -4664,7 +4787,7 @@ function hasSafeRawDotDotSegments(rawPath) {
 }
 function isSafeRealDir(path) {
   try {
-    if (!path || /[\x00-\x1f\x7f]/.test(path) || !hasSafeRawDotDotSegments(path)) {
+    if (!path || /[\x00-\x1f\x7f]/.test(path) || !hasSafeRawDotDotSegments3(path)) {
       return false;
     }
     const st = lstatSync6(path);
@@ -4995,7 +5118,7 @@ import { fileURLToPath } from "url";
 // src/profile-store.ts
 import {
   lstatSync as lstatSync7,
-  realpathSync as realpathSync3,
+  realpathSync as realpathSync5,
   writeFileSync as writeFileSync2,
   renameSync as renameSync2,
   copyFileSync as copyFileSync2,
@@ -5025,7 +5148,7 @@ function isAllowedDarwinSystemSymlink2(dirPath) {
   if (process.platform !== "darwin" || !DARWIN_SYSTEM_SYMLINKS2.has(dirPath))
     return false;
   try {
-    const resolved = realpathSync3(dirPath);
+    const resolved = realpathSync5(dirPath);
     if (resolved !== `/private${dirPath}`)
       return false;
     const realSt = lstatSync7(resolved);
@@ -5386,7 +5509,7 @@ import {
   copyFileSync as copyFileSync3,
   lstatSync as lstatSync8,
   readFileSync as readFileSync9,
-  realpathSync as realpathSync4,
+  realpathSync as realpathSync6,
   renameSync as renameSync3,
   unlinkSync as unlinkSync5,
   writeFileSync as writeFileSync3
@@ -5404,7 +5527,7 @@ function isDarwinCanonicalRootLink(dir, st) {
     return false;
   }
   try {
-    return realpathSync4(dir) === `/private${dir}` && !lstatSync8("/private").isSymbolicLink() && lstatSync8("/private").isDirectory() && !lstatSync8(`/private${dir}`).isSymbolicLink() && lstatSync8(`/private${dir}`).isDirectory();
+    return realpathSync6(dir) === `/private${dir}` && !lstatSync8("/private").isSymbolicLink() && lstatSync8("/private").isDirectory() && !lstatSync8(`/private${dir}`).isSymbolicLink() && lstatSync8(`/private${dir}`).isDirectory();
   } catch {
     return false;
   }
@@ -5651,7 +5774,7 @@ import {
   copyFileSync as copyFileSync4,
   lstatSync as lstatSync9,
   readFileSync as readFileSync10,
-  realpathSync as realpathSync5,
+  realpathSync as realpathSync7,
   renameSync as renameSync4,
   unlinkSync as unlinkSync6,
   writeFileSync as writeFileSync4
@@ -5669,7 +5792,7 @@ function isDarwinCanonicalRootLink2(dir, st) {
     return false;
   }
   try {
-    return realpathSync5(dir) === `/private${dir}` && !lstatSync9("/private").isSymbolicLink() && lstatSync9("/private").isDirectory() && !lstatSync9(`/private${dir}`).isSymbolicLink() && lstatSync9(`/private${dir}`).isDirectory();
+    return realpathSync7(dir) === `/private${dir}` && !lstatSync9("/private").isSymbolicLink() && lstatSync9("/private").isDirectory() && !lstatSync9(`/private${dir}`).isSymbolicLink() && lstatSync9(`/private${dir}`).isDirectory();
   } catch {
     return false;
   }
