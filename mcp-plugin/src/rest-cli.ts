@@ -17,8 +17,8 @@
  *    being swallowed by cold-start seeding.
  */
 import { randomBytes } from "node:crypto";
-import { lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { lstatSync, mkdirSync, readFileSync, readlinkSync, renameSync, unlinkSync, writeFileSync, type Stats } from "node:fs";
+import { dirname, isAbsolute, join, parse, resolve } from "node:path";
 import { matchesMention } from "./mentions.ts";
 import { safeWriteProfile } from "./profile-store.ts";
 import { cursorFileForAgent, loadCursor, persistCursor, safeAgentCursorSlug, type Warn } from "./read-cursor.ts";
@@ -76,6 +76,109 @@ function isLoopbackHost(hostname: string): boolean {
   return h === "127.0.0.1" || h === "localhost" || h === "[::1]" || h === "::1";
 }
 
+function isUnsafeMetadataOrLinkLocalHost(hostname: string): boolean {
+  const lower = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  if (
+    !lower ||
+    lower === "0.0.0.0" ||
+    lower === "::" ||
+    lower === "100.100.100.200" ||
+    lower === "fd00:ec2::254" ||
+    lower === "metadata.google.internal" ||
+    lower === "metadata" ||
+    lower === "metadata.goog" ||
+    lower.endsWith(".metadata.goog") ||
+    lower === "instance-data"
+  ) {
+    return true;
+  }
+  if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(lower)) return true;
+  if (/^fe[89ab][0-9a-f]:/.test(lower)) return true;
+  if (lower.startsWith("::ffff:")) {
+    const tail = lower.slice("::ffff:".length);
+    const tailParts = tail.startsWith("0:") ? tail.slice(2) : tail;
+    if (
+      /^169\.254\.\d{1,3}\.\d{1,3}$/.test(tailParts) ||
+      tailParts === "100.100.100.200" ||
+      tailParts === "0.0.0.0"
+    ) {
+      return true;
+    }
+    const hexMatch = tailParts.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    if (hexMatch) {
+      const hi = parseInt(hexMatch[1]!, 16);
+      const lo = parseInt(hexMatch[2]!, 16);
+      if (
+        (((hi >> 8) & 0xff) === 169 && (hi & 0xff) === 254) ||
+        (hi === 0x6464 && lo === 0x64c8) ||
+        (hi === 0 && lo === 0)
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function isAllowedDarwinSystemLink(dirPath: string): boolean {
+  if (process.platform !== "darwin") return false;
+  if (dirPath !== "/var" && dirPath !== "/tmp" && dirPath !== "/etc") return false;
+  try {
+    return readlinkSync(dirPath) === `private${dirPath}`;
+  } catch {
+    return false;
+  }
+}
+
+export function hasSafeDirChain(dirPath: string): boolean {
+  if (typeof dirPath !== "string" || !dirPath.trim() || /[\x00-\x1f\x7f]/.test(dirPath)) {
+    return false;
+  }
+  // Guard against `symlink_dir/..` lexical collapse before `resolve(dirPath)`.
+  if (/(?:^|[\\/])\.\.(?:[\\/]|$)/.test(dirPath)) {
+    const rawBase = isAbsolute(dirPath) ? parse(dirPath).root : resolve(".");
+    const rawRel = isAbsolute(dirPath) ? dirPath.slice(rawBase.length) : dirPath;
+    let rawCur = rawBase.replace(/[\\/]+$/, "") || "/";
+    for (const seg of rawRel.split(/[\\/]+/).filter(Boolean)) {
+      if (seg === ".") continue;
+      if (seg === "..") {
+        rawCur = dirname(rawCur);
+        continue;
+      }
+      rawCur = rawCur === "/" ? `/${seg}` : `${rawCur}/${seg}`;
+      try {
+        const st = lstatSync(rawCur);
+        if (st.isSymbolicLink() && !isAllowedDarwinSystemLink(rawCur)) return false;
+        if (!st.isSymbolicLink() && !st.isDirectory()) return false;
+      } catch (err: any) {
+        if (err && err.code === "ENOENT") break;
+        return false;
+      }
+    }
+  }
+  const abs = resolve(dirPath);
+  const root = parse(abs).root;
+  const rel = abs.slice(root.length);
+  const segments = rel.split(/[\\/]+/).filter(Boolean);
+  let cur = root;
+  for (let i = 0; i < segments.length; i++) {
+    cur = join(cur, segments[i]!);
+    let st: Stats;
+    try {
+      st = lstatSync(cur);
+    } catch (err: any) {
+      if (err && err.code === "ENOENT") return true;
+      return false;
+    }
+    if (st.isSymbolicLink()) {
+      if (isAllowedDarwinSystemLink(cur)) continue;
+      return false;
+    }
+    if (!st.isDirectory()) return false;
+  }
+  return true;
+}
+
 export function validateSafeRestBaseUrl(rawUrl: string): string {
   if (typeof rawUrl !== "string") throw new Error("Invalid AgentsChat REST URL");
   const trimmed = rawUrl.trim().replace(/\/+$/, "");
@@ -90,6 +193,9 @@ export function validateSafeRestBaseUrl(rawUrl: string): string {
   }
   if (parsed.username || parsed.password || parsed.search || parsed.hash) {
     throw new Error("Invalid AgentsChat REST URL");
+  }
+  if (isUnsafeMetadataOrLinkLocalHost(parsed.hostname)) {
+    throw new Error("Refusing cloud-metadata, link-local, or unspecified AgentsChat REST URL");
   }
   if (parsed.protocol === "https:") return trimmed;
   if (
@@ -118,18 +224,34 @@ export function isSafeCliChannelId(channelId: unknown): channelId is string {
 }
 
 function ensureRealDirectory(dir: string): void {
+  if (!hasSafeDirChain(dir)) {
+    throw new Error("Refusing symlink or non-directory state root");
+  }
   const pre = lstatSync(dir, { throwIfNoEntry: false });
   if (pre && (pre.isSymbolicLink() || !pre.isDirectory())) {
     throw new Error("Refusing symlink or non-directory state root");
   }
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const post = lstatSync(dir);
-  if (post.isSymbolicLink() || !post.isDirectory()) {
+  if (post.isSymbolicLink() || !post.isDirectory() || !hasSafeDirChain(dir)) {
     throw new Error("Refusing symlink or non-directory state root");
   }
 }
 
-async function readBoundedResponseJson(res: Response, maxBytes = MAX_HTTP_JSON_BYTES): Promise<any> {
+function parseSafeResponseJsonText(text: string): any {
+  const parsed = JSON.parse(text);
+  if (
+    parsed &&
+    typeof parsed === "object" &&
+    !Array.isArray(parsed) &&
+    Object.prototype.hasOwnProperty.call(parsed, "__proto__")
+  ) {
+    throw new Error("Refusing prototype-polluting HTTP JSON response");
+  }
+  return parsed;
+}
+
+export async function readBoundedResponseJson(res: Response, maxBytes = MAX_HTTP_JSON_BYTES): Promise<any> {
   const cl = Number(res.headers?.get("content-length") ?? "");
   if (Number.isFinite(cl) && cl > maxBytes) {
     await res.body?.cancel().catch(() => {});
@@ -140,7 +262,7 @@ async function readBoundedResponseJson(res: Response, maxBytes = MAX_HTTP_JSON_B
     if (Buffer.byteLength(text, "utf8") > maxBytes) {
       throw new Error("HTTP JSON response exceeds byte limit");
     }
-    return JSON.parse(text);
+    return parseSafeResponseJsonText(text);
   }
   const reader = res.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -163,7 +285,7 @@ async function readBoundedResponseJson(res: Response, maxBytes = MAX_HTTP_JSON_B
       reader.releaseLock();
     } catch {}
   }
-  return JSON.parse(Buffer.concat(chunks, total).toString("utf8"));
+  return parseSafeResponseJsonText(Buffer.concat(chunks, total).toString("utf8"));
 }
 
 export function clampTimerMs(raw: unknown, fallback: number, minMs = 0): number {
@@ -273,6 +395,7 @@ export interface WakeOnceEvent {
 
 export function loadSeenIds(file: string): string[] {
   try {
+    if (!hasSafeDirChain(dirname(file))) return [];
     const stat = lstatSync(file);
     if (stat.isSymbolicLink() || !stat.isFile() || stat.size > MAX_STATE_FILE_BYTES) return [];
     const parsed = JSON.parse(readFileSync(file, "utf8"));
@@ -293,6 +416,7 @@ function saveSeenIds(file: string, ids: Iterable<string>): void {
 export function loadJsonMap(file: string): Record<string, string> {
   const out: Record<string, string> = Object.create(null);
   try {
+    if (!hasSafeDirChain(dirname(file))) return out;
     const stat = lstatSync(file);
     if (stat.isSymbolicLink() || !stat.isFile() || stat.size > MAX_STATE_FILE_BYTES) return out;
     const raw = JSON.parse(readFileSync(file, "utf8"));
@@ -315,7 +439,9 @@ export function acquireWakePidFile(
   let tmp = "";
   let created = false;
   try {
-    const dirStat = lstatSync(dirname(wakePidFile));
+    const dir = dirname(wakePidFile);
+    if (!hasSafeDirChain(dir)) return false;
+    const dirStat = lstatSync(dir);
     if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) return false;
     try {
       const existing = lstatSync(wakePidFile);
@@ -337,9 +463,10 @@ export function acquireWakePidFile(
     tmp = `${wakePidFile}.${pid}.${randomBytes(4).toString("hex")}.tmp`;
     writeFileSync(tmp, `${pid}\n`, { mode: 0o600, flag: "wx" });
     created = true;
-    const recheckDir = lstatSync(dirname(wakePidFile), { throwIfNoEntry: false });
+    const recheckDir = lstatSync(dir, { throwIfNoEntry: false });
     const recheckTarget = lstatSync(wakePidFile, { throwIfNoEntry: false });
     if (
+      !hasSafeDirChain(dir) ||
       !recheckDir ||
       recheckDir.isSymbolicLink() ||
       !recheckDir.isDirectory() ||
@@ -364,6 +491,7 @@ export function acquireWakePidFile(
 
 export function releaseWakePidFile(wakePidFile: string, pid = process.pid): void {
   try {
+    if (!hasSafeDirChain(dirname(wakePidFile))) return;
     const stat = lstatSync(wakePidFile);
     if (stat.isSymbolicLink() || !stat.isFile() || stat.size > MAX_PID_FILE_BYTES) return;
     if (readFileSync(wakePidFile, "utf8").trim() === String(pid)) {
@@ -709,7 +837,10 @@ export async function wakeOnce(opts: {
         const trimmed = msgs.slice(-20);
         if (trimmed.length > 0) {
           const context = trimmed
-            .map((m: any) => `${redactParticipantPii(m.sender_id || "?")}: ${String(m.content || "").slice(0, 500)}${formatWakeAttachments(m.attachments)}`)
+            .map(
+              (m: any) =>
+                `${redactParticipantPii(m.sender_id || "?")}: ${redactSecrets(String(m.content || "").slice(0, 500))}${formatWakeAttachments(m.attachments)}`,
+            )
             .join("\n");
           prefix = `[频道上下文 - 最近 ${trimmed.length} 条消息]\n${context}\n\n[你被 @mention 了，请回复]\n`;
         }
@@ -750,15 +881,19 @@ export async function wakeOnce(opts: {
       String(lastMsg.id || ""),
       String(lastMsg.timestamp || ""),
     );
-    const combinedContent =
+    const allSameOwnerDirect = batch.every((m) => m?.same_owner_direct === true);
+    const combinedRedactOpts = allSameOwnerDirect ? { preserveAcKeys: true } : undefined;
+    const rawCombinedContent =
       batch.length === 1
         ? String(lastMsg.content || "")
         : batch.map((m) => String(m.content || "")).join("\n");
+    const safeCombinedContent = redactSecrets(rawCombinedContent, combinedRedactOpts);
     const prompt = buildWakePrompt(
       {
         ...lastMsg,
+        same_owner_direct: allSameOwnerDirect,
         channel_id: channelId,
-        content: combinedContent,
+        content: rawCombinedContent,
       },
       contextPrefix,
     );
@@ -769,14 +904,17 @@ export async function wakeOnce(opts: {
       channel_id: channelId,
       message_id: String(lastMsg.id || ""),
       sender_id: String(lastMsg.sender_id || ""),
-      content: combinedContent,
+      content: safeCombinedContent,
       timestamp: String(lastMsg.timestamp || ""),
       ...(batch.length > 1
         ? {
             messages: batch.map((m) => ({
               id: String(m.id || ""),
               sender_id: String(m.sender_id || ""),
-              content: String(m.content || ""),
+              content: redactSecrets(
+                String(m.content || ""),
+                m?.same_owner_direct === true ? { preserveAcKeys: true } : undefined,
+              ),
               timestamp: String(m.timestamp || ""),
             })),
           }
@@ -946,6 +1084,14 @@ export async function wakeOnce(opts: {
                   if (!raw) continue;
                   try {
                     const parsed = JSON.parse(raw);
+                    if (
+                      !parsed ||
+                      typeof parsed !== "object" ||
+                      Array.isArray(parsed) ||
+                      Object.prototype.hasOwnProperty.call(parsed, "__proto__")
+                    ) {
+                      continue;
+                    }
                     const wakeEv = await inspectChannelMessages(channelId, [parsed]);
                     if (wakeEv) {
                       finish(wakeEv);
