@@ -100,7 +100,14 @@ test("manager snapshot survives broken registry; parent death cleans workers", a
  let worker=0;
  const wait=async(fn:()=>boolean)=>{const end=Date.now()+15000;while(Date.now()<end){if(fn())return;await Bun.sleep(100);}throw Error("lifecycle timeout");};
  const status=()=>{try{return JSON.parse(readFileSync(join(home,".agentschat/codex-bots/status.json"),"utf8")).bots[0];}catch{return {};}};
- const dead=(pid:number)=>{try{process.kill(pid,0);return false;}catch{return true;}};
+ const dead=(pid:number)=>{
+  try {process.kill(pid,0);} catch {return true;}
+  // Container PID 1 may leave a terminated orphan unreaped; kill(0) still finds it.
+  if(process.platform==="linux") {
+   try {return /^Z\s/.test(readFileSync(`/proc/${pid}/stat`,"utf8").split(") ").at(-1)!);} catch {return true;}
+  }
+  return false;
+ };
  try {
   await wait(()=>status().status==="connected"); worker=status().pid; expect(worker).toBeGreaterThan(0);
   const firstApp=Number(readFileSync(join(home,"app.pid"),"utf8"));
@@ -249,7 +256,7 @@ test("registry rejects own prototype fields and bounds even disabled bots",()=>{
  } finally {rmSync(home,{recursive:true,force:true});}
 });
 
-test("registry checks directory leaves before default creation and canonicalizes parent aliases",()=>{
+test("registry checks directory leaves before default creation and rejects parent aliases",()=>{
  const home=mkdtempSync(join(tmpdir(),"bots-leaves-")),file=join(home,"bots.json"),outside=join(home,"outside");mkdirSync(outside);
  const write=(bot:any={},extra:any={})=>writeFileSync(file,JSON.stringify({version:1,bots:[{name:"one",profile:"one",...bot}],...extra}));
  try {
@@ -265,7 +272,7 @@ test("registry checks directory leaves before default creation and canonicalizes
   const alias=join(home,"alias");symlinkSync(outside,alias);
   for(const extra of [false,true]) {write(extra?{}:{workdir:alias},extra?{default_workdir:alias}:{});expect(()=>loadBots(file,home)).toThrow("workdir");}
   mkdirSync(join(outside,"project"));write({workdir:join(alias,"project")});
-  expect(loadBots(file,home)[0]!.cwd).toBe(realpathSync(join(outside,"project")));
+  expect(()=>loadBots(file,home)).toThrow("non-symlink directory");
  } finally {rmSync(home,{recursive:true,force:true});}
 });
 

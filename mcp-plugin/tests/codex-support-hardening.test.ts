@@ -1,6 +1,8 @@
 import { afterEach, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import { InboxSync } from "../codex/inbox-sync.ts";
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import { loadBots } from "../codex/bots-config.ts";
@@ -264,4 +266,179 @@ test("config expands Windows tilde paths and accepts canonical loopback aliases 
       expect(() => resolveConfig({ cwd, profile: "~\\valid.json", settings: { [field]: url } }, {}, home)).toThrow("Server URLs");
     }
   }
+});
+
+const metadataHosts = [
+  "169.254.169.254", "169.254.0.1", "169.254.255.255", "2852039166", "0xa9fea9fe", "0251.0376.0251.0376",
+  "metadata.google.internal", "METADATA.GOOGLE.INTERNAL.", "metadata.goog", "nested.metadata.goog.",
+  "[fe80::1]", "[febf:ffff::1]", "[::ffff:169.254.169.254]", "[::ffff:0:169.254.1.2]",
+];
+test("config and owner reject canonical metadata/link-local hosts before authenticated requests", async () => {
+  const { home, cwd, profile } = configFixture();
+  let calls = 0;
+  const request = (async (url: RequestInfo | URL) => {
+    calls++;
+    return Response.json(String(url).endsWith("onboarding") ? { agent_id: "bot-ok", claimed: true } : { owner_account_id: "owner-1" });
+  }) as typeof fetch;
+  for (const host of metadataHosts) {
+    for (const field of ["api_url", "ws_url"] as const) {
+      const url = `${field === "api_url" ? "https" : "wss"}://${host}`;
+      expect(() => resolveConfig({ cwd, profile, settings: { [field]: url } }, {}, home)).toThrow("Server URLs");
+    }
+    expect(await getBotOwner(`https://${host}`, "bot-ok", "synthetic", request)).toBeNull();
+  }
+  expect(calls).toBe(0);
+  for (const host of ["metadata.goog.example", "notmetadata.goog", "metadata.google.internal.example", "169.253.255.255", "169.255.0.1", "[fe7f::1]", "[fec0::1]", "[::ffff:169.253.1.2]"]) {
+    expect(resolveConfig({ cwd, profile, settings: { api_url: `https://${host}` } }, {}, home).apiUrl).toBe(`https://${new URL(`https://${host}`).host}`);
+    expect(await getBotOwner(`https://${host}`, "bot-ok", "synthetic", request)).toBe("owner-1");
+  }
+});
+
+test("owner rejects own prototype JSON and path-like owners on either response", async () => {
+  const status = { agent_id: "bot-ok", claimed: true }, entitlement = { owner_account_id: "owner-1" };
+  const lookup = (s: unknown, e: unknown) => getBotOwner("https://example.invalid", "bot-ok", "synthetic",
+    (async (url: RequestInfo | URL) => Response.json(String(url).endsWith("onboarding") ? s : e)) as typeof fetch);
+  for (const value of [".", "..", "a/b", "a\\b"]) expect(await lookup(status, { owner_account_id: value })).toBeNull();
+  for (const badStatus of [true, false]) {
+    const dirty = JSON.parse('{"__proto__":{}}');
+    expect(await lookup(badStatus ? { ...status, ...dirty } : status, badStatus ? entitlement : { ...entitlement, ...dirty })).toBeNull();
+  }
+  expect(await lookup(status, entitlement)).toBe("owner-1");
+});
+
+const sidecarStems = ["grok-binds", "session-binds", "agy-binds", "cursor", "read-cursors", "wake-pids", "config", "codex-bots"];
+test("config and registry reject reserved sidecars and preserve mixed-case JSON suffixes", () => {
+  const { home, cwd } = configFixture();
+  const profiles = join(home, ".agentschat/profiles");
+  mkdirSync(profiles, { recursive: true });
+  writeFileSync(join(profiles, "Bot.JSON"), JSON.stringify({ agent_id: "bot-ok", token: "ac_ok_token" }), { mode: 0o600 });
+  expect(resolveConfig({ cwd, profile: "Bot.JSON" }, {}, home).profileFile).toBe(join(profiles, "Bot.JSON"));
+  const registry = join(home, "bots.json");
+  for (const stem of sidecarStems) {
+    for (const selector of [stem, `${stem.toUpperCase()}.JSON`]) {
+      expect(() => resolveConfig({ cwd, profile: selector }, {}, home)).toThrow("central profile");
+      writeFileSync(registry, JSON.stringify({ version: 1, default_workdir: cwd, bots: [{ name: "one", profile: selector }] }));
+      expect(() => loadBots(registry, home)).toThrow("central profile");
+    }
+  }
+  writeFileSync(registry, JSON.stringify({ version: 1, default_workdir: cwd, bots: [{ name: "one", profile: "Bot.JSON" }] }));
+  expect(loadBots(registry, home)[0]!.agentId).toBe("bot-ok");
+});
+
+test("selected profile JSON rejects an own __proto__ key even with valid credentials", () => {
+  const { home, cwd, profile } = configFixture();
+  writeFileSync(profile, '{"agent_id":"bot-ok","token":"ac_ok_token","__proto__":{}}', { mode: 0o600 });
+  expect(() => resolveConfig({ cwd, profile }, {}, home)).toThrow("prototype key");
+});
+
+function linkedAncestor() {
+  const root = tempDir("codex-ancestor-");
+  const target = join(root, "target"), link = join(root, "link");
+  mkdirSync(target); symlinkSync(target, link, "dir");
+  return { root, target, link };
+}
+test("config rejects ancestors of explicit, central and project paths", () => {
+  const { home, cwd, profile } = configFixture();
+  const { target, link } = linkedAncestor();
+  mkdirSync(join(target, "nested"));
+  writeFileSync(join(target, "nested/profile.json"), JSON.stringify({ agent_id: "bot-ok", token: "ac_ok_token" }), { mode: 0o600 });
+  expect(() => resolveConfig({ cwd, profile: join(link, "nested/profile.json") }, {}, home)).toThrow("non-symlink directory");
+  expect(() => resolveConfig({ cwd: join(link, "nested"), profile }, {}, home)).toThrow("non-symlink directory");
+  mkdirSync(join(target, ".agentschat/profiles"), { recursive: true });
+  writeFileSync(join(target, ".agentschat/profiles/valid.json"), JSON.stringify({ agent_id: "bot-ok", token: "ac_ok_token" }), { mode: 0o600 });
+  expect(() => resolveConfig({ cwd, profile: "valid" }, {}, link)).toThrow("non-symlink directory");
+});
+
+test("registry rejects file and configured workdir ancestors", () => {
+  const { home, cwd } = configFixture();
+  const { target, link } = linkedAncestor();
+  const registry = join(home, "bots.json");
+  mkdirSync(join(target, "work"));
+  const doc = { version: 1, default_workdir: cwd, bots: [{ name: "one", profile: "valid" }] };
+  writeFileSync(join(target, "bots.json"), JSON.stringify(doc));
+  expect(() => loadBots(join(link, "bots.json"), home)).toThrow("non-symlink directory");
+  for (const botWorkdir of [true, false]) {
+    writeFileSync(registry, JSON.stringify({ ...doc, default_workdir: botWorkdir ? cwd : join(link, "work"),
+      bots: [{ ...doc.bots[0], ...(botWorkdir ? { workdir: join(link, "work") } : {}) }] }));
+    expect(() => loadBots(registry, home)).toThrow("non-symlink directory");
+  }
+});
+
+test("default bot workspace rejects an ancestor link before recursive mkdir", () => {
+  const { root, target, link } = linkedAncestor();
+  const registry = join(root, "bots.json");
+  writeFileSync(registry, JSON.stringify({ version: 1, bots: [{ name: "one", profile: "valid" }] }));
+  expect(() => loadBots(registry, link)).toThrow("non-symlink directory");
+  expect(existsSync(join(target, ".agentschat"))).toBe(false);
+});
+
+test("all runtime home modes reject ancestor links before creating state", () => {
+  for (const mode of ["isolated", "auth-only", "linked"] as const) {
+    const { root, target, link } = linkedAncestor();
+    const source = join(root, "desktop"); mkdirSync(source); writeFileSync(join(source, "auth.json"), "{}");
+    expect(() => prepareRuntimeHome(join(link, "new/state"), source, mode)).toThrow("non-symlink directory");
+    expect(existsSync(join(target, "new"))).toBe(false);
+  }
+});
+
+test("inbox and thread archives reject ancestor links before creating directories", () => {
+  const { target, link } = linkedAncestor();
+  expect(() => new InboxSync(join(link, "new/state"), async () => [], () => true, () => true)).toThrow("non-symlink directory");
+  expect(() => preserveChannelHistory(join(link, "new/state"), "room", [], s => s)).toThrow("non-symlink directory");
+  expect(existsSync(join(target, "new"))).toBe(false);
+});
+
+test("inbox refuses prototype state, prototype channels and more than 1024 channel entries", () => {
+  const root = tempDir("codex-cursor-prototype-");
+  const file = join(root, "inbound-cursors.json");
+  const timestamp = "2026-11-14T00:00:00.000Z";
+  for (const text of ['{"version":1,"channels":{},"__proto__":{}}', '{"version":1,"channels":{"__proto__":"'+timestamp+'"}}',
+    JSON.stringify({ version: 1, channels: Object.fromEntries(Array.from({ length: 1025 }, (_, i) => [`room-${i}`, timestamp])) })]) {
+    writeFileSync(file, text);
+    expect(() => new InboxSync(root, async () => [], () => true, () => true)).toThrow("Invalid inbound cursors");
+    expect(readFileSync(file, "utf8")).toBe(text);
+  }
+  const text = JSON.stringify({ version: 1, channels: Object.fromEntries(Array.from({ length: 1024 }, (_, i) => [`room-${i}`, timestamp])) });
+  writeFileSync(file, text);
+  const sync = new InboxSync(root, async () => [], () => true, () => true);
+  sync.watch("room-0"); sync.memberships(["room-0", "room-0"]);
+  expect(() => sync.watch("overflow")).toThrow("channel limit");
+  expect(() => sync.memberships(["room-0", "overflow"])).toThrow("channel limit");
+  expect(readFileSync(file, "utf8")).toBe(text);
+});
+
+test("inbox rejects single dot and padded channels on registration and skips them in saved state", () => {
+  const root = tempDir("codex-cursor-channel-");
+  writeFileSync(join(root, "inbound-cursors.json"), JSON.stringify({ version: 1, channels: { ".": "invalid", " room": "invalid", "room ": "invalid" } }));
+  const sync = new InboxSync(root, async () => [], () => true, () => true);
+  for (const channel of [".", " room", "room ", "\troom"]) {
+    expect(() => sync.watch(channel)).toThrow("Invalid inbound channel");
+    expect(() => sync.memberships(["valid", channel])).toThrow("Invalid inbound channel");
+  }
+  sync.watch("room.name"); sync.watch("dm-owner");
+  expect(Object.keys(JSON.parse(readFileSync(join(root, "inbound-cursors.json"), "utf8")).channels)).toEqual(["room.name", "dm-owner"]);
+});
+
+test("thread archive requires a regular destination before and after temp write", () => {
+  for (const afterWrite of [false, true]) {
+    const root = tempDir("codex-history-special-");
+    const histDir = join(root, "history"); mkdirSync(histDir);
+    const file = join(histDir, createHash("sha256").update("room").digest("hex").slice(0, 24) + ".json");
+    if (!afterWrite) mkdirSync(file);
+    expect(() => preserveChannelHistory(root, "room", [], s => {
+      if (afterWrite) mkdirSync(file);
+      return s;
+    })).toThrow("regular file");
+    expect(readdirSync(histDir)).toEqual([file.split(sep).at(-1)!]);
+  }
+});
+
+test("thread preview strips every casing of prototype keys while retaining ordinary fields", () => {
+  const root = tempDir("codex-history-keys-");
+  const message = JSON.parse('{"channel_id":"room","id":"one","content":"hello","__proto__":{},"__PrOtO__":{},"CONSTRUCTOR":"bad","Prototype":"bad"}');
+  const histories = [{ id: "h1", turns: [{ id: "001", items: [{ type: "userMessage", content: [{ type: "text", text: "AgentsChat message:\n" + JSON.stringify(message) }] }] }] }];
+  const prompt = preserveChannelHistory(root, "room", histories, s => s);
+  const line = prompt.split("Past messages in order:\n")[1]!.split("\n")[0]!;
+  expect(JSON.parse(line)).toEqual({ channel_id: "room", id: "one", content: "hello", role: "user" });
+  expect(Object.hasOwn(message, "__proto__")).toBe(true);
 });

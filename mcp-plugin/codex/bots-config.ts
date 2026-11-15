@@ -1,11 +1,12 @@
 import { readFileSync, realpathSync, mkdirSync, lstatSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { resolveConfig, type BridgeConfig, type IdentitySettings } from "./config.ts";
+import { assertDirectoryAncestors, reservedProfileStem, resolveConfig, type BridgeConfig, type IdentitySettings } from "./config.ts";
 
 export interface BotConfig extends BridgeConfig { name: string }
 export function defaultRegistry(home = homedir()) { return join(home, ".agentschat/codex-bots.json"); }
 export function loadBots(file = defaultRegistry(), home = homedir()): BotConfig[] {
+  assertDirectoryAncestors(dirname(file));
   let doc: any;
   try {
     const info = lstatSync(file);
@@ -34,12 +35,13 @@ export function loadBots(file = defaultRegistry(), home = homedir()): BotConfig[
     if (!text(bot.profile) || (bot.workdir !== undefined && !text(bot.workdir))) throw new Error(`Bot ${bot.name} needs a profile and valid optional workdir`);
     // Registry profiles are named, centrally stored identities, not project-relative files.
     if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/.test(bot.profile) || bot.profile.includes("..") ||
-      reserved(bot.profile) || reserved(bot.profile.replace(/\.json$/i, ""))) {
+      reservedProfileStem(bot.profile)) {
       throw new Error(`Bot ${bot.name}: profile must be a central profile name`);
     }
     const directoryLeaf = (dir: string) => {
       const info = lstatSync(dir, { throwIfNoEntry: false });
       if (info && (info.isSymbolicLink() || !info.isDirectory())) throw new Error("Bot workdir must be a directory, not a symlink");
+      assertDirectoryAncestors(dir);
     };
     if (!doc.default_workdir && !bot.workdir) {
       directoryLeaf(join(home, ".agentschat"));

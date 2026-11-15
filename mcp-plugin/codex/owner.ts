@@ -1,3 +1,11 @@
+/** URL parsing canonicalizes numeric IPv4 and mapped IPv6 before this check. */
+export function blockedServerHost(url: URL): boolean {
+  const host = url.hostname.toLowerCase().replace(/\.+$/, "").replace(/^\[|\]$/g, "");
+  return /^169\.254\./.test(host) || host === "metadata.google.internal" ||
+    host === "metadata.goog" || host.endsWith(".metadata.goog") ||
+    /^fe[89ab][0-9a-f]:/.test(host) || /^::ffff:(?:0:)?a9fe:/.test(host);
+}
+
 /** Read bounded response bytes before decoding or parsing untrusted JSON. */
 async function ownerJson(response: Response): Promise<unknown> {
   if (!response.body) throw new Error("Missing owner response");
@@ -37,7 +45,7 @@ export async function getBotOwner(
       !token || token !== token.trim() || /[\x00-\x1f\x7f]/.test(token)) return null;
     const parsed = new URL(base);
     const loopback = ["127.0.0.1", "localhost", "[::1]", "::1"].includes(parsed.hostname.toLowerCase().replace(/\.$/, ""));
-    if ((parsed.protocol !== "https:" && !(parsed.protocol === "http:" && loopback)) ||
+    if (blockedServerHost(parsed) || (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && loopback)) ||
       parsed.username || parsed.password || parsed.search || parsed.hash || parsed.port === "0") return null;
     const origin = parsed.href.replace(/\/+$/, "");
     const options: RequestInit = {
@@ -66,12 +74,12 @@ export async function getBotOwner(
     ]);
     const status = statusValue as Record<string, unknown> | null;
     const entitlement = entitlementValue as Record<string, unknown> | null;
-    if (!status || typeof status !== "object" || Array.isArray(status) || status.agent_id !== agentId || status.claimed !== true) return null;
-    if (!entitlement || typeof entitlement !== "object" || Array.isArray(entitlement)) return null;
+    if (!status || typeof status !== "object" || Array.isArray(status) || Object.hasOwn(status, "__proto__") || status.agent_id !== agentId || status.claimed !== true) return null;
+    if (!entitlement || typeof entitlement !== "object" || Array.isArray(entitlement) || Object.hasOwn(entitlement, "__proto__")) return null;
     const owner = entitlement.owner_account_id;
     return typeof owner === "string" && owner.trim().length > 0 && owner === owner.trim() &&
-      !/[\x00-\x1f\x7f]/.test(owner) && owner !== agentId &&
-      !["__proto__", "constructor", "prototype"].includes(owner.toLowerCase()) ? owner : null;
+      !/[\/\\\x00-\x1f\x7f]/.test(owner) && owner !== agentId &&
+      ![".", "..", "__proto__", "constructor", "prototype"].includes(owner.toLowerCase()) ? owner : null;
   } catch {
     // Missing endpoints, failed authentication and unavailable ownership all fail closed.
     // Never retain a previous owner or expose response bodies / credentials in diagnostics.

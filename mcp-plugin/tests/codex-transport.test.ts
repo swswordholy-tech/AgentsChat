@@ -221,3 +221,56 @@ test("synchronous message send failure releases pending resources", async () => 
     finally { send.mockRestore(); }
   });
 });
+
+test("transport rejects padded channel IDs before requests or typing timers", async () => {
+  const t = new AgentsChatTransport(config, () => {}, () => {});
+  const api = spyOn(t, "api").mockResolvedValue({});
+  try {
+    for (const channel of [" room", "room ", "\troom", "room\u00a0"]) {
+      await expect(t.send(channel, "hello")).rejects.toThrow("Invalid AgentsChat channel");
+      expect(() => t.setTyping(channel, true)).toThrow("Invalid AgentsChat channel");
+    }
+    expect(api).not.toHaveBeenCalled(); expect((t as any).typing.size).toBe(0);
+  } finally { t.stop(); api.mockRestore(); }
+});
+
+test("API rejects own prototype JSON and invalid UTF-8 while decoding split multibyte characters", async () => {
+  let response: () => Response = () => new Response('{}');
+  const stub = spyOn(globalThis, "fetch").mockImplementation(Object.assign(async () => response(), { preconnect: globalThis.fetch.preconnect }));
+  const t = new AgentsChatTransport(config, () => {}, () => {});
+  try {
+    for (const bytes of [new TextEncoder().encode('{"__proto__":{},"ok":true}'),
+      Uint8Array.from([...new TextEncoder().encode('{"text":"'), 0xff, ...new TextEncoder().encode('"}')]),
+      Uint8Array.from([...new TextEncoder().encode('{"text":"'), 0xe2, 0x82])]) {
+      response = () => new Response(bytes);
+      await expect(t.api("/test")).rejects.toThrow("Invalid AgentsChat response");
+    }
+    response = () => new Response(new ReadableStream({ start(c) {
+      for (const byte of new TextEncoder().encode('{"text":"你好😀"}')) c.enqueue(Uint8Array.of(byte));
+      c.close();
+    } }));
+    await expect(t.api("/test")).resolves.toEqual({ text: "你好😀" });
+    response = () => Response.json([{ id: "room" }]);
+    await expect(t.api("/test")).resolves.toEqual([{ id: "room" }]);
+  } finally { t.stop(); stub.mockRestore(); }
+});
+
+test("WS prototype frames cannot authenticate, join, refresh heartbeat or deliver messages", async () => {
+  await socketTest(async (t, state) => {
+    const send = spyOn(state.socket, "send"), pong = spyOn(state.heartbeat, "receivedPong");
+    const receive = spyOn(state, "receive");
+    try {
+      state.authenticated = false;
+      for (const frame of [
+        '{"type":"auth_ok","__proto__":{}}',
+        '{"type":"channel_created","channel_id":"room","__proto__":{}}',
+        '{"type":"message","content":"bad","__proto__":{}}',
+        '{"type":"thread_reply","content":"bad","__proto__":{}}',
+      ]) state.socket.emit("message", Buffer.from(frame));
+      expect(state.authenticated).toBe(false);
+      expect(send).not.toHaveBeenCalled(); expect(pong).not.toHaveBeenCalled(); expect(receive).not.toHaveBeenCalled();
+      state.socket.emit("message", Buffer.from('{"type":"message","content":"valid"}'));
+      expect(pong).toHaveBeenCalledTimes(1); expect(receive).toHaveBeenCalledTimes(1);
+    } finally { send.mockRestore(); pong.mockRestore(); receive.mockRestore(); }
+  });
+});
