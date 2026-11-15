@@ -15,11 +15,26 @@
  * So: the write reports success, and the dirty flag is cleared ONLY once it lands.
  */
 import { randomBytes } from "crypto";
-import { chmodSync, lstatSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "fs";
-import { dirname, isAbsolute, join, sep } from "path";
+import {
+  chmodSync,
+  copyFileSync,
+  lstatSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+   type Stats,
+  unlinkSync,
+  writeFileSync,
+} from "fs";
+import { dirname, isAbsolute, join, parse, resolve, sep } from "path";
 import { redactSecrets } from "./redact.ts";
 
 export type Warn = (message: string) => void;
+
+export interface PersistCursorFsOps {
+  renameSync?: (oldPath: string, newPath: string) => void;
+  copyFileSync?: (src: string, dest: string) => void;
+}
 
 const MAX_CURSOR_BYTES = 4 * 1024 * 1024;
 const MAX_CURSOR_ENTRIES = 50_000;
@@ -28,13 +43,71 @@ let tmpCounter = 0;
 
 function scrubDiag(value: unknown): string {
   return redactSecrets(String(value ?? ""))
+    .replace(/\b(https?:\/\/)([^/\s@]*@)/gi, "$1[REDACTED]@")
     .replace(/\b(?:Bearer|Basic)\s+[^\s"'<>\\]+/gi, "[REDACTED]")
-    .replace(/(?:agent_key_|sk-|whsec_|gh[pousr]_|github_pat_|AIza|AKIA|ASIA)[A-Za-z0-9+/=_-]{12,}/g, "[REDACTED]")
+    .replace(
+      /(?:ac_|mcp_at_|mcp_rt_|mcp_|agent_key_|sk-|rk_live_|rk_test_|whsec_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|AIza|AKIA|ASIA)[A-Za-z0-9+/=._-]{8,}/g,
+      "[REDACTED]",
+    )
     .replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
 }
 
+function isDarwinCanonicalRootLink(dir: string, st: Stats): boolean {
+  if (
+    process.platform !== "darwin" ||
+    (dir !== "/var" && dir !== "/tmp" && dir !== "/etc") ||
+    !st.isSymbolicLink()
+  ) {
+    return false;
+  }
+  try {
+    return (
+      realpathSync(dir) === `/private${dir}` &&
+      !lstatSync("/private").isSymbolicLink() &&
+      lstatSync("/private").isDirectory() &&
+      !lstatSync(`/private${dir}`).isSymbolicLink() &&
+      lstatSync(`/private${dir}`).isDirectory()
+    );
+  } catch {
+    return false;
+  }
+}
+
+function hasSafeRawDotDotAncestors(rawDirPath: string): boolean {
+  const absRaw = isAbsolute(rawDirPath) ? rawDirPath : `${process.cwd()}${sep}${rawDirPath}`;
+  const root = parse(absRaw).root;
+  const segments = absRaw.slice(root.length).split(/[\\/]+/).filter(Boolean);
+  if (!segments.includes("..")) return true;
+  let cur = root;
+  for (const seg of segments) {
+    if (seg === ".") continue;
+    if (seg === "..") {
+      cur = dirname(cur);
+      continue;
+    }
+    const next = join(cur, seg);
+    try {
+      const st = lstatSync(next);
+      if (st.isSymbolicLink() && !isDarwinCanonicalRootLink(next, st)) {
+        return false;
+      }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") return false;
+    }
+    cur = next;
+  }
+  return true;
+}
+
 function hasSafeAncestorDirs(targetFile: string): boolean {
-  let dir = dirname(isAbsolute(targetFile) ? targetFile : `${process.cwd()}${sep}${targetFile}`);
+  if (typeof targetFile !== "string" || !targetFile || /[\x00-\x1f\x7f]/.test(targetFile)) {
+    return false;
+  }
+  const rawParent = dirname(isAbsolute(targetFile) ? targetFile : `${process.cwd()}${sep}${targetFile}`);
+  if (!hasSafeRawDotDotAncestors(rawParent)) {
+    return false;
+  }
+  let dir = resolve(rawParent);
   while (true) {
     let st;
     try {
@@ -42,23 +115,7 @@ function hasSafeAncestorDirs(targetFile: string): boolean {
     } catch {
       return false;
     }
-    const isDarwinRootLink =
-      process.platform === "darwin" &&
-      (dir === "/var" || dir === "/tmp" || dir === "/etc") &&
-      st.isSymbolicLink() &&
-      (() => {
-        try {
-          return (
-            realpathSync(dir) === `/private${dir}` &&
-            !lstatSync("/private").isSymbolicLink() &&
-            lstatSync("/private").isDirectory() &&
-            !lstatSync(`/private${dir}`).isSymbolicLink() &&
-            lstatSync(`/private${dir}`).isDirectory()
-          );
-        } catch {
-          return false;
-        }
-      })();
+    const isDarwinRootLink = isDarwinCanonicalRootLink(dir, st);
     if (!isDarwinRootLink && (st.isSymbolicLink() || !st.isDirectory())) {
       return false;
     }
@@ -141,8 +198,13 @@ export function loadCursor(file: string, warn: Warn): Map<string, string> {
   }
 }
 
-/** Write the cursor to disk atomically (0600 tmp + rename). Returns true iff it actually landed. Never throws. */
-export function persistCursor(file: string, cursor: Map<string, string>, warn: Warn): boolean {
+/** Write the cursor to disk atomically (0600 tmp + rename, with Windows NTFS EPERM/EACCES fallback). Returns true iff it actually landed. Never throws. */
+export function persistCursor(
+  file: string,
+  cursor: Map<string, string>,
+  warn: Warn,
+  fsOps?: PersistCursorFsOps,
+): boolean {
   try {
     const parentStat = lstatSync(dirname(file));
     if (parentStat.isSymbolicLink() || !parentStat.isDirectory() || !hasSafeAncestorDirs(file)) {
@@ -180,17 +242,46 @@ export function persistCursor(file: string, cursor: Map<string, string>, warn: W
   for (const [k, v] of boundedEntries) {
     payloadObj[k] = v;
   }
+  const renameFn = fsOps?.renameSync ?? renameSync;
+  const copyFn = fsOps?.copyFileSync ?? copyFileSync;
   const tmp = `${file}.${process.pid}.${Date.now()}.${++tmpCounter}.${randomBytes(4).toString("hex")}.tmp`;
   try {
     writeFileSync(tmp, JSON.stringify(payloadObj), { mode: 0o600, flag: "wx" });
     if (process.platform !== "win32") {
       chmodSync(tmp, 0o600);
     }
+    if (!hasSafeAncestorDirs(file)) {
+      throw new Error("parent is not a real directory");
+    }
     const current = lstatSync(file, { throwIfNoEntry: false });
     if (current && (current.isSymbolicLink() || !current.isFile())) {
       throw new Error("target was replaced by a symlink or non-file");
     }
-    renameSync(tmp, file);
+    try {
+      renameFn(tmp, file);
+    } catch (renameErr) {
+      const code = (renameErr as NodeJS.ErrnoException)?.code;
+      if (code === "EPERM" || code === "EACCES") {
+        if (!hasSafeAncestorDirs(file)) {
+          throw new Error("parent is not a real directory");
+        }
+        const recheck = lstatSync(file, { throwIfNoEntry: false });
+        if (recheck && (recheck.isSymbolicLink() || !recheck.isFile())) {
+          throw new Error("target was replaced by a symlink or non-file");
+        }
+        copyFn(tmp, file);
+        if (process.platform !== "win32") {
+          chmodSync(file, 0o600);
+        }
+        try {
+          unlinkSync(tmp);
+        } catch {
+          /* ignore cleanup error */
+        }
+        return true;
+      }
+      throw renameErr;
+    }
     return true;
   } catch (e) {
     try {

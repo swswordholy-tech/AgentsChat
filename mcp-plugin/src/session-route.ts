@@ -13,23 +13,37 @@
  * `undefined`, which leaves the receiver on its existing fallback. Routing must
  * never turn a delivery problem into a lost message.
  */
-import { lstatSync, readFileSync, readlinkSync } from "node:fs";
+import { lstatSync, readFileSync, readlinkSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, parse, resolve } from "node:path";
+import { dirname, isAbsolute, join, parse, resolve, sep } from "node:path";
 import { loadSessionBinds } from "./session-bind.ts";
 
 const MAX_PROFILE_BYTES = 64 * 1024;
 const MAX_DIR_PATH_LENGTH = 4096;
+const MAX_SESSION_ID_LENGTH = 256;
 const RESERVED_PROFILE_KEY = /^(?:__proto__|constructor|prototype)$/i;
 const RESERVED_ROUTE_SIDECARS = new Set([
+  "profile",
   "session-binds",
+  "session-binds_meta",
+  "session-binds-meta",
   "agy-binds",
+  "agy-binds_meta",
+  "agy-binds-meta",
+  "agy-session-binds",
+  "agy-session-binds_meta",
   "grok-binds",
+  "grok-binds_meta",
+  "grok-binds-meta",
+  "identity-guard",
   "cursor",
   "read-cursors",
+  "mention-timestamps",
   "wake-pids",
   "config",
   "codex-bots",
+  "dsh",
+  "muse",
 ]);
 
 export interface AgentSessionRoute {
@@ -91,18 +105,65 @@ function isSafeRegularProfileFile(path: string): boolean {
   }
 }
 
+function isSafeSessionId(sessionId: string): boolean {
+  return (
+    sessionId.length > 0 &&
+    sessionId.length <= MAX_SESSION_ID_LENGTH &&
+    sessionId !== "." &&
+    sessionId !== ".." &&
+    !RESERVED_PROFILE_KEY.test(sessionId) &&
+    !/[\x00-\x1f\x7f]/.test(sessionId)
+  );
+}
+
 function isAllowedDarwinSystemLink(dirPath: string): boolean {
   if (process.platform !== "darwin") return false;
   if (dirPath !== "/var" && dirPath !== "/tmp" && dirPath !== "/etc") return false;
   try {
-    return readlinkSync(dirPath) === `private${dirPath}`;
+    return (
+      readlinkSync(dirPath) === `private${dirPath}` &&
+      realpathSync(dirPath) === `/private${dirPath}` &&
+      !lstatSync("/private").isSymbolicLink() &&
+      lstatSync("/private").isDirectory() &&
+      !lstatSync(`/private${dirPath}`).isSymbolicLink() &&
+      lstatSync(`/private${dirPath}`).isDirectory()
+    );
   } catch {
     return false;
   }
 }
 
+function hasSafeRawDotDotSegments(rawPath: string): boolean {
+  const absRaw = isAbsolute(rawPath) ? rawPath : `${process.cwd()}${sep}${rawPath}`;
+  const root = parse(absRaw).root;
+  const segments = absRaw.slice(root.length).split(/[\\/]+/).filter(Boolean);
+  if (!segments.includes("..")) return true;
+  let cur = root;
+  for (const seg of segments) {
+    if (seg === ".") continue;
+    if (seg === "..") {
+      cur = dirname(cur);
+      continue;
+    }
+    const next = join(cur, seg);
+    try {
+      const st = lstatSync(next);
+      if (st.isSymbolicLink() && !isAllowedDarwinSystemLink(next)) {
+        return false;
+      }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") return false;
+    }
+    cur = next;
+  }
+  return true;
+}
+
 function isSafeRealDir(path: string): boolean {
   try {
+    if (!path || /[\x00-\x1f\x7f]/.test(path) || !hasSafeRawDotDotSegments(path)) {
+      return false;
+    }
     const st = lstatSync(path);
     if (st.isSymbolicLink() || !st.isDirectory()) return false;
     const abs = resolve(path);
@@ -190,6 +251,7 @@ export function resolveSessionForAgent(
     return undefined;
   }
   for (const [sessionId, profileName] of Object.entries(binds).reverse()) {
+    if (!isSafeSessionId(sessionId)) continue;
     if (opts.filter && !opts.filter(sessionId)) continue;
     const path = profilePathForName(configDir, profileName);
     if (path === undefined) continue;
