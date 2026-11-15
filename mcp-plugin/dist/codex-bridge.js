@@ -2248,6 +2248,9 @@ var TEAM_LEAD_SKILL_ID = "agentschat-team-lead";
 var TEAM_LEAD_SKILL_BODY = readFileSync5(new URL("../skills/agentschat-team-lead/SKILL.md", import.meta.url), "utf8");
 var TEAM_LEAD_NO_UPDATE = "[[AGENTSCHAT_NO_UPDATE]]";
 function isTeamLeadSkillInvocation(prompt) {
+  if (typeof prompt !== "string" || prompt.length > 256 || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u2028\u2029]/.test(prompt)) {
+    return false;
+  }
   return [TEAM_LEAD_SKILL_ID, `$${TEAM_LEAD_SKILL_ID}`, `执行 $${TEAM_LEAD_SKILL_ID}`].includes(prompt.trim());
 }
 

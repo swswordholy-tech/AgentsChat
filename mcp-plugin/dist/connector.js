@@ -20,6 +20,8 @@ function hmacHex(payload, secret) {
   return createHmac("sha256", secret).update(payload, "utf8").digest("hex");
 }
 function verifySignature(payload, sigHex, secrets) {
+  if (typeof payload !== "string" || !Array.isArray(secrets))
+    return false;
   if (typeof sigHex !== "string" || !/^[0-9a-f]{64}$/i.test(sigHex))
     return false;
   let sigBuf;
@@ -31,8 +33,9 @@ function verifySignature(payload, sigHex, secrets) {
   if (sigBuf.length === 0)
     return false;
   for (const secret of secrets) {
-    if (!secret)
+    if (typeof secret !== "string" || secret.length === 0 || secret.length > 8192 || DISALLOWED_TOKEN_PAYLOAD_CTRL_RE.test(secret)) {
       continue;
+    }
     const expected = Buffer.from(hmacHex(payload, secret), "hex");
     if (expected.length !== sigBuf.length)
       continue;
@@ -43,12 +46,17 @@ function verifySignature(payload, sigHex, secrets) {
 }
 var DISALLOWED_TOKEN_PAYLOAD_CTRL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
 var PROTOTYPE_PAYLOAD_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+var STRICT_BASE64URL_RE = /^[A-Za-z0-9_-]+$/;
 function verifyToken(token, secrets) {
-  if (typeof token !== "string" || token.length === 0 || token.length > 4096)
+  if (typeof token !== "string" || token.length === 0 || token.length > 4096 || !STRICT_BASE64URL_RE.test(token) || !Array.isArray(secrets)) {
     return null;
+  }
   let decoded;
   try {
-    decoded = Buffer.from(token, "base64url").toString("utf8");
+    const rawBuf = Buffer.from(token, "base64url");
+    if (rawBuf.toString("base64url") !== token)
+      return null;
+    decoded = rawBuf.toString("utf8");
   } catch {
     return null;
   }
@@ -79,17 +87,25 @@ function verifyUpgradeToken(token, secrets) {
 var CONTRACT_VERSION = 1;
 var AGENTSCHAT_MAX_MESSAGE_LENGTH = 4000;
 var SUPPORTED_OPS = ["send", "typing", "get_chat_info"];
+var DESCRIPTOR_PROTO_KEYS = new Set([
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase())
+]);
 function buildDescriptor(overrides = {}) {
+  if (!overrides || typeof overrides !== "object" || Array.isArray(overrides) || Object.prototype.hasOwnProperty.call(overrides, "__proto__")) {
+    throw new Error("invalid descriptor overrides");
+  }
   const keys = new Set;
   for (const key of Object.keys(overrides)) {
     const trimmed = key.trim();
-    if (!trimmed || ["__proto__", "constructor", "prototype"].includes(trimmed.toLowerCase()) || keys.has(trimmed))
+    if (!trimmed || DESCRIPTOR_PROTO_KEYS.has(trimmed.toLowerCase()) || keys.has(trimmed))
       throw new Error("invalid or duplicate descriptor override key");
     keys.add(trimmed);
   }
   if ([...keys].some((key) => !Object.hasOwn(overrides, key))) {
     throw new Error("descriptor override keys must not contain surrounding whitespace");
   }
+  const resolvedOps = Array.isArray(overrides.supported_ops) ? [...overrides.supported_ops] : [...SUPPORTED_OPS];
   return {
     contract_version: CONTRACT_VERSION,
     platform: "agentschat",
@@ -103,8 +119,8 @@ function buildDescriptor(overrides = {}) {
     emoji: "\uD83E\uDD16",
     pii_safe: false,
     platform_hint: "AgentsChat named skills are reusable instructions. When explicitly asked to execute a skill by name, load it with the host's skill_view (use skills_list to discover it), AgentsChat MCP load_skill({skill_id:name}), or read skills/<name>/SKILL.md from the installed AgentsChat MCP package in this runtime. Report a missing loader or skill; do not pretend it ran. Keep skill text out of chat and keep replies in the originating chat.",
-    supported_ops: [...SUPPORTED_OPS],
-    ...overrides
+    ...overrides,
+    supported_ops: resolvedOps
   };
 }
 
@@ -944,6 +960,9 @@ function flushCursor(state, persist) {
   return ok;
 }
 
+// connector/backfill.ts
+import { join as join2 } from "node:path";
+
 // src/timestamps.ts
 var ISO_OFFSET_RE = /^(\d{4}-\d{2}-\d{2})[Tt ](\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|z|[+-]\d{2}:\d{2})$/;
 function isValidCalendarDateTime(datePart, timePart, tzPart) {
@@ -1000,26 +1019,35 @@ function normalizeTimestampForCursor(ts, mode) {
 }
 
 // connector/backfill.ts
-import { join as join2 } from "node:path";
+var CANONICAL_CURSOR_TS_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{9}Z$/;
+var RESERVED_CURSOR_BOT_NAMES = /^(?:__proto__|constructor|prototype|con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
+function canonicalCursorTimestamp(raw) {
+  if (typeof raw !== "string" || raw.length === 0 || raw.length > 128)
+    return null;
+  const norm = normalizeTimestampForCursor(raw, "after");
+  return typeof norm === "string" && CANONICAL_CURSOR_TS_RE.test(norm) ? norm : null;
+}
+function isPlainMessageRecord(m) {
+  return Boolean(m && typeof m === "object" && !Array.isArray(m) && !Object.prototype.hasOwnProperty.call(m, "__proto__"));
+}
 function compareNormalizedTimestamps(aRaw, bRaw) {
-  const aStr = String(aRaw ?? "");
-  const bStr = String(bRaw ?? "");
-  const aNorm = normalizeTimestampForCursor(aStr, "after") || aStr;
-  const bNorm = normalizeTimestampForCursor(bStr, "after") || bStr;
+  const aNorm = canonicalCursorTimestamp(aRaw) ?? "";
+  const bNorm = canonicalCursorTimestamp(bRaw) ?? "";
   return aNorm < bNorm ? -1 : aNorm > bNorm ? 1 : 0;
 }
 function planBackfill(after, msgs, agentId) {
   const list = Array.isArray(msgs) ? msgs : [];
-  if (!after) {
+  const afterTs = canonicalCursorTimestamp(after);
+  if (!afterTs) {
     let newestRaw = "";
     let newestNorm = "";
     for (const m of list) {
-      if (!m || typeof m !== "object" || typeof m.content !== "string" || m.content === "__typing__")
+      if (!isPlainMessageRecord(m) || typeof m.content !== "string" || m.content === "__typing__")
         continue;
-      const raw = String(m.timestamp || "");
-      if (!raw)
+      const raw = typeof m.timestamp === "string" ? m.timestamp : "";
+      const norm = canonicalCursorTimestamp(raw);
+      if (!norm)
         continue;
-      const norm = normalizeTimestampForCursor(raw, "after") || raw;
       if (norm > newestNorm) {
         newestNorm = norm;
         newestRaw = raw;
@@ -1027,41 +1055,43 @@ function planBackfill(after, msgs, agentId) {
     }
     return newestRaw ? { seed: newestRaw, replay: [] } : { replay: [] };
   }
-  const afterTs = normalizeTimestampForCursor(after, "after") || after;
   const replay = list.filter((m) => {
-    if (!m || typeof m !== "object" || typeof m.content !== "string" || m.content === "__typing__")
+    if (!isPlainMessageRecord(m) || typeof m.content !== "string" || m.content === "__typing__")
       return false;
     if (m.sender_id === agentId && !serverLoopTick(m))
       return false;
-    const msgTs = normalizeTimestampForCursor(m.timestamp, "after");
-    return typeof msgTs === "string" && msgTs > afterTs;
+    const msgTs = canonicalCursorTimestamp(m.timestamp);
+    return msgTs !== null && msgTs > afterTs;
   });
   replay.sort((a, b) => compareNormalizedTimestamps(a.timestamp, b.timestamp));
   return { replay };
 }
 function selectChannelContextMessages(msgs, sinceTs, excludeId) {
   const list = Array.isArray(msgs) ? msgs : [];
-  const filtered = list.filter((m) => typeof m?.content === "string" && m.content.length > 0 && m.content !== "__typing__" && (!excludeId || m?.id !== excludeId)).sort((a, b) => compareNormalizedTimestamps(a.timestamp, b.timestamp));
+  const filtered = list.filter((m) => isPlainMessageRecord(m) && typeof m.content === "string" && m.content.length > 0 && m.content !== "__typing__" && (!excludeId || m.id !== excludeId)).sort((a, b) => compareNormalizedTimestamps(a.timestamp, b.timestamp));
   if (!sinceTs)
     return filtered.slice(-10);
-  const normSince = normalizeTimestampForCursor(sinceTs, "after") || sinceTs;
+  const normSince = canonicalCursorTimestamp(sinceTs);
+  if (!normSince)
+    return [];
   return filtered.filter((m) => {
-    const raw = String(m.timestamp ?? "");
-    const norm = normalizeTimestampForCursor(raw, "after") || raw;
-    return norm > normSince;
+    const norm = canonicalCursorTimestamp(m.timestamp);
+    return norm !== null && norm > normSince;
   }).slice(-10);
 }
 function safeCursorBotFile(cursorDir, botId) {
-  const cleaned = String(botId || "default").replace(/[^A-Za-z0-9._-]/g, "_").replace(/\.{2,}/g, "_");
-  const safeId = cleaned && cleaned !== "." && !["__proto__", "constructor", "prototype"].includes(cleaned.toLowerCase()) ? cleaned.slice(0, 128) : "default";
+  const raw = typeof botId === "string" && botId.trim() ? botId : "default";
+  const cleaned = raw.replace(/[^A-Za-z0-9._-]/g, "_").replace(/\.+$/, "").replace(/\.{2,}/g, "_");
+  const safeId = cleaned && !RESERVED_CURSOR_BOT_NAMES.test(cleaned) ? cleaned.slice(0, 128) : "default";
   return join2(cursorDir, `last-seen-msg-ts-${safeId}.json`);
 }
 
 // connector/ingest.ts
 function ingestAgentsChatFrame(id, frame, deps) {
-  if (!frame || typeof frame !== "object")
+  if (!frame || typeof frame !== "object" || Array.isArray(frame) || Object.prototype.hasOwnProperty.call(frame, "__proto__")) {
     return false;
-  if (frame.content !== "__typing__") {
+  }
+  if (frame.content !== "__typing__" && canonicalCursorTimestamp(frame.timestamp) !== null) {
     deps.advanceCursor(id, frame.channel_id, frame.timestamp);
   }
   const key = messageDedupKey(frame);
@@ -1539,10 +1569,12 @@ async function main() {
   function advanceCursor(id, channelId, timestamp) {
     if (!validIdentityId(channelId) || typeof timestamp !== "string" || !timestamp)
       return;
+    const currentTs = canonicalCursorTimestamp(timestamp);
+    if (!currentTs)
+      return;
     const s = cursorFor(id);
     const prev = s.map.get(channelId) || "";
-    const currentTs = normalizeTimestampForCursor(timestamp, "after") || timestamp;
-    const prevTs = normalizeTimestampForCursor(prev, "after") || prev;
+    const prevTs = canonicalCursorTimestamp(prev) ?? "";
     if (currentTs > prevTs) {
       s.map.set(channelId, timestamp);
       scheduleSave(s);

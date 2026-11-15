@@ -41,7 +41,7 @@ import { redactSecrets } from "../src/redact.ts";
 import { flushCursor, loadCursor, persistCursor } from "../src/read-cursor.ts";
 import { normalizeTimestampForCursor } from "../src/timestamps.ts";
 import { MessageDedup } from "../src/dedup.ts";
-import { planBackfill, safeCursorBotFile, selectChannelContextMessages } from "./backfill.ts";
+import { canonicalCursorTimestamp, planBackfill, safeCursorBotFile, selectChannelContextMessages } from "./backfill.ts";
 import { ingestAgentsChatFrame } from "./ingest.ts";
 import { HeartbeatMonitor, WS_CLOSED } from "../src/heartbeat.ts";
 import { resolveDrainReconnectDelay, withTimeoutController } from "../src/reconnect.ts";
@@ -378,10 +378,11 @@ function scheduleSave(s: CursorStore) {
 
 function advanceCursor(id: Pick<Identity, "botId">, channelId: string | undefined, timestamp: string | undefined) {
   if (!validIdentityId(channelId) || typeof timestamp !== "string" || !timestamp) return;
+  const currentTs = canonicalCursorTimestamp(timestamp);
+  if (!currentTs) return;
   const s = cursorFor(id);
   const prev = s.map.get(channelId) || "";
-  const currentTs = normalizeTimestampForCursor(timestamp, "after") || timestamp;
-  const prevTs = normalizeTimestampForCursor(prev, "after") || prev;
+  const prevTs = canonicalCursorTimestamp(prev) ?? "";
   if (currentTs > prevTs) {
     s.map.set(channelId, timestamp);
     scheduleSave(s);

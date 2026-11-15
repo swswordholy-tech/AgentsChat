@@ -36,17 +36,33 @@ export const SUPPORTED_OPS = ["send", "typing", "get_chat_info"] as const;
  * Build the descriptor the connector hands the gateway at handshake.
  * Single-tenant agentschat: narrow, honest capability set.
  */
+const DESCRIPTOR_PROTO_KEYS = new Set([
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase()),
+]);
+
 export function buildDescriptor(overrides: Partial<CapabilityDescriptor> = {}): CapabilityDescriptor {
+  if (
+    !overrides ||
+    typeof overrides !== "object" ||
+    Array.isArray(overrides) ||
+    Object.prototype.hasOwnProperty.call(overrides, "__proto__")
+  ) {
+    throw new Error("invalid descriptor overrides");
+  }
   const keys = new Set<string>();
   for (const key of Object.keys(overrides)) {
     const trimmed = key.trim();
-    if (!trimmed || ["__proto__", "constructor", "prototype"].includes(trimmed.toLowerCase()) ||
+    if (!trimmed || DESCRIPTOR_PROTO_KEYS.has(trimmed.toLowerCase()) ||
         keys.has(trimmed)) throw new Error("invalid or duplicate descriptor override key");
     keys.add(trimmed);
   }
   if ([...keys].some(key => !Object.hasOwn(overrides, key))) {
     throw new Error("descriptor override keys must not contain surrounding whitespace");
   }
+  const resolvedOps = Array.isArray(overrides.supported_ops)
+    ? [...overrides.supported_ops]
+    : [...SUPPORTED_OPS];
   return {
     contract_version: CONTRACT_VERSION,
     platform: "agentschat",
@@ -60,7 +76,7 @@ export function buildDescriptor(overrides: Partial<CapabilityDescriptor> = {}): 
     emoji: "🤖",
     pii_safe: false,
     platform_hint: "AgentsChat named skills are reusable instructions. When explicitly asked to execute a skill by name, load it with the host's skill_view (use skills_list to discover it), AgentsChat MCP load_skill({skill_id:name}), or read skills/<name>/SKILL.md from the installed AgentsChat MCP package in this runtime. Report a missing loader or skill; do not pretend it ran. Keep skill text out of chat and keep replies in the originating chat.",
-    supported_ops: [...SUPPORTED_OPS],
     ...overrides,
+    supported_ops: resolvedOps,
   };
 }

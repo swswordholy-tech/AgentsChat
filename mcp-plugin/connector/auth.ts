@@ -38,6 +38,7 @@ export function sign(payload: string, secret: string): string {
 
 /** Constant-time check that `sigHex` is a valid HMAC of `payload` under ANY of `secrets`. */
 export function verifySignature(payload: string, sigHex: string, secrets: readonly string[]): boolean {
+  if (typeof payload !== "string" || !Array.isArray(secrets)) return false;
   if (typeof sigHex !== "string" || !/^[0-9a-f]{64}$/i.test(sigHex)) return false;
   let sigBuf: Buffer;
   try {
@@ -47,7 +48,14 @@ export function verifySignature(payload: string, sigHex: string, secrets: readon
   }
   if (sigBuf.length === 0) return false;
   for (const secret of secrets) {
-    if (!secret) continue;
+    if (
+      typeof secret !== "string" ||
+      secret.length === 0 ||
+      secret.length > 8192 ||
+      DISALLOWED_TOKEN_PAYLOAD_CTRL_RE.test(secret)
+    ) {
+      continue;
+    }
     const expected = Buffer.from(hmacHex(payload, secret), "hex");
     if (expected.length !== sigBuf.length) continue; // no timing leak on length
     if (timingSafeEqual(sigBuf, expected)) return true;
@@ -61,6 +69,7 @@ export function verifySignature(payload: string, sigHex: string, secrets: readon
  */
 const DISALLOWED_TOKEN_PAYLOAD_CTRL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
 const PROTOTYPE_PAYLOAD_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+const STRICT_BASE64URL_RE = /^[A-Za-z0-9_-]+$/;
 
 export function makeToken(payload: string, secret: string, ttlSeconds = 0): string {
   if (
@@ -71,7 +80,12 @@ export function makeToken(payload: string, secret: string, ttlSeconds = 0): stri
   ) {
     throw new Error("invalid token payload");
   }
-  if (typeof secret !== "string" || secret.length === 0) {
+  if (
+    typeof secret !== "string" ||
+    secret.length === 0 ||
+    secret.length > 8192 ||
+    DISALLOWED_TOKEN_PAYLOAD_CTRL_RE.test(secret)
+  ) {
     throw new Error("invalid token secret");
   }
   if (!Number.isFinite(ttlSeconds) || ttlSeconds < 0) {
@@ -99,10 +113,20 @@ export function makeUpgradeToken(
  * any signature not matching a secret in the verify list.
  */
 export function verifyToken(token: string, secrets: readonly string[]): string | null {
-  if (typeof token !== "string" || token.length === 0 || token.length > 4096) return null;
+  if (
+    typeof token !== "string" ||
+    token.length === 0 ||
+    token.length > 4096 ||
+    !STRICT_BASE64URL_RE.test(token) ||
+    !Array.isArray(secrets)
+  ) {
+    return null;
+  }
   let decoded: string;
   try {
-    decoded = Buffer.from(token, "base64url").toString("utf8");
+    const rawBuf = Buffer.from(token, "base64url");
+    if (rawBuf.toString("base64url") !== token) return null;
+    decoded = rawBuf.toString("utf8");
   } catch {
     return null;
   }

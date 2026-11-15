@@ -12,11 +12,27 @@ import { serverLoopTick, type AgentsChatMessage } from "./normalize.ts";
 
 export type BackfillMsg = AgentsChatMessage;
 
+const CANONICAL_CURSOR_TS_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{9}Z$/;
+const RESERVED_CURSOR_BOT_NAMES = /^(?:__proto__|constructor|prototype|con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
+
+export function canonicalCursorTimestamp(raw: unknown): string | null {
+  if (typeof raw !== "string" || raw.length === 0 || raw.length > 128) return null;
+  const norm = normalizeTimestampForCursor(raw, "after");
+  return typeof norm === "string" && CANONICAL_CURSOR_TS_RE.test(norm) ? norm : null;
+}
+
+function isPlainMessageRecord(m: unknown): m is BackfillMsg {
+  return Boolean(
+    m &&
+      typeof m === "object" &&
+      !Array.isArray(m) &&
+      !Object.prototype.hasOwnProperty.call(m, "__proto__"),
+  );
+}
+
 function compareNormalizedTimestamps(aRaw: unknown, bRaw: unknown): number {
-  const aStr = String(aRaw ?? "");
-  const bStr = String(bRaw ?? "");
-  const aNorm = normalizeTimestampForCursor(aStr, "after") || aStr;
-  const bNorm = normalizeTimestampForCursor(bStr, "after") || bStr;
+  const aNorm = canonicalCursorTimestamp(aRaw) ?? "";
+  const bNorm = canonicalCursorTimestamp(bRaw) ?? "";
   return aNorm < bNorm ? -1 : aNorm > bNorm ? 1 : 0;
 }
 
@@ -26,14 +42,15 @@ export function planBackfill(
   agentId: string,
 ): { seed?: string; replay: BackfillMsg[] } {
   const list = Array.isArray(msgs) ? msgs : [];
-  if (!after) {
+  const afterTs = canonicalCursorTimestamp(after);
+  if (!afterTs) {
     let newestRaw = "";
     let newestNorm = "";
     for (const m of list) {
-      if (!m || typeof m !== "object" || typeof m.content !== "string" || m.content === "__typing__") continue;
-      const raw = String(m.timestamp || "");
-      if (!raw) continue;
-      const norm = normalizeTimestampForCursor(raw, "after") || raw;
+      if (!isPlainMessageRecord(m) || typeof m.content !== "string" || m.content === "__typing__") continue;
+      const raw = typeof m.timestamp === "string" ? m.timestamp : "";
+      const norm = canonicalCursorTimestamp(raw);
+      if (!norm) continue;
       if (norm > newestNorm) {
         newestNorm = norm;
         newestRaw = raw;
@@ -41,12 +58,11 @@ export function planBackfill(
     }
     return newestRaw ? { seed: newestRaw, replay: [] } : { replay: [] };
   }
-  const afterTs = normalizeTimestampForCursor(after, "after") || after;
   const replay = list.filter((m) => {
-    if (!m || typeof m !== "object" || typeof m.content !== "string" || m.content === "__typing__") return false;
+    if (!isPlainMessageRecord(m) || typeof m.content !== "string" || m.content === "__typing__") return false;
     if (m.sender_id === agentId && !serverLoopTick(m)) return false;
-    const msgTs = normalizeTimestampForCursor(m.timestamp, "after");
-    return typeof msgTs === "string" && msgTs > afterTs;
+    const msgTs = canonicalCursorTimestamp(m.timestamp);
+    return msgTs !== null && msgTs > afterTs;
   });
   replay.sort((a, b) => compareNormalizedTimestamps(a.timestamp, b.timestamp));
   return { replay };
@@ -64,15 +80,22 @@ export function selectChannelContextMessages(
 ): BackfillMsg[] {
   const list = Array.isArray(msgs) ? msgs : [];
   const filtered = list
-    .filter((m) => typeof m?.content === "string" && m.content.length > 0 && m.content !== "__typing__" && (!excludeId || m?.id !== excludeId))
+    .filter(
+      (m) =>
+        isPlainMessageRecord(m) &&
+        typeof m.content === "string" &&
+        m.content.length > 0 &&
+        m.content !== "__typing__" &&
+        (!excludeId || m.id !== excludeId),
+    )
     .sort((a, b) => compareNormalizedTimestamps(a.timestamp, b.timestamp));
   if (!sinceTs) return filtered.slice(-10);
-  const normSince = normalizeTimestampForCursor(sinceTs, "after") || sinceTs;
+  const normSince = canonicalCursorTimestamp(sinceTs);
+  if (!normSince) return [];
   return filtered
     .filter((m) => {
-      const raw = String(m.timestamp ?? "");
-      const norm = normalizeTimestampForCursor(raw, "after") || raw;
-      return norm > normSince;
+      const norm = canonicalCursorTimestamp(m.timestamp);
+      return norm !== null && norm > normSince;
     })
     .slice(-10);
 }
@@ -83,10 +106,14 @@ export function selectChannelContextMessages(
  * `cursorDir` or fail persistence while keeping standard agent IDs unchanged.
  */
 export function safeCursorBotFile(cursorDir: string, botId: string): string {
-  const cleaned = String(botId || "default")
+  const raw = typeof botId === "string" && botId.trim() ? botId : "default";
+  const cleaned = raw
     .replace(/[^A-Za-z0-9._-]/g, "_")
+    .replace(/\.+$/, "")
     .replace(/\.{2,}/g, "_");
-  const safeId = cleaned && cleaned !== "." && !["__proto__", "constructor", "prototype"].includes(cleaned.toLowerCase())
-    ? cleaned.slice(0, 128) : "default";
+  const safeId =
+    cleaned && !RESERVED_CURSOR_BOT_NAMES.test(cleaned)
+      ? cleaned.slice(0, 128)
+      : "default";
   return join(cursorDir, `last-seen-msg-ts-${safeId}.json`);
 }

@@ -10,5 +10,8 @@ export const TEAM_LEAD_NO_UPDATE = "[[AGENTSCHAT_NO_UPDATE]]";
 
 /** Only an exact, locally authorized loop reference activates the bundled skill. */
 export function isTeamLeadSkillInvocation(prompt: string): boolean {
+  if (typeof prompt !== "string" || prompt.length > 256 || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u2028\u2029]/.test(prompt)) {
+    return false;
+  }
   return [TEAM_LEAD_SKILL_ID, `$${TEAM_LEAD_SKILL_ID}`, `执行 $${TEAM_LEAD_SKILL_ID}`].includes(prompt.trim());
 }

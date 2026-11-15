@@ -2602,10 +2602,15 @@ var TOOL_ANNOTATIONS = {
   list_channel_doc_revisions: R
 };
 function annotateTools(tools) {
-  return tools.map((t) => ({
-    ...t,
-    annotations: Object.prototype.hasOwnProperty.call(TOOL_ANNOTATIONS, t.name) ? TOOL_ANNOTATIONS[t.name] : W
-  }));
+  if (!Array.isArray(tools))
+    return [];
+  return tools.map((t) => {
+    const base = Object.prototype.hasOwnProperty.call(TOOL_ANNOTATIONS, t.name) ? TOOL_ANNOTATIONS[t.name] : W;
+    return {
+      ...t,
+      annotations: { ...base }
+    };
+  });
 }
 
 // src/wake.ts

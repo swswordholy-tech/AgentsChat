@@ -1,4 +1,5 @@
 import { MessageDedup, messageDedupKey } from "../src/dedup.ts";
+import { canonicalCursorTimestamp } from "./backfill.ts";
 import { serverLoopTick, type AgentsChatMessage } from "./normalize.ts";
 
 export type IngestIdentity = { botId: string; agentId: string };
@@ -24,8 +25,15 @@ export function ingestAgentsChatFrame(
     dedup: MessageDedup;
   },
 ): boolean {
-  if (!frame || typeof frame !== "object") return false;
-  if (frame.content !== "__typing__") {
+  if (
+    !frame ||
+    typeof frame !== "object" ||
+    Array.isArray(frame) ||
+    Object.prototype.hasOwnProperty.call(frame, "__proto__")
+  ) {
+    return false;
+  }
+  if (frame.content !== "__typing__" && canonicalCursorTimestamp(frame.timestamp) !== null) {
     deps.advanceCursor(id, frame.channel_id, frame.timestamp);
   }
   const key = messageDedupKey(frame as { id?: string; channel_id?: string });
