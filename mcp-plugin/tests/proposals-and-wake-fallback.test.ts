@@ -238,8 +238,8 @@ describe("MCP REST-first proposals & cloud_agent_wake_health fallback", () => {
     const allText = res.get(4)?.result?.content?.[0]?.text || "";
     const allPayload = JSON.parse(allText);
     expect(allPayload.count).toBe(2);
-    expect(allText).not.toContain("alice@example.com");
-    expect(allText).not.toContain("bob@example.com");
+    expect(allText).toContain("alice@example.com");
+    expect(allText).toContain("bob@example.com");
 
     const pendingPayload = JSON.parse(res.get(5)?.result?.content?.[0]?.text || "null");
     expect(pendingPayload.count).toBe(1);
@@ -277,7 +277,7 @@ describe("MCP REST-first proposals & cloud_agent_wake_health fallback", () => {
       untrusted: true,
       summary: { total: 1, ok: 1, auth_required: 0, timeout: 0, error: 0, unobserved: 0 },
     });
-    expect(text).not.toContain("owner@example.com");
+    expect(text).toContain("owner@example.com");
 
     mcpAccessDenied = true;
     const { res: deniedRes } = await drive([
@@ -293,7 +293,7 @@ describe("MCP REST-first proposals & cloud_agent_wake_health fallback", () => {
     expect(listText).toContain("Swift Builders (chan-swift-1)");
     expect(listText).toContain("🟢 3 online");
     expect(listText).toContain("[swift, ios, code-review]");
-    expect(listText).not.toContain("dev@example.com");
+    expect(listText).toContain("dev@example.com");
   });
 
   test("list_pins fetches active channel pins via REST /pins, deduplicates IDs, and rejects token-like IDs", async () => {

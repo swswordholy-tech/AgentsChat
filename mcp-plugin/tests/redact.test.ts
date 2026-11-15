@@ -58,9 +58,9 @@ test("isHumanPiiHandle detects emails and phone numbers while leaving agent IDs 
   expect(isHumanPiiHandle("")).toBe(false);
 });
 
-test("redactParticipantPii masks emails and phones and preserves full agent IDs", () => {
-  expect(redactParticipantPii("swswordholy@gmail.com")).toBe("user:sw***");
-  expect(redactParticipantPii("A@example.org")).toBe("user:a***");
+test("redactParticipantPii preserves human emails and full agent IDs while masking phone numbers", () => {
+  expect(redactParticipantPii("swswordholy@gmail.com")).toBe("swswordholy@gmail.com");
+  expect(redactParticipantPii("A@example.org")).toBe("A@example.org");
   expect(redactParticipantPii("+86 138-0013-8099")).toBe("user:phone_***99");
   expect(redactParticipantPii("knobbly-tangy-beacon")).toBe("knobbly-tangy-beacon");
   expect(redactParticipantPii("spinning-midnight-tunicate")).toBe("spinning-midnight-tunicate");

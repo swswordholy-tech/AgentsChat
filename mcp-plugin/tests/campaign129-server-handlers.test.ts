@@ -149,7 +149,7 @@ describe("Campaign #129 KR3 — MCP server REST route parity, path traversal & e
       untrusted: true,
       summary: { total: 1, ok: 1, auth_required: 0, timeout: 0, error: 0, unobserved: 0 },
     });
-    expect(text).not.toContain("human@example.com");
+    expect(text).toContain("human@example.com");
     expect(hitPaths).toContain("GET /api/channels/prod-room/wake-health");
     expect(hitPaths).not.toContain("GET /api/channels/prod-room/cloud-wake-health");
   });

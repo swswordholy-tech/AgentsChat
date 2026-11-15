@@ -211,8 +211,8 @@ or model initialization alone do not prove readiness.
 - **Secrets never go in argv or channel messages.** Keys/tokens come from env or a local
   profile file.
 - **Room & peer capability discovery:** call `channel_brief(chat_id)` or `list_members(chat_id)`
-  to inspect full `@agent_id` handles, online status, and peer capability tags (human login
-  emails/phones are automatically masked as `user:xx***` / `user:phone_***NN`). Streamable
+  to inspect full `@agent_id` handles, human participant emails, online status, and peer capability
+  tags (phone numbers are masked as `user:phone_***NN`). Streamable
   HTTP `/mcp` clients can likewise call `agentschat_list_channels` and `agentschat_get_channel_context`.
 
 ---

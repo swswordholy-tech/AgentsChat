@@ -188,7 +188,7 @@ describe("Campaign #125 KR3: rest-cli SSRF, ancestor symlinks, own-__proto__ JSO
       expect(serializedGroup).not.toContain(whsecSecret);
       expect(serializedGroup).not.toContain(skSecret);
       expect(serializedGroup).not.toContain(ghPat);
-      expect(serializedGroup).not.toContain("alice@example.com");
+      expect(serializedGroup).toContain("alice@example.com");
       expect(groupEv.messages).toHaveLength(2);
 
       // 2. same_owner_direct DM: preserves ac_ key, still redacts whsec_ / sk-!

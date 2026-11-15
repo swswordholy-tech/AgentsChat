@@ -298,6 +298,6 @@ describe("Campaign #134 KR4: session-bind, grok-bind, heartbeat, reconnect & red
     expect(scrubbed).not.toContain(FAKE_NPM);
 
     expect(isHumanPiiHandle("alice\u0085@example.com")).toBe(true);
-    expect(redactParticipantPii("alice\u0085@example.com")).toBe("user:al***");
+    expect(redactParticipantPii("alice\u0085@example.com")).toBe("alice@example.com");
   });
 });

@@ -3155,7 +3155,9 @@ function sanitizeProposalItem(p: any): any {
         voter_id: typeof v?.voter_id === "string" ? redactParticipantPii(v.voter_id) : "unknown",
         voter_type: v?.voter_type === "human" ? "human" : "agent",
         decision: v?.decision,
-        ...(typeof v?.reason === "string" && v.reason ? { reason: redactSecrets(redactParticipantPii(v.reason)).slice(0, 500) } : {}),
+        ...(typeof v?.reason === "string" && v.reason
+          ? { reason: redactSecrets(v.reason.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, " ").trim()).slice(0, 500) }
+          : {}),
       }))
     : [];
   return {
@@ -3377,7 +3379,9 @@ HANDLERS.set("list_channels", async (args) => {
       const list = channels.map((ch: any) => {
         const onlineBadge = typeof ch.online_agent_count === "number" && ch.online_agent_count > 0 ? `, 🟢 ${ch.online_agent_count} online` : "";
         const caps = Array.isArray(ch.capabilities) && ch.capabilities.length > 0 ? ` [${ch.capabilities.slice(0, 6).join(", ")}]` : "";
-        const topic = ch.topic ? ` — ${redactSecrets(redactParticipantPii(String(ch.topic))).slice(0, 60)}` : "";
+        const topic = ch.topic
+          ? ` — ${redactSecrets(String(ch.topic).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, " ").trim()).slice(0, 60)}`
+          : "";
         return `• ${ch.name || ch.id} (${ch.id}) — ${ch.member_count || "?"} members${onlineBadge}${caps}${topic}`;
       }).join("\n");
       return { content: [{ type: "text", text: `${channels.length} channels:\n${list}` }] };
@@ -6328,7 +6332,11 @@ const handleToolCall = async (request: any): Promise<any> => {
             const safeId = redactParticipantPii(rawId);
             const peer = !isHuman ? peerById.get(rawId) : undefined;
             const rawDisplay = m?.display_name ? String(m.display_name).trim() : (peer?.name ? String(peer.name).trim() : "");
-            const safeDisplay = rawDisplay && !isHumanPiiHandle(rawDisplay) ? rawDisplay : safeId;
+            const cleanDisplay =
+              rawDisplay && !/^user:[a-z0-9]{1,4}\*\*\*$/i.test(rawDisplay)
+                ? redactParticipantPii(rawDisplay)
+                : "";
+            const safeDisplay = cleanDisplay || safeId;
             const handleBadge = isHuman ? `(${safeId})` : `(@${safeId})`;
             const roleBadge = m?.role ? ` [${m.role}]` : "";
             const onlineVal = typeof m?.online === "boolean" ? m.online : peer?.online;

@@ -340,14 +340,13 @@ describe("Room peer capability discovery & human PII redaction", () => {
     // Full agent handles (never truncated to 12 chars) + capability tags
     expect(text).toContain("Codex Live (@knobbly-tangy-beacon) [member] (online) {capabilities: swift, ios, cloud-subagent}");
     expect(text).toContain("Claude Code Live (@claude-code-live) [member] (offline) {capabilities: chrome-devtools, seo, frontend}");
-    // Human PII masked cleanly
-    expect(text).toContain("user:sw*** (user:sw***) [owner]");
+    // Human emails preserved for bot recognition; phone numbers remain masked
+    expect(text).toContain("swswordholy@gmail.com (swswordholy@gmail.com) [owner]");
     expect(text).toContain("user:phone_***88 (user:phone_***88) [member]");
-    expect(text).not.toContain("swswordholy@gmail.com");
     expect(text).not.toContain("138-0013-8088");
   });
 
-  test("channel_brief masks online human PII, surfaces agent_peers capabilities, and degrades gracefully without /mcp", async () => {
+  test("channel_brief preserves online human emails, masks phones, surfaces agent_peers capabilities, and degrades gracefully without /mcp", async () => {
     const home = makeHome();
     const { res } = await drive(home, [
       INIT,
@@ -360,12 +359,11 @@ describe("Room peer capability discovery & human PII redaction", () => {
     ]);
 
     const briefRaw: string = res.get(2)?.result?.content?.[0]?.text || "{}";
-    expect(briefRaw).not.toContain("swswordholy@gmail.com");
     expect(briefRaw).not.toContain("138-0013-8088");
     const brief = JSON.parse(briefRaw);
     expect(brief.channel_name).toBe("AgentChatDev");
     expect(brief.topic).toBe("Core multi-agent engineering room");
-    expect(brief.members.online).toContain("user:sw***");
+    expect(brief.members.online).toContain("swswordholy@gmail.com");
     expect(brief.members.online).toContain("user:phone_***88");
     expect(brief.members.online).toContain("knobbly-tangy-beacon");
     expect(brief.agent_peers).toEqual([
@@ -387,9 +385,8 @@ describe("Room peer capability discovery & human PII redaction", () => {
 
     // Legacy fallback when /mcp agentschat_get_channel_context returns error
     const legacyRaw: string = res.get(3)?.result?.content?.[0]?.text || "{}";
-    expect(legacyRaw).not.toContain("alice@example.com");
     const legacy = JSON.parse(legacyRaw);
-    expect(legacy.members.online).toEqual(["user:al***", "spinning-midnight-tunicate"]);
+    expect(legacy.members.online).toEqual(["alice@example.com", "spinning-midnight-tunicate"]);
     expect(legacy.agent_peers).toEqual([
       {
         id: "spinning-midnight-tunicate",
@@ -400,11 +397,10 @@ describe("Room peer capability discovery & human PII redaction", () => {
       },
     ]);
 
-    // get_history shows full @agent_id and masks human sender email
+    // get_history shows full @agent_id and preserves human sender email
     const hist: string = res.get(4)?.result?.content?.[0]?.text || "";
-    expect(hist).toContain("user:sw***: 请大家一起 review 这个 PR");
+    expect(hist).toContain("swswordholy@gmail.com: 请大家一起 review 这个 PR");
     expect(hist).toContain("knobbly-tangy-beacon: 收到，我来看 SwiftData 测试");
-    expect(hist).not.toContain("swswordholy@");
 
     // channel_brief surfaces okr_wake/okr_watch guard coverage without leaking foreign objective_ids
     const guardedRaw: string = res.get(5)?.result?.content?.[0]?.text || "{}";

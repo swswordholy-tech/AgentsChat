@@ -193,14 +193,9 @@ function isHumanPiiHandle(rawId) {
   return false;
 }
 function redactParticipantPii(rawId) {
-  const s = String(rawId ?? "").replace(PII_CONTROL_STRIP_RE, "").trim();
+  const s = redactSecrets(String(rawId ?? "").replace(PII_CONTROL_STRIP_RE, "").trim());
   if (!s)
     return "unknown";
-  const atIdx = s.indexOf("@");
-  if (atIdx >= 0) {
-    const local = s.slice(0, atIdx).replace(/[^a-zA-Z0-9]/g, "");
-    return `user:${(local.slice(0, 2) || "u").toLowerCase()}***`;
-  }
   if (isPhoneShapedPii(s)) {
     const digits = s.replace(/\D/g, "");
     return `user:phone_***${digits.slice(-2) || "00"}`;
@@ -1917,14 +1912,9 @@ function isPhoneShapedPii2(s) {
   return PHONE_PII_RE2.test(s) && s.replace(/\D/g, "").length >= 7;
 }
 function redactParticipantPii2(rawId) {
-  const s = String(rawId ?? "").replace(PII_CONTROL_STRIP_RE2, "").trim();
+  const s = redactSecrets2(String(rawId ?? "").replace(PII_CONTROL_STRIP_RE2, "").trim());
   if (!s)
     return "unknown";
-  const atIdx = s.indexOf("@");
-  if (atIdx >= 0) {
-    const local = s.slice(0, atIdx).replace(/[^a-zA-Z0-9]/g, "");
-    return `user:${(local.slice(0, 2) || "u").toLowerCase()}***`;
-  }
   if (isPhoneShapedPii2(s)) {
     const digits = s.replace(/\D/g, "");
     return `user:phone_***${digits.slice(-2) || "00"}`;
@@ -10117,7 +10107,7 @@ function sanitizeProposalItem(p) {
     voter_id: typeof v?.voter_id === "string" ? redactParticipantPii(v.voter_id) : "unknown",
     voter_type: v?.voter_type === "human" ? "human" : "agent",
     decision: v?.decision,
-    ...typeof v?.reason === "string" && v.reason ? { reason: redactSecrets(redactParticipantPii(v.reason)).slice(0, 500) } : {}
+    ...typeof v?.reason === "string" && v.reason ? { reason: redactSecrets(v.reason.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, " ").trim()).slice(0, 500) } : {}
   })) : [];
   return {
     id: String(p.id || ""),
@@ -10337,7 +10327,7 @@ HANDLERS.set("list_channels", async (args) => {
       const list = channels.map((ch) => {
         const onlineBadge = typeof ch.online_agent_count === "number" && ch.online_agent_count > 0 ? `, \uD83D\uDFE2 ${ch.online_agent_count} online` : "";
         const caps = Array.isArray(ch.capabilities) && ch.capabilities.length > 0 ? ` [${ch.capabilities.slice(0, 6).join(", ")}]` : "";
-        const topic = ch.topic ? ` \u2014 ${redactSecrets(redactParticipantPii(String(ch.topic))).slice(0, 60)}` : "";
+        const topic = ch.topic ? ` \u2014 ${redactSecrets(String(ch.topic).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, " ").trim()).slice(0, 60)}` : "";
         return `\u2022 ${ch.name || ch.id} (${ch.id}) \u2014 ${ch.member_count || "?"} members${onlineBadge}${caps}${topic}`;
       }).join(`
 `);
@@ -12948,7 +12938,8 @@ ${lines}` }] };
             const safeId = redactParticipantPii(rawId);
             const peer = !isHuman ? peerById.get(rawId) : undefined;
             const rawDisplay = m?.display_name ? String(m.display_name).trim() : peer?.name ? String(peer.name).trim() : "";
-            const safeDisplay = rawDisplay && !isHumanPiiHandle(rawDisplay) ? rawDisplay : safeId;
+            const cleanDisplay = rawDisplay && !/^user:[a-z0-9]{1,4}\*\*\*$/i.test(rawDisplay) ? redactParticipantPii(rawDisplay) : "";
+            const safeDisplay = cleanDisplay || safeId;
             const handleBadge = isHuman ? `(${safeId})` : `(@${safeId})`;
             const roleBadge = m?.role ? ` [${m.role}]` : "";
             const onlineVal = typeof m?.online === "boolean" ? m.online : peer?.online;

@@ -60,18 +60,13 @@ export function isHumanPiiHandle(rawId: unknown): boolean {
 }
 
 /**
- * Mask human login emails (`user@domain` -> `user:us***`) and phone numbers
- * (`+86 138...99` -> `user:phone_***99`) while preserving non-PII agent handles
- * in full (no 8/12-char truncation).
+ * Preserve human login emails (`swswordholy@gmail.com`) and non-PII agent handles
+ * in full so bots can recognize human teammates, while masking phone numbers
+ * (`+86 138...99` -> `user:phone_***99`), secrets, and control characters.
  */
 export function redactParticipantPii(rawId: unknown): string {
-  const s = String(rawId ?? "").replace(PII_CONTROL_STRIP_RE, "").trim();
+  const s = redactSecrets(String(rawId ?? "").replace(PII_CONTROL_STRIP_RE, "").trim());
   if (!s) return "unknown";
-  const atIdx = s.indexOf("@");
-  if (atIdx >= 0) {
-    const local = s.slice(0, atIdx).replace(/[^a-zA-Z0-9]/g, "");
-    return `user:${(local.slice(0, 2) || "u").toLowerCase()}***`;
-  }
   if (isPhoneShapedPii(s)) {
     const digits = s.replace(/\D/g, "");
     return `user:phone_***${digits.slice(-2) || "00"}`;
