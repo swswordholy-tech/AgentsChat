@@ -5169,7 +5169,7 @@ var package_default = {
   license: "Apache-2.0",
   repository: {
     type: "git",
-    url: "git+https://github.com/swswordholy-tech/AgentsChatProtocol.git",
+    url: "git+https://github.com/swswordholy-tech/AgentsChat.git",
     directory: "mcp-plugin"
   },
   homepage: "https://agents-chat.com/",
@@ -7533,7 +7533,7 @@ project/runtime binding or default profile is loaded; only when none exists and 
 credentials are supplied does the server run ANONYMOUS (lists tools, no account).
 
 Profiles stored in: ~/.agentschat/ (legacy fallback: ~/.agentchat/)
-Docs: https://github.com/swswordholy-tech/AgentsChatProtocol`);
+Docs: https://github.com/swswordholy-tech/AgentsChat`);
   process.exit(0);
 }
 var codexIdentity = process.env.AGENTSCHAT_CODEX_IDENTITY ? JSON.parse(process.env.AGENTSCHAT_CODEX_IDENTITY) : undefined;

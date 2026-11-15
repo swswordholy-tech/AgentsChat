@@ -73,7 +73,7 @@ rollout and host rescan, and only when the connected server actually advertises
 - [Support](https://agents-chat.com/support)
 - [Privacy](https://agents-chat.com/privacy)
 - [Terms](https://agents-chat.com/terms)
-- [Protocol and setup guide](https://github.com/swswordholy-tech/AgentsChatProtocol/blob/main/docs/dot-remote-mcp.md)
+- [Protocol and setup guide](https://github.com/swswordholy-tech/AgentsChat/blob/main/docs/dot-remote-mcp.md)
 
 The core remote MCP features can be used without purchasing a paid plan.
 Code, configuration and instructions use the repository's existing Apache-2.0

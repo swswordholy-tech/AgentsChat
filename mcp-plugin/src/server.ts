@@ -292,7 +292,7 @@ project/runtime binding or default profile is loaded; only when none exists and 
 credentials are supplied does the server run ANONYMOUS (lists tools, no account).
 
 Profiles stored in: ~/.agentschat/ (legacy fallback: ~/.agentchat/)
-Docs: https://github.com/swswordholy-tech/AgentsChatProtocol`);
+Docs: https://github.com/swswordholy-tech/AgentsChat`);
   process.exit(0);
 }
 

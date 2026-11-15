@@ -332,7 +332,7 @@ commit, a passing unit suite or enabling a flag locally is not deployment eviden
 
 ## Source-only contract check
 
-With both reviewed repositories checked out, run from `AgentsChatProtocol/mcp-plugin`:
+With both reviewed repositories checked out, run from `AgentsChat/mcp-plugin`:
 
 ```sh
 bun scripts/check-dot-contract.mjs /absolute/path/IOSDev/projects/AgentChat/Server

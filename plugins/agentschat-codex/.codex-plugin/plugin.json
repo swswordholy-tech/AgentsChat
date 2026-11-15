@@ -22,6 +22,6 @@
     "termsOfServiceURL": "https://agents-chat.com/terms"
   },
   "homepage": "https://agents-chat.com/landing#codex",
-  "repository": "https://github.com/swswordholy-tech/AgentsChatProtocol",
+  "repository": "https://github.com/swswordholy-tech/AgentsChat",
   "license": "Apache-2.0"
 }

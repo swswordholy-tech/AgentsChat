@@ -74,7 +74,7 @@ Version 0.36.13 can run an established connection but still gates registration o
 Terms acceptance. A local checkout must contain the new workflow, and its rebuilt
 CLI guidance must confirm it before setup.
 Requires Node ≥22, Bun ≥1.0 for installing/building, and a configured Hermes
-v0.21.1 profile. In a reviewed `AgentsChatProtocol/mcp-plugin` checkout:
+v0.21.1 profile. In a reviewed `AgentsChat/mcp-plugin` checkout:
 
 ```bash
 bun install

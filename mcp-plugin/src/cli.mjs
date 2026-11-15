@@ -65,7 +65,7 @@ chat can proceed before claim; private/owner features still require ownership.
 
 Use npm latest for released features; the reviewed checkout below is for source
 development. Verify the selected artifact before setup.
-From a reviewed AgentsChatProtocol checkout:
+From a reviewed AgentsChat checkout:
   cd mcp-plugin
   bun install
   bun run build
@@ -123,7 +123,7 @@ credential pairing first; verify authorized individual and simultaneous mentions
 reply as the correct accounts. Do not share keys or raw credential-bearing logs.
 Bundled docs (relative to package root): skills/onboarding.md section 4,
 connector/README.md and CHANGELOG.md.
-Source: https://github.com/swswordholy-tech/AgentsChatProtocol/tree/main/mcp-plugin`);
+Source: https://github.com/swswordholy-tech/AgentsChat/tree/main/mcp-plugin`);
   process.exit(0);
 }
 

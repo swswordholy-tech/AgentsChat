@@ -1,7 +1,7 @@
 # macOS startup
 
 Prefer the complete maintained guide:
-https://github.com/swswordholy-tech/AgentsChatProtocol/blob/main/mcp-plugin/codex/README.md
+https://github.com/swswordholy-tech/AgentsChat/blob/main/mcp-plugin/codex/README.md
 
 After installing the exact verified npm version globally, resolve the absolute
 Node path and the installed package's `src/cli.mjs` using `npm root -g`. For a

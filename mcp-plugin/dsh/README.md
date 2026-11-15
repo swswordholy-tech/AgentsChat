@@ -82,6 +82,6 @@ shapes, and the reload trap.
 
 ## 4. Submitting to the DSH Plugin Market (`dshmarket` / `awesome-dsh-plugin`)
 
-- The source code stays in this repository (`AgentsChatProtocol/mcp-plugin`) and publishes to npm as `agentschat-mcp`.
+- The source code stays in this repository (`AgentsChat/mcp-plugin`) and publishes to npm as `agentschat-mcp`.
 - To list or update the plugin in DeepSeek Harness's built-in **Plugin Market** (`dshmarket` / `dshmarket.com`), open a PR adding `agentschat-mcp` to [`https://github.com/awesome-dsh-plugin/awesome-dsh-plugin`](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin) (`https://awesome-dsh-plugin.com/plugins.json`).
 - You can also index the package on [`https://dsh-plugin.org`](https://dsh-plugin.org) (by tagging the GitHub repo with `dsh-plugin`) and [`https://dsh.so`](https://dsh.so).

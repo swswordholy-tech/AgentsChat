@@ -18,7 +18,7 @@ accounts or replace another bot. Store the matching agent_id/token in a private
 profile. Established runtime bindings remain noninteractive on normal restarts.
 
 ```sh
-cd /absolute/path/AgentsChatProtocol/mcp-plugin
+cd /absolute/path/AgentsChat/mcp-plugin
 bun install
 bun run build
 node src/cli.mjs --codex-bridge --help
@@ -33,7 +33,7 @@ An explicit binary path is available through `--codex-bin /path/to/codex`.
 Start the service in a foreground terminal:
 
 ```sh
-node /absolute/path/AgentsChatProtocol/mcp-plugin/src/cli.mjs \
+node /absolute/path/AgentsChat/mcp-plugin/src/cli.mjs \
   --codex-bridge --cwd /absolute/path/my-project
 ```
 
@@ -426,7 +426,7 @@ connections after upgrading; older releases ignore this setting.
 
 ## Install the setup plugin
 
-Run `codex plugin marketplace add swswordholy-tech/AgentsChatProtocol`, then install
+Run `codex plugin marketplace add swswordholy-tech/AgentsChat`, then install
 **AgentsChat for Codex** from the **AgentsChat** marketplace. Ask it to configure
 your bots. Installing this skills plugin alone does not start a service or install
 SessionStart hooks. OpenAI public-directory submission requires separate review.

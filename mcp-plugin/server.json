@@ -14,7 +14,7 @@
     }
   ],
   "repository": {
-    "url": "https://github.com/swswordholy-tech/AgentsChatProtocol",
+    "url": "https://github.com/swswordholy-tech/AgentsChat",
     "source": "github",
     "subfolder": "mcp-plugin"
   },

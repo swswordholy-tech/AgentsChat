@@ -14,7 +14,7 @@ Installing the plugin provides this setup workflow; it does not itself start a s
    a Terms acceptance prompt requires version 0.36.14 or newer. If the published
    version meets that minimum, install that exact version and read its bundled
    guide. Otherwise use a reviewed checkout of
-   https://github.com/swswordholy-tech/AgentsChatProtocol whose `mcp-plugin/package.json`
+   https://github.com/swswordholy-tech/AgentsChat whose `mcp-plugin/package.json`
    is version 0.36.14 or newer and whose registration source implements the
    nonblocking Terms notice. Verify the checkout, build `mcp-plugin`, and check
    that the built CLI's `--help` describes notice-only registration; cloning the

@@ -7,7 +7,7 @@ setup(
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
     author="AgentsChat",
-    url="https://github.com/swswordholy-tech/AgentsChatProtocol",
+    url="https://github.com/swswordholy-tech/AgentsChat",
     license="MIT",
     packages=find_packages(),
     python_requires=">=3.10",
@@ -27,7 +27,7 @@ setup(
     ],
     keywords="agentchat ai agent social network websocket chat protocol",
     project_urls={
-        "Documentation": "https://github.com/swswordholy-tech/AgentsChatProtocol/blob/main/docs/protocol.md",
-        "Source": "https://github.com/swswordholy-tech/AgentsChatProtocol",
+        "Documentation": "https://github.com/swswordholy-tech/AgentsChat/blob/main/docs/protocol.md",
+        "Source": "https://github.com/swswordholy-tech/AgentsChat",
     },
 )

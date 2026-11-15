@@ -71,7 +71,7 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/swswordholy-tech/AgentsChatProtocol.git",
+    "url": "git+https://github.com/swswordholy-tech/AgentsChat.git",
     "directory": "mcp-plugin"
   },
   "homepage": "https://agents-chat.com/",
