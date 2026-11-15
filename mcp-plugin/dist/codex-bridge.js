@@ -13,15 +13,16 @@ function redactSecrets(text, opts) {
   if (typeof text !== "string" || !text)
     return "";
   const step = opts?.preserveAcKeys ? text : text.replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***");
-  return step.replace(/-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)/g, "***PRIVATE_KEY_REDACTED***").replace(/mcp_(?:at|rt|code)_[A-Za-z0-9_-]{16,}/g, "mcp_***REDACTED***").replace(/agent_key_[A-Za-z0-9_-]{12,}/g, "agent_key_***REDACTED***").replace(/whsec_[A-Za-z0-9_-]{12,}/g, "whsec_***REDACTED***").replace(/\bsk-(?:proj-|ant-|live-|test-)?[A-Za-z0-9_-]{16,}/g, "sk-***REDACTED***").replace(/\brk_(?:live|test)_[A-Za-z0-9]{12,}/g, "rk_***REDACTED***").replace(/\bgh[pousr]_[A-Za-z0-9_]{16,}/g, "gh_***REDACTED***").replace(/\bgithub_pat_[A-Za-z0-9_]{16,}/g, "github_pat_***REDACTED***").replace(/\bglpat-[A-Za-z0-9_-]{12,}/g, "glpat-***REDACTED***").replace(/\bxox[baprs]-[A-Za-z0-9-]{10,}/g, "xox-***REDACTED***").replace(/\bAIza[0-9A-Za-z_-]{20,}/g, "AIza***REDACTED***").replace(/(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])/g, "AKIA***REDACTED***").replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
+  return step.replace(/-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)/g, "***PRIVATE_KEY_REDACTED***").replace(/mcp_(?:at|rt|code)_[A-Za-z0-9_-]{16,}/g, "mcp_***REDACTED***").replace(/agent_key_[A-Za-z0-9_-]{12,}/g, "agent_key_***REDACTED***").replace(/whsec_[A-Za-z0-9_-]{12,}/g, "whsec_***REDACTED***").replace(/\bsk-(?:proj-|ant-|live-|test-)?[A-Za-z0-9_-]{16,}/g, "sk-***REDACTED***").replace(/\brk_(?:live|test)_[A-Za-z0-9]{12,}/g, "rk_***REDACTED***").replace(/\bgh[pousr]_[A-Za-z0-9_]{16,}/g, "gh_***REDACTED***").replace(/\bgithub_pat_[A-Za-z0-9_]{16,}/g, "github_pat_***REDACTED***").replace(/\bglpat-[A-Za-z0-9_-]{12,}/g, "glpat-***REDACTED***").replace(/\bxox[baprs]-[A-Za-z0-9-]{10,}/g, "xox-***REDACTED***").replace(/\bhf_[A-Za-z0-9]{20,}/g, "hf_***REDACTED***").replace(/\bnpm_[A-Za-z0-9]{20,}/g, "npm_***REDACTED***").replace(/\bAIza[0-9A-Za-z_-]{20,}/g, "AIza***REDACTED***").replace(/(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])/g, "AKIA***REDACTED***").replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
 }
 
 // src/identity.ts
 var RESERVED_IDENTITY_IDS = new Set(["__proto__", "constructor", "prototype"]);
 var MAX_AGENT_ID_LEN = 128;
 var MAX_CAPABILITIES_LEN = 64;
+var CONTROL_OR_SEP_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
 function isValidProfileAgentId(raw) {
-  if (typeof raw !== "string" || /[\x00-\x1f\x7f/\\\s]/.test(raw))
+  if (typeof raw !== "string" || /[\x00-\x1f\x7f-\x9f\u2028\u2029/\\\s]/.test(raw) || /(?:%2e|%2f|%5c|%00)/i.test(raw))
     return false;
   const trimmed = raw.trim();
   return trimmed.length > 0 && trimmed === raw && trimmed.length <= MAX_AGENT_ID_LEN && trimmed !== "." && !trimmed.includes("..") && !RESERVED_IDENTITY_IDS.has(trimmed.toLowerCase());
@@ -29,11 +30,11 @@ function isValidProfileAgentId(raw) {
 function sanitizeDiagnosticField(raw, fallback = "(unknown)") {
   if (typeof raw !== "string")
     return fallback;
-  const cleaned = redactSecrets(raw).replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED]").replace(/\b(?:agent_key_|sk-|whsec_|gh[pousr]_|github_pat_|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g, "[REDACTED]").replace(/[\x00-\x1f\x7f]+/g, " ").trim();
+  const cleaned = redactSecrets(raw).replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED]").replace(/\b(?:agent_key_|sk-|whsec_|gh[pousr]_|github_pat_|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g, "[REDACTED]").replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g, " ").trim();
   return cleaned.length > 0 ? cleaned.slice(0, 256) : fallback;
 }
 function validateIdentityProfile(profile, file, allowDevToken = false) {
-  const cleanNonempty = (value) => typeof value === "string" && value.trim().length > 0 && value.length <= 4096 && !/[\x00-\x1f\x7f]/.test(value);
+  const cleanNonempty = (value) => typeof value === "string" && value.trim().length > 0 && value.length <= 4096 && !CONTROL_OR_SEP_RE.test(value);
   const safeFile = sanitizeDiagnosticField(file, "(unknown-path)");
   if (!profile || typeof profile !== "object" || Array.isArray(profile) || Object.prototype.hasOwnProperty.call(profile, "__proto__") || !isValidProfileAgentId(profile.agent_id) || !cleanNonempty(profile.token) || !allowDevToken && profile.token.trim() === "dev-token" || profile.capabilities !== undefined && (!Array.isArray(profile.capabilities) || profile.capabilities.length > MAX_CAPABILITIES_LEN || !profile.capabilities.every((c) => cleanNonempty(c) && c.length <= 64))) {
     throw new Error(`Invalid identity profile at ${safeFile}. Use --profile <valid-name>, or provide a paired --id / AGENTCHAT_AGENT_ID and --token / AGENTCHAT_TOKEN; token must not be empty or dev-token and capabilities must be a string array.`);
@@ -1422,7 +1423,7 @@ function isForbiddenMetadataOrLinkLocalHost(host) {
     if (inner === "::" || inner === "0:0:0:0:0:0:0:0" || inner === "fd00:ec2::254" || /^fe[89ab][0-9a-f]*:/i.test(inner)) {
       return true;
     }
-    if (/^::ffff:(?:0:)?(?:0\.0\.0\.0|0:0|169\.254\.|a9fe:|100\.100\.100\.200$|6464:64c8$)/i.test(inner)) {
+    if (/^::ffff:(?:0:)?(?:0\.0\.0\.0|0:[0-9a-f]{1,4}$|169\.254\.|a9fe:|100\.100\.100\.200$|6464:64c8$)/i.test(inner)) {
       return true;
     }
   }
@@ -1430,7 +1431,7 @@ function isForbiddenMetadataOrLinkLocalHost(host) {
 }
 function isSafeOnboardingBase(base) {
   try {
-    if (!base || base !== base.trim() || /[\x00-\x20\x7f"<>\\]/.test(base))
+    if (!base || base !== base.trim() || /[\x00-\x20\x7f-\x9f\u2028\u2029"<>\\]/.test(base))
       return false;
     if (/:0(?:\/|$)/.test(base))
       return false;
@@ -1454,7 +1455,7 @@ function isSafeOnboardingBase(base) {
   }
 }
 function isSafeOnboardingAgentId(id) {
-  if (!id || id.length > 128 || /[\x00-\x1f\x7f\s/\\]/.test(id))
+  if (!id || id.length > 128 || /[\x00-\x1f\x7f-\x9f\u2028\u2029\s/\\]/.test(id))
     return false;
   if (id === "." || id.includes(".."))
     return false;
@@ -1465,12 +1466,15 @@ function isSafeOnboardingAgentId(id) {
 }
 var MAX_ONBOARDING_JSON_BYTES = 64 * 1024;
 async function readBoundedJson(r, maxBytes = MAX_ONBOARDING_JSON_BYTES) {
-  const declaredLen = Number(r.headers?.get?.("content-length"));
-  if (Number.isFinite(declaredLen) && declaredLen > maxBytes) {
-    try {
-      await r.body?.cancel?.();
-    } catch {}
-    throw new Error("onboarding response too large");
+  const rawContentLen = r.headers?.get?.("content-length");
+  if (rawContentLen !== null && rawContentLen !== undefined && rawContentLen.trim() !== "") {
+    const trimmedLen = rawContentLen.trim();
+    if (!/^\d+$/.test(trimmedLen) || Number(trimmedLen) > maxBytes) {
+      try {
+        await r.body?.cancel?.();
+      } catch {}
+      throw new Error("onboarding response too large");
+    }
   }
   if (!r.body) {
     const txt = await r.text();
@@ -1507,7 +1511,7 @@ async function getOnboardingStatus(base, agentId, token, request = fetch) {
   const rawAgentId = typeof agentId === "string" ? agentId.trim() : "";
   const validAgent = isSafeOnboardingAgentId(rawAgentId);
   const safeAgentId = validAgent ? rawAgentId : "";
-  const validBase = Boolean(cleanBase && !/[\x00-\x1f\x7f]/.test(cleanBase) && isSafeOnboardingBase(cleanBase));
+  const validBase = Boolean(cleanBase && !/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(cleanBase) && isSafeOnboardingBase(cleanBase));
   const safeDisplayBase = validBase ? cleanBase : DEFAULT_PUBLIC_BASE;
   const chat = `${safeDisplayBase}/chat/${encodeURIComponent(safeAgentId)}`;
   const result = {
@@ -1518,7 +1522,7 @@ async function getOnboardingStatus(base, agentId, token, request = fetch) {
     claim_url: `${chat}?claim=1`,
     next_step: "check_identity"
   };
-  if (!validBase || !validAgent || typeof token !== "string" || !token.trim() || /[\x00-\x1f\x7f]/.test(token)) {
+  if (!validBase || !validAgent || typeof token !== "string" || !token.trim() || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(token)) {
     return result;
   }
   try {
@@ -2659,7 +2663,7 @@ var NON_PROFILE_JSON_FILES = new Set([
 
 // src/session-bind.ts
 function isPidAlive(pid) {
-  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0)
+  if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0)
     return false;
   try {
     process.kill(pid, 0);
@@ -2682,7 +2686,7 @@ function resolveLockDir(homeDir, env = process.env) {
 var LOCK_FILE_MAX_BYTES = 64 * 1024;
 var LOCK_KEY_MAX_CHARS = 128;
 var SESSION_BINDS_MAX_BYTES = 1024 * 1024;
-var CONTROL_CHAR_RE2 = /[\x00-\x1f\x7f]/;
+var CONTROL_CHAR_RE2 = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
 var RESERVED_BIND_SIDECARS = new Set([
   "session-binds",
   "session-binds.meta",
@@ -2830,7 +2834,8 @@ function checkAgentLock(opts) {
   if (!record) {
     try {
       const st = lstatSync9(file);
-      if (!st.isSymbolicLink() && st.isFile() && Date.now() - st.mtimeMs > 1000)
+      const ageMs = Date.now() - st.mtimeMs;
+      if (!st.isSymbolicLink() && st.isFile() && (ageMs > 1000 || ageMs < -1000))
         unlinkSync4(file);
     } catch {}
     return { locked: false };
@@ -2885,7 +2890,8 @@ function releaseAgentLock(opts) {
   if (!existing) {
     try {
       const st = lstatSync9(file);
-      if (!st.isSymbolicLink() && st.isFile() && Date.now() - st.mtimeMs > 1000) {
+      const ageMs = Date.now() - st.mtimeMs;
+      if (!st.isSymbolicLink() && st.isFile() && (ageMs > 1000 || ageMs < -1000)) {
         unlinkSync4(file);
         return true;
       }
@@ -3343,9 +3349,13 @@ class HeartbeatMonitor {
       this.safeReconnect("readyState failed");
       return;
     }
+    const now = Date.now();
     if (state === WS_OPEN) {
       this.connectingSince = null;
-      if (Date.now() - this.lastPong > this.pongTimeout) {
+      if (this.lastPong > now) {
+        this.lastPong = now;
+      }
+      if (now - this.lastPong > this.pongTimeout) {
         this.safeReconnect("pong timeout");
         return;
       }
@@ -3357,9 +3367,9 @@ class HeartbeatMonitor {
       return;
     }
     if (state === WS_CONNECTING) {
-      if (this.connectingSince === null) {
-        this.connectingSince = Date.now();
-      } else if (Date.now() - this.connectingSince > this.connectTimeout) {
+      if (this.connectingSince === null || this.connectingSince > now) {
+        this.connectingSince = now;
+      } else if (now - this.connectingSince > this.connectTimeout) {
         this.connectingSince = null;
         this.safeReconnect("connect timeout");
       }

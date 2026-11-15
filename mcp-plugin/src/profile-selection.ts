@@ -1,4 +1,4 @@
-import { lstatSync, readFileSync, readlinkSync, type Stats } from "node:fs";
+import { lstatSync, readFileSync, readlinkSync, realpathSync, statSync, type Stats } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, parse, relative, resolve } from "node:path";
 
@@ -52,18 +52,58 @@ function safeLstat(target: string): Stats | undefined {
   }
 }
 
+const PROJECT_CONTROL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+
 function isAllowedDarwinSystemLink(dirPath: string): boolean {
   if (process.platform !== "darwin") return false;
   if (dirPath !== "/var" && dirPath !== "/tmp" && dirPath !== "/etc") return false;
   try {
-    return readlinkSync(dirPath) === `private${dirPath}`;
+    const expected = `/private${dirPath}`;
+    return (
+      readlinkSync(dirPath) === `private${dirPath}` &&
+      realpathSync(dirPath) === expected &&
+      !lstatSync("/private").isSymbolicLink() &&
+      lstatSync("/private").isDirectory() &&
+      !lstatSync(expected).isSymbolicLink() &&
+      statSync(expected).isDirectory()
+    );
   } catch {
     return false;
   }
 }
 
-function hasSafeDirChain(dirPath: string): boolean {
-  const abs = resolve(dirPath);
+function hasSafeRawDotDotSegments(rawPath: string, baseDir?: string): boolean {
+  if (!rawPath.includes("..")) return true;
+  const baseAbs = isAbsolute(rawPath) ? rawPath : `${baseDir ? resolve(baseDir) : process.cwd()}/${rawPath}`;
+  const root = parse(baseAbs).root;
+  const rawParts = baseAbs.slice(root.length).split(/[\\/]+/).filter(Boolean);
+  let cur = root;
+  for (const part of rawParts) {
+    if (part === ".") continue;
+    if (part === "..") {
+      cur = resolve(cur, "..");
+      continue;
+    }
+    cur = join(cur, part);
+    try {
+      const st = lstatSync(cur);
+      if (st.isSymbolicLink()) {
+        if (isAllowedDarwinSystemLink(cur)) continue;
+        return false;
+      }
+      if (!st.isDirectory()) return false;
+    } catch (err: any) {
+      if (err && err.code === "ENOENT") continue;
+      return false;
+    }
+  }
+  return true;
+}
+
+function hasSafeDirChain(dirPath: string, baseDir?: string): boolean {
+  if (!dirPath || PROJECT_CONTROL_RE.test(dirPath)) return false;
+  if (!hasSafeRawDotDotSegments(dirPath, baseDir)) return false;
+  const abs = baseDir && !isAbsolute(dirPath) ? resolve(baseDir, dirPath) : resolve(dirPath);
   const root = parse(abs).root;
   const rel = abs.slice(root.length);
   const segments = rel.split(/[\\/]+/).filter(Boolean);
@@ -95,23 +135,37 @@ function isUnsafeMetadataOrLinkLocalHost(hostname: string): boolean {
   const lower = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
   if (
     lower === "metadata.google.internal" ||
+    lower.endsWith(".metadata.google.internal") ||
     lower === "metadata" ||
     lower === "metadata.goog" ||
     lower.endsWith(".metadata.goog") ||
-    lower === "instance-data"
+    lower === "instance-data" ||
+    lower === "100.100.100.200" ||
+    lower === "0.0.0.0" ||
+    lower === "::" ||
+    lower === "0:0:0:0:0:0:0:0" ||
+    lower === "fd00:ec2::254"
   ) {
     return true;
   }
-  if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(lower)) return true;
-  if (/^fe[89ab][0-9a-f]:/.test(lower)) return true;
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(lower)) {
+    const [a, b] = lower.split(".").map(Number);
+    if (a === 0 || (a === 169 && b === 254)) return true;
+  }
+  if (/^fe[89ab][0-9a-f]*:/.test(lower)) return true;
   if (lower.startsWith("::ffff:")) {
     const tail = lower.slice("::ffff:".length);
-    const tailParts = tail.startsWith("0:") ? tail.slice(2) : tail;
+    const afterZero = tail.startsWith("0:") ? tail.slice(2) : "";
+    const tailParts = afterZero && (afterZero.includes(".") || afterZero.includes(":")) ? afterZero : tail;
+    if (tailParts === "0.0.0.0" || tailParts === "100.100.100.200" || /^0\.\d+\.\d+\.\d+$/.test(tailParts)) return true;
     if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(tailParts)) return true;
     const hexMatch = tailParts.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
     if (hexMatch) {
       const hi = parseInt(hexMatch[1]!, 16);
+      const lo = parseInt(hexMatch[2]!, 16);
+      if (((hi >> 8) & 0xff) === 0) return true;
       if (((hi >> 8) & 0xff) === 169 && (hi & 0xff) === 254) return true;
+      if (hi === 0x6464 && lo === 0x64c8) return true;
     }
   }
   return false;
@@ -122,14 +176,18 @@ function isSafeProjectAgentId(id: string): boolean {
     id.length > 0 &&
     id.length <= 128 &&
     id !== "." &&
-    id !== ".." &&
-    !/[\/\\\s\x00-\x1f\x7f]/.test(id) &&
+    !id.includes("..") &&
+    !/[\/\\\s\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(id) &&
+    !/(?:%2e|%2f|%5c|%00)/i.test(id) &&
     !PROTOTYPE_KEYS.has(id.toLowerCase())
   );
 }
 
 /** Read only this project's binding. Never scan parents or choose a sibling bot. */
 export function projectProfileSelector(cwd: string): ProjectProfileSelection | undefined {
+  if (!cwd || PROJECT_CONTROL_RE.test(cwd) || !hasSafeRawDotDotSegments(cwd)) {
+    throw new Error("Refusing symlinked or non-directory project .agentschat");
+  }
   const resolvedCwd = resolve(cwd);
   const projectDir = join(resolvedCwd, ".agentschat");
   const dirStat = safeLstat(projectDir);
@@ -160,7 +218,7 @@ export function projectProfileSelector(cwd: string): ProjectProfileSelection | u
       throw new Error("Credentials must not be stored in project .agentschat/config.json");
     }
     for (const field of ["profile", "agent_id", "api_url", "ws_url"]) {
-      if (doc[field] !== undefined && (typeof doc[field] !== "string" || !doc[field].trim() || /[\x00-\x1f\x7f]/.test(doc[field]))) {
+      if (doc[field] !== undefined && (typeof doc[field] !== "string" || !doc[field].trim() || PROJECT_CONTROL_RE.test(doc[field]))) {
         throw new Error(`Invalid project ${field}`);
       }
     }
@@ -169,9 +227,10 @@ export function projectProfileSelector(cwd: string): ProjectProfileSelection | u
     }
     for (const [field, protocols] of [["api_url", ["https:", "http:"]], ["ws_url", ["wss:", "ws:"]]] as const) {
       if (doc[field] === undefined) continue;
+      const rawUrl = (doc[field] as string).trim();
       let url: URL;
-      try { url = new URL((doc[field] as string).trim()); } catch { throw new Error(`Invalid project ${field}`); }
-      const portBad = url.port !== "" && (!Number.isInteger(Number(url.port)) || Number(url.port) < 1 || Number(url.port) > 65535);
+      try { url = new URL(rawUrl); } catch { throw new Error(`Invalid project ${field}`); }
+      const portBad = /:0+(?:\/|$)/.test(rawUrl) || (url.port !== "" && (!Number.isInteger(Number(url.port)) || Number(url.port) < 1 || Number(url.port) > 65535));
       if (
         portBad ||
         !(protocols as readonly string[]).includes(url.protocol) ||
@@ -206,7 +265,7 @@ export function projectProfileSelector(cwd: string): ProjectProfileSelection | u
       const homeBase = resolve(homedir());
       const resolvedHomeTarget = resolve(homeBase, value.slice(2));
       const relHome = relative(homeBase, resolvedHomeTarget);
-      if (!relHome || relHome.startsWith("..") || isAbsolute(relHome) || !hasSafeDirChain(dirname(resolvedHomeTarget))) {
+      if (!relHome || relHome.startsWith("..") || isAbsolute(relHome) || !hasSafeRawDotDotSegments(value.slice(2), homeBase) || !hasSafeDirChain(dirname(resolvedHomeTarget))) {
         throw new Error("Invalid project profile: home-relative path traversal");
       }
       return { selector: value, source: "project-config", ...settings };
@@ -214,12 +273,12 @@ export function projectProfileSelector(cwd: string): ProjectProfileSelection | u
     if (!isAbsolute(value) && (value.includes("/") || value.includes("\\"))) {
       const resolvedTarget = resolve(resolvedCwd, value);
       const rel = relative(resolvedCwd, resolvedTarget);
-      if (!rel || rel.startsWith("..") || isAbsolute(rel) || !hasSafeDirChain(dirname(resolvedTarget))) {
+      if (!rel || rel.startsWith("..") || isAbsolute(rel) || !hasSafeRawDotDotSegments(value, resolvedCwd) || !hasSafeDirChain(dirname(resolvedTarget))) {
         throw new Error("Invalid project profile: relative path must stay within project directory");
       }
       return { selector: resolvedTarget, source: "project-config", ...settings };
     }
-    if (isAbsolute(value) && !hasSafeDirChain(dirname(value))) {
+    if (isAbsolute(value) && (!hasSafeRawDotDotSegments(value) || !hasSafeDirChain(dirname(value)))) {
       throw new Error("Invalid project profile: symlinked parent directory");
     }
     return { selector: value, source: "project-config", ...settings };

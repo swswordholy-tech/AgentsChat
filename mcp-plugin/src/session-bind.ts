@@ -48,7 +48,7 @@ export interface AgentLockCheck {
 
 /** Check whether a local OS process is still alive. Never throws. */
 export function isPidAlive(pid: unknown): boolean {
-  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
+  if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
     return true;
@@ -80,7 +80,7 @@ const LOCK_FILE_MAX_BYTES = 64 * 1024;
 const LOCK_KEY_MAX_CHARS = 128;
 const SESSION_BINDS_MAX_BYTES = 1024 * 1024;
 const MAX_SESSION_BINDS_ENTRIES = 1024;
-const CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
+const CONTROL_CHAR_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
 // NOTE: "profile" MUST NEVER be added here — `profile.json` is the default boot identity slot.
 const RESERVED_BIND_SIDECARS = new Set([
   "session-binds",
@@ -275,7 +275,8 @@ export function checkAgentLock(opts: {
   if (!record) {
     try {
       const st = lstatSync(file);
-      if (!st.isSymbolicLink() && st.isFile() && Date.now() - st.mtimeMs > 1_000) unlinkSync(file);
+      const ageMs = Date.now() - st.mtimeMs;
+      if (!st.isSymbolicLink() && st.isFile() && (ageMs > 1_000 || ageMs < -1_000)) unlinkSync(file);
     } catch {}
     return { locked: false };
   }
@@ -339,7 +340,8 @@ export function releaseAgentLock(opts: {
   if (!existing) {
     try {
       const st = lstatSync(file);
-      if (!st.isSymbolicLink() && st.isFile() && Date.now() - st.mtimeMs > 1_000) {
+      const ageMs = Date.now() - st.mtimeMs;
+      if (!st.isSymbolicLink() && st.isFile() && (ageMs > 1_000 || ageMs < -1_000)) {
         unlinkSync(file);
         return true;
       }
@@ -638,7 +640,7 @@ export function parseAntigravityLsofOutput(
     const portMatch = line.match(/127\.0\.0\.1:(\d+)\s+\(LISTEN\)/);
     if (portMatch) {
       const p = Number(portMatch[1]);
-      if (p > 0 && !ports.includes(p)) ports.push(p);
+      if (Number.isSafeInteger(p) && p >= 1 && p <= 65535 && !ports.includes(p)) ports.push(p);
     }
     if (!isCliTarget && line.includes("/antigravity-cli/")) continue;
 
@@ -684,7 +686,7 @@ function extractCliFlagValue(cmd: string, flag: string): string {
  * work identically.
  */
 export function parseWindowsNetstatOutput(stdout: string, targetPid: number): number[] {
-  if (!stdout || !Number.isFinite(targetPid) || targetPid <= 0) return [];
+  if (!stdout || !Number.isSafeInteger(targetPid) || targetPid <= 0) return [];
   const ports: number[] = [];
   for (const line of stdout.split(/\r?\n/)) {
     const m = line.match(
@@ -693,7 +695,7 @@ export function parseWindowsNetstatOutput(stdout: string, targetPid: number): nu
     if (!m) continue;
     const port = Number(m[1]);
     const pid = Number(m[2]);
-    if (pid === targetPid && port > 0 && !ports.includes(port)) {
+    if (pid === targetPid && Number.isSafeInteger(port) && port >= 1 && port <= 65535 && !ports.includes(port)) {
       ports.push(port);
     }
   }
@@ -718,9 +720,12 @@ export function parseWindowsAntigravityProbeJson(
   } catch {
     return null;
   }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || Object.prototype.hasOwnProperty.call(parsed, "__proto__")) {
+    return null;
+  }
   const lsPid = Number(parsed?.lsPid);
   const lsCmd = typeof parsed?.lsCmd === "string" ? parsed.lsCmd : "";
-  if (!Number.isFinite(lsPid) || lsPid <= 0 || !lsCmd) return null;
+  if (!Number.isSafeInteger(lsPid) || lsPid <= 0 || !lsCmd) return null;
 
   const csrfToken = extractCliFlagValue(lsCmd, "--csrf_token");
   if (!csrfToken) return null;
@@ -733,7 +738,7 @@ export function parseWindowsAntigravityProbeJson(
       : [];
   for (const p of rawPorts) {
     const num = Number(p);
-    if (Number.isFinite(num) && num > 0) portSet.add(num);
+    if (Number.isSafeInteger(num) && num >= 1 && num <= 65535) portSet.add(num);
   }
   if (portSet.size === 0 && netstatStdout) {
     for (const p of parseWindowsNetstatOutput(netstatStdout, lsPid)) {
@@ -889,7 +894,7 @@ export function discoverAntigravityHost(opts?: {
 
   const now = Date.now();
   const cacheMs = opts?.cacheMs ?? 5_000;
-  if (cachedAgyHost && now - cachedAgyHost.at < cacheMs) return cachedAgyHost.info;
+  if (cachedAgyHost && now >= cachedAgyHost.at && now - cachedAgyHost.at < cacheMs) return cachedAgyHost.info;
 
   try {
     const startPid = opts?.currentPid ?? process.pid;
@@ -1103,7 +1108,7 @@ export function isDshHostProcess(opts?: {
   }
   const now = Date.now();
   const cacheMs = opts?.cacheMs ?? 15_000;
-  if (cachedIsDshHost && now - cachedIsDshHost.at < cacheMs) return cachedIsDshHost.value;
+  if (cachedIsDshHost && now >= cachedIsDshHost.at && now - cachedIsDshHost.at < cacheMs) return cachedIsDshHost.value;
   try {
     let pid = opts?.currentPid ?? process.pid;
     if (process.platform === "win32") {
@@ -1198,10 +1203,13 @@ function isLoopbackDshHealthUrl(rawUrl: string): boolean {
 }
 
 async function readBoundedDshHealthJson(res: Response): Promise<unknown> {
-  const contentLength = Number(res.headers?.get?.("content-length") ?? "");
-  if (Number.isFinite(contentLength) && contentLength > DSH_HEALTH_MAX_BYTES) {
-    await res.body?.cancel?.().catch(() => {});
-    throw new Error("DSH /health response exceeded byte cap");
+  const rawLen = res.headers?.get?.("content-length");
+  if (rawLen !== null && rawLen !== undefined && rawLen.trim() !== "") {
+    const trimmedLen = rawLen.trim();
+    if (!/^\d+$/.test(trimmedLen) || Number(trimmedLen) > DSH_HEALTH_MAX_BYTES) {
+      await res.body?.cancel?.().catch(() => {});
+      throw new Error("DSH /health response exceeded byte cap");
+    }
   }
   const reader = (res as any)?.body?.getReader?.();
   let parsed: unknown;

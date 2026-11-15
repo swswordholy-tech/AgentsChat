@@ -88,9 +88,13 @@ export class HeartbeatMonitor {
       return;
     }
 
+    const now = Date.now();
     if (state === WS_OPEN) {
       this.connectingSince = null;
-      if (Date.now() - this.lastPong > this.pongTimeout) {
+      if (this.lastPong > now) {
+        this.lastPong = now;
+      }
+      if (now - this.lastPong > this.pongTimeout) {
         // No pong in too long — force reconnect
         this.safeReconnect("pong timeout");
         return;
@@ -104,10 +108,10 @@ export class HeartbeatMonitor {
     }
 
     if (state === WS_CONNECTING) {
-      // Track how long we've been stuck in CONNECTING
-      if (this.connectingSince === null) {
-        this.connectingSince = Date.now();
-      } else if (Date.now() - this.connectingSince > this.connectTimeout) {
+      // Track how long we've been stuck in CONNECTING (recovering from backward NTP jumps)
+      if (this.connectingSince === null || this.connectingSince > now) {
+        this.connectingSince = now;
+      } else if (now - this.connectingSince > this.connectTimeout) {
         // Stuck in CONNECTING too long (server probably still down) — force retry
         this.connectingSince = null;
         this.safeReconnect("connect timeout");

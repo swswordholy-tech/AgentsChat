@@ -19,7 +19,7 @@ function isForbiddenMetadataOrLinkLocalHost(host) {
     if (inner === "::" || inner === "0:0:0:0:0:0:0:0" || inner === "fd00:ec2::254" || /^fe[89ab][0-9a-f]*:/i.test(inner)) {
       return true;
     }
-    if (/^::ffff:(?:0:)?(?:0\.0\.0\.0|0:0|169\.254\.|a9fe:|100\.100\.100\.200$|6464:64c8$)/i.test(inner)) {
+    if (/^::ffff:(?:0:)?(?:0\.0\.0\.0|0:[0-9a-f]{1,4}$|169\.254\.|a9fe:|100\.100\.100\.200$|6464:64c8$)/i.test(inner)) {
       return true;
     }
   }
@@ -27,7 +27,7 @@ function isForbiddenMetadataOrLinkLocalHost(host) {
 }
 function isSafeOnboardingBase(base) {
   try {
-    if (!base || base !== base.trim() || /[\x00-\x20\x7f"<>\\]/.test(base))
+    if (!base || base !== base.trim() || /[\x00-\x20\x7f-\x9f\u2028\u2029"<>\\]/.test(base))
       return false;
     if (/:0(?:\/|$)/.test(base))
       return false;
@@ -51,7 +51,7 @@ function isSafeOnboardingBase(base) {
   }
 }
 function isSafeOnboardingAgentId(id) {
-  if (!id || id.length > 128 || /[\x00-\x1f\x7f\s/\\]/.test(id))
+  if (!id || id.length > 128 || /[\x00-\x1f\x7f-\x9f\u2028\u2029\s/\\]/.test(id))
     return false;
   if (id === "." || id.includes(".."))
     return false;
@@ -62,12 +62,15 @@ function isSafeOnboardingAgentId(id) {
 }
 var MAX_ONBOARDING_JSON_BYTES = 64 * 1024;
 async function readBoundedJson(r, maxBytes = MAX_ONBOARDING_JSON_BYTES) {
-  const declaredLen = Number(r.headers?.get?.("content-length"));
-  if (Number.isFinite(declaredLen) && declaredLen > maxBytes) {
-    try {
-      await r.body?.cancel?.();
-    } catch {}
-    throw new Error("onboarding response too large");
+  const rawContentLen = r.headers?.get?.("content-length");
+  if (rawContentLen !== null && rawContentLen !== undefined && rawContentLen.trim() !== "") {
+    const trimmedLen = rawContentLen.trim();
+    if (!/^\d+$/.test(trimmedLen) || Number(trimmedLen) > maxBytes) {
+      try {
+        await r.body?.cancel?.();
+      } catch {}
+      throw new Error("onboarding response too large");
+    }
   }
   if (!r.body) {
     const txt = await r.text();
@@ -104,7 +107,7 @@ async function getOnboardingStatus(base, agentId, token, request = fetch) {
   const rawAgentId = typeof agentId === "string" ? agentId.trim() : "";
   const validAgent = isSafeOnboardingAgentId(rawAgentId);
   const safeAgentId = validAgent ? rawAgentId : "";
-  const validBase = Boolean(cleanBase && !/[\x00-\x1f\x7f]/.test(cleanBase) && isSafeOnboardingBase(cleanBase));
+  const validBase = Boolean(cleanBase && !/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(cleanBase) && isSafeOnboardingBase(cleanBase));
   const safeDisplayBase = validBase ? cleanBase : DEFAULT_PUBLIC_BASE;
   const chat = `${safeDisplayBase}/chat/${encodeURIComponent(safeAgentId)}`;
   const result = {
@@ -115,7 +118,7 @@ async function getOnboardingStatus(base, agentId, token, request = fetch) {
     claim_url: `${chat}?claim=1`,
     next_step: "check_identity"
   };
-  if (!validBase || !validAgent || typeof token !== "string" || !token.trim() || /[\x00-\x1f\x7f]/.test(token)) {
+  if (!validBase || !validAgent || typeof token !== "string" || !token.trim() || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(token)) {
     return result;
   }
   try {
@@ -148,7 +151,7 @@ async function getOnboardingStatus(base, agentId, token, request = fetch) {
   return result;
 }
 function claimSummary(status) {
-  const safeClaimUrl = typeof status?.claim_url === "string" ? status.claim_url.replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 512) : "";
+  const safeClaimUrl = typeof status?.claim_url === "string" ? status.claim_url.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g, "").slice(0, 512) : "";
   if (status?.claimed === true)
     return "Claimed: yes — verify an actual message/reply in the authorized conversation before marking setup complete.";
   if (status?.claimed === false)
@@ -172,14 +175,15 @@ function redactSecrets(text, opts) {
   if (typeof text !== "string" || !text)
     return "";
   const step = opts?.preserveAcKeys ? text : text.replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***");
-  return step.replace(/-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)/g, "***PRIVATE_KEY_REDACTED***").replace(/mcp_(?:at|rt|code)_[A-Za-z0-9_-]{16,}/g, "mcp_***REDACTED***").replace(/agent_key_[A-Za-z0-9_-]{12,}/g, "agent_key_***REDACTED***").replace(/whsec_[A-Za-z0-9_-]{12,}/g, "whsec_***REDACTED***").replace(/\bsk-(?:proj-|ant-|live-|test-)?[A-Za-z0-9_-]{16,}/g, "sk-***REDACTED***").replace(/\brk_(?:live|test)_[A-Za-z0-9]{12,}/g, "rk_***REDACTED***").replace(/\bgh[pousr]_[A-Za-z0-9_]{16,}/g, "gh_***REDACTED***").replace(/\bgithub_pat_[A-Za-z0-9_]{16,}/g, "github_pat_***REDACTED***").replace(/\bglpat-[A-Za-z0-9_-]{12,}/g, "glpat-***REDACTED***").replace(/\bxox[baprs]-[A-Za-z0-9-]{10,}/g, "xox-***REDACTED***").replace(/\bAIza[0-9A-Za-z_-]{20,}/g, "AIza***REDACTED***").replace(/(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])/g, "AKIA***REDACTED***").replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
+  return step.replace(/-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)/g, "***PRIVATE_KEY_REDACTED***").replace(/mcp_(?:at|rt|code)_[A-Za-z0-9_-]{16,}/g, "mcp_***REDACTED***").replace(/agent_key_[A-Za-z0-9_-]{12,}/g, "agent_key_***REDACTED***").replace(/whsec_[A-Za-z0-9_-]{12,}/g, "whsec_***REDACTED***").replace(/\bsk-(?:proj-|ant-|live-|test-)?[A-Za-z0-9_-]{16,}/g, "sk-***REDACTED***").replace(/\brk_(?:live|test)_[A-Za-z0-9]{12,}/g, "rk_***REDACTED***").replace(/\bgh[pousr]_[A-Za-z0-9_]{16,}/g, "gh_***REDACTED***").replace(/\bgithub_pat_[A-Za-z0-9_]{16,}/g, "github_pat_***REDACTED***").replace(/\bglpat-[A-Za-z0-9_-]{12,}/g, "glpat-***REDACTED***").replace(/\bxox[baprs]-[A-Za-z0-9-]{10,}/g, "xox-***REDACTED***").replace(/\bhf_[A-Za-z0-9]{20,}/g, "hf_***REDACTED***").replace(/\bnpm_[A-Za-z0-9]{20,}/g, "npm_***REDACTED***").replace(/\bAIza[0-9A-Za-z_-]{20,}/g, "AIza***REDACTED***").replace(/(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])/g, "AKIA***REDACTED***").replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
 }
 var PHONE_PII_RE = /^\+?\d[\d\s()-]{5,}[\d)]$/;
+var PII_CONTROL_STRIP_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g;
 function isPhoneShapedPii(s) {
   return PHONE_PII_RE.test(s) && s.replace(/\D/g, "").length >= 7;
 }
 function isHumanPiiHandle(rawId) {
-  const s = String(rawId ?? "").trim();
+  const s = String(rawId ?? "").replace(PII_CONTROL_STRIP_RE, "").trim();
   if (!s)
     return false;
   if (s.includes("@"))
@@ -189,7 +193,7 @@ function isHumanPiiHandle(rawId) {
   return false;
 }
 function redactParticipantPii(rawId) {
-  const s = String(rawId ?? "").replace(/[\x00-\x1f\x7f]+/g, "").trim();
+  const s = String(rawId ?? "").replace(PII_CONTROL_STRIP_RE, "").trim();
   if (!s)
     return "unknown";
   const atIdx = s.indexOf("@");
@@ -290,7 +294,7 @@ function safeUnitRand(rand) {
   return r >= 1 ? 0.999999 : r;
 }
 function computeReconnectDelay(attempt, rand = Math.random) {
-  const safeAttempt = typeof attempt === "number" && !Number.isNaN(attempt) ? Math.max(0, attempt) : 0;
+  const safeAttempt = typeof attempt === "number" && !Number.isNaN(attempt) ? attempt === Infinity ? 15 : Math.max(0, Math.min(attempt, 15)) : 0;
   const jitter = safeUnitRand(rand) * 3000;
   return Math.min(safeAttempt * 2, 30) * 1000 + jitter;
 }
@@ -1903,14 +1907,15 @@ function redactSecrets2(text, opts) {
   if (typeof text !== "string" || !text)
     return "";
   const step = opts?.preserveAcKeys ? text : text.replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***");
-  return step.replace(/-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)/g, "***PRIVATE_KEY_REDACTED***").replace(/mcp_(?:at|rt|code)_[A-Za-z0-9_-]{16,}/g, "mcp_***REDACTED***").replace(/agent_key_[A-Za-z0-9_-]{12,}/g, "agent_key_***REDACTED***").replace(/whsec_[A-Za-z0-9_-]{12,}/g, "whsec_***REDACTED***").replace(/\bsk-(?:proj-|ant-|live-|test-)?[A-Za-z0-9_-]{16,}/g, "sk-***REDACTED***").replace(/\brk_(?:live|test)_[A-Za-z0-9]{12,}/g, "rk_***REDACTED***").replace(/\bgh[pousr]_[A-Za-z0-9_]{16,}/g, "gh_***REDACTED***").replace(/\bgithub_pat_[A-Za-z0-9_]{16,}/g, "github_pat_***REDACTED***").replace(/\bglpat-[A-Za-z0-9_-]{12,}/g, "glpat-***REDACTED***").replace(/\bxox[baprs]-[A-Za-z0-9-]{10,}/g, "xox-***REDACTED***").replace(/\bAIza[0-9A-Za-z_-]{20,}/g, "AIza***REDACTED***").replace(/(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])/g, "AKIA***REDACTED***").replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
+  return step.replace(/-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)/g, "***PRIVATE_KEY_REDACTED***").replace(/mcp_(?:at|rt|code)_[A-Za-z0-9_-]{16,}/g, "mcp_***REDACTED***").replace(/agent_key_[A-Za-z0-9_-]{12,}/g, "agent_key_***REDACTED***").replace(/whsec_[A-Za-z0-9_-]{12,}/g, "whsec_***REDACTED***").replace(/\bsk-(?:proj-|ant-|live-|test-)?[A-Za-z0-9_-]{16,}/g, "sk-***REDACTED***").replace(/\brk_(?:live|test)_[A-Za-z0-9]{12,}/g, "rk_***REDACTED***").replace(/\bgh[pousr]_[A-Za-z0-9_]{16,}/g, "gh_***REDACTED***").replace(/\bgithub_pat_[A-Za-z0-9_]{16,}/g, "github_pat_***REDACTED***").replace(/\bglpat-[A-Za-z0-9_-]{12,}/g, "glpat-***REDACTED***").replace(/\bxox[baprs]-[A-Za-z0-9-]{10,}/g, "xox-***REDACTED***").replace(/\bhf_[A-Za-z0-9]{20,}/g, "hf_***REDACTED***").replace(/\bnpm_[A-Za-z0-9]{20,}/g, "npm_***REDACTED***").replace(/\bAIza[0-9A-Za-z_-]{20,}/g, "AIza***REDACTED***").replace(/(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])/g, "AKIA***REDACTED***").replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
 }
 var PHONE_PII_RE2 = /^\+?\d[\d\s()-]{5,}[\d)]$/;
+var PII_CONTROL_STRIP_RE2 = /[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g;
 function isPhoneShapedPii2(s) {
   return PHONE_PII_RE2.test(s) && s.replace(/\D/g, "").length >= 7;
 }
 function redactParticipantPii2(rawId) {
-  const s = String(rawId ?? "").replace(/[\x00-\x1f\x7f]+/g, "").trim();
+  const s = String(rawId ?? "").replace(PII_CONTROL_STRIP_RE2, "").trim();
   if (!s)
     return "unknown";
   const atIdx = s.indexOf("@");
@@ -1930,14 +1935,15 @@ var RESERVED_IDENTITY_IDS = new Set(["__proto__", "constructor", "prototype"]);
 var MAX_DISPLAY_NAME_LEN = 128;
 var MAX_AGENT_ID_LEN = 128;
 var MAX_CAPABILITIES_LEN = 64;
+var CONTROL_OR_SEP_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
 function isValidDisplayName(raw) {
-  if (typeof raw !== "string" || /[\x00-\x1f\x7f]/.test(raw))
+  if (typeof raw !== "string" || CONTROL_OR_SEP_RE.test(raw))
     return false;
   const trimmed = raw.trim();
   return trimmed.length > 0 && trimmed.length <= MAX_DISPLAY_NAME_LEN && !RESERVED_IDENTITY_IDS.has(trimmed.toLowerCase());
 }
 function isValidProfileAgentId(raw) {
-  if (typeof raw !== "string" || /[\x00-\x1f\x7f/\\\s]/.test(raw))
+  if (typeof raw !== "string" || /[\x00-\x1f\x7f-\x9f\u2028\u2029/\\\s]/.test(raw) || /(?:%2e|%2f|%5c|%00)/i.test(raw))
     return false;
   const trimmed = raw.trim();
   return trimmed.length > 0 && trimmed === raw && trimmed.length <= MAX_AGENT_ID_LEN && trimmed !== "." && !trimmed.includes("..") && !RESERVED_IDENTITY_IDS.has(trimmed.toLowerCase());
@@ -1945,7 +1951,7 @@ function isValidProfileAgentId(raw) {
 function sanitizeDiagnosticField(raw, fallback = "(unknown)") {
   if (typeof raw !== "string")
     return fallback;
-  const cleaned = redactSecrets2(raw).replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED]").replace(/\b(?:agent_key_|sk-|whsec_|gh[pousr]_|github_pat_|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g, "[REDACTED]").replace(/[\x00-\x1f\x7f]+/g, " ").trim();
+  const cleaned = redactSecrets2(raw).replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED]").replace(/\b(?:agent_key_|sk-|whsec_|gh[pousr]_|github_pat_|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g, "[REDACTED]").replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g, " ").trim();
   return cleaned.length > 0 ? cleaned.slice(0, 256) : fallback;
 }
 function decideIdentity(i) {
@@ -1993,7 +1999,7 @@ function decideIdentity(i) {
   };
 }
 function validateIdentityProfile(profile, file, allowDevToken = false) {
-  const cleanNonempty = (value) => typeof value === "string" && value.trim().length > 0 && value.length <= 4096 && !/[\x00-\x1f\x7f]/.test(value);
+  const cleanNonempty = (value) => typeof value === "string" && value.trim().length > 0 && value.length <= 4096 && !CONTROL_OR_SEP_RE.test(value);
   const safeFile = sanitizeDiagnosticField(file, "(unknown-path)");
   if (!profile || typeof profile !== "object" || Array.isArray(profile) || Object.prototype.hasOwnProperty.call(profile, "__proto__") || !isValidProfileAgentId(profile.agent_id) || !cleanNonempty(profile.token) || !allowDevToken && profile.token.trim() === "dev-token" || profile.capabilities !== undefined && (!Array.isArray(profile.capabilities) || profile.capabilities.length > MAX_CAPABILITIES_LEN || !profile.capabilities.every((c) => cleanNonempty(c) && c.length <= 64))) {
     throw new Error(`Invalid identity profile at ${safeFile}. Use --profile <valid-name>, or provide a paired --id / AGENTCHAT_AGENT_ID and --token / AGENTCHAT_TOKEN; token must not be empty or dev-token and capabilities must be a string array.`);
@@ -2008,7 +2014,7 @@ function shouldMigrateDevToken(i) {
 }
 
 // src/profile-selection.ts
-import { lstatSync, readFileSync as readFileSync2, readlinkSync } from "node:fs";
+import { lstatSync, readFileSync as readFileSync2, readlinkSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, parse, relative, resolve } from "node:path";
 var MAX_PROJECT_CONFIG_BYTES = 64 * 1024;
@@ -2052,19 +2058,57 @@ function safeLstat(target) {
     throw err;
   }
 }
+var PROJECT_CONTROL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
 function isAllowedDarwinSystemLink(dirPath) {
   if (process.platform !== "darwin")
     return false;
   if (dirPath !== "/var" && dirPath !== "/tmp" && dirPath !== "/etc")
     return false;
   try {
-    return readlinkSync(dirPath) === `private${dirPath}`;
+    const expected = `/private${dirPath}`;
+    return readlinkSync(dirPath) === `private${dirPath}` && realpathSync(dirPath) === expected && !lstatSync("/private").isSymbolicLink() && lstatSync("/private").isDirectory() && !lstatSync(expected).isSymbolicLink() && statSync(expected).isDirectory();
   } catch {
     return false;
   }
 }
-function hasSafeDirChain(dirPath) {
-  const abs = resolve(dirPath);
+function hasSafeRawDotDotSegments(rawPath, baseDir) {
+  if (!rawPath.includes(".."))
+    return true;
+  const baseAbs = isAbsolute(rawPath) ? rawPath : `${baseDir ? resolve(baseDir) : process.cwd()}/${rawPath}`;
+  const root = parse(baseAbs).root;
+  const rawParts = baseAbs.slice(root.length).split(/[\\/]+/).filter(Boolean);
+  let cur = root;
+  for (const part of rawParts) {
+    if (part === ".")
+      continue;
+    if (part === "..") {
+      cur = resolve(cur, "..");
+      continue;
+    }
+    cur = join(cur, part);
+    try {
+      const st = lstatSync(cur);
+      if (st.isSymbolicLink()) {
+        if (isAllowedDarwinSystemLink(cur))
+          continue;
+        return false;
+      }
+      if (!st.isDirectory())
+        return false;
+    } catch (err) {
+      if (err && err.code === "ENOENT")
+        continue;
+      return false;
+    }
+  }
+  return true;
+}
+function hasSafeDirChain(dirPath, baseDir) {
+  if (!dirPath || PROJECT_CONTROL_RE.test(dirPath))
+    return false;
+  if (!hasSafeRawDotDotSegments(dirPath, baseDir))
+    return false;
+  const abs = baseDir && !isAbsolute(dirPath) ? resolve(baseDir, dirPath) : resolve(dirPath);
   const root = parse(abs).root;
   const rel = abs.slice(root.length);
   const segments = rel.split(/[\\/]+/).filter(Boolean);
@@ -2095,31 +2139,45 @@ function isLoopbackHost(hostname) {
 }
 function isUnsafeMetadataOrLinkLocalHost(hostname) {
   const lower = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
-  if (lower === "metadata.google.internal" || lower === "metadata" || lower === "metadata.goog" || lower.endsWith(".metadata.goog") || lower === "instance-data") {
+  if (lower === "metadata.google.internal" || lower.endsWith(".metadata.google.internal") || lower === "metadata" || lower === "metadata.goog" || lower.endsWith(".metadata.goog") || lower === "instance-data" || lower === "100.100.100.200" || lower === "0.0.0.0" || lower === "::" || lower === "0:0:0:0:0:0:0:0" || lower === "fd00:ec2::254") {
     return true;
   }
-  if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(lower))
-    return true;
-  if (/^fe[89ab][0-9a-f]:/.test(lower))
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(lower)) {
+    const [a, b] = lower.split(".").map(Number);
+    if (a === 0 || a === 169 && b === 254)
+      return true;
+  }
+  if (/^fe[89ab][0-9a-f]*:/.test(lower))
     return true;
   if (lower.startsWith("::ffff:")) {
     const tail = lower.slice("::ffff:".length);
-    const tailParts = tail.startsWith("0:") ? tail.slice(2) : tail;
+    const afterZero = tail.startsWith("0:") ? tail.slice(2) : "";
+    const tailParts = afterZero && (afterZero.includes(".") || afterZero.includes(":")) ? afterZero : tail;
+    if (tailParts === "0.0.0.0" || tailParts === "100.100.100.200" || /^0\.\d+\.\d+\.\d+$/.test(tailParts))
+      return true;
     if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(tailParts))
       return true;
     const hexMatch = tailParts.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
     if (hexMatch) {
       const hi = parseInt(hexMatch[1], 16);
+      const lo = parseInt(hexMatch[2], 16);
+      if ((hi >> 8 & 255) === 0)
+        return true;
       if ((hi >> 8 & 255) === 169 && (hi & 255) === 254)
+        return true;
+      if (hi === 25700 && lo === 25800)
         return true;
     }
   }
   return false;
 }
 function isSafeProjectAgentId(id) {
-  return id.length > 0 && id.length <= 128 && id !== "." && id !== ".." && !/[\/\\\s\x00-\x1f\x7f]/.test(id) && !PROTOTYPE_KEYS.has(id.toLowerCase());
+  return id.length > 0 && id.length <= 128 && id !== "." && !id.includes("..") && !/[\/\\\s\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(id) && !/(?:%2e|%2f|%5c|%00)/i.test(id) && !PROTOTYPE_KEYS.has(id.toLowerCase());
 }
 function projectProfileSelector(cwd) {
+  if (!cwd || PROJECT_CONTROL_RE.test(cwd) || !hasSafeRawDotDotSegments(cwd)) {
+    throw new Error("Refusing symlinked or non-directory project .agentschat");
+  }
   const resolvedCwd = resolve(cwd);
   const projectDir = join(resolvedCwd, ".agentschat");
   const dirStat = safeLstat(projectDir);
@@ -2148,7 +2206,7 @@ function projectProfileSelector(cwd) {
       throw new Error("Credentials must not be stored in project .agentschat/config.json");
     }
     for (const field of ["profile", "agent_id", "api_url", "ws_url"]) {
-      if (doc[field] !== undefined && (typeof doc[field] !== "string" || !doc[field].trim() || /[\x00-\x1f\x7f]/.test(doc[field]))) {
+      if (doc[field] !== undefined && (typeof doc[field] !== "string" || !doc[field].trim() || PROJECT_CONTROL_RE.test(doc[field]))) {
         throw new Error(`Invalid project ${field}`);
       }
     }
@@ -2158,13 +2216,14 @@ function projectProfileSelector(cwd) {
     for (const [field, protocols] of [["api_url", ["https:", "http:"]], ["ws_url", ["wss:", "ws:"]]]) {
       if (doc[field] === undefined)
         continue;
+      const rawUrl = doc[field].trim();
       let url;
       try {
-        url = new URL(doc[field].trim());
+        url = new URL(rawUrl);
       } catch {
         throw new Error(`Invalid project ${field}`);
       }
-      const portBad = url.port !== "" && (!Number.isInteger(Number(url.port)) || Number(url.port) < 1 || Number(url.port) > 65535);
+      const portBad = /:0+(?:\/|$)/.test(rawUrl) || url.port !== "" && (!Number.isInteger(Number(url.port)) || Number(url.port) < 1 || Number(url.port) > 65535);
       if (portBad || !protocols.includes(url.protocol) || url.username || url.password || url.search || url.hash || isUnsafeMetadataOrLinkLocalHost(url.hostname) || !url.protocol.endsWith("s:") && !isLoopbackHost(url.hostname)) {
         throw new Error(`Invalid project ${field}: require TLS (except loopback), safe host, and no credentials/query`);
       }
@@ -2185,7 +2244,7 @@ function projectProfileSelector(cwd) {
       const homeBase = resolve(homedir());
       const resolvedHomeTarget = resolve(homeBase, value.slice(2));
       const relHome = relative(homeBase, resolvedHomeTarget);
-      if (!relHome || relHome.startsWith("..") || isAbsolute(relHome) || !hasSafeDirChain(dirname(resolvedHomeTarget))) {
+      if (!relHome || relHome.startsWith("..") || isAbsolute(relHome) || !hasSafeRawDotDotSegments(value.slice(2), homeBase) || !hasSafeDirChain(dirname(resolvedHomeTarget))) {
         throw new Error("Invalid project profile: home-relative path traversal");
       }
       return { selector: value, source: "project-config", ...settings };
@@ -2193,12 +2252,12 @@ function projectProfileSelector(cwd) {
     if (!isAbsolute(value) && (value.includes("/") || value.includes("\\"))) {
       const resolvedTarget = resolve(resolvedCwd, value);
       const rel = relative(resolvedCwd, resolvedTarget);
-      if (!rel || rel.startsWith("..") || isAbsolute(rel) || !hasSafeDirChain(dirname(resolvedTarget))) {
+      if (!rel || rel.startsWith("..") || isAbsolute(rel) || !hasSafeRawDotDotSegments(value, resolvedCwd) || !hasSafeDirChain(dirname(resolvedTarget))) {
         throw new Error("Invalid project profile: relative path must stay within project directory");
       }
       return { selector: resolvedTarget, source: "project-config", ...settings };
     }
-    if (isAbsolute(value) && !hasSafeDirChain(dirname(value))) {
+    if (isAbsolute(value) && (!hasSafeRawDotDotSegments(value) || !hasSafeDirChain(dirname(value)))) {
       throw new Error("Invalid project profile: symlinked parent directory");
     }
     return { selector: value, source: "project-config", ...settings };
@@ -2223,8 +2282,10 @@ function isUnsafeObjectKey(key) {
   const lower = key.toLowerCase();
   return lower === "__proto__" || lower === "constructor" || lower === "prototype";
 }
+var GROK_CONTROL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+var GROK_CONTROL_STRIP_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g;
 function hasControlChars(s) {
-  return /[\x00-\x1f\x7f]/.test(s);
+  return GROK_CONTROL_RE.test(s);
 }
 function normalizeProfileSlug(s) {
   const base = profileNameFromPath(s) ?? s;
@@ -2343,7 +2404,7 @@ function gateSwitchProfile(input) {
   if (bindValues.length === 0)
     return { kind: "allow" };
   const lockedMessage = (lockedName) => {
-    const clean = lockedName.replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 128);
+    const clean = lockedName.replace(GROK_CONTROL_STRIP_RE, "").slice(0, 128);
     return `Outbound identity is locked to grok-bind profile "${clean}" on this shared MCP; ` + `use a separate MCP process / wake daemon, do not switch_profile.`;
   };
   const bound = boundProfileForConversation(input.conversationId, binds);
@@ -2353,7 +2414,7 @@ function gateSwitchProfile(input) {
     return {
       kind: "locked",
       boundProfileName: bound,
-      requestedProfileName: reqRaw.replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 128),
+      requestedProfileName: reqRaw.replace(GROK_CONTROL_STRIP_RE, "").slice(0, 128),
       message: lockedMessage(bound)
     };
   }
@@ -2364,8 +2425,8 @@ function gateSwitchProfile(input) {
       return { kind: "allow" };
     return {
       kind: "locked",
-      boundProfileName: current.replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 128),
-      requestedProfileName: reqRaw.replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 128),
+      boundProfileName: current.replace(GROK_CONTROL_STRIP_RE, "").slice(0, 128),
+      requestedProfileName: reqRaw.replace(GROK_CONTROL_STRIP_RE, "").slice(0, 128),
       message: lockedMessage(current)
     };
   }
@@ -2376,9 +2437,9 @@ function gateGrokProfileMutation(input) {
   const bindValues = Object.values(binds).filter((v) => typeof v === "string" && isSafeProfileBindName(v.trim()));
   if (bindValues.length === 0)
     return { kind: "allow" };
-  const reqLabel = typeof input.requestedName === "string" && input.requestedName.trim() ? input.requestedName.trim().replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 128) : `(${input.action})`;
+  const reqLabel = typeof input.requestedName === "string" && input.requestedName.trim() ? input.requestedName.trim().replace(GROK_CONTROL_STRIP_RE, "").slice(0, 128) : `(${input.action})`;
   const lockedMessage = (lockedName) => {
-    const clean = lockedName.replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 128);
+    const clean = lockedName.replace(GROK_CONTROL_STRIP_RE, "").slice(0, 128);
     return `Outbound identity is locked to grok-bind profile "${clean}" on this shared MCP; ` + `use a separate MCP process / wake daemon, do not switch_profile or disconnect_profile.`;
   };
   const bound = boundProfileForConversation(input.conversationId, binds);
@@ -2395,7 +2456,7 @@ function gateGrokProfileMutation(input) {
   if (current && bindValues.some((v) => normalizeProfileSlug(v) === currentSlug)) {
     return {
       kind: "locked",
-      boundProfileName: current.replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 128),
+      boundProfileName: current.replace(GROK_CONTROL_STRIP_RE, "").slice(0, 128),
       requestedProfileName: reqLabel,
       message: lockedMessage(current)
     };
@@ -2420,7 +2481,7 @@ var WAKE_MODE_ENV = "AGENTCHAT_WAKE_MODE";
 function nonGrokWakeReason(env) {
   if (!env || typeof env !== "object")
     return null;
-  const clean = (v) => redactSecrets2(v.replace(/[\x00-\x1f\x7f]+/g, "")).slice(0, 64);
+  const clean = (v) => redactSecrets2(v.replace(GROK_CONTROL_STRIP_RE, "")).slice(0, 64);
   const anti = clean((env[ANTIGRAVITY_WAKE_ENV] ?? "").trim());
   if (anti)
     return `${ANTIGRAVITY_WAKE_ENV}=${anti}`;
@@ -3254,7 +3315,7 @@ function fireZcodeWake(msg, cfg) {
 
 // src/session-bind.ts
 import { createHash } from "node:crypto";
-import { closeSync, lstatSync as lstatSync4, mkdirSync, openSync, readFileSync as readFileSync5, readSync, readdirSync as readdirSync2, readlinkSync as readlinkSync3, realpathSync as realpathSync2, statSync, unlinkSync as unlinkSync2 } from "node:fs";
+import { closeSync, lstatSync as lstatSync4, mkdirSync, openSync, readFileSync as readFileSync5, readSync, readdirSync as readdirSync2, readlinkSync as readlinkSync3, realpathSync as realpathSync3, statSync as statSync2, unlinkSync as unlinkSync2 } from "node:fs";
 import { homedir as homedir3, tmpdir } from "node:os";
 import { isAbsolute as isAbsolute3, join as join5, parse as parse3, resolve as resolve4 } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -3262,7 +3323,7 @@ import { spawnSync } from "node:child_process";
 // src/profile-store.ts
 import {
   lstatSync as lstatSync3,
-  realpathSync,
+  realpathSync as realpathSync2,
   writeFileSync,
   renameSync,
   copyFileSync,
@@ -3292,7 +3353,7 @@ function isAllowedDarwinSystemSymlink(dirPath) {
   if (process.platform !== "darwin" || !DARWIN_SYSTEM_SYMLINKS.has(dirPath))
     return false;
   try {
-    const resolved = realpathSync(dirPath);
+    const resolved = realpathSync2(dirPath);
     if (resolved !== `/private${dirPath}`)
       return false;
     const realSt = lstatSync3(resolved);
@@ -3453,7 +3514,7 @@ var NON_PROFILE_JSON_FILES = new Set([
 var DEFAULT_SESSION_BINDS_FILENAME = "session-binds.json";
 var LEGACY_AGY_BINDS_FILENAME = "agy-binds.json";
 function isPidAlive(pid) {
-  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0)
+  if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0)
     return false;
   try {
     process.kill(pid, 0);
@@ -3477,7 +3538,7 @@ var LOCK_FILE_MAX_BYTES = 64 * 1024;
 var LOCK_KEY_MAX_CHARS = 128;
 var SESSION_BINDS_MAX_BYTES = 1024 * 1024;
 var MAX_SESSION_BINDS_ENTRIES = 1024;
-var CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
+var CONTROL_CHAR_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
 var RESERVED_BIND_SIDECARS = new Set([
   "session-binds",
   "session-binds.meta",
@@ -3535,12 +3596,12 @@ function isAllowedDarwinSystemLink3(dirPath) {
     return false;
   try {
     const expected = `/private${dirPath}`;
-    return readlinkSync3(dirPath) === `private${dirPath}` && realpathSync2(dirPath) === expected && !lstatSync4("/private").isSymbolicLink() && lstatSync4("/private").isDirectory() && !lstatSync4(expected).isSymbolicLink() && statSync(expected).isDirectory();
+    return readlinkSync3(dirPath) === `private${dirPath}` && realpathSync3(dirPath) === expected && !lstatSync4("/private").isSymbolicLink() && lstatSync4("/private").isDirectory() && !lstatSync4(expected).isSymbolicLink() && statSync2(expected).isDirectory();
   } catch {
     return false;
   }
 }
-function hasSafeRawDotDotSegments(rawPath) {
+function hasSafeRawDotDotSegments2(rawPath) {
   if (!rawPath.includes(".."))
     return true;
   const baseAbs = isAbsolute3(rawPath) ? rawPath : `${process.cwd()}/${rawPath}`;
@@ -3575,7 +3636,7 @@ function hasSafeRawDotDotSegments(rawPath) {
 function isSafeDirOrMissing(dirPath) {
   if (!dirPath || CONTROL_CHAR_RE.test(dirPath))
     return false;
-  if (!hasSafeRawDotDotSegments(dirPath))
+  if (!hasSafeRawDotDotSegments2(dirPath))
     return false;
   const abs = resolve4(dirPath);
   const root = parse3(abs).root;
@@ -3643,7 +3704,8 @@ function checkAgentLock(opts) {
   if (!record) {
     try {
       const st = lstatSync4(file);
-      if (!st.isSymbolicLink() && st.isFile() && Date.now() - st.mtimeMs > 1000)
+      const ageMs = Date.now() - st.mtimeMs;
+      if (!st.isSymbolicLink() && st.isFile() && (ageMs > 1000 || ageMs < -1000))
         unlinkSync2(file);
     } catch {}
     return { locked: false };
@@ -3698,7 +3760,8 @@ function releaseAgentLock(opts) {
   if (!existing) {
     try {
       const st = lstatSync4(file);
-      if (!st.isSymbolicLink() && st.isFile() && Date.now() - st.mtimeMs > 1000) {
+      const ageMs = Date.now() - st.mtimeMs;
+      if (!st.isSymbolicLink() && st.isFile() && (ageMs > 1000 || ageMs < -1000)) {
         unlinkSync2(file);
         return true;
       }
@@ -3929,7 +3992,7 @@ function parseAntigravityLsofOutput(stdout, appDataDir = "antigravity") {
     const portMatch = line.match(/127\.0\.0\.1:(\d+)\s+\(LISTEN\)/);
     if (portMatch) {
       const p = Number(portMatch[1]);
-      if (p > 0 && !ports.includes(p))
+      if (Number.isSafeInteger(p) && p >= 1 && p <= 65535 && !ports.includes(p))
         ports.push(p);
     }
     if (!isCliTarget && line.includes("/antigravity-cli/"))
@@ -3962,7 +4025,7 @@ function extractCliFlagValue(cmd, flag) {
   return (m?.[1] ?? m?.[2] ?? m?.[3] ?? "").trim();
 }
 function parseWindowsNetstatOutput(stdout, targetPid) {
-  if (!stdout || !Number.isFinite(targetPid) || targetPid <= 0)
+  if (!stdout || !Number.isSafeInteger(targetPid) || targetPid <= 0)
     return [];
   const ports = [];
   for (const line of stdout.split(/\r?\n/)) {
@@ -3971,7 +4034,7 @@ function parseWindowsNetstatOutput(stdout, targetPid) {
       continue;
     const port = Number(m[1]);
     const pid = Number(m[2]);
-    if (pid === targetPid && port > 0 && !ports.includes(port)) {
+    if (pid === targetPid && Number.isSafeInteger(port) && port >= 1 && port <= 65535 && !ports.includes(port)) {
       ports.push(port);
     }
   }
@@ -3988,9 +4051,12 @@ function parseWindowsAntigravityProbeJson(stdout, netstatStdout = "") {
   } catch {
     return null;
   }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || Object.prototype.hasOwnProperty.call(parsed, "__proto__")) {
+    return null;
+  }
   const lsPid = Number(parsed?.lsPid);
   const lsCmd = typeof parsed?.lsCmd === "string" ? parsed.lsCmd : "";
-  if (!Number.isFinite(lsPid) || lsPid <= 0 || !lsCmd)
+  if (!Number.isSafeInteger(lsPid) || lsPid <= 0 || !lsCmd)
     return null;
   const csrfToken = extractCliFlagValue(lsCmd, "--csrf_token");
   if (!csrfToken)
@@ -3999,7 +4065,7 @@ function parseWindowsAntigravityProbeJson(stdout, netstatStdout = "") {
   const rawPorts = Array.isArray(parsed?.ports) ? parsed.ports : typeof parsed?.ports === "number" ? [parsed.ports] : [];
   for (const p of rawPorts) {
     const num = Number(p);
-    if (Number.isFinite(num) && num > 0)
+    if (Number.isSafeInteger(num) && num >= 1 && num <= 65535)
       portSet.add(num);
   }
   if (portSet.size === 0 && netstatStdout) {
@@ -4128,7 +4194,7 @@ function discoverAntigravityHost(opts) {
   }
   const now = Date.now();
   const cacheMs = opts?.cacheMs ?? 5000;
-  if (cachedAgyHost && now - cachedAgyHost.at < cacheMs)
+  if (cachedAgyHost && now >= cachedAgyHost.at && now - cachedAgyHost.at < cacheMs)
     return cachedAgyHost.info;
   try {
     const startPid = opts?.currentPid ?? process.pid;
@@ -4292,7 +4358,7 @@ function isDshHostProcess(opts) {
   }
   const now = Date.now();
   const cacheMs = opts?.cacheMs ?? 15000;
-  if (cachedIsDshHost && now - cachedIsDshHost.at < cacheMs)
+  if (cachedIsDshHost && now >= cachedIsDshHost.at && now - cachedIsDshHost.at < cacheMs)
     return cachedIsDshHost.value;
   try {
     let pid = opts?.currentPid ?? process.pid;
@@ -4382,10 +4448,13 @@ function isLoopbackDshHealthUrl(rawUrl) {
   return true;
 }
 async function readBoundedDshHealthJson(res) {
-  const contentLength = Number(res.headers?.get?.("content-length") ?? "");
-  if (Number.isFinite(contentLength) && contentLength > DSH_HEALTH_MAX_BYTES) {
-    await res.body?.cancel?.().catch(() => {});
-    throw new Error("DSH /health response exceeded byte cap");
+  const rawLen = res.headers?.get?.("content-length");
+  if (rawLen !== null && rawLen !== undefined && rawLen.trim() !== "") {
+    const trimmedLen = rawLen.trim();
+    if (!/^\d+$/.test(trimmedLen) || Number(trimmedLen) > DSH_HEALTH_MAX_BYTES) {
+      await res.body?.cancel?.().catch(() => {});
+      throw new Error("DSH /health response exceeded byte cap");
+    }
   }
   const reader = res?.body?.getReader?.();
   let parsed;
@@ -4556,19 +4625,19 @@ async function detectDshCallerSession(opts) {
 }
 
 // src/session-route.ts
-import { lstatSync as lstatSync6, readFileSync as readFileSync7, readlinkSync as readlinkSync5, realpathSync as realpathSync4 } from "node:fs";
+import { lstatSync as lstatSync6, readFileSync as readFileSync7, readlinkSync as readlinkSync5, realpathSync as realpathSync5 } from "node:fs";
 import { homedir as homedir4 } from "node:os";
 import { dirname as dirname4, isAbsolute as isAbsolute5, join as join7, parse as parse5, resolve as resolve6, sep } from "node:path";
 
 // src/session-bind.ts
-import { closeSync as closeSync2, lstatSync as lstatSync5, mkdirSync as mkdirSync2, openSync as openSync2, readFileSync as readFileSync6, readSync as readSync2, readdirSync as readdirSync3, readlinkSync as readlinkSync4, realpathSync as realpathSync3, statSync as statSync2, unlinkSync as unlinkSync3 } from "node:fs";
+import { closeSync as closeSync2, lstatSync as lstatSync5, mkdirSync as mkdirSync2, openSync as openSync2, readFileSync as readFileSync6, readSync as readSync2, readdirSync as readdirSync3, readlinkSync as readlinkSync4, realpathSync as realpathSync4, statSync as statSync3, unlinkSync as unlinkSync3 } from "node:fs";
 import { isAbsolute as isAbsolute4, join as join6, parse as parse4, resolve as resolve5 } from "node:path";
 var DEFAULT_SESSION_BINDS_FILENAME2 = "session-binds.json";
 var LEGACY_AGY_BINDS_FILENAME2 = "agy-binds.json";
 var LOCK_FILE_MAX_BYTES2 = 64 * 1024;
 var SESSION_BINDS_MAX_BYTES2 = 1024 * 1024;
 var MAX_SESSION_BINDS_ENTRIES2 = 1024;
-var CONTROL_CHAR_RE2 = /[\x00-\x1f\x7f]/;
+var CONTROL_CHAR_RE2 = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
 var RESERVED_BIND_SIDECARS2 = new Set([
   "session-binds",
   "session-binds.meta",
@@ -4611,12 +4680,12 @@ function isAllowedDarwinSystemLink4(dirPath) {
     return false;
   try {
     const expected = `/private${dirPath}`;
-    return readlinkSync4(dirPath) === `private${dirPath}` && realpathSync3(dirPath) === expected && !lstatSync5("/private").isSymbolicLink() && lstatSync5("/private").isDirectory() && !lstatSync5(expected).isSymbolicLink() && statSync2(expected).isDirectory();
+    return readlinkSync4(dirPath) === `private${dirPath}` && realpathSync4(dirPath) === expected && !lstatSync5("/private").isSymbolicLink() && lstatSync5("/private").isDirectory() && !lstatSync5(expected).isSymbolicLink() && statSync3(expected).isDirectory();
   } catch {
     return false;
   }
 }
-function hasSafeRawDotDotSegments2(rawPath) {
+function hasSafeRawDotDotSegments3(rawPath) {
   if (!rawPath.includes(".."))
     return true;
   const baseAbs = isAbsolute4(rawPath) ? rawPath : `${process.cwd()}/${rawPath}`;
@@ -4651,7 +4720,7 @@ function hasSafeRawDotDotSegments2(rawPath) {
 function isSafeDirOrMissing2(dirPath) {
   if (!dirPath || CONTROL_CHAR_RE2.test(dirPath))
     return false;
-  if (!hasSafeRawDotDotSegments2(dirPath))
+  if (!hasSafeRawDotDotSegments3(dirPath))
     return false;
   const abs = resolve5(dirPath);
   const root = parse4(abs).root;
@@ -4795,12 +4864,12 @@ function isAllowedDarwinSystemLink5(dirPath) {
   if (dirPath !== "/var" && dirPath !== "/tmp" && dirPath !== "/etc")
     return false;
   try {
-    return readlinkSync5(dirPath) === `private${dirPath}` && realpathSync4(dirPath) === `/private${dirPath}` && !lstatSync6("/private").isSymbolicLink() && lstatSync6("/private").isDirectory() && !lstatSync6(`/private${dirPath}`).isSymbolicLink() && lstatSync6(`/private${dirPath}`).isDirectory();
+    return readlinkSync5(dirPath) === `private${dirPath}` && realpathSync5(dirPath) === `/private${dirPath}` && !lstatSync6("/private").isSymbolicLink() && lstatSync6("/private").isDirectory() && !lstatSync6(`/private${dirPath}`).isSymbolicLink() && lstatSync6(`/private${dirPath}`).isDirectory();
   } catch {
     return false;
   }
 }
-function hasSafeRawDotDotSegments3(rawPath) {
+function hasSafeRawDotDotSegments4(rawPath) {
   const absRaw = isAbsolute5(rawPath) ? rawPath : `${process.cwd()}${sep}${rawPath}`;
   const root = parse5(absRaw).root;
   const segments = absRaw.slice(root.length).split(/[\\/]+/).filter(Boolean);
@@ -4830,7 +4899,7 @@ function hasSafeRawDotDotSegments3(rawPath) {
 }
 function isSafeRealDir(path) {
   try {
-    if (!path || /[\x00-\x1f\x7f]/.test(path) || !hasSafeRawDotDotSegments3(path)) {
+    if (!path || /[\x00-\x1f\x7f]/.test(path) || !hasSafeRawDotDotSegments4(path)) {
       return false;
     }
     const st = lstatSync6(path);
@@ -4966,9 +5035,13 @@ class HeartbeatMonitor {
       this.safeReconnect("readyState failed");
       return;
     }
+    const now = Date.now();
     if (state === WS_OPEN) {
       this.connectingSince = null;
-      if (Date.now() - this.lastPong > this.pongTimeout) {
+      if (this.lastPong > now) {
+        this.lastPong = now;
+      }
+      if (now - this.lastPong > this.pongTimeout) {
         this.safeReconnect("pong timeout");
         return;
       }
@@ -4980,9 +5053,9 @@ class HeartbeatMonitor {
       return;
     }
     if (state === WS_CONNECTING) {
-      if (this.connectingSince === null) {
-        this.connectingSince = Date.now();
-      } else if (Date.now() - this.connectingSince > this.connectTimeout) {
+      if (this.connectingSince === null || this.connectingSince > now) {
+        this.connectingSince = now;
+      } else if (now - this.connectingSince > this.connectTimeout) {
         this.connectingSince = null;
         this.safeReconnect("connect timeout");
       }
@@ -5161,7 +5234,7 @@ import { fileURLToPath } from "url";
 // src/profile-store.ts
 import {
   lstatSync as lstatSync7,
-  realpathSync as realpathSync5,
+  realpathSync as realpathSync6,
   writeFileSync as writeFileSync2,
   renameSync as renameSync2,
   copyFileSync as copyFileSync2,
@@ -5191,7 +5264,7 @@ function isAllowedDarwinSystemSymlink2(dirPath) {
   if (process.platform !== "darwin" || !DARWIN_SYSTEM_SYMLINKS2.has(dirPath))
     return false;
   try {
-    const resolved = realpathSync5(dirPath);
+    const resolved = realpathSync6(dirPath);
     if (resolved !== `/private${dirPath}`)
       return false;
     const realSt = lstatSync7(resolved);
@@ -5430,10 +5503,11 @@ function isUnsafeSelectorKey(key) {
   const lower = key.toLowerCase();
   return lower === "__proto__" || lower === "constructor" || lower === "prototype";
 }
+var GUARD_CONTROL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
 function cleanDisplayToken(raw, maxLen = 128) {
   if (typeof raw !== "string")
     return "";
-  return redactSecrets2(raw).replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED]").replace(/\b(?:agent_key_|sk-|whsec_|gh[pousr]_|github_pat_|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g, "[REDACTED]").replace(/[\x00-\x1f\x7f]+/g, "").trim().slice(0, maxLen);
+  return redactSecrets2(raw).replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED]").replace(/\b(?:agent_key_|sk-|whsec_|gh[pousr]_|github_pat_|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g, "[REDACTED]").replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g, "").trim().slice(0, maxLen);
 }
 function parseGuardRecord(text) {
   if (!text || typeof text !== "string" || text.length > 262144)
@@ -5448,7 +5522,7 @@ function parseGuardRecord(text) {
       for (const [k, v] of Object.entries(raw.bySelector)) {
         if (Object.keys(bySelector).length >= MAX_GUARD_SELECTORS)
           break;
-        if (/[\x00-\x1f\x7f]/.test(k) || typeof v !== "string" || /[\x00-\x1f\x7f]/.test(v))
+        if (GUARD_CONTROL_RE.test(k) || typeof v !== "string" || GUARD_CONTROL_RE.test(v))
           continue;
         const key = k.trim();
         const val = v.trim();
@@ -5552,7 +5626,7 @@ import {
   copyFileSync as copyFileSync3,
   lstatSync as lstatSync8,
   readFileSync as readFileSync9,
-  realpathSync as realpathSync6,
+  realpathSync as realpathSync7,
   renameSync as renameSync3,
   unlinkSync as unlinkSync5,
   writeFileSync as writeFileSync3
@@ -5570,7 +5644,7 @@ function isDarwinCanonicalRootLink(dir, st) {
     return false;
   }
   try {
-    return realpathSync6(dir) === `/private${dir}` && !lstatSync8("/private").isSymbolicLink() && lstatSync8("/private").isDirectory() && !lstatSync8(`/private${dir}`).isSymbolicLink() && lstatSync8(`/private${dir}`).isDirectory();
+    return realpathSync7(dir) === `/private${dir}` && !lstatSync8("/private").isSymbolicLink() && lstatSync8("/private").isDirectory() && !lstatSync8(`/private${dir}`).isSymbolicLink() && lstatSync8(`/private${dir}`).isDirectory();
   } catch {
     return false;
   }
@@ -5817,7 +5891,7 @@ import {
   copyFileSync as copyFileSync4,
   lstatSync as lstatSync9,
   readFileSync as readFileSync10,
-  realpathSync as realpathSync7,
+  realpathSync as realpathSync8,
   renameSync as renameSync4,
   unlinkSync as unlinkSync6,
   writeFileSync as writeFileSync4
@@ -5835,7 +5909,7 @@ function isDarwinCanonicalRootLink2(dir, st) {
     return false;
   }
   try {
-    return realpathSync7(dir) === `/private${dir}` && !lstatSync9("/private").isSymbolicLink() && lstatSync9("/private").isDirectory() && !lstatSync9(`/private${dir}`).isSymbolicLink() && lstatSync9(`/private${dir}`).isDirectory();
+    return realpathSync8(dir) === `/private${dir}` && !lstatSync9("/private").isSymbolicLink() && lstatSync9("/private").isDirectory() && !lstatSync9(`/private${dir}`).isSymbolicLink() && lstatSync9(`/private${dir}`).isDirectory();
   } catch {
     return false;
   }

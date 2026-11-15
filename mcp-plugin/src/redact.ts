@@ -33,12 +33,15 @@ export function redactSecrets(text: string, opts?: RedactOptions): string {
     .replace(/\bgithub_pat_[A-Za-z0-9_]{16,}/g, "github_pat_***REDACTED***")
     .replace(/\bglpat-[A-Za-z0-9_-]{12,}/g, "glpat-***REDACTED***")
     .replace(/\bxox[baprs]-[A-Za-z0-9-]{10,}/g, "xox-***REDACTED***")
+    .replace(/\bhf_[A-Za-z0-9]{20,}/g, "hf_***REDACTED***")
+    .replace(/\bnpm_[A-Za-z0-9]{20,}/g, "npm_***REDACTED***")
     .replace(/\bAIza[0-9A-Za-z_-]{20,}/g, "AIza***REDACTED***")
     .replace(/(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])/g, "AKIA***REDACTED***")
     .replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
 }
 
 const PHONE_PII_RE = /^\+?\d[\d\s()-]{5,}[\d)]$/;
+const PII_CONTROL_STRIP_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g;
 
 function isPhoneShapedPii(s: string): boolean {
   return PHONE_PII_RE.test(s) && s.replace(/\D/g, "").length >= 7;
@@ -49,7 +52,7 @@ function isPhoneShapedPii(s: string): boolean {
  * rather than an agent handle. Matches the AgentsChat Server PII contract.
  */
 export function isHumanPiiHandle(rawId: unknown): boolean {
-  const s = String(rawId ?? "").trim();
+  const s = String(rawId ?? "").replace(PII_CONTROL_STRIP_RE, "").trim();
   if (!s) return false;
   if (s.includes("@")) return true;
   if (isPhoneShapedPii(s)) return true;
@@ -62,7 +65,7 @@ export function isHumanPiiHandle(rawId: unknown): boolean {
  * in full (no 8/12-char truncation).
  */
 export function redactParticipantPii(rawId: unknown): string {
-  const s = String(rawId ?? "").replace(/[\x00-\x1f\x7f]+/g, "").trim();
+  const s = String(rawId ?? "").replace(PII_CONTROL_STRIP_RE, "").trim();
   if (!s) return "unknown";
   const atIdx = s.indexOf("@");
   if (atIdx >= 0) {

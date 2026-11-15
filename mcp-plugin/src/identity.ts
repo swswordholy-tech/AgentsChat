@@ -66,14 +66,16 @@ const MAX_DISPLAY_NAME_LEN = 128;
 const MAX_AGENT_ID_LEN = 128;
 const MAX_CAPABILITIES_LEN = 64;
 
+const CONTROL_OR_SEP_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+
 function isValidDisplayName(raw: unknown): raw is string {
-  if (typeof raw !== "string" || /[\x00-\x1f\x7f]/.test(raw)) return false;
+  if (typeof raw !== "string" || CONTROL_OR_SEP_RE.test(raw)) return false;
   const trimmed = raw.trim();
   return trimmed.length > 0 && trimmed.length <= MAX_DISPLAY_NAME_LEN && !RESERVED_IDENTITY_IDS.has(trimmed.toLowerCase());
 }
 
 function isValidProfileAgentId(raw: unknown): raw is string {
-  if (typeof raw !== "string" || /[\x00-\x1f\x7f/\\\s]/.test(raw)) return false;
+  if (typeof raw !== "string" || /[\x00-\x1f\x7f-\x9f\u2028\u2029/\\\s]/.test(raw) || /(?:%2e|%2f|%5c|%00)/i.test(raw)) return false;
   const trimmed = raw.trim();
   return (
     trimmed.length > 0 &&
@@ -90,7 +92,7 @@ function sanitizeDiagnosticField(raw: string | undefined, fallback = "(unknown)"
   const cleaned = redactSecrets(raw)
     .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED]")
     .replace(/\b(?:agent_key_|sk-|whsec_|gh[pousr]_|github_pat_|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g, "[REDACTED]")
-    .replace(/[\x00-\x1f\x7f]+/g, " ")
+    .replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g, " ")
     .trim();
   return cleaned.length > 0 ? cleaned.slice(0, 256) : fallback;
 }
@@ -158,7 +160,7 @@ export function decideIdentity(i: IdentityInputs): IdentityDecision {
 /** Validate effective credentials without including credential values in errors. */
 export function validateIdentityProfile(profile: any, file: string, allowDevToken = false): void {
   const cleanNonempty = (value: unknown): value is string =>
-    typeof value === "string" && value.trim().length > 0 && value.length <= 4096 && !/[\x00-\x1f\x7f]/.test(value);
+    typeof value === "string" && value.trim().length > 0 && value.length <= 4096 && !CONTROL_OR_SEP_RE.test(value);
   const safeFile = sanitizeDiagnosticField(file, "(unknown-path)");
   if (!profile || typeof profile !== "object" || Array.isArray(profile) ||
       Object.prototype.hasOwnProperty.call(profile, "__proto__") ||

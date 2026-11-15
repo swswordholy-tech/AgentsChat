@@ -50,8 +50,11 @@ function isUnsafeObjectKey(key: string): boolean {
   return lower === "__proto__" || lower === "constructor" || lower === "prototype";
 }
 
+const GROK_CONTROL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+const GROK_CONTROL_STRIP_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g;
+
 function hasControlChars(s: string): boolean {
-  return /[\x00-\x1f\x7f]/.test(s);
+  return GROK_CONTROL_RE.test(s);
 }
 
 function normalizeProfileSlug(s: string): string {
@@ -213,7 +216,7 @@ export function gateSwitchProfile(input: {
   if (bindValues.length === 0) return { kind: "allow" };
 
   const lockedMessage = (lockedName: string) => {
-    const clean = lockedName.replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 128);
+    const clean = lockedName.replace(GROK_CONTROL_STRIP_RE, "").slice(0, 128);
     return (
       `Outbound identity is locked to grok-bind profile "${clean}" on this shared MCP; ` +
       `use a separate MCP process / wake daemon, do not switch_profile.`
@@ -226,7 +229,7 @@ export function gateSwitchProfile(input: {
     return {
       kind: "locked",
       boundProfileName: bound,
-      requestedProfileName: reqRaw.replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 128),
+      requestedProfileName: reqRaw.replace(GROK_CONTROL_STRIP_RE, "").slice(0, 128),
       message: lockedMessage(bound),
     };
   }
@@ -238,8 +241,8 @@ export function gateSwitchProfile(input: {
     if (!reqHasPath && reqSlug === currentSlug) return { kind: "allow" };
     return {
       kind: "locked",
-      boundProfileName: current.replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 128),
-      requestedProfileName: reqRaw.replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 128),
+      boundProfileName: current.replace(GROK_CONTROL_STRIP_RE, "").slice(0, 128),
+      requestedProfileName: reqRaw.replace(GROK_CONTROL_STRIP_RE, "").slice(0, 128),
       message: lockedMessage(current),
     };
   }
@@ -264,10 +267,10 @@ export function gateGrokProfileMutation(input: {
 
   const reqLabel =
     typeof input.requestedName === "string" && input.requestedName.trim()
-      ? input.requestedName.trim().replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 128)
+      ? input.requestedName.trim().replace(GROK_CONTROL_STRIP_RE, "").slice(0, 128)
       : `(${input.action})`;
   const lockedMessage = (lockedName: string) => {
-    const clean = lockedName.replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 128);
+    const clean = lockedName.replace(GROK_CONTROL_STRIP_RE, "").slice(0, 128);
     return (
       `Outbound identity is locked to grok-bind profile "${clean}" on this shared MCP; ` +
       `use a separate MCP process / wake daemon, do not switch_profile or disconnect_profile.`
@@ -290,7 +293,7 @@ export function gateGrokProfileMutation(input: {
   if (current && bindValues.some((v) => normalizeProfileSlug(v) === currentSlug)) {
     return {
       kind: "locked",
-      boundProfileName: current.replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 128),
+      boundProfileName: current.replace(GROK_CONTROL_STRIP_RE, "").slice(0, 128),
       requestedProfileName: reqLabel,
       message: lockedMessage(current),
     };
@@ -340,7 +343,7 @@ export const WAKE_MODE_ENV = "AGENTCHAT_WAKE_MODE";
  */
 export function nonGrokWakeReason(env: Record<string, string | undefined>): string | null {
   if (!env || typeof env !== "object") return null;
-  const clean = (v: string) => redactSecrets(v.replace(/[\x00-\x1f\x7f]+/g, "")).slice(0, 64);
+  const clean = (v: string) => redactSecrets(v.replace(GROK_CONTROL_STRIP_RE, "")).slice(0, 64);
   const anti = clean((env[ANTIGRAVITY_WAKE_ENV] ?? "").trim());
   if (anti) return `${ANTIGRAVITY_WAKE_ENV}=${anti}`;
   const kind = clean((env[WAKE_KIND_ENV] ?? "").trim());

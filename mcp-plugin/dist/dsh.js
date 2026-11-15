@@ -977,7 +977,7 @@ var LEGACY_AGY_BINDS_FILENAME = "agy-binds.json";
 var LOCK_FILE_MAX_BYTES = 64 * 1024;
 var SESSION_BINDS_MAX_BYTES = 1024 * 1024;
 var MAX_SESSION_BINDS_ENTRIES = 1024;
-var CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
+var CONTROL_CHAR_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
 var RESERVED_BIND_SIDECARS = new Set([
   "session-binds",
   "session-binds.meta",

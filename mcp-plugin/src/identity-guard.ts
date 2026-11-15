@@ -67,12 +67,14 @@ function isUnsafeSelectorKey(key: string): boolean {
   return lower === "__proto__" || lower === "constructor" || lower === "prototype";
 }
 
+const GUARD_CONTROL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+
 function cleanDisplayToken(raw: unknown, maxLen = 128): string {
   if (typeof raw !== "string") return "";
   return redactSecrets(raw)
     .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED]")
     .replace(/\b(?:agent_key_|sk-|whsec_|gh[pousr]_|github_pat_|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g, "[REDACTED]")
-    .replace(/[\x00-\x1f\x7f]+/g, "")
+    .replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g, "")
     .trim()
     .slice(0, maxLen);
 }
@@ -93,7 +95,7 @@ export function parseGuardRecord(text: string | null): IdentityGuardRecord {
     ) {
       for (const [k, v] of Object.entries(raw.bySelector as Record<string, unknown>)) {
         if (Object.keys(bySelector).length >= MAX_GUARD_SELECTORS) break;
-        if (/[\x00-\x1f\x7f]/.test(k) || typeof v !== "string" || /[\x00-\x1f\x7f]/.test(v)) continue;
+        if (GUARD_CONTROL_RE.test(k) || typeof v !== "string" || GUARD_CONTROL_RE.test(v)) continue;
         const key = k.trim();
         const val = v.trim();
         if (!key || key.length > 128 || isUnsafeSelectorKey(key) || !val || val.length > 128) continue;

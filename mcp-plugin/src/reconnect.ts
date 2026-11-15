@@ -20,7 +20,12 @@ function safeUnitRand(rand: () => number): number {
 }
 
 export function computeReconnectDelay(attempt: number, rand: () => number = Math.random): number {
-  const safeAttempt = typeof attempt === "number" && !Number.isNaN(attempt) ? Math.max(0, attempt) : 0;
+  const safeAttempt =
+    typeof attempt === "number" && !Number.isNaN(attempt)
+      ? attempt === Infinity
+        ? 15
+        : Math.max(0, Math.min(attempt, 15))
+      : 0;
   const jitter = safeUnitRand(rand) * 3000; // 0–3s
   return Math.min(safeAttempt * 2, 30) * 1000 + jitter;
 }
