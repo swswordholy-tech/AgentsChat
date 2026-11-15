@@ -4,8 +4,8 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // connector/run.ts
 import WS from "ws";
-import { lstatSync as lstatSync2, readFileSync as readFileSync2 } from "node:fs";
-import { resolve } from "node:path";
+import { lstatSync as lstatSync2, readFileSync as readFileSync2, realpathSync as realpathSync2 } from "node:fs";
+import { dirname as dirname2, isAbsolute as isAbsolute2, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // connector/server.ts
@@ -109,22 +109,23 @@ function toWireEvent(msg, platform = "agentschat") {
   const content = typeof msg.content === "string" ? msg.content : "";
   if (content === "__typing__")
     return null;
-  const chatId = msg.channel_id ?? "";
+  const metadata = (value) => typeof value === "string" ? value.replace(/[\x00-\x1f\x7f]/g, "") : undefined;
+  const chatId = metadata(msg.channel_id) ?? "";
   if (!chatId)
     return null;
   const isDm = /^dm[-:]/i.test(chatId);
   return {
     text: content,
     message_type: "text",
-    message_id: msg.id,
-    reply_to_message_id: msg.reply_to ?? msg.parent_id,
+    message_id: metadata(msg.id),
+    reply_to_message_id: metadata(msg.reply_to ?? msg.parent_id),
     source: {
       platform,
       chat_id: chatId,
       chat_type: isDm ? "dm" : "group",
-      chat_name: msg.channel_id ?? null,
-      user_id: msg.sender_id,
-      user_name: msg.sender_name ?? msg.sender_id,
+      chat_name: chatId,
+      user_id: metadata(msg.sender_id),
+      user_name: metadata(msg.sender_name ?? msg.sender_id),
       thread_id: null
     }
   };
@@ -147,6 +148,14 @@ function matchesLiveLoop(msg, agentId, response) {
     return false;
   const row = matches[0];
   return row.status === "active" && row.channel_id === msg.channel_id && row.prompt === tick.prompt && row.interval_ms === tick.interval_ms && row.next_tick_ms === tick.next_tick_ms && row.expires_at === null && (row.mode === undefined || row.mode === "static") && Number.isSafeInteger(row.last_tick_at) && row.last_tick_at > 0 && row.last_tick_at + row.interval_ms === row.next_tick_ms;
+}
+
+// src/redact.ts
+function redactSecrets(text, opts) {
+  if (typeof text !== "string" || !text)
+    return "";
+  const step = opts?.preserveAcKeys ? text : text.replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***");
+  return step.replace(/-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)/g, "***PRIVATE_KEY_REDACTED***").replace(/mcp_(?:at|rt|code)_[A-Za-z0-9_-]{16,}/g, "mcp_***REDACTED***").replace(/agent_key_[A-Za-z0-9_-]{12,}/g, "agent_key_***REDACTED***").replace(/whsec_[A-Za-z0-9_-]{12,}/g, "whsec_***REDACTED***").replace(/\bsk-(?:proj-|ant-|live-|test-)?[A-Za-z0-9_-]{16,}/g, "sk-***REDACTED***").replace(/\brk_(?:live|test)_[A-Za-z0-9]{12,}/g, "rk_***REDACTED***").replace(/\bgh[pousr]_[A-Za-z0-9_]{16,}/g, "gh_***REDACTED***").replace(/\bgithub_pat_[A-Za-z0-9_]{16,}/g, "github_pat_***REDACTED***").replace(/\bglpat-[A-Za-z0-9_-]{12,}/g, "glpat-***REDACTED***").replace(/\bxox[baprs]-[A-Za-z0-9-]{10,}/g, "xox-***REDACTED***").replace(/\bAIza[0-9A-Za-z_-]{20,}/g, "AIza***REDACTED***").replace(/(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])/g, "AKIA***REDACTED***").replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
 }
 
 // src/dedup.ts
@@ -206,7 +215,7 @@ var PROTOTYPE_MENTION_IDS = new Set(["__proto__", "constructor", "prototype"]);
 
 // connector/identities.ts
 function validIdentityId(value) {
-  return typeof value === "string" && value.length > 0 && !/\s|[\x00-\x1f\x7f]/.test(value) && !["__proto__", "constructor", "prototype"].includes(value.toLowerCase());
+  return typeof value === "string" && value.length > 0 && value.length <= 128 && value !== "." && value !== ".." && !/[/\\\s\x00-\x1f\x7f]/.test(value) && !["__proto__", "constructor", "prototype"].includes(value.toLowerCase());
 }
 function validateIdentities(identities, allowEmptyCredentials = false) {
   const bots = new Set;
@@ -386,10 +395,12 @@ function startConnector(config) {
         let frame;
         try {
           frame = JSON.parse(line);
+          if (frame && typeof frame === "object" && Object.prototype.hasOwnProperty.call(frame, "__proto__"))
+            continue;
         } catch {
           continue;
         }
-        await handleFrame(conn, frame).catch((e) => log(`[connector] frame error: ${e}`));
+        await handleFrame(conn, frame).catch((e) => log(`[connector] frame error: ${redactSecrets(String(e))}`));
       }
     });
     ws.on("close", () => {
@@ -447,7 +458,7 @@ function startConnector(config) {
       log(`[connector] outbound failed: no usable identity for botId=${requested ?? "?"}`);
       return { success: false, error: `no usable identity for outbound (botId=${requested ?? "?"})` };
     }
-    if (typeof chatId !== "string" || chatId !== chatId.trim() || chatId.length < 1 || chatId.length > 128 || /[\x00-\x1f\x7f/\\]/.test(chatId) || chatId === "." || chatId.includes("..") || ["__proto__", "constructor", "prototype"].includes(chatId.toLowerCase())) {
+    if (typeof chatId !== "string" || chatId !== chatId.trim() || chatId.length < 1 || chatId.length > 128 || /[\s\x00-\x1f\x7f/\\]/.test(chatId) || chatId === "." || chatId.includes("..") || ["__proto__", "constructor", "prototype"].includes(chatId.toLowerCase())) {
       return { success: false, error: "invalid chat_id" };
     }
     switch (op) {
@@ -643,14 +654,6 @@ function peekPayload(token) {
   } catch {
     return null;
   }
-}
-
-// src/redact.ts
-function redactSecrets(text, opts) {
-  if (typeof text !== "string" || !text)
-    return "";
-  const step = opts?.preserveAcKeys ? text : text.replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***");
-  return step.replace(/-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)/g, "***PRIVATE_KEY_REDACTED***").replace(/mcp_(?:at|rt|code)_[A-Za-z0-9_-]{16,}/g, "mcp_***REDACTED***").replace(/agent_key_[A-Za-z0-9_-]{12,}/g, "agent_key_***REDACTED***").replace(/whsec_[A-Za-z0-9_-]{12,}/g, "whsec_***REDACTED***").replace(/\bsk-(?:proj-|ant-|live-|test-)?[A-Za-z0-9_-]{16,}/g, "sk-***REDACTED***").replace(/\brk_(?:live|test)_[A-Za-z0-9]{12,}/g, "rk_***REDACTED***").replace(/\bgh[pousr]_[A-Za-z0-9_]{16,}/g, "gh_***REDACTED***").replace(/\bgithub_pat_[A-Za-z0-9_]{16,}/g, "github_pat_***REDACTED***").replace(/\bglpat-[A-Za-z0-9_-]{12,}/g, "glpat-***REDACTED***").replace(/\bxox[baprs]-[A-Za-z0-9-]{10,}/g, "xox-***REDACTED***").replace(/\bAIza[0-9A-Za-z_-]{20,}/g, "AIza***REDACTED***").replace(/(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])/g, "AKIA***REDACTED***").replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
 }
 
 // src/read-cursor.ts
@@ -1096,7 +1099,7 @@ function withTimeoutController(parentSignal, timeoutMs) {
 }
 
 // connector/run.ts
-var log = (m) => process.stderr.write(`[agentschat-connector] ${m}
+var log = (m) => process.stderr.write(`[agentschat-connector] ${redactSecrets(m)}
 `);
 function need(name) {
   const v = process.env[name];
@@ -1105,6 +1108,63 @@ function need(name) {
     process.exit(1);
   }
   return v;
+}
+function isUnsafeConnectorHost(hostname) {
+  const host = hostname.toLowerCase().replace(/\.$/, "").replace(/^\[|\]$/g, "");
+  if (["metadata", "instance-data", "metadata.google.internal", "metadata.goog"].includes(host) || host.endsWith(".metadata.goog"))
+    return true;
+  const unsafeV4 = (ip) => ip === "0.0.0.0" || ip.startsWith("169.254.") || ip === "100.100.100.200";
+  if (!host.includes(":"))
+    return unsafeV4(host);
+  const halves = host.split("::");
+  const left = halves[0] ? halves[0].split(":") : [];
+  const right = halves[1] ? halves[1].split(":") : [];
+  const words = [...left, ...Array(8 - left.length - right.length).fill("0"), ...right].map((v) => parseInt(v, 16));
+  if (words.every((v) => v === 0) || (words[0] & 65472) === 65152 || host === "fd00:ec2::254")
+    return true;
+  if (words.slice(0, 5).every((v) => v === 0) && words[5] === 65535) {
+    return unsafeV4(`${words[6] >>> 8}.${words[6] & 255}.${words[7] >>> 8}.${words[7] & 255}`);
+  }
+  return false;
+}
+function assertSafeConnectorAncestors(target, directoryLeaf = false) {
+  const absolute = (isAbsolute2(target) ? target : `${process.cwd()}/${target}`).replace(/\/+$/, "") || "/";
+  let dir = directoryLeaf ? absolute : dirname2(absolute);
+  let leaf = directoryLeaf;
+  for (;; ) {
+    const stat = lstatSync2(dir);
+    let systemAlias = false;
+    if (!leaf && process.platform === "darwin" && ["/tmp", "/var", "/etc"].includes(dir) && stat.isSymbolicLink()) {
+      const privateRoot = lstatSync2("/private");
+      const privateDir = lstatSync2(`/private${dir}`);
+      systemAlias = realpathSync2(dir) === `/private${dir}` && !privateRoot.isSymbolicLink() && privateRoot.isDirectory() && !privateDir.isSymbolicLink() && privateDir.isDirectory();
+    }
+    if (!systemAlias && (stat.isSymbolicLink() || !stat.isDirectory()))
+      throw new Error("unsafe connector directory");
+    const parent = dirname2(dir);
+    if (parent === dir)
+      return;
+    dir = parent;
+    leaf = false;
+  }
+}
+function loadConnectorCursor(file, warn) {
+  try {
+    assertSafeConnectorAncestors(dirname2(file), true);
+  } catch {
+    warn("[connector] unsafe cursor directory; cursor not loaded");
+    return new Map;
+  }
+  return loadCursor(file, warn);
+}
+function persistConnectorCursor(file, map, warn) {
+  try {
+    assertSafeConnectorAncestors(dirname2(file), true);
+  } catch {
+    warn("[connector] unsafe cursor directory; cursor not persisted");
+    return false;
+  }
+  return persistCursor(file, map, warn);
 }
 function readConnectorConfig(env = process.env) {
   const API = (env.AGENTCHAT_API_URL || "https://agents-chat.com").replace(/\/$/, "");
@@ -1123,7 +1183,7 @@ function readConnectorConfig(env = process.env) {
       throw new Error(`invalid ${name}`);
     }
     const loopback = ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname);
-    if (!protocols.includes(url.protocol) || url.username || url.password || url.port === "0" || name === "AGENTCHAT_API_URL" && (url.search || url.hash || raw.includes("?") || raw.includes("#")) || (url.protocol === "http:" || url.protocol === "ws:") && !loopback && env.AGENTSCHAT_ALLOW_INSECURE_HTTP !== "1") {
+    if (!protocols.includes(url.protocol) || url.username || url.password || url.port === "0" || isUnsafeConnectorHost(url.hostname) || name === "AGENTCHAT_API_URL" && (url.search || url.hash || raw.includes("?") || raw.includes("#")) || (url.protocol === "http:" || url.protocol === "ws:") && !loopback && env.AGENTSCHAT_ALLOW_INSECURE_HTTP !== "1") {
       throw new Error(`invalid ${name}`);
     }
   }
@@ -1148,7 +1208,11 @@ async function readBoundedJson(response) {
       text += decoder.decode(value, { stream: true });
     }
     text += decoder.decode();
-    return JSON.parse(text);
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === "object" && Object.prototype.hasOwnProperty.call(parsed, "__proto__")) {
+      throw new Error("invalid JSON response");
+    }
+    return parsed;
   } catch (error) {
     reader.cancel().catch(() => {});
     throw error;
@@ -1200,6 +1264,7 @@ function loadIdentities() {
   if (file) {
     let raw2;
     try {
+      assertSafeConnectorAncestors(file);
       const stat = lstatSync2(file);
       if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 1048576) {
         throw new Error("Unsafe identities file");
@@ -1282,6 +1347,11 @@ async function main() {
     heartbeatsByBot.delete(botId);
   }
   const CURSOR_DIR = process.env.AGENTCHAT_CURSOR_DIR || process.cwd();
+  try {
+    assertSafeConnectorAncestors(CURSOR_DIR, true);
+  } catch {
+    throw new Error("unsafe connector cursor directory");
+  }
   const cursorFlushMs = clampTimerMs(process.env.AGENTSCHAT_MCP_CURSOR_FLUSH_MS, 5000, 500);
   const cursors = new Map;
   function cursorFor(id) {
@@ -1289,7 +1359,7 @@ async function main() {
     if (s)
       return s;
     const file = safeCursorBotFile(CURSOR_DIR, id.botId);
-    s = { file, map: loadCursor(file, (m) => log(m.trimEnd())), state: { dirty: false }, timer: null };
+    s = { file, map: loadConnectorCursor(file, (m) => log(m.trimEnd())), state: { dirty: false }, timer: null };
     cursors.set(id.botId, s);
     return s;
   }
@@ -1298,7 +1368,7 @@ async function main() {
       clearTimeout(s.timer);
       s.timer = null;
     }
-    flushCursor(s.state, () => persistCursor(s.file, s.map, (m) => log(m.trimEnd())));
+    flushCursor(s.state, () => persistConnectorCursor(s.file, s.map, (m) => log(m.trimEnd())));
   }
   function scheduleSave(s) {
     s.state.dirty = true;
@@ -1311,7 +1381,7 @@ async function main() {
     s.timer.unref?.();
   }
   function advanceCursor(id, channelId, timestamp) {
-    if (typeof channelId !== "string" || typeof timestamp !== "string" || !timestamp)
+    if (!validIdentityId(channelId) || typeof timestamp !== "string" || !timestamp)
       return;
     const s = cursorFor(id);
     const prev = s.map.get(channelId) || "";
@@ -1323,6 +1393,8 @@ async function main() {
     }
   }
   function joinChannel(ws, id, channelId, name) {
+    if (!validIdentityId(channelId))
+      return;
     try {
       ws.send(JSON.stringify({ type: "join_channel", channel_id: channelId, agent_id: id.agentId }));
       log(`joined channel ${channelId}${name ? ` (${name})` : ""}`);
@@ -1349,7 +1421,7 @@ async function main() {
       const joined = [];
       for (const ch of channels) {
         const channelId = ch?.id || ch?.channel_id;
-        if (!channelId)
+        if (!validIdentityId(channelId))
           continue;
         joinChannel(ws, id, channelId, ch?.name);
         joined.push(channelId);
@@ -1372,6 +1444,8 @@ async function main() {
   async function backfillIdentity(id, channelIds) {
     const s = cursorFor(id);
     for (const channelId of channelIds) {
+      if (!validIdentityId(channelId))
+        continue;
       if (!currentIdentity(id))
         return;
       try {
@@ -1469,6 +1543,8 @@ async function main() {
       } catch {
         return;
       }
+      if (!data || typeof data !== "object" || Array.isArray(data) || Object.prototype.hasOwnProperty.call(data, "__proto__"))
+        return;
       if (data.type === "pong") {
         hb.receivedPong();
         return;
@@ -1489,7 +1565,7 @@ async function main() {
         } catch {}
         return;
       }
-      if (data.type === "channel_created" && data.channel_id) {
+      if (data.type === "channel_created" && validIdentityId(data.channel_id)) {
         hb.receivedPong();
         joinChannel(ws, id, data.channel_id, data.name);
         return;
@@ -1712,8 +1788,11 @@ if (isConnectorEntrypoint(process.argv[1], import.meta.url, __require.main == __
 export {
   readConnectorConfig,
   readBoundedJson,
+  persistConnectorCursor,
   parseIdentitiesJson,
   loadIdentities,
+  loadConnectorCursor,
   isConnectorEntrypoint,
-  clampTimerMs
+  clampTimerMs,
+  assertSafeConnectorAncestors
 };

@@ -5422,8 +5422,8 @@ function flushCursor(state, persist) {
 
 // src/rest-cli.ts
 import { randomBytes as randomBytes3 } from "node:crypto";
-import { lstatSync as lstatSync10, mkdirSync as mkdirSync3, readFileSync as readFileSync11, renameSync as renameSync5, unlinkSync as unlinkSync7, writeFileSync as writeFileSync5 } from "node:fs";
-import { dirname as dirname8, join as join12 } from "node:path";
+import { lstatSync as lstatSync10, mkdirSync as mkdirSync3, readFileSync as readFileSync11, readlinkSync as readlinkSync6, renameSync as renameSync5, unlinkSync as unlinkSync7, writeFileSync as writeFileSync5 } from "node:fs";
+import { dirname as dirname8, isAbsolute as isAbsolute7, join as join12, parse as parse7, resolve as resolve9 } from "node:path";
 
 // src/mentions.ts
 var MAX_MENTION_ID_CHARS2 = 128;
@@ -5811,6 +5811,97 @@ function isLoopbackHost2(hostname) {
   const h = hostname.toLowerCase();
   return h === "127.0.0.1" || h === "localhost" || h === "[::1]" || h === "::1";
 }
+function isUnsafeMetadataOrLinkLocalHost4(hostname) {
+  const lower = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  if (!lower || lower === "0.0.0.0" || lower === "::" || lower === "100.100.100.200" || lower === "fd00:ec2::254" || lower === "metadata.google.internal" || lower === "metadata" || lower === "metadata.goog" || lower.endsWith(".metadata.goog") || lower === "instance-data") {
+    return true;
+  }
+  if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(lower))
+    return true;
+  if (/^fe[89ab][0-9a-f]:/.test(lower))
+    return true;
+  if (lower.startsWith("::ffff:")) {
+    const tail = lower.slice("::ffff:".length);
+    const tailParts = tail.startsWith("0:") ? tail.slice(2) : tail;
+    if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(tailParts) || tailParts === "100.100.100.200" || tailParts === "0.0.0.0") {
+      return true;
+    }
+    const hexMatch = tailParts.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    if (hexMatch) {
+      const hi = parseInt(hexMatch[1], 16);
+      const lo = parseInt(hexMatch[2], 16);
+      if ((hi >> 8 & 255) === 169 && (hi & 255) === 254 || hi === 25700 && lo === 25800 || hi === 0 && lo === 0) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+function isAllowedDarwinSystemLink6(dirPath) {
+  if (process.platform !== "darwin")
+    return false;
+  if (dirPath !== "/var" && dirPath !== "/tmp" && dirPath !== "/etc")
+    return false;
+  try {
+    return readlinkSync6(dirPath) === `private${dirPath}`;
+  } catch {
+    return false;
+  }
+}
+function hasSafeDirChain3(dirPath) {
+  if (typeof dirPath !== "string" || !dirPath.trim() || /[\x00-\x1f\x7f]/.test(dirPath)) {
+    return false;
+  }
+  if (/(?:^|[\\/])\.\.(?:[\\/]|$)/.test(dirPath)) {
+    const rawBase = isAbsolute7(dirPath) ? parse7(dirPath).root : resolve9(".");
+    const rawRel = isAbsolute7(dirPath) ? dirPath.slice(rawBase.length) : dirPath;
+    let rawCur = rawBase.replace(/[\\/]+$/, "") || "/";
+    for (const seg of rawRel.split(/[\\/]+/).filter(Boolean)) {
+      if (seg === ".")
+        continue;
+      if (seg === "..") {
+        rawCur = dirname8(rawCur);
+        continue;
+      }
+      rawCur = rawCur === "/" ? `/${seg}` : `${rawCur}/${seg}`;
+      try {
+        const st = lstatSync10(rawCur);
+        if (st.isSymbolicLink() && !isAllowedDarwinSystemLink6(rawCur))
+          return false;
+        if (!st.isSymbolicLink() && !st.isDirectory())
+          return false;
+      } catch (err) {
+        if (err && err.code === "ENOENT")
+          break;
+        return false;
+      }
+    }
+  }
+  const abs = resolve9(dirPath);
+  const root = parse7(abs).root;
+  const rel = abs.slice(root.length);
+  const segments = rel.split(/[\\/]+/).filter(Boolean);
+  let cur = root;
+  for (let i = 0;i < segments.length; i++) {
+    cur = join12(cur, segments[i]);
+    let st;
+    try {
+      st = lstatSync10(cur);
+    } catch (err) {
+      if (err && err.code === "ENOENT")
+        return true;
+      return false;
+    }
+    if (st.isSymbolicLink()) {
+      if (isAllowedDarwinSystemLink6(cur))
+        continue;
+      return false;
+    }
+    if (!st.isDirectory())
+      return false;
+  }
+  return true;
+}
 function validateSafeRestBaseUrl(rawUrl) {
   if (typeof rawUrl !== "string")
     throw new Error("Invalid AgentsChat REST URL");
@@ -5826,6 +5917,9 @@ function validateSafeRestBaseUrl(rawUrl) {
   }
   if (parsed.username || parsed.password || parsed.search || parsed.hash) {
     throw new Error("Invalid AgentsChat REST URL");
+  }
+  if (isUnsafeMetadataOrLinkLocalHost4(parsed.hostname)) {
+    throw new Error("Refusing cloud-metadata, link-local, or unspecified AgentsChat REST URL");
   }
   if (parsed.protocol === "https:")
     return trimmed;
@@ -5843,15 +5937,25 @@ function isSafeCliChannelId(channelId) {
   return true;
 }
 function ensureRealDirectory(dir) {
+  if (!hasSafeDirChain3(dir)) {
+    throw new Error("Refusing symlink or non-directory state root");
+  }
   const pre = lstatSync10(dir, { throwIfNoEntry: false });
   if (pre && (pre.isSymbolicLink() || !pre.isDirectory())) {
     throw new Error("Refusing symlink or non-directory state root");
   }
   mkdirSync3(dir, { recursive: true, mode: 448 });
   const post = lstatSync10(dir);
-  if (post.isSymbolicLink() || !post.isDirectory()) {
+  if (post.isSymbolicLink() || !post.isDirectory() || !hasSafeDirChain3(dir)) {
     throw new Error("Refusing symlink or non-directory state root");
   }
+}
+function parseSafeResponseJsonText(text) {
+  const parsed = JSON.parse(text);
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && Object.prototype.hasOwnProperty.call(parsed, "__proto__")) {
+    throw new Error("Refusing prototype-polluting HTTP JSON response");
+  }
+  return parsed;
 }
 async function readBoundedResponseJson(res, maxBytes = MAX_HTTP_JSON_BYTES) {
   const cl = Number(res.headers?.get("content-length") ?? "");
@@ -5864,7 +5968,7 @@ async function readBoundedResponseJson(res, maxBytes = MAX_HTTP_JSON_BYTES) {
     if (Buffer.byteLength(text, "utf8") > maxBytes) {
       throw new Error("HTTP JSON response exceeds byte limit");
     }
-    return JSON.parse(text);
+    return parseSafeResponseJsonText(text);
   }
   const reader = res.body.getReader();
   const chunks = [];
@@ -5888,7 +5992,7 @@ async function readBoundedResponseJson(res, maxBytes = MAX_HTTP_JSON_BYTES) {
       reader.releaseLock();
     } catch {}
   }
-  return JSON.parse(Buffer.concat(chunks, total).toString("utf8"));
+  return parseSafeResponseJsonText(Buffer.concat(chunks, total).toString("utf8"));
 }
 function clampTimerMs(raw, fallback, minMs = 0) {
   if (typeof raw !== "number" || !Number.isFinite(raw))
@@ -5928,14 +6032,14 @@ async function fetchWithDeadline(f, url, init, timeoutMs, parentSignal) {
 function sleepAbortable(ms, signal) {
   if (signal.aborted)
     return Promise.resolve();
-  return new Promise((resolve9) => {
+  return new Promise((resolve10) => {
     const onAbort = () => {
       clearTimeout(t);
-      resolve9();
+      resolve10();
     };
     const t = setTimeout(() => {
       signal.removeEventListener("abort", onAbort);
-      resolve9();
+      resolve10();
     }, ms);
     t.unref?.();
     signal.addEventListener("abort", onAbort, { once: true });
@@ -5943,6 +6047,8 @@ function sleepAbortable(ms, signal) {
 }
 function loadSeenIds(file) {
   try {
+    if (!hasSafeDirChain3(dirname8(file)))
+      return [];
     const stat = lstatSync10(file);
     if (stat.isSymbolicLink() || !stat.isFile() || stat.size > MAX_STATE_FILE_BYTES)
       return [];
@@ -5962,6 +6068,8 @@ function saveSeenIds(file, ids) {
 function loadJsonMap(file) {
   const out = Object.create(null);
   try {
+    if (!hasSafeDirChain3(dirname8(file)))
+      return out;
     const stat = lstatSync10(file);
     if (stat.isSymbolicLink() || !stat.isFile() || stat.size > MAX_STATE_FILE_BYTES)
       return out;
@@ -5982,7 +6090,10 @@ function acquireWakePidFile(wakePidFile, pid = process.pid, killFn = process.kil
   let tmp = "";
   let created = false;
   try {
-    const dirStat = lstatSync10(dirname8(wakePidFile));
+    const dir = dirname8(wakePidFile);
+    if (!hasSafeDirChain3(dir))
+      return false;
+    const dirStat = lstatSync10(dir);
     if (dirStat.isSymbolicLink() || !dirStat.isDirectory())
       return false;
     try {
@@ -6008,9 +6119,9 @@ function acquireWakePidFile(wakePidFile, pid = process.pid, killFn = process.kil
     writeFileSync5(tmp, `${pid}
 `, { mode: 384, flag: "wx" });
     created = true;
-    const recheckDir = lstatSync10(dirname8(wakePidFile), { throwIfNoEntry: false });
+    const recheckDir = lstatSync10(dir, { throwIfNoEntry: false });
     const recheckTarget = lstatSync10(wakePidFile, { throwIfNoEntry: false });
-    if (!recheckDir || recheckDir.isSymbolicLink() || !recheckDir.isDirectory() || recheckTarget && (recheckTarget.isSymbolicLink() || !recheckTarget.isFile())) {
+    if (!hasSafeDirChain3(dir) || !recheckDir || recheckDir.isSymbolicLink() || !recheckDir.isDirectory() || recheckTarget && (recheckTarget.isSymbolicLink() || !recheckTarget.isFile())) {
       unlinkSync7(tmp);
       created = false;
       return false;
@@ -6029,6 +6140,8 @@ function acquireWakePidFile(wakePidFile, pid = process.pid, killFn = process.kil
 }
 function releaseWakePidFile(wakePidFile, pid = process.pid) {
   try {
+    if (!hasSafeDirChain3(dirname8(wakePidFile)))
+      return;
     const stat = lstatSync10(wakePidFile);
     if (stat.isSymbolicLink() || !stat.isFile() || stat.size > MAX_PID_FILE_BYTES)
       return;
@@ -6283,7 +6396,7 @@ async function wakeOnce(opts) {
         const msgs = (data.messages || []).filter((m) => m && m.id !== triggerMsgId && m.content !== "__typing__");
         const trimmed = msgs.slice(-20);
         if (trimmed.length > 0) {
-          const context = trimmed.map((m) => `${redactParticipantPii2(m.sender_id || "?")}: ${String(m.content || "").slice(0, 500)}${formatWakeAttachments2(m.attachments)}`).join(`
+          const context = trimmed.map((m) => `${redactParticipantPii2(m.sender_id || "?")}: ${redactSecrets2(String(m.content || "").slice(0, 500))}${formatWakeAttachments2(m.attachments)}`).join(`
 `);
           prefix = `[频道上下文 - 最近 ${trimmed.length} 条消息]
 ${context}
@@ -6322,12 +6435,16 @@ ${context}
       });
     }
     const contextPrefix = await buildGroupContextPrefix(channelId, String(lastMsg.id || ""), String(lastMsg.timestamp || ""));
-    const combinedContent = batch.length === 1 ? String(lastMsg.content || "") : batch.map((m) => String(m.content || "")).join(`
+    const allSameOwnerDirect = batch.every((m) => m?.same_owner_direct === true);
+    const combinedRedactOpts = allSameOwnerDirect ? { preserveAcKeys: true } : undefined;
+    const rawCombinedContent = batch.length === 1 ? String(lastMsg.content || "") : batch.map((m) => String(m.content || "")).join(`
 `);
+    const safeCombinedContent = redactSecrets2(rawCombinedContent, combinedRedactOpts);
     const prompt = buildWakePrompt2({
       ...lastMsg,
+      same_owner_direct: allSameOwnerDirect,
       channel_id: channelId,
-      content: combinedContent
+      content: rawCombinedContent
     }, contextPrefix);
     return {
       event: "agentschat_wake",
@@ -6335,13 +6452,13 @@ ${context}
       channel_id: channelId,
       message_id: String(lastMsg.id || ""),
       sender_id: String(lastMsg.sender_id || ""),
-      content: combinedContent,
+      content: safeCombinedContent,
       timestamp: String(lastMsg.timestamp || ""),
       ...batch.length > 1 ? {
         messages: batch.map((m) => ({
           id: String(m.id || ""),
           sender_id: String(m.sender_id || ""),
-          content: String(m.content || ""),
+          content: redactSecrets2(String(m.content || ""), m?.same_owner_direct === true ? { preserveAcKeys: true } : undefined),
           timestamp: String(m.timestamp || "")
         }))
       } : {},
@@ -6507,6 +6624,9 @@ ${context}
                     continue;
                   try {
                     const parsed = JSON.parse(raw);
+                    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || Object.prototype.hasOwnProperty.call(parsed, "__proto__")) {
+                      continue;
+                    }
                     const wakeEv = await inspectChannelMessages(channelId, [parsed]);
                     if (wakeEv) {
                       finish(wakeEv);
