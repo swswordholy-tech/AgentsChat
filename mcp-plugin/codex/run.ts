@@ -5,11 +5,11 @@ import { getOnboardingStatus } from "../src/onboarding-status.ts";
 import { GuiChannel } from "./gui-channel.ts";
 import { readFileSync, lstatSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { loadBots } from "./bots-config.ts";
 import type { BridgeConfig } from "./config.ts";
 import { parseArgs } from "node:util";
-import { resolveConfig } from "./config.ts";
+import { assertDirectoryAncestors, resolveConfig } from "./config.ts";
 import { AppServer } from "./app-server.ts";
 import { Bridge } from "./bridge.ts";
 import { AgentsChatTransport } from "./transport.ts";
@@ -57,6 +57,7 @@ async function main() {
     const channel = new GuiChannel(join(homedir(), ".agentschat/codex-gui-outbox"), values["gui-thread"] ? [values["gui-thread"]] : []);
     if (values["gui-status"]) { console.log(JSON.stringify(channel.list().map(({prompt, ...receipt}) => receipt))); return; }
     if (!values["gui-thread"] || !values["gui-message-file"]) throw new Error("GUI submission requires --gui-thread and --gui-message-file");
+    assertDirectoryAncestors(dirname(values["gui-message-file"]));
     const stat = lstatSync(values["gui-message-file"]);
     if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("GUI message must be a regular file, not a symlink");
     if (stat.size > 256 * 1024) throw new Error("GUI message file exceeds 256 KiB");
@@ -93,12 +94,13 @@ async function main() {
   if (values.conversations || values["read-conversation"]) {
     const dir = lstatSync(c.stateDir), stateFile = join(c.stateDir, "state.json");
     if (dir.isSymbolicLink() || !dir.isDirectory()) throw new Error("Conversation state must use a real directory");
+    assertDirectoryAncestors(c.stateDir);
     const stat = lstatSync(stateFile);
     if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 16 * 1024 * 1024) throw new Error("Unsafe conversation state file");
     const state = JSON.parse(readFileSync(stateFile, "utf8"));
     if (!isPlainObject(state) || Object.prototype.hasOwnProperty.call(state, "__proto__")) throw new Error("Invalid conversation state");
     const channels = state?.channels === undefined ? {} : state.channels;
-    if (!isPlainObject(channels)) throw new Error("Invalid conversation channels");
+    if (!isPlainObject(channels) || Object.prototype.hasOwnProperty.call(channels, "__proto__")) throw new Error("Invalid conversation channels");
     const safeOutput = (value: unknown) => {
       const text = JSON.stringify(value);
       return redactSecrets(typeof c.token === "string" && c.token.length > 0 ? text.split(c.token).join("[REDACTED]") : text);

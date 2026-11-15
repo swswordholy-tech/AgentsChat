@@ -4,6 +4,7 @@ import { lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync, openSync
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { priorChannelThreads, preserveChannelHistory, type ThreadHistory } from "./thread-history.ts";
+import { assertDirectoryAncestors } from "./config.ts";
 import type { BridgeConfig, PermissionMode } from "./config.ts";
 import { redactSecrets } from "../src/redact.ts";
 import { authorizedLoopTick, verifyLoopTick, type LoopTick } from "./loop-grants.ts";
@@ -25,7 +26,8 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
     (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
 }
 function safeMessageId(value: unknown): value is string {
-  return typeof value === "string" && !!value.trim() && !/[\x00-\x1f\x7f]/.test(value) && !isPrototypeKey(value);
+  return typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value &&
+    value !== "." && value !== ".." && !/[\/\\\x00-\x1f\x7f]/.test(value) && !isPrototypeKey(value);
 }
 function validMentions(value: unknown): boolean {
   return value === undefined || (Array.isArray(value) && value.length <= 128 && [...value].every(id => typeof id === "string"));
@@ -35,10 +37,11 @@ function checkStateDir(dir: string, allowMissing = false) {
     const stat = lstatSync(dir);
     if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("Unsafe bridge state directory");
   } catch (error: any) { if (!allowMissing || error.code !== "ENOENT") throw error; }
+  assertDirectoryAncestors(dir);
 }
 const entryStatuses = new Set<Entry["status"]>(["pending", "running", "ready", "sending", "sent", "failed", "uncertain", "blocked", "skipped"]);
 export function addressed(m: any, c: BridgeConfig): m is ChatMessage {
-  if (!m || ["id", "channel_id", "sender_id", "content"].some(k => typeof m[k] !== "string" || !m[k].trim())) return false;
+  if (!isPlainObject(m as unknown) || Object.prototype.hasOwnProperty.call(m, "__proto__") || ["id", "channel_id", "sender_id", "content"].some(k => typeof m[k] !== "string" || !m[k].trim())) return false;
   if (![m.id, m.channel_id, m.sender_id].every(safeMessageId) || !validMentions(m.mentions) || !validMentions(m.mentioned_ids)) return false;
   if (m.content === "__typing__" || m.content.length > 32_000) return false;
   if (["slash_input", "loop_status", "slash_response"].includes(m.meta?.kind)) return false;
@@ -86,10 +89,10 @@ export class Bridge {
         hasState = true;
       } catch (error: any) { if (error.code !== "ENOENT") throw error; }
       this.state = hasState ? JSON.parse(readFileSync(this.file, "utf8")) : { version: 1, threads: {}, entries: [] };
-      if (this.state?.version !== 1 || !isPlainObject(this.state.threads) || !Array.isArray(this.state.entries) ||
+      if (this.state?.version !== 1 || Object.prototype.hasOwnProperty.call(this.state, "__proto__") || !isPlainObject(this.state.threads) || !Array.isArray(this.state.entries) ||
         (Object.prototype.hasOwnProperty.call(this.state, "channels") && !isPlainObject(this.state.channels))) throw new Error("Invalid bridge state");
       for (const e of this.state.entries) {
-        if (!isPlainObject(e) || !entryStatuses.has(e.status as Entry["status"]) || !isPlainObject(e.message) ||
+        if (!isPlainObject(e) || Object.prototype.hasOwnProperty.call(e, "__proto__") || !entryStatuses.has(e.status as Entry["status"]) || !isPlainObject(e.message) || Object.prototype.hasOwnProperty.call(e.message, "__proto__") ||
           ![e.message.id, e.message.channel_id, e.message.sender_id].every(safeMessageId) || typeof e.message.content !== "string" ||
           !validMentions(e.message.mentions) || !validMentions(e.message.mentioned_ids)) throw new Error("Invalid bridge entry");
         if (e.status === "sending") e.status = "uncertain";
@@ -177,7 +180,7 @@ export class Bridge {
   }
   /** Can be called while idle to migrate existing channels without sending messages. */
   async prepareChannel(chat: string): Promise<ChannelThread> {
-    if (isPrototypeKey(chat)) throw new Error("Invalid channel ID");
+    if (!safeMessageId(chat)) throw new Error("Invalid channel ID");
     this.state.channels ??= {};
     let channel = Object.prototype.hasOwnProperty.call(this.state.channels, chat) ? this.state.channels[chat] : undefined;
     if (!this.loaded.has(chat)) {

@@ -1,11 +1,12 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdirSync, openSync, closeSync, readFileSync, writeFileSync, unlinkSync, lstatSync, renameSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join, resolve, dirname } from "node:path";
 import { homedir } from "node:os";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { loadBots, defaultRegistry, type BotConfig } from "./bots-config.ts";
+import { assertDirectoryAncestors } from "./config.ts";
 import { codexPresent } from "./processes.ts";
 let values: { config?: string; "watch-codex"?: boolean; check?: boolean; status?: boolean; help?: boolean } = {};
 const root = join(homedir(), ".agentschat/codex-bots");
@@ -17,6 +18,7 @@ let stopping = false, missing = 0, saveSeq = 0, timer: ReturnType<typeof setTime
 export function removeDeadLock(file: string) {
   let raw: string;
   try {
+    assertDirectoryAncestors(dirname(file));
     const stat = lstatSync(file);
     if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 64 * 1024) return;
     raw = readFileSync(file, "utf8").trim();
@@ -33,12 +35,14 @@ export function save(rootDir = root) {
   const tmp = `${statusFile}.${process.pid}.${++saveSeq}.tmp`;
   let created = false;
   try {
+    assertDirectoryAncestors(rootDir);
     const dir = lstatSync(rootDir);
     if (dir.isSymbolicLink() || !dir.isDirectory()) return;
     try { if (lstatSync(statusFile).isSymbolicLink()) return; }
     catch (e: any) { if (e.code !== "ENOENT") return; }
     writeFileSync(tmp, JSON.stringify({ pid: process.pid, updated_at: new Date().toISOString(), bots: [...workers.values()].map(w => ({ name: w.config.name, agent_id: w.config.agentId, workdir: w.config.cwd, effort: w.config.effort, model: w.config.model, pid: w.child?.pid, status: w.status })) }, null, 2), { mode: 0o600, flag: "wx" });
     created = true;
+    assertDirectoryAncestors(rootDir);
     const currentDir = lstatSync(rootDir);
     const currentFile = lstatSync(statusFile, { throwIfNoEntry: false });
     if (currentDir.isSymbolicLink() || !currentDir.isDirectory() ||
@@ -106,6 +110,7 @@ async function tick() {
 }
 export function removeOwnedLock(file: string) {
   try {
+    assertDirectoryAncestors(dirname(file));
     const stat = lstatSync(file);
     if (!stat.isSymbolicLink() && stat.isFile() && stat.size <= 64 * 1024 && readFileSync(file, "utf8").trim() === String(process.pid)) unlinkSync(file);
   } catch {}
@@ -114,9 +119,13 @@ async function main() {
   if (values.help) { console.log("agentschat-mcp --codex-bots [--config FILE] [--watch-codex] [--check|--status]\nCentral registry: ~/.agentschat/codex-bots.json; profiles: ~/.agentschat/profiles\nWatch polls external Codex processes every 5 seconds."); return; }
   if (values.status) {
     try {
+      assertDirectoryAncestors(root);
       const stat = lstatSync(statusFile);
       if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 1_048_576) throw new Error("Unsafe status file");
-      console.log(readFileSync(statusFile, "utf8"));
+      const raw = readFileSync(statusFile, "utf8"), status = JSON.parse(raw);
+      if (!status || typeof status !== "object" || Array.isArray(status) ||
+        Object.prototype.hasOwnProperty.call(status, "__proto__")) throw new Error("Invalid status file");
+      console.log(raw);
     } catch { console.error("Bot manager status unavailable; status file is missing, unsafe, or unreadable"); process.exitCode = 1; }
     return;
   }
@@ -126,6 +135,7 @@ async function main() {
     const stat = lstatSync(directory, { throwIfNoEntry: false });
     if (stat && (stat.isSymbolicLink() || !stat.isDirectory())) throw new Error("Unsafe manager directory");
   }
+  assertDirectoryAncestors(root);
   mkdirSync(root, { recursive: true, mode: 0o700 });
   const dir = lstatSync(root);
   if (dir.isSymbolicLink() || !dir.isDirectory()) throw new Error("Unsafe manager directory");
