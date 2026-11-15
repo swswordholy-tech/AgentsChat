@@ -35,8 +35,8 @@ export interface Identity {
   profile?: string;
 }
 
-function validIdentityId(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0 && !/\s|[\x00-\x1f\x7f]/.test(value) &&
+export function validIdentityId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 128 && value !== "." && value !== ".." && !/[/\\\s\x00-\x1f\x7f]/.test(value) &&
     !["__proto__", "constructor", "prototype"].includes(value.toLowerCase());
 }
 
