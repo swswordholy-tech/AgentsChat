@@ -23,6 +23,22 @@ def _quote_segment(value: str) -> str:
     return urllib.parse.quote(value, safe="")
 
 
+def _normalize_limit(limit: Any, *, max_limit: int = 1000) -> int:
+    if isinstance(limit, bool):
+        raise ValueError("Invalid limit")
+    if isinstance(limit, str):
+        if not limit.isdigit():
+            raise ValueError("Invalid limit")
+        parsed = int(limit, 10)
+    elif isinstance(limit, int):
+        parsed = limit
+    else:
+        raise ValueError("Invalid limit")
+    if parsed < 1 or parsed > max_limit:
+        raise ValueError("Invalid limit")
+    return parsed
+
+
 class AgentChatRESTError(Exception):
     """Raised when the AgentsChat REST API returns a non-2xx response."""
 
@@ -114,7 +130,7 @@ class AgentChatREST:
 
     def discover(self, capabilities: list[str] | None = None, limit: int = 20) -> list[dict[str, Any]]:
         """Discover agents by capabilities."""
-        query: dict[str, Any] = {"limit": limit}
+        query: dict[str, Any] = {"limit": _normalize_limit(limit)}
         if capabilities:
             query["capabilities"] = ",".join(capabilities)
         data = self._get(f"/api/discover?{urllib.parse.urlencode(query)}")
@@ -138,7 +154,7 @@ class AgentChatREST:
             validate_path_segment(before, "before")
         if after is not None:
             validate_path_segment(after, "after")
-        query: dict[str, Any] = {"limit": limit}
+        query: dict[str, Any] = {"limit": _normalize_limit(limit)}
         if before:
             query["before"] = before
         if after:
@@ -163,7 +179,7 @@ class AgentChatREST:
         """Search messages by keyword."""
         if channel_id is not None:
             validate_path_segment(channel_id, "channel_id")
-        params: dict[str, Any] = {"q": query, "limit": limit}
+        params: dict[str, Any] = {"q": query, "limit": _normalize_limit(limit)}
         if channel_id:
             params["channel_id"] = channel_id
         data = self._get(f"/api/search?{urllib.parse.urlencode(params)}")
@@ -180,11 +196,19 @@ class AgentChatREST:
     def register_webhook(self, channel_id: str, url: str) -> dict[str, Any]:
         """Register a webhook callback URL for a channel."""
         validate_path_segment(channel_id, "channel_id")
+        try:
+            validate_server_url(url, ("http", "https"), loopback_http=True, allow_query=True)
+        except ValueError:
+            raise ValueError("Invalid webhook URL") from None
         return self._post("/api/webhooks", {"channel_id": channel_id, "url": url})
 
     def remove_webhook(self, channel_id: str, url: str) -> dict[str, Any]:
         """Remove a webhook callback URL."""
         validate_path_segment(channel_id, "channel_id")
+        try:
+            validate_server_url(url, ("http", "https"), loopback_http=True, allow_query=True)
+        except ValueError:
+            raise ValueError("Invalid webhook URL") from None
         return self._delete("/api/webhooks", {"channel_id": channel_id, "url": url})
 
     # MARK: - Agent Registration
@@ -207,7 +231,7 @@ class AgentChatREST:
         Returns:
             List of unclaimed agent dicts.
         """
-        query = urllib.parse.urlencode({"limit": int(limit)})
+        query = urllib.parse.urlencode({"limit": _normalize_limit(limit)})
         data = self._get(f"/api/agents/unclaimed?{query}")
         return _collection(data, "agents")
 
@@ -260,7 +284,7 @@ class AgentChatREST:
 
     def discover_channels(self, query: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
         """Browse public channels."""
-        params: dict[str, Any] = {"limit": limit}
+        params: dict[str, Any] = {"limit": _normalize_limit(limit)}
         if query:
             params["q"] = query
         data = self._get(f"/api/channels/discover?{urllib.parse.urlencode(params)}")
@@ -292,7 +316,7 @@ class AgentChatREST:
                 if not raw_bytes:
                     return {}
                 data = json.loads(raw_bytes.decode("utf-8"))
-                if not isinstance(data, dict):
+                if not isinstance(data, dict) or "__proto__" in data:
                     raise AgentChatRESTError(0, "Expected a JSON object")
                 return data
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -313,7 +337,7 @@ class AgentChatREST:
                 )
             except (json.JSONDecodeError, ValueError):
                 msg = e.reason
-            raise AgentChatRESTError(e.code, redact_error(msg, self.token)) from None
+            raise AgentChatRESTError(e.code, redact_error(msg, self.token)[:512]) from None
         except (TimeoutError, socket.timeout) as e:
             raise AgentChatRESTError(0, "Request timed out") from None
         except urllib.error.URLError as e:

@@ -57,6 +57,24 @@ def _safe_content_type(raw: Any) -> ContentType:
         return ContentType.TEXT
 
 
+def _decode_bounded_ws_json(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, (bytes, bytearray, memoryview)):
+        raw_bytes = bytes(raw)
+        if len(raw_bytes) > MAX_WS_MESSAGE_BYTES:
+            raise ValueError("WebSocket frame exceeded maximum allowed size")
+        text = raw_bytes.decode("utf-8")
+    elif isinstance(raw, str):
+        if len(raw.encode("utf-8")) > MAX_WS_MESSAGE_BYTES:
+            raise ValueError("WebSocket frame exceeded maximum allowed size")
+        text = raw
+    else:
+        raise TypeError("Unsupported WebSocket frame type")
+    parsed = json.loads(text)
+    if not isinstance(parsed, dict) or "__proto__" in parsed:
+        raise ValueError("Expected safe JSON object frame")
+    return parsed
+
+
 class AgentChatClient:
     """Async WebSocket client for the AgentsChat network.
 
@@ -146,9 +164,12 @@ class AgentChatClient:
             })
 
             raw = await asyncio.wait_for(self._ws.recv(), timeout=self.connect_timeout)
-            response = json.loads(raw)
-            if not isinstance(response, dict):
-                raise ConnectionError("Unexpected non-object handshake response")
+            try:
+                response = _decode_bounded_ws_json(raw)
+            except ValueError as e:
+                if "non-object" in str(e) or "safe JSON object" in str(e):
+                    raise ConnectionError("Unexpected non-object handshake response") from None
+                raise
 
             resp_type = response.get("type")
             if resp_type == "auth_ok":
@@ -243,10 +264,8 @@ class AgentChatClient:
                 break
 
             try:
-                data = json.loads(raw)
-            except (json.JSONDecodeError, TypeError, ValueError):
-                continue
-            if not isinstance(data, dict):
+                data = _decode_bounded_ws_json(raw)
+            except (json.JSONDecodeError, TypeError, ValueError, UnicodeDecodeError):
                 continue
 
             msg_type = data.get("type")
@@ -414,11 +433,14 @@ class AgentChatClient:
             consensus_rule: Voting rule for proposals in this channel.
         """
         self._validate_not_empty(name=name)
+        member_list = members if members is not None else [self.agent_id]
+        for member_id in member_list:
+            validate_path_segment(member_id, "member_id")
         await self._send({
             "type": "create_channel",
             "name": name,
             "channel_type": channel_type,
-            "members": members or [self.agent_id],
+            "members": member_list,
             "consensus_rule": consensus_rule.value,
         })
 
@@ -447,8 +469,14 @@ class AgentChatClient:
             The generated proposal ID (UUID string).
         """
         self._validate_not_empty(channel_id=channel_id, title=title, content=content)
-        if expires_in_hours <= 0:
-            raise ValueError("expires_in_hours must be > 0")
+        if (
+            isinstance(expires_in_hours, bool)
+            or not isinstance(expires_in_hours, (int, float))
+            or not math.isfinite(expires_in_hours)
+            or expires_in_hours <= 0
+            or expires_in_hours > 8760
+        ):
+            raise ValueError("expires_in_hours must be > 0 and <= 8760")
         proposal_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc)
         expires_at = (now + timedelta(hours=expires_in_hours)).isoformat()
@@ -500,6 +528,8 @@ class AgentChatClient:
             capabilities: Filter agents by these capability strings.
             limit: Maximum number of agents to return.
         """
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1 or limit > 1000:
+            raise ValueError("limit must be an integer between 1 and 1000")
         await self._send({
             "type": "discover",
             "capabilities": capabilities or [],
