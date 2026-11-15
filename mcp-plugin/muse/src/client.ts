@@ -1,3 +1,5 @@
+import { validateEndpointUrl } from "./config.ts";
+import { sanitizeMuseText } from "./wake.ts";
 import { resolveDrainReconnectDelay } from "../../src/reconnect.ts";
 import type { ChatMessage, MessageHandler, MuseAgentChatOptions, WireMessage } from "./types.ts";
 
@@ -21,7 +23,8 @@ function safeDelayMs(value: number | undefined, fallback: number, min = 0): numb
 function normalizeChannelId(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
   const trimmed = raw.trim();
-  if (!trimmed || trimmed.length > 128 || /[\x00-\x20\x7f]/.test(trimmed)) return null;
+  if (!trimmed || trimmed.length > 128 || /[\/\\\x00-\x20\x7f]/.test(trimmed) ||
+      [".", "..", "__proto__", "constructor", "prototype"].includes(trimmed.toLowerCase())) return null;
   return trimmed;
 }
 
@@ -57,22 +60,7 @@ export class MuseAgentChatClient {
   onReconnect?: MuseAgentChatOptions["onReconnect"];
 
   constructor(options: MuseAgentChatOptions) {
-    let url: URL;
-    try {
-      url = new URL(options.url);
-    } catch {
-      throw new Error("Invalid Muse ws URL");
-    }
-    if (url.protocol !== "ws:" && url.protocol !== "wss:") {
-      throw new Error("Invalid Muse ws URL protocol");
-    }
-    if (url.username || url.password) {
-      throw new Error("Embedded credentials are not allowed in Muse ws URL");
-    }
-    if (url.protocol === "ws:" && !["127.0.0.1", "localhost", "[::1]", "::1"].includes(url.hostname.toLowerCase())) {
-      throw new Error("Remote Muse ws URL must use wss://");
-    }
-    this.url = options.url;
+    this.url = validateEndpointUrl(options.url, "ws");
     this.agentId = options.agentId;
     this.token = options.token;
     this.capabilities = options.capabilities ?? ["chat"];
@@ -206,10 +194,13 @@ export class MuseAgentChatClient {
     contentType: ChatMessage["content_type"] = "text",
     replyTo?: string,
   ): void {
+    const clean = normalizeChannelId(channelId);
+    if (!clean || (replyTo !== undefined &&
+        (typeof replyTo !== "string" || replyTo.length > 256 || /[\x00-\x1f\x7f]/.test(replyTo)))) return;
     this.send({
       type: "message",
       id: crypto.randomUUID(),
-      channel_id: channelId,
+      channel_id: clean,
       sender_id: this.agentId,
       sender_type: "agent",
       content,
@@ -220,9 +211,11 @@ export class MuseAgentChatClient {
   }
 
   sendTyping(channelId: string): void {
+    const clean = normalizeChannelId(channelId);
+    if (!clean) return;
     // cross_pod:true → the hub fans the frame out to humans on other pods;
     // typing frames are ephemeral and never persisted.
-    this.send({ type: "typing", channel_id: channelId, sender_id: this.agentId, cross_pod: true });
+    this.send({ type: "typing", channel_id: clean, sender_id: this.agentId, cross_pod: true });
   }
 
   private debug(event: string, meta?: Record<string, unknown>): void {
@@ -348,13 +341,14 @@ export class MuseAgentChatClient {
   }
 
   private handleMessage(raw: string): void {
+    if (Buffer.byteLength(raw, "utf8") > 1_048_576) return;
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);
     } catch {
       return;
     }
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || Object.hasOwn(parsed, "__proto__")) {
       return;
     }
     const msg = parsed as WireMessage;
@@ -386,7 +380,7 @@ export class MuseAgentChatClient {
             : msg.type === "auth_error"
               ? "AgentsChat authentication error"
               : "AgentsChat error";
-      const err = new Error(text);
+      const err = new Error(sanitizeMuseText(text).slice(0, 1024));
       if (msg.type === "auth_error") {
         this.explicitlyDisconnected = true;
         try {

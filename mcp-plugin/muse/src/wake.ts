@@ -1,7 +1,7 @@
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { appendFileSync, chmodSync, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { assertSafeParentDirectories } from "./config.ts";
+import { assertSafeParentDirectories, isUnsafeEndpointHost } from "./config.ts";
 
 /**
  * Muse wake — the Grok Bot pattern, adapted for Muse.
@@ -60,31 +60,39 @@ export interface WakePayload {
 
 export function redactSecrets(text: string): string {
   return text
+    .replace(/-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)/g, "[redacted]")
     .replace(/\b(?:Bearer|Basic)\s+[^\s"'<>\\]+/gi, "[redacted]")
     .replace(
-      /(?:ac_|agent_key_|mcp_(?:at|rt|code)_|sk-|sk_|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_)[A-Za-z0-9_-]+/g,
+      /(?:ac_|agent_key_|mcp_(?:at|rt|code)_|sk-|sk_|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|whsec_|AIza)[A-Za-z0-9_-]+/g,
       "[redacted]",
     )
     .replace(/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, "[redacted]")
-    .replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[redacted]");
+    .replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[redacted]")
+    .replace(/\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, "[redacted]");
+}
+
+/** Redact before stripping controls (PEM/header syntax), then catch joined fragments. */
+export function sanitizeMuseText(text: string): string {
+  return redactSecrets(redactSecrets(text).replace(/[\x00-\x1f\x7f]/g, ""));
 }
 
 export function buildWakePayload(
   msg: WakeMessage,
   opts: { targetSessionId?: string } = {},
 ): WakePayload {
-  const content =
-    typeof msg.content === "string" ? redactSecrets(msg.content.slice(0, WAKE_CONTENT_MAX)) : undefined;
-  const targetSessionId =
-    typeof opts.targetSessionId === "string" && opts.targetSessionId.length > 0 ? opts.targetSessionId : undefined;
+  const clean = (value: unknown, cap = 128): string | undefined =>
+    typeof value === "string" ? sanitizeMuseText(value).slice(0, cap) : undefined;
+  const targetSessionId = clean(opts.targetSessionId);
   return {
-    type: typeof msg.type === "string" ? msg.type : "message",
-    channel_id: msg.channel_id,
-    message_id: msg.id,
-    sender_id: msg.sender_id,
-    content,
-    mentioned_ids: Array.isArray(msg.mentioned_ids) ? msg.mentioned_ids.filter((x) => typeof x === "string") : undefined,
-    timestamp: typeof msg.timestamp === "string" ? msg.timestamp : undefined,
+    type: clean(msg.type, 64) ?? "message",
+    channel_id: clean(msg.channel_id),
+    message_id: clean(msg.id, 256),
+    sender_id: clean(msg.sender_id),
+    content: clean(msg.content, WAKE_CONTENT_MAX),
+    mentioned_ids: Array.isArray(msg.mentioned_ids)
+      ? msg.mentioned_ids.filter((x): x is string => typeof x === "string").slice(0, 256).map(x => clean(x)!)
+      : undefined,
+    timestamp: clean(msg.timestamp, 64),
     ...(targetSessionId ? { target_session_id: targetSessionId } : {}),
   };
 }
@@ -150,6 +158,7 @@ export interface WakeConfig {
 
 // Loopback receivers are intentional; remote non-public address literals are not.
 function isUnsafeWakeHost(hostname: string): boolean {
+  if (isUnsafeEndpointHost(hostname)) return true;
   const host = hostname.toLowerCase().replace(/\.$/, "");
   if (["metadata.google.internal", "metadata.goog"].includes(host)) return true;
   const unsafeV4 = (ip: string) => {
@@ -178,7 +187,7 @@ function isUnsafeWakeHost(hostname: string): boolean {
 
 /** POST a wake event. Best-effort: resolves void whether it succeeded or not. */
 export async function fireWake(msg: WakeMessage, cfg: WakeConfig): Promise<void> {
-  const log = cfg.logger ?? (() => {});
+  const log = (text: string) => cfg.logger?.(sanitizeMuseText(text));
   const url = (cfg.url ?? "").trim();
   if (!url) return;
   const safeLogUrl = sanitizeWakeLogUrl(url);
