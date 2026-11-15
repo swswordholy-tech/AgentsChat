@@ -3,11 +3,19 @@ import { chmodSync, lstatSync, mkdirSync, unlinkSync, writeFileSync } from "node
 import { join } from "node:path";
 import { assertDirectoryAncestors, atomicReplaceRegularFile } from "./config.ts";
 
+const HISTORY_FORBIDDEN_KEYS = new Set<string>([
+  "__proto__",
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype),
+  ...Object.getOwnPropertyNames(Object.prototype).map(k => k.toLowerCase()),
+]);
+const isHistoryForbiddenKey = (key: string) => HISTORY_FORBIDDEN_KEYS.has(key) || HISTORY_FORBIDDEN_KEYS.has(key.toLowerCase());
+
 export interface ThreadHistory { id: string; createdAt?: number; turns: any[] }
 export function priorChannelThreads(threads: Record<string, string>, channel: string): string[] {
   if (!threads || typeof threads !== "object" || typeof channel !== "string" || !channel) return [];
   return [...new Set(Object.entries(threads).filter(([key, id]) => {
-    if (["__proto__", "constructor", "prototype"].includes(key.toLowerCase())) return false;
+    if (isHistoryForbiddenKey(key)) return false;
     if (typeof id !== "string" || !id.trim()) return false;
     if (key === channel) return true;
     try { const parts = JSON.parse(key); return Array.isArray(parts) && parts[0] === channel; }
@@ -17,7 +25,9 @@ export function priorChannelThreads(threads: Record<string, string>, channel: st
 
 /** Keep complete source turns privately; seed the new task with past chat, not old instructions. */
 export function preserveChannelHistory(directory: string, channel: string, histories: ThreadHistory[], redact: (s: string) => string): string {
-  if (typeof channel !== "string" || !channel.trim() || channel.length > 256 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(channel)) {
+  if (typeof channel !== "string" || !channel.trim() || channel !== channel.trim() || channel.length > 256 ||
+    channel === "." || channel.includes("..") || /[\/\\\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(channel) ||
+    /%(?:2e%2e|2f|5c|00)/i.test(channel) || isHistoryForbiddenKey(channel)) {
     throw new Error("Invalid history channel");
   }
   const checkDirectory = (path: string) => {
@@ -73,7 +83,7 @@ export function preserveChannelHistory(directory: string, channel: string, histo
               let message = JSON.parse(text.slice(text.lastIndexOf(marker) + marker.length));
               if (message && typeof message === "object" && !Array.isArray(message)) {
                 message = Object.fromEntries(Object.entries(message).filter(([key]) =>
-                  !["__proto__", "constructor", "prototype"].includes(key.toLowerCase())));
+                  !isHistoryForbiddenKey(key)));
                 if (message.channel_id === channel) records.push({order,sequence:sequence++,value:{...message,role:"user"}});
                 continue;
               }

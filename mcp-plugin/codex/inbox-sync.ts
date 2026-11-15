@@ -17,12 +17,24 @@ function timestamp(value: unknown): string {
   if (!normalized || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{9}Z$/.test(normalized)) throw new Error("Invalid history timestamp");
   return normalized;
 }
+const INBOX_FORBIDDEN_KEYS = new Set<string>([
+  "__proto__",
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype),
+  ...Object.getOwnPropertyNames(Object.prototype).map(k => k.toLowerCase()),
+]);
+const isInboxForbiddenKey = (key: string) => INBOX_FORBIDDEN_KEYS.has(key) || INBOX_FORBIDDEN_KEYS.has(key.toLowerCase());
 function validChannel(channel: unknown): channel is string {
   return typeof channel === "string" && channel.length > 0 && channel.length <= 128 && channel === channel.trim() && channel !== "."
     && !channel.includes("..") && !/[\/\\]/.test(channel)
     && !/%(?:2e%2e|2f|5c|00)/i.test(channel)
     && !/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(channel)
-    && !["__proto__", "constructor", "prototype"].includes(channel.trim().toLowerCase());
+    && !isInboxForbiddenKey(channel);
+}
+function validHistoryMessageId(id: unknown): id is string {
+  return typeof id === "string" && id.length > 0 && id.length <= 256 && id === id.trim() && id !== "."
+    && !id.includes("..") && !/[\/\\\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(id)
+    && !/%(?:2e%2e|2f|5c|00)/i.test(id) && !isInboxForbiddenKey(id);
 }
 function validateChannel(channel: unknown): asserts channel is string {
   if (!validChannel(channel)) throw new Error("Invalid inbound channel");
@@ -117,7 +129,7 @@ export class InboxSync {
         const messages = Array.isArray(body) ? body : body?.messages;
         if (!Array.isArray(messages)) throw new Error("Invalid history response");
         const rows = messages.map(m => {
-          if (!m || m.channel_id !== channel || typeof m.id !== "string" || m.id.trim().length === 0 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(m.id)) throw new Error("Invalid history message");
+          if (!m || typeof m !== "object" || Object.hasOwn(m, "__proto__") || m.channel_id !== channel || !validHistoryMessageId(m.id)) throw new Error("Invalid history message");
           return {message:m, time:timestamp(m.timestamp)};
         }).sort((a,b) => a.time.localeCompare(b.time));
         // One bounded page per channel per pass. Full pages continue next pass.

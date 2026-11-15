@@ -19,6 +19,15 @@ export interface LoopTick {
   prompt: string;
 }
 
+const GRANT_FORBIDDEN_KEYS = new Set<string>([
+  "__proto__",
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype),
+  ...Object.getOwnPropertyNames(Object.prototype).map(k => k.toLowerCase()),
+]);
+const isGrantForbiddenKey = (key: string) => GRANT_FORBIDDEN_KEYS.has(key) || GRANT_FORBIDDEN_KEYS.has(key.toLowerCase());
+const ownProto = (value: any) => Boolean(value && typeof value === "object" && Object.prototype.hasOwnProperty.call(value, "__proto__"));
+
 // An operator writes this local authorization only after an explicit owner request.
 // Neither chat content nor a server-created loop alone grants local execution.
 function grants(
@@ -37,16 +46,15 @@ function grants(
       if (typeof getuid !== "function" || (stat.mode & 0o077) !== 0 || stat.uid !== getuid()) return [];
     }
     const doc = JSON.parse(readFileSync(file, "utf8"));
-    const ownProto = (value: any) => Object.prototype.hasOwnProperty.call(value, "__proto__");
     if (doc?.version !== 1 || ownProto(doc) || !Array.isArray(doc.grants) || doc.grants.length > 256) return [];
     const safeId = (value: unknown): value is string => typeof value === "string" && value.length > 0 &&
-      value.length <= 128 && value.trim() === value && value !== "." && value !== ".." &&
+      value.length <= 128 && value.trim() === value && value !== "." && !value.includes("..") &&
       !/[\/\\\s\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(value) && !/%(?:2e%2e|2f|5c|00)/i.test(value) &&
-      !["__proto__", "constructor", "prototype"].includes(value.toLowerCase());
+      !isGrantForbiddenKey(value);
     const safeOwnerId = (value: unknown): value is string => typeof value === "string" && value.length > 0 &&
       value.length <= 254 && value.trim() === value && value !== "." && !value.includes("..") &&
       !/[\/\\\s\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(value) && !/%(?:2e%2e|2f|5c|00)/i.test(value) &&
-      !["__proto__", "constructor", "prototype"].includes(value.toLowerCase());
+      !isGrantForbiddenKey(value);
     return doc.grants.filter((g: any) => g && !ownProto(g) &&
       [g.loop_id, g.channel_id, g.agent_id, g.owner_id, g.prompt].every(v => typeof v === "string" && v.trim()) &&
       /^loop_[A-Za-z0-9_-]+$/.test(g.loop_id) &&
@@ -84,7 +92,7 @@ export async function verifyLoopTick(raw: any, config: BridgeConfig, owner: stri
   const rows = Array.isArray(response?.loops) && response.loops.length <= 1024 ? response.loops.filter((r: any) => r?.loop_id === grant.loop_id) : [];
   if (rows.length !== 1) return null;
   const loop = rows[0];
-  if (!loop || loop.status !== "active" || loop.channel_id !== grant.channel_id || loop.prompt !== grant.prompt ||
+  if (!loop || ownProto(loop) || loop.status !== "active" || loop.channel_id !== grant.channel_id || loop.prompt !== grant.prompt ||
     loop.interval_ms !== grant.interval_ms || loop.expires_at !== null ||
     (loop.mode !== undefined && loop.mode !== "static") ||
     !Number.isSafeInteger(loop.last_tick_at) || loop.last_tick_at <= 0 ||

@@ -933,9 +933,15 @@ function parse(toml, { maxDepth = 1000, integersAsBigInt } = {}) {
  */
 
 // codex/owner.ts
+var OWNER_FORBIDDEN_KEYS = new Set([
+  "__proto__",
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype),
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase())
+]);
 function blockedServerHost(url) {
   const host = url.hostname.toLowerCase().replace(/\.+$/, "").replace(/^\[|\]$/g, "");
-  if (!host || host === "0.0.0.0" || /^0\./.test(host) || host === "::" || host === "0:0:0:0:0:0:0:0" || /^169\.254\./.test(host) || host === "100.100.100.200" || host === "fd00:ec2::254" || host === "fd00:ec2:0:0:0:0:0:254" || host === "metadata" || host === "instance-data" || host === "metadata.google.internal" || host.endsWith(".metadata.google.internal") || host === "metadata.goog" || host.endsWith(".metadata.goog") || /^fe[89ab][0-9a-f]:/.test(host)) {
+  if (!host || host === "0.0.0.0" || /^0\./.test(host) || host === "::" || host === "0:0:0:0:0:0:0:0" || /^169\.254\./.test(host) || host === "100.100.100.200" || /^100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}$/.test(host) || host === "fd00:ec2::254" || host === "fd00:ec2:0:0:0:0:0:254" || host === "metadata" || host === "instance-data" || host === "metadata.google.internal" || host.endsWith(".metadata.google.internal") || host === "metadata.goog" || host.endsWith(".metadata.goog") || /^fe[89ab][0-9a-f]:/.test(host)) {
     return true;
   }
   if (host.startsWith("::ffff:")) {
@@ -943,8 +949,18 @@ function blockedServerHost(url) {
     if (rawTail === "0:0" || rawTail === "0.0.0.0")
       return true;
     const tail = /^0:(?:[0-9a-f]{1,4}:|\d{1,3}\.)/.test(rawTail) ? rawTail.slice(2) : rawTail;
-    if (tail === "0:0" || tail === "0.0.0.0" || /^0\./.test(tail) || /^[0-9a-f]{1,2}:[0-9a-f]{1,4}$/.test(tail) || /^127\./.test(tail) || /^7f[0-9a-f]{2}:/.test(tail) || /^169\.254\./.test(tail) || /^a9fe:/.test(tail) || tail === "100.100.100.200" || tail === "6464:64c8") {
+    if (tail === "0:0" || tail === "0.0.0.0" || /^0\./.test(tail) || /^[0-9a-f]{1,2}:[0-9a-f]{1,4}$/.test(tail) || /^127\./.test(tail) || /^7f[0-9a-f]{2}:/.test(tail) || /^169\.254\./.test(tail) || /^a9fe:/.test(tail) || tail === "100.100.100.200" || /^100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}$/.test(tail) || tail === "6464:64c8") {
       return true;
+    }
+    const hexMatch = tail.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    if (hexMatch) {
+      const hi = parseInt(hexMatch[1], 16);
+      const lo = parseInt(hexMatch[2], 16);
+      const firstOctet = hi >> 8 & 255;
+      const secondOctet = hi & 255;
+      if (firstOctet === 0 || firstOctet === 127 || firstOctet === 169 && secondOctet === 254 || firstOctet === 100 && (secondOctet & 192) === 64 || hi === 25700 && lo === 25800) {
+        return true;
+      }
     }
   }
   return false;

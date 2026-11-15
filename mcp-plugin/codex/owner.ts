@@ -1,8 +1,17 @@
+const OWNER_FORBIDDEN_KEYS = new Set<string>([
+  "__proto__",
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype),
+  ...Object.getOwnPropertyNames(Object.prototype).map(k => k.toLowerCase()),
+]);
+const isOwnerForbiddenKey = (key: string) => OWNER_FORBIDDEN_KEYS.has(key) || OWNER_FORBIDDEN_KEYS.has(key.toLowerCase());
+
 /** URL parsing canonicalizes numeric IPv4 and mapped IPv6 before this check. */
 export function blockedServerHost(url: URL): boolean {
   const host = url.hostname.toLowerCase().replace(/\.+$/, "").replace(/^\[|\]$/g, "");
   if (!host || host === "0.0.0.0" || /^0\./.test(host) || host === "::" || host === "0:0:0:0:0:0:0:0" ||
     /^169\.254\./.test(host) || host === "100.100.100.200" ||
+    /^100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}$/.test(host) ||
     host === "fd00:ec2::254" || host === "fd00:ec2:0:0:0:0:0:254" ||
     host === "metadata" || host === "instance-data" ||
     host === "metadata.google.internal" || host.endsWith(".metadata.google.internal") ||
@@ -17,8 +26,24 @@ export function blockedServerHost(url: URL): boolean {
     if (tail === "0:0" || tail === "0.0.0.0" || /^0\./.test(tail) || /^[0-9a-f]{1,2}:[0-9a-f]{1,4}$/.test(tail) ||
       /^127\./.test(tail) || /^7f[0-9a-f]{2}:/.test(tail) ||
       /^169\.254\./.test(tail) || /^a9fe:/.test(tail) ||
-      tail === "100.100.100.200" || tail === "6464:64c8") {
+      tail === "100.100.100.200" || /^100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}$/.test(tail) || tail === "6464:64c8") {
       return true;
+    }
+    const hexMatch = tail.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    if (hexMatch) {
+      const hi = parseInt(hexMatch[1]!, 16);
+      const lo = parseInt(hexMatch[2]!, 16);
+      const firstOctet = (hi >> 8) & 0xff;
+      const secondOctet = hi & 0xff;
+      if (
+        firstOctet === 0 ||
+        firstOctet === 127 ||
+        (firstOctet === 169 && secondOctet === 254) ||
+        (firstOctet === 100 && (secondOctet & 0xc0) === 0x40) ||
+        (hi === 0x6464 && lo === 0x64c8)
+      ) {
+        return true;
+      }
     }
   }
   return false;
@@ -60,7 +85,7 @@ export async function getBotOwner(
     if (!base || base !== base.trim() || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(base) ||
       !agentId || agentId !== agentId.trim() || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(agentId) ||
       /%(?:2e%2e|2f|5c|00)/i.test(agentId) ||
-      [".", "..", "__proto__", "constructor", "prototype"].includes(agentId.toLowerCase()) || /[\/\\\s]/.test(agentId) ||
+      agentId === "." || agentId.includes("..") || isOwnerForbiddenKey(agentId) || /[\/\\\s]/.test(agentId) ||
       !token || token !== token.trim() || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(token)) return null;
     const parsed = new URL(base);
     const loopback = ["127.0.0.1", "localhost", "[::1]", "::1"].includes(parsed.hostname.toLowerCase().replace(/\.$/, ""));
@@ -98,7 +123,7 @@ export async function getBotOwner(
     const owner = entitlement.owner_account_id;
     return typeof owner === "string" && owner.trim().length > 0 && owner === owner.trim() &&
       !/[\/\\\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(owner) && !/%(?:2e%2e|2f|5c|00)/i.test(owner) && owner !== agentId &&
-      ![".", "..", "__proto__", "constructor", "prototype"].includes(owner.toLowerCase()) ? owner : null;
+      owner !== "." && !owner.includes("..") && !isOwnerForbiddenKey(owner) ? owner : null;
   } catch {
     // Missing endpoints, failed authentication and unavailable ownership all fail closed.
     // Never retain a previous owner or expose response bodies / credentials in diagnostics.

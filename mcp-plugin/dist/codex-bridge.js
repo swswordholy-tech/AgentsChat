@@ -919,9 +919,16 @@ function parse(toml, { maxDepth = 1000, integersAsBigInt } = {}) {
  */
 
 // codex/owner.ts
+var OWNER_FORBIDDEN_KEYS = new Set([
+  "__proto__",
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype),
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase())
+]);
+var isOwnerForbiddenKey = (key) => OWNER_FORBIDDEN_KEYS.has(key) || OWNER_FORBIDDEN_KEYS.has(key.toLowerCase());
 function blockedServerHost(url) {
   const host = url.hostname.toLowerCase().replace(/\.+$/, "").replace(/^\[|\]$/g, "");
-  if (!host || host === "0.0.0.0" || /^0\./.test(host) || host === "::" || host === "0:0:0:0:0:0:0:0" || /^169\.254\./.test(host) || host === "100.100.100.200" || host === "fd00:ec2::254" || host === "fd00:ec2:0:0:0:0:0:254" || host === "metadata" || host === "instance-data" || host === "metadata.google.internal" || host.endsWith(".metadata.google.internal") || host === "metadata.goog" || host.endsWith(".metadata.goog") || /^fe[89ab][0-9a-f]:/.test(host)) {
+  if (!host || host === "0.0.0.0" || /^0\./.test(host) || host === "::" || host === "0:0:0:0:0:0:0:0" || /^169\.254\./.test(host) || host === "100.100.100.200" || /^100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}$/.test(host) || host === "fd00:ec2::254" || host === "fd00:ec2:0:0:0:0:0:254" || host === "metadata" || host === "instance-data" || host === "metadata.google.internal" || host.endsWith(".metadata.google.internal") || host === "metadata.goog" || host.endsWith(".metadata.goog") || /^fe[89ab][0-9a-f]:/.test(host)) {
     return true;
   }
   if (host.startsWith("::ffff:")) {
@@ -929,8 +936,18 @@ function blockedServerHost(url) {
     if (rawTail === "0:0" || rawTail === "0.0.0.0")
       return true;
     const tail = /^0:(?:[0-9a-f]{1,4}:|\d{1,3}\.)/.test(rawTail) ? rawTail.slice(2) : rawTail;
-    if (tail === "0:0" || tail === "0.0.0.0" || /^0\./.test(tail) || /^[0-9a-f]{1,2}:[0-9a-f]{1,4}$/.test(tail) || /^127\./.test(tail) || /^7f[0-9a-f]{2}:/.test(tail) || /^169\.254\./.test(tail) || /^a9fe:/.test(tail) || tail === "100.100.100.200" || tail === "6464:64c8") {
+    if (tail === "0:0" || tail === "0.0.0.0" || /^0\./.test(tail) || /^[0-9a-f]{1,2}:[0-9a-f]{1,4}$/.test(tail) || /^127\./.test(tail) || /^7f[0-9a-f]{2}:/.test(tail) || /^169\.254\./.test(tail) || /^a9fe:/.test(tail) || tail === "100.100.100.200" || /^100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}$/.test(tail) || tail === "6464:64c8") {
       return true;
+    }
+    const hexMatch = tail.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    if (hexMatch) {
+      const hi = parseInt(hexMatch[1], 16);
+      const lo = parseInt(hexMatch[2], 16);
+      const firstOctet = hi >> 8 & 255;
+      const secondOctet = hi & 255;
+      if (firstOctet === 0 || firstOctet === 127 || firstOctet === 169 && secondOctet === 254 || firstOctet === 100 && (secondOctet & 192) === 64 || hi === 25700 && lo === 25800) {
+        return true;
+      }
     }
   }
   return false;
@@ -966,7 +983,7 @@ async function ownerJson(response) {
 }
 async function getBotOwner(base, agentId, token, request = fetch) {
   try {
-    if (!base || base !== base.trim() || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(base) || !agentId || agentId !== agentId.trim() || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(agentId) || /%(?:2e%2e|2f|5c|00)/i.test(agentId) || [".", "..", "__proto__", "constructor", "prototype"].includes(agentId.toLowerCase()) || /[\/\\\s]/.test(agentId) || !token || token !== token.trim() || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(token))
+    if (!base || base !== base.trim() || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(base) || !agentId || agentId !== agentId.trim() || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(agentId) || /%(?:2e%2e|2f|5c|00)/i.test(agentId) || agentId === "." || agentId.includes("..") || isOwnerForbiddenKey(agentId) || /[\/\\\s]/.test(agentId) || !token || token !== token.trim() || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(token))
       return null;
     const parsed = new URL(base);
     const loopback = ["127.0.0.1", "localhost", "[::1]", "::1"].includes(parsed.hostname.toLowerCase().replace(/\.$/, ""));
@@ -1004,7 +1021,7 @@ async function getBotOwner(base, agentId, token, request = fetch) {
     if (!entitlement || typeof entitlement !== "object" || Array.isArray(entitlement) || Object.hasOwn(entitlement, "__proto__"))
       return null;
     const owner = entitlement.owner_account_id;
-    return typeof owner === "string" && owner.trim().length > 0 && owner === owner.trim() && !/[\/\\\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(owner) && !/%(?:2e%2e|2f|5c|00)/i.test(owner) && owner !== agentId && ![".", "..", "__proto__", "constructor", "prototype"].includes(owner.toLowerCase()) ? owner : null;
+    return typeof owner === "string" && owner.trim().length > 0 && owner === owner.trim() && !/[\/\\\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(owner) && !/%(?:2e%2e|2f|5c|00)/i.test(owner) && owner !== agentId && owner !== "." && !owner.includes("..") && !isOwnerForbiddenKey(owner) ? owner : null;
   } catch {
     return null;
   }
@@ -2267,11 +2284,18 @@ import { randomBytes as randomBytes2 } from "node:crypto";
 import { createHash as createHash2, randomBytes } from "node:crypto";
 import { chmodSync, lstatSync as lstatSync6, mkdirSync as mkdirSync4, unlinkSync as unlinkSync2, writeFileSync as writeFileSync2 } from "node:fs";
 import { join as join6 } from "node:path";
+var HISTORY_FORBIDDEN_KEYS = new Set([
+  "__proto__",
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype),
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase())
+]);
+var isHistoryForbiddenKey = (key) => HISTORY_FORBIDDEN_KEYS.has(key) || HISTORY_FORBIDDEN_KEYS.has(key.toLowerCase());
 function priorChannelThreads(threads, channel) {
   if (!threads || typeof threads !== "object" || typeof channel !== "string" || !channel)
     return [];
   return [...new Set(Object.entries(threads).filter(([key, id]) => {
-    if (["__proto__", "constructor", "prototype"].includes(key.toLowerCase()))
+    if (isHistoryForbiddenKey(key))
       return false;
     if (typeof id !== "string" || !id.trim())
       return false;
@@ -2286,7 +2310,7 @@ function priorChannelThreads(threads, channel) {
   }).map(([, id]) => id))];
 }
 function preserveChannelHistory(directory, channel, histories, redact) {
-  if (typeof channel !== "string" || !channel.trim() || channel.length > 256 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(channel)) {
+  if (typeof channel !== "string" || !channel.trim() || channel !== channel.trim() || channel.length > 256 || channel === "." || channel.includes("..") || /[\/\\\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(channel) || /%(?:2e%2e|2f|5c|00)/i.test(channel) || isHistoryForbiddenKey(channel)) {
     throw new Error("Invalid history channel");
   }
   const checkDirectory = (path) => {
@@ -2359,7 +2383,7 @@ function preserveChannelHistory(directory, channel, histories, redact) {
             try {
               let message = JSON.parse(text.slice(text.lastIndexOf(marker) + marker.length));
               if (message && typeof message === "object" && !Array.isArray(message)) {
-                message = Object.fromEntries(Object.entries(message).filter(([key]) => !["__proto__", "constructor", "prototype"].includes(key.toLowerCase())));
+                message = Object.fromEntries(Object.entries(message).filter(([key]) => !isHistoryForbiddenKey(key)));
                 if (message.channel_id === channel)
                   records.push({ order, sequence: sequence++, value: { ...message, role: "user" } });
                 continue;
@@ -2414,6 +2438,14 @@ End of historical context.
 // codex/loop-grants.ts
 import { lstatSync as lstatSync7, readFileSync as readFileSync6 } from "node:fs";
 import { join as join7 } from "node:path";
+var GRANT_FORBIDDEN_KEYS = new Set([
+  "__proto__",
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype),
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase())
+]);
+var isGrantForbiddenKey = (key) => GRANT_FORBIDDEN_KEYS.has(key) || GRANT_FORBIDDEN_KEYS.has(key.toLowerCase());
+var ownProto = (value) => Boolean(value && typeof value === "object" && Object.prototype.hasOwnProperty.call(value, "__proto__"));
 function grants(config, opts) {
   try {
     const platform = opts?.platform ?? process.platform;
@@ -2430,11 +2462,10 @@ function grants(config, opts) {
         return [];
     }
     const doc = JSON.parse(readFileSync6(file, "utf8"));
-    const ownProto = (value) => Object.prototype.hasOwnProperty.call(value, "__proto__");
     if (doc?.version !== 1 || ownProto(doc) || !Array.isArray(doc.grants) || doc.grants.length > 256)
       return [];
-    const safeId = (value) => typeof value === "string" && value.length > 0 && value.length <= 128 && value.trim() === value && value !== "." && value !== ".." && !/[\/\\\s\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(value) && !/%(?:2e%2e|2f|5c|00)/i.test(value) && !["__proto__", "constructor", "prototype"].includes(value.toLowerCase());
-    const safeOwnerId = (value) => typeof value === "string" && value.length > 0 && value.length <= 254 && value.trim() === value && value !== "." && !value.includes("..") && !/[\/\\\s\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(value) && !/%(?:2e%2e|2f|5c|00)/i.test(value) && !["__proto__", "constructor", "prototype"].includes(value.toLowerCase());
+    const safeId = (value) => typeof value === "string" && value.length > 0 && value.length <= 128 && value.trim() === value && value !== "." && !value.includes("..") && !/[\/\\\s\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(value) && !/%(?:2e%2e|2f|5c|00)/i.test(value) && !isGrantForbiddenKey(value);
+    const safeOwnerId = (value) => typeof value === "string" && value.length > 0 && value.length <= 254 && value.trim() === value && value !== "." && !value.includes("..") && !/[\/\\\s\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(value) && !/%(?:2e%2e|2f|5c|00)/i.test(value) && !isGrantForbiddenKey(value);
     return doc.grants.filter((g) => g && !ownProto(g) && [g.loop_id, g.channel_id, g.agent_id, g.owner_id, g.prompt].every((v) => typeof v === "string" && v.trim()) && /^loop_[A-Za-z0-9_-]+$/.test(g.loop_id) && [g.loop_id, g.channel_id, g.agent_id].every(safeId) && safeOwnerId(g.owner_id) && g.agent_id === config.agentId && g.prompt.length <= 4000 && Number.isSafeInteger(g.interval_ms) && g.interval_ms >= 60000 && g.interval_ms <= 86400000);
   } catch {
     return [];
@@ -2466,7 +2497,7 @@ async function verifyLoopTick(raw, config, owner, list, opts) {
   if (rows.length !== 1)
     return null;
   const loop = rows[0];
-  if (!loop || loop.status !== "active" || loop.channel_id !== grant.channel_id || loop.prompt !== grant.prompt || loop.interval_ms !== grant.interval_ms || loop.expires_at !== null || loop.mode !== undefined && loop.mode !== "static" || !Number.isSafeInteger(loop.last_tick_at) || loop.last_tick_at <= 0 || !Number.isSafeInteger(loop.next_tick_ms) || loop.next_tick_ms !== raw.meta.next_tick_ms || loop.last_tick_at + grant.interval_ms !== loop.next_tick_ms)
+  if (!loop || ownProto(loop) || loop.status !== "active" || loop.channel_id !== grant.channel_id || loop.prompt !== grant.prompt || loop.interval_ms !== grant.interval_ms || loop.expires_at !== null || loop.mode !== undefined && loop.mode !== "static" || !Number.isSafeInteger(loop.last_tick_at) || loop.last_tick_at <= 0 || !Number.isSafeInteger(loop.next_tick_ms) || loop.next_tick_ms !== raw.meta.next_tick_ms || loop.last_tick_at + grant.interval_ms !== loop.next_tick_ms)
     return null;
   const current = authorizedLoopTick(raw, config, opts);
   return current && current.owner_id === owner ? current : null;
@@ -2942,11 +2973,12 @@ function permitted(m, c) {
   return (!c.channels.length || c.channels.includes(m.channel_id)) && (!c.senders.length || c.senders.includes(m.sender_id));
 }
 var isPrototypeKey = (key) => /^(?:__proto__|constructor|prototype)$/i.test(key);
+var cleanBridgeLog = (text) => text.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g, " ");
 function isPlainObject(value) {
   return value !== null && typeof value === "object" && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
 }
 function safeMessageId(value) {
-  return typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value && value !== "." && value !== ".." && !/[\/\\\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(value) && !/%(?:2e%2e|2f|5c|00)/i.test(value) && !isPrototypeKey(value);
+  return typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value && value !== "." && !value.includes("..") && !/[\/\\\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(value) && !/%(?:2e%2e|2f|5c|00)/i.test(value) && !isPrototypeKey(value);
 }
 function validMentions(value) {
   return value === undefined || Array.isArray(value) && value.length <= 128 && [...value].every((id) => typeof id === "string");
@@ -3040,7 +3072,7 @@ class Bridge {
           throw error;
       }
       this.state = hasState ? JSON.parse(readFileSync9(this.file, "utf8")) : { version: 1, threads: {}, entries: [] };
-      if (this.state?.version !== 1 || Object.prototype.hasOwnProperty.call(this.state, "__proto__") || !isPlainObject(this.state.threads) || !Array.isArray(this.state.entries) || Object.prototype.hasOwnProperty.call(this.state, "channels") && !isPlainObject(this.state.channels))
+      if (this.state?.version !== 1 || Object.prototype.hasOwnProperty.call(this.state, "__proto__") || !isPlainObject(this.state.threads) || Object.prototype.hasOwnProperty.call(this.state.threads, "__proto__") || !Array.isArray(this.state.entries) || Object.prototype.hasOwnProperty.call(this.state, "channels") && (!isPlainObject(this.state.channels) || Object.prototype.hasOwnProperty.call(this.state.channels, "__proto__")))
         throw new Error("Invalid bridge state");
       for (const e of this.state.entries) {
         if (!isPlainObject(e) || Object.prototype.hasOwnProperty.call(e, "__proto__") || !entryStatuses.has(e.status) || !isPlainObject(e.message) || Object.prototype.hasOwnProperty.call(e.message, "__proto__") || ![e.message.id, e.message.channel_id, e.message.sender_id].every(safeMessageId) || typeof e.message.content !== "string" || !validMentions(e.message.mentions) || !validMentions(e.message.mentioned_ids))
@@ -3251,7 +3283,7 @@ AgentsChat message:
             delete e.answer;
             e.message.content = "";
             this.save();
-            this.log(`Scheduled skill completed quietly in ${JSON.stringify(chat)}`);
+            this.log(cleanBridgeLog(`Scheduled skill completed quietly in ${JSON.stringify(chat)}`));
             continue;
           }
           e.status = "ready";
@@ -3266,7 +3298,7 @@ AgentsChat message:
         delete e.answer;
         e.message.content = "";
         this.save();
-        this.log(`Replied in ${JSON.stringify(e.message.channel_id)}`);
+        this.log(cleanBridgeLog(`Replied in ${JSON.stringify(e.message.channel_id)}`));
       } catch (error) {
         if (error instanceof ThreadBusyError) {
           e.status = "pending";
@@ -3285,7 +3317,7 @@ AgentsChat message:
         e.error = this.redact(error instanceof Error ? error.message : "Bridge operation failed").slice(0, 240);
         e.status = e.status === "sending" ? "uncertain" : "failed";
         this.save();
-        this.log(`Message ${JSON.stringify(e.message.id)} ${e.status}; inspect private state before retrying`);
+        this.log(cleanBridgeLog(`Message ${JSON.stringify(e.message.id)} ${e.status}; inspect private state before retrying`));
       } finally {
         this.activity(e.message.channel_id, false);
       }
@@ -3498,8 +3530,18 @@ function timestamp(value) {
     throw new Error("Invalid history timestamp");
   return normalized;
 }
+var INBOX_FORBIDDEN_KEYS = new Set([
+  "__proto__",
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype),
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase())
+]);
+var isInboxForbiddenKey = (key) => INBOX_FORBIDDEN_KEYS.has(key) || INBOX_FORBIDDEN_KEYS.has(key.toLowerCase());
 function validChannel(channel) {
-  return typeof channel === "string" && channel.length > 0 && channel.length <= 128 && channel === channel.trim() && channel !== "." && !channel.includes("..") && !/[\/\\]/.test(channel) && !/%(?:2e%2e|2f|5c|00)/i.test(channel) && !/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(channel) && !["__proto__", "constructor", "prototype"].includes(channel.trim().toLowerCase());
+  return typeof channel === "string" && channel.length > 0 && channel.length <= 128 && channel === channel.trim() && channel !== "." && !channel.includes("..") && !/[\/\\]/.test(channel) && !/%(?:2e%2e|2f|5c|00)/i.test(channel) && !/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(channel) && !isInboxForbiddenKey(channel);
+}
+function validHistoryMessageId(id) {
+  return typeof id === "string" && id.length > 0 && id.length <= 256 && id === id.trim() && id !== "." && !id.includes("..") && !/[\/\\\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(id) && !/%(?:2e%2e|2f|5c|00)/i.test(id) && !isInboxForbiddenKey(id);
 }
 function validateChannel(channel) {
   if (!validChannel(channel))
@@ -3625,7 +3667,7 @@ class InboxSync {
         if (!Array.isArray(messages))
           throw new Error("Invalid history response");
         const rows = messages.map((m) => {
-          if (!m || m.channel_id !== channel || typeof m.id !== "string" || m.id.trim().length === 0 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(m.id))
+          if (!m || typeof m !== "object" || Object.hasOwn(m, "__proto__") || m.channel_id !== channel || !validHistoryMessageId(m.id))
             throw new Error("Invalid history message");
           return { message: m, time: timestamp(m.timestamp) };
         }).sort((a, b) => a.time.localeCompare(b.time));
@@ -3662,8 +3704,15 @@ class InboxSync {
 }
 
 // codex/transport.ts
+var TRANSPORT_FORBIDDEN_KEYS = new Set([
+  "__proto__",
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype),
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase())
+]);
+var cleanTransportLog = (value) => value.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g, " ");
 function safeChannel(channel) {
-  return typeof channel === "string" && channel.trim().length > 0 && channel === channel.trim() && channel.length <= 128 && !/[.\/\\\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(channel) && !/%(?:2e%2e|2f|5c|00)/i.test(channel) && !/^(?:__proto__|constructor|prototype)$/i.test(channel);
+  return typeof channel === "string" && channel.trim().length > 0 && channel === channel.trim() && channel.length <= 128 && !/[.\/\\\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(channel) && !/%(?:2e%2e|2f|5c|00)/i.test(channel) && !TRANSPORT_FORBIDDEN_KEYS.has(channel) && !TRANSPORT_FORBIDDEN_KEYS.has(channel.toLowerCase());
 }
 function requireChannel(channel) {
   if (!safeChannel(channel))
@@ -3905,7 +3954,7 @@ class AgentsChatTransport {
       if (data.type === "auth_ok") {
         this.authenticated = true;
         this.delay = 1000;
-        this.log(`AgentsChat connected as ${this.config.agentId}`);
+        this.log(cleanTransportLog(`AgentsChat connected as ${this.config.agentId}`));
         if (this.inboxSync && !this.syncTimer) {
           this.syncTimer = setInterval(() => {
             this.inboxSync.sync();
@@ -3930,11 +3979,14 @@ class AgentsChatTransport {
           }
         });
       } else if (data.type === "message_ack") {
-        const id = data.message_id ?? data.id, pending = this.pending.get(id);
-        if (pending) {
-          clearTimeout(pending.timer);
-          this.pending.delete(id);
-          pending.resolve();
+        const id = data.message_id ?? data.id;
+        if (typeof id === "string") {
+          const pending = this.pending.get(id);
+          if (pending) {
+            clearTimeout(pending.timer);
+            this.pending.delete(id);
+            pending.resolve();
+          }
         }
       } else if (data.type === "channel_created" && typeof data.channel_id === "string")
         join12(data.channel_id);

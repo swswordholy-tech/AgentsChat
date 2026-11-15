@@ -5,10 +5,17 @@ import { HeartbeatMonitor } from "../src/heartbeat.ts";
 import { resolveDrainReconnectDelay } from "../src/reconnect.ts";
 import { InboxSync } from "./inbox-sync.ts";
 
+const TRANSPORT_FORBIDDEN_KEYS = new Set<string>([
+  "__proto__",
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype),
+  ...Object.getOwnPropertyNames(Object.prototype).map(k => k.toLowerCase()),
+]);
+const cleanTransportLog = (value: string) => value.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g, " ");
 function safeChannel(channel: unknown): channel is string {
   return typeof channel === "string" && channel.trim().length > 0 && channel === channel.trim() && channel.length <= 128 &&
     !/[.\/\\\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(channel) && !/%(?:2e%2e|2f|5c|00)/i.test(channel) &&
-    !/^(?:__proto__|constructor|prototype)$/i.test(channel);
+    !TRANSPORT_FORBIDDEN_KEYS.has(channel) && !TRANSPORT_FORBIDDEN_KEYS.has(channel.toLowerCase());
 }
 function requireChannel(channel: unknown): asserts channel is string {
   if (!safeChannel(channel)) throw new Error("Invalid AgentsChat channel");
@@ -167,7 +174,7 @@ export class AgentsChatTransport {
       if (!data || typeof data !== "object" || Array.isArray(data) || Object.hasOwn(data, "__proto__")) return;
       if (data.type !== "auth_error") this.heartbeat?.receivedPong();
       if (data.type === "auth_ok") {
-        this.authenticated = true; this.delay = 1000; this.log(`AgentsChat connected as ${this.config.agentId}`);
+        this.authenticated = true; this.delay = 1000; this.log(cleanTransportLog(`AgentsChat connected as ${this.config.agentId}`));
         if (this.inboxSync && !this.syncTimer) {
           this.syncTimer = setInterval(() => { void this.inboxSync!.sync(); }, this.syncIntervalMs);
           this.syncTimer.unref?.();
@@ -183,8 +190,11 @@ export class AgentsChatTransport {
           void this.inboxSync?.sync();
         }).catch(() => { if (current()) { this.log("Membership sync failed; reconnecting"); socket.terminate(); } });
       } else if (data.type === "message_ack") {
-        const id = data.message_id ?? data.id, pending = this.pending.get(id);
-        if (pending) { clearTimeout(pending.timer); this.pending.delete(id); pending.resolve(); }
+        const id = data.message_id ?? data.id;
+        if (typeof id === "string") {
+          const pending = this.pending.get(id);
+          if (pending) { clearTimeout(pending.timer); this.pending.delete(id); pending.resolve(); }
+        }
       } else if (data.type === "channel_created" && typeof data.channel_id === "string") join(data.channel_id);
       else if (["message", "thread_reply"].includes(data.type)) this.receive(data);
       else if (data.type === "shard_moved" || data.type === "please_reconnect") {

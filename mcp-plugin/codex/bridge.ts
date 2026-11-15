@@ -21,13 +21,14 @@ function permitted(m: ChatMessage, c: BridgeConfig) {
   return (!c.channels.length || c.channels.includes(m.channel_id)) && (!c.senders.length || c.senders.includes(m.sender_id));
 }
 const isPrototypeKey = (key: string) => /^(?:__proto__|constructor|prototype)$/i.test(key);
+const cleanBridgeLog = (text: string) => text.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g, " ");
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" &&
     (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
 }
 function safeMessageId(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value &&
-    value !== "." && value !== ".." && !/[\/\\\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(value) &&
+    value !== "." && !value.includes("..") && !/[\/\\\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(value) &&
     !/%(?:2e%2e|2f|5c|00)/i.test(value) && !isPrototypeKey(value);
 }
 function validMentions(value: unknown): boolean {
@@ -90,8 +91,8 @@ export class Bridge {
         hasState = true;
       } catch (error: any) { if (error.code !== "ENOENT") throw error; }
       this.state = hasState ? JSON.parse(readFileSync(this.file, "utf8")) : { version: 1, threads: {}, entries: [] };
-      if (this.state?.version !== 1 || Object.prototype.hasOwnProperty.call(this.state, "__proto__") || !isPlainObject(this.state.threads) || !Array.isArray(this.state.entries) ||
-        (Object.prototype.hasOwnProperty.call(this.state, "channels") && !isPlainObject(this.state.channels))) throw new Error("Invalid bridge state");
+      if (this.state?.version !== 1 || Object.prototype.hasOwnProperty.call(this.state, "__proto__") || !isPlainObject(this.state.threads) || Object.prototype.hasOwnProperty.call(this.state.threads, "__proto__") || !Array.isArray(this.state.entries) ||
+        (Object.prototype.hasOwnProperty.call(this.state, "channels") && (!isPlainObject(this.state.channels) || Object.prototype.hasOwnProperty.call(this.state.channels, "__proto__")))) throw new Error("Invalid bridge state");
       for (const e of this.state.entries) {
         if (!isPlainObject(e) || Object.prototype.hasOwnProperty.call(e, "__proto__") || !entryStatuses.has(e.status as Entry["status"]) || !isPlainObject(e.message) || Object.prototype.hasOwnProperty.call(e.message, "__proto__") ||
           ![e.message.id, e.message.channel_id, e.message.sender_id].every(safeMessageId) || typeof e.message.content !== "string" ||
@@ -258,7 +259,7 @@ export class Bridge {
           delete channel.bootstrap;
           if (teamLead && e.answer.trim() === TEAM_LEAD_NO_UPDATE) {
             e.status = "skipped"; delete e.answer; e.message.content = ""; this.save();
-            this.log(`Scheduled skill completed quietly in ${JSON.stringify(chat)}`);
+            this.log(cleanBridgeLog(`Scheduled skill completed quietly in ${JSON.stringify(chat)}`));
             continue;
           }
           e.status = "ready"; this.save();
@@ -267,7 +268,7 @@ export class Bridge {
         e.status = "sending"; this.save();
         await this.send(e.message.channel_id, e.answer!);
         e.status = "sent"; delete e.answer; e.message.content = ""; this.save();
-        this.log(`Replied in ${JSON.stringify(e.message.channel_id)}`);
+        this.log(cleanBridgeLog(`Replied in ${JSON.stringify(e.message.channel_id)}`));
       } catch (error) {
         if (error instanceof ThreadBusyError) {
           e.status = "pending"; e.error = error.message; this.save();
@@ -280,7 +281,7 @@ export class Bridge {
         }
         e.error = this.redact(error instanceof Error ? error.message : "Bridge operation failed").slice(0, 240);
         e.status = e.status === "sending" ? "uncertain" : "failed";
-        this.save(); this.log(`Message ${JSON.stringify(e.message.id)} ${e.status}; inspect private state before retrying`);
+        this.save(); this.log(cleanBridgeLog(`Message ${JSON.stringify(e.message.id)} ${e.status}; inspect private state before retrying`));
       } finally { this.activity(e.message.channel_id, false); }
     }
   }
