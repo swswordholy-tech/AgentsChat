@@ -46,6 +46,10 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value) &&
     (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
 }
+const IPC_CONTROL_CHAR_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+function isCleanIpcString(value: unknown, allowEmpty = false): value is string {
+  return typeof value === "string" && (allowEmpty || value.length > 0) && !IPC_CONTROL_CHAR_RE.test(value);
+}
 async function main() {
   const { values } = parseArgs({ options: { "codex-bridge": { type: "boolean" }, cwd: { type: "string" },
     "state-root": { type: "string" }, "codex-home-mode": { type: "string" }, "conversations": { type: "boolean" }, "read-conversation": { type: "string" }, "gui-thread": { type: "string" }, "gui-message-file": { type: "string" }, "gui-status": { type: "boolean" }, "managed-worker": { type: "boolean" }, registry: { type: "string" }, bot: { type: "string" }, profile: { type: "string" }, "codex-bin": { type: "string" }, check: { type: "boolean" }, "onboarding-status": { type: "boolean" },
@@ -72,11 +76,19 @@ async function main() {
     process.once("message", config => {
       clearTimeout(timer);
       if (!isPlainObject(config) || Object.prototype.hasOwnProperty.call(config, "__proto__") ||
-        typeof config.cwd !== "string" || !config.cwd.length ||
-        typeof config.stateDir !== "string" || !config.stateDir.length ||
-        typeof config.agentId !== "string" || !config.agentId.length ||
-        typeof config.token !== "string" || !config.token.length ||
-        typeof config.apiUrl !== "string" || typeof config.wsUrl !== "string") { reject(new Error("Invalid parent configuration")); return; }
+        !isCleanIpcString(config.cwd) ||
+        !isCleanIpcString(config.stateDir) ||
+        !isCleanIpcString(config.agentId) ||
+        !isCleanIpcString(config.token) ||
+        !isCleanIpcString(config.apiUrl, true) ||
+        !isCleanIpcString(config.wsUrl, true) ||
+        (config.codexBin !== undefined && !isCleanIpcString(config.codexBin)) ||
+        (config.model !== undefined && !isCleanIpcString(config.model)) ||
+        (config.effort !== undefined && !isCleanIpcString(config.effort)) ||
+        (config.permissions !== undefined && config.permissions !== "full-access" && config.permissions !== "read-only") ||
+        (config.codexHomeMode !== undefined && config.codexHomeMode !== "linked" && config.codexHomeMode !== "isolated" && config.codexHomeMode !== "auth-only") ||
+        (config.channels !== undefined && (!Array.isArray(config.channels) || config.channels.some(ch => !isCleanIpcString(ch)))) ||
+        (config.senders !== undefined && (!Array.isArray(config.senders) || config.senders.some(s => !isCleanIpcString(s))))) { reject(new Error("Invalid parent configuration")); return; }
       resolve(config as unknown as BridgeConfig);
     });
   }) : undefined;
@@ -144,8 +156,11 @@ async function main() {
   void bridge.drain(); transport.start();
 }
 main().catch(async e => {
-  // Do not echo arbitrary parse errors or subprocess output containing credentials.
-  const diagnostic = e instanceof Error ? redactSecrets(e.message) : "invalid configuration";
-  console.error(`Bridge startup failed: ${/token|secret|bearer|password|key/i.test(diagnostic) ? "invalid configuration" : diagnostic}`);
+  // Do not echo arbitrary parse errors, terminal escape codes, or subprocess output containing credentials.
+  const rawMessage = e instanceof Error
+    ? e.message.replace(/\x1b\[[0-9;]*[A-Za-z]|[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g, " ").trim()
+    : "";
+  const diagnostic = rawMessage ? redactSecrets(rawMessage) : "invalid configuration";
+  console.error(`Bridge startup failed: ${/token|secret|bearer|password|key|cookie|authorization|credential/i.test(diagnostic) ? "invalid configuration" : diagnostic}`);
   transport?.stop(); codex?.close(); await bridge?.stop(); process.exitCode = 1;
 });

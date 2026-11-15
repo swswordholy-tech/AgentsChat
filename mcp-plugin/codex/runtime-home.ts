@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 function executablePath(bin: string): string | undefined {
-  if (!bin || /[\x00-\x1f\x7f]/.test(bin)) return undefined;
+  if (!bin || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(bin)) return undefined;
   const exts = process.platform === "win32" && !/\.[A-Za-z0-9]+$/.test(bin)
     ? ["", ...(process.env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";").filter(Boolean)]
     : [""];
@@ -71,7 +71,10 @@ export function prepareRuntimeHome(stateDir: string, source = process.env.CODEX_
   if (mode === "auth-only") {
     const legacyHome = realpathSync(source);
     const origin = join(legacyHome, "auth.json");
-    if (!lstatSync(origin).isFile()) throw new Error("auth-only requires an existing regular auth.json; authorize its use explicitly");
+    const originStat = lstatSync(origin, { throwIfNoEntry: false });
+    if (!originStat || originStat.isSymbolicLink() || !originStat.isFile()) {
+      throw new Error("auth-only requires an existing regular auth.json; authorize its use explicitly");
+    }
     const home = join(stateDir, "codex-home-auth-only");
     prepareHomeDirectory(stateDir, home);
     if (lstatSync(home).isSymbolicLink() || realpathSync(home) === legacyHome) throw new Error("auth-only home must be independent");

@@ -1276,7 +1276,7 @@ function resolveConfig(opts, env = process.env, home = homedir()) {
 import { homedir as homedir2 } from "node:os";
 import { delimiter, isAbsolute as isAbsolute2, join as join2, relative, resolve as resolve2, sep } from "node:path";
 function executablePath(bin) {
-  if (!bin || /[\x00-\x1f\x7f]/.test(bin))
+  if (!bin || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(bin))
     return;
   const exts = process.platform === "win32" && !/\.[A-Za-z0-9]+$/.test(bin) ? ["", ...(process.env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";").filter(Boolean)] : [""];
   const bases = isAbsolute2(bin) || bin.includes("/") || bin.includes("\\") ? [resolve2(bin)] : (process.env.PATH ?? "").split(delimiter).filter(Boolean).map((dir) => join2(dir, bin));
@@ -1344,8 +1344,10 @@ function prepareRuntimeHome(stateDir, source = process.env.CODEX_HOME || join2(h
   if (mode === "auth-only") {
     const legacyHome2 = realpathSync2(source);
     const origin = join2(legacyHome2, "auth.json");
-    if (!lstatSync2(origin).isFile())
+    const originStat = lstatSync2(origin, { throwIfNoEntry: false });
+    if (!originStat || originStat.isSymbolicLink() || !originStat.isFile()) {
       throw new Error("auth-only requires an existing regular auth.json; authorize its use explicitly");
+    }
     const home2 = join2(stateDir, "codex-home-auth-only");
     prepareHomeDirectory(stateDir, home2);
     if (lstatSync2(home2).isSymbolicLink() || realpathSync2(home2) === legacyHome2)
@@ -1551,7 +1553,7 @@ async function getOnboardingStatus(base, agentId, token, request = fetch) {
 
 // codex/gui-channel.ts
 import { randomUUID } from "node:crypto";
-import { mkdirSync as mkdirSync2, writeFileSync, readFileSync as readFileSync2, renameSync as renameSync2, readdirSync as readdirSync2, rmSync, lstatSync as lstatSync3 } from "node:fs";
+import { mkdirSync as mkdirSync2, writeFileSync, readFileSync as readFileSync2, readdirSync as readdirSync2, rmSync, lstatSync as lstatSync3 } from "node:fs";
 import { join as join3 } from "node:path";
 function payload(result) {
   if (result?.isError || result?.success === false || result?.error)
@@ -1570,7 +1572,7 @@ function payload(result) {
   return result;
 }
 function validTarget(value) {
-  return typeof value === "string" && value.trim() === value && value.length >= 1 && value.length <= 256 && value !== "." && value !== ".." && !/[\/\\\x00-\x1f\x7f]/.test(value) && !["__proto__", "prototype", "constructor"].includes(value.toLowerCase());
+  return typeof value === "string" && value.trim() === value && value.length >= 1 && value.length <= 256 && value !== "." && value !== ".." && !/[\/\\\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(value) && !/%(?:2e%2e|2f|5c|00)|%25(?:2e|2f|5c|00)/i.test(value) && !["__proto__", "prototype", "constructor"].includes(value.toLowerCase());
 }
 
 class GuiChannel {
@@ -1600,10 +1602,11 @@ class GuiChannel {
       throw new Error("GUI receipt must be a regular file, not a symlink");
     try {
       writeFileSync(temp, JSON.stringify(entry), { mode: 384, flag: "wx" });
-      const current = lstatSync3(path, { throwIfNoEntry: false });
-      if (current && (current.isSymbolicLink() || !current.isFile()))
-        throw new Error("GUI receipt must be a regular file, not a symlink");
-      renameSync2(temp, path);
+      atomicReplaceRegularFile(temp, path, () => {
+        const current = lstatSync3(path, { throwIfNoEntry: false });
+        if (current && (current.isSymbolicLink() || !current.isFile()))
+          throw new Error("GUI receipt must be a regular file, not a symlink");
+      });
     } catch (error) {
       if (error.code !== "EEXIST")
         rmSync(temp, { force: true });
@@ -1662,7 +1665,8 @@ ${text}`,
       const stat = lstatSync3(lock);
       if (stat.isSymbolicLink())
         throw new Error("GUI delivery lock must not be a symlink");
-      if (!stat.isDirectory() || Date.now() - stat.mtimeMs <= 5 * 60000)
+      const ageMs = Date.now() - stat.mtimeMs;
+      if (!stat.isDirectory() || ageMs >= -5 * 60000 && ageMs <= 5 * 60000)
         throw error;
       rmSync(lock, { recursive: true, force: true });
       mkdirSync2(lock, { mode: 448 });
@@ -1752,7 +1756,7 @@ function loadBots(file = defaultRegistry(), home = homedir3()) {
     if (!object(x) || Object.getOwnPropertyNames(x).some((k) => !keys.includes(k)))
       throw new Error("Unknown or invalid bot registry field");
   };
-  const text = (x) => typeof x === "string" && x.trim().length > 0 && !/[\x00-\x1f\x7f]/.test(x);
+  const text = (x) => typeof x === "string" && x.trim().length > 0 && !/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(x);
   const reserved = (s) => ["__proto__", "constructor", "prototype"].includes(s.toLowerCase());
   fields(doc, ["version", "default_workdir", "codex_bin", "bots"]);
   if (doc.version !== 1 || !Array.isArray(doc.bots) || doc.bots.length > 128)
@@ -2468,7 +2472,7 @@ import {
   lstatSync as lstatSync8,
   realpathSync as realpathSync4,
   writeFileSync as writeFileSync3,
-  renameSync as renameSync3,
+  renameSync as renameSync2,
   copyFileSync as copyFileSync2,
   chmodSync as chmodSync2,
   unlinkSync as unlinkSync3,
@@ -2585,7 +2589,7 @@ function safeWriteProfile(path, data, warn = defaultWarn) {
     throw new Error(`Refusing to overwrite symlinked profile: ${sanitizeWarnPart(path)}`);
   }
   try {
-    renameSync3(tmp, path);
+    renameSync2(tmp, path);
   } catch (err) {
     if (process.platform === "win32" && (err?.code === "EPERM" || err?.code === "EACCES")) {
       const winTarget = safeLstat(path);
@@ -3984,6 +3988,10 @@ var transport;
 function isPlainObject2(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value) && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
 }
+var IPC_CONTROL_CHAR_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+function isCleanIpcString(value, allowEmpty = false) {
+  return typeof value === "string" && (allowEmpty || value.length > 0) && !IPC_CONTROL_CHAR_RE.test(value);
+}
 async function main() {
   const { values } = parseArgs({ options: {
     "codex-bridge": { type: "boolean" },
@@ -4040,7 +4048,7 @@ async function main() {
     timer.unref?.();
     process.once("message", (config) => {
       clearTimeout(timer);
-      if (!isPlainObject2(config) || Object.prototype.hasOwnProperty.call(config, "__proto__") || typeof config.cwd !== "string" || !config.cwd.length || typeof config.stateDir !== "string" || !config.stateDir.length || typeof config.agentId !== "string" || !config.agentId.length || typeof config.token !== "string" || !config.token.length || typeof config.apiUrl !== "string" || typeof config.wsUrl !== "string") {
+      if (!isPlainObject2(config) || Object.prototype.hasOwnProperty.call(config, "__proto__") || !isCleanIpcString(config.cwd) || !isCleanIpcString(config.stateDir) || !isCleanIpcString(config.agentId) || !isCleanIpcString(config.token) || !isCleanIpcString(config.apiUrl, true) || !isCleanIpcString(config.wsUrl, true) || config.codexBin !== undefined && !isCleanIpcString(config.codexBin) || config.model !== undefined && !isCleanIpcString(config.model) || config.effort !== undefined && !isCleanIpcString(config.effort) || config.permissions !== undefined && config.permissions !== "full-access" && config.permissions !== "read-only" || config.codexHomeMode !== undefined && config.codexHomeMode !== "linked" && config.codexHomeMode !== "isolated" && config.codexHomeMode !== "auth-only" || config.channels !== undefined && (!Array.isArray(config.channels) || config.channels.some((ch) => !isCleanIpcString(ch))) || config.senders !== undefined && (!Array.isArray(config.senders) || config.senders.some((s) => !isCleanIpcString(s)))) {
         reject(new Error("Invalid parent configuration"));
         return;
       }
@@ -4161,8 +4169,9 @@ async function main() {
   transport.start();
 }
 main().catch(async (e) => {
-  const diagnostic = e instanceof Error ? redactSecrets(e.message) : "invalid configuration";
-  console.error(`Bridge startup failed: ${/token|secret|bearer|password|key/i.test(diagnostic) ? "invalid configuration" : diagnostic}`);
+  const rawMessage = e instanceof Error ? e.message.replace(/\x1b\[[0-9;]*[A-Za-z]|[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g, " ").trim() : "";
+  const diagnostic = rawMessage ? redactSecrets(rawMessage) : "invalid configuration";
+  console.error(`Bridge startup failed: ${/token|secret|bearer|password|key|cookie|authorization|credential/i.test(diagnostic) ? "invalid configuration" : diagnostic}`);
   transport?.stop();
   codex?.close();
   await bridge?.stop();

@@ -4,7 +4,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // codex/manager.ts
 import { spawn } from "node:child_process";
-import { mkdirSync as mkdirSync2, openSync, closeSync, readFileSync as readFileSync3, writeFileSync, unlinkSync as unlinkSync2, lstatSync as lstatSync3, renameSync as renameSync2 } from "node:fs";
+import { mkdirSync as mkdirSync2, openSync, closeSync, readFileSync as readFileSync3, writeFileSync, unlinkSync as unlinkSync2, lstatSync as lstatSync3 } from "node:fs";
 import { join as join3, resolve as resolve3, dirname as dirname3 } from "node:path";
 import { homedir as homedir3 } from "node:os";
 import { createHash as createHash2 } from "node:crypto";
@@ -1048,6 +1048,22 @@ function assertDirectoryAncestors(directory) {
   for (const path of paths)
     checkSingleAncestorDir(path);
 }
+function atomicReplaceRegularFile(tmp, target, verifySafeTarget, opts) {
+  verifySafeTarget();
+  const rename = opts?.rename ?? renameSync;
+  const platform = opts?.platform ?? process.platform;
+  try {
+    rename(tmp, target);
+  } catch (err) {
+    if (platform === "win32" && (err?.code === "EPERM" || err?.code === "EACCES")) {
+      verifySafeTarget();
+      copyFileSync(tmp, target);
+      unlinkSync(tmp);
+      return;
+    }
+    throw err;
+  }
+}
 function checkedPath(path, directory = false) {
   assertDirectoryAncestors(dirname(path));
   let stat;
@@ -1216,7 +1232,7 @@ function loadBots(file = defaultRegistry(), home = homedir2()) {
     if (!object(x) || Object.getOwnPropertyNames(x).some((k) => !keys.includes(k)))
       throw new Error("Unknown or invalid bot registry field");
   };
-  const text = (x) => typeof x === "string" && x.trim().length > 0 && !/[\x00-\x1f\x7f]/.test(x);
+  const text = (x) => typeof x === "string" && x.trim().length > 0 && !/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(x);
   const reserved = (s) => ["__proto__", "constructor", "prototype"].includes(s.toLowerCase());
   fields(doc, ["version", "default_workdir", "codex_bin", "bots"]);
   if (doc.version !== 1 || !Array.isArray(doc.bots) || doc.bots.length > 128)
@@ -1279,8 +1295,10 @@ function loadBots(file = defaultRegistry(), home = homedir2()) {
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 function parseProcesses(text) {
+  if (typeof text !== "string" || !text)
+    return [];
   return text.split(/\r?\n/, 65536).flatMap((line) => {
-    if (/[\x00-\x1f\x7f]/.test(line))
+    if (/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(line))
       return [];
     const m = /^\s*(\d+)\s+(\d+)\s+(.+)$/.exec(line);
     if (!m)
@@ -1300,14 +1318,21 @@ function commandBasename(cmd) {
   return basename(first) === "codex" ? "codex" : basename(trimmed);
 }
 function externalCodexPresent(rows, managerPid) {
+  if (!Array.isArray(rows) || rows.length === 0)
+    return false;
   const children = new Set(Number.isSafeInteger(managerPid) && managerPid > 0 ? [managerPid] : []);
   const byParent = new Map;
   for (const row of rows) {
-    const siblings = byParent.get(row.ppid);
+    if (!row || !Number.isSafeInteger(row.pid) || row.pid <= 0)
+      continue;
+    const ppid = row.ppid;
+    if (!Number.isSafeInteger(ppid) || ppid < 0)
+      continue;
+    const siblings = byParent.get(ppid);
     if (siblings)
       siblings.push(row.pid);
     else
-      byParent.set(row.ppid, [row.pid]);
+      byParent.set(ppid, [row.pid]);
   }
   const queue = [...children];
   for (let i = 0;i < queue.length; i++) {
@@ -1318,7 +1343,7 @@ function externalCodexPresent(rows, managerPid) {
       queue.push(pid);
     }
   }
-  return rows.some((r) => !children.has(r.pid) && commandBasename(r.command) === "codex");
+  return rows.some((r) => Boolean(r) && typeof r.command === "string" && Number.isSafeInteger(r.pid) && r.pid > 0 && !children.has(r.pid) && commandBasename(r.command) === "codex");
 }
 async function codexPresent(managerPid = process.pid) {
   if (process.platform === "win32") {
@@ -1359,7 +1384,7 @@ function removeDeadLock(file) {
     return;
   }
   const pid = Number(raw);
-  if (!raw || !Number.isInteger(pid) || pid <= 0) {
+  if (!/^\d+$/.test(raw) || !Number.isSafeInteger(pid) || pid <= 0) {
     try {
       unlinkSync2(file);
     } catch {}
@@ -1392,12 +1417,13 @@ function save(rootDir = root) {
     }
     writeFileSync(tmp, JSON.stringify({ pid: process.pid, updated_at: new Date().toISOString(), bots: [...workers.values()].map((w) => ({ name: w.config.name, agent_id: w.config.agentId, workdir: w.config.cwd, effort: w.config.effort, model: w.config.model, pid: w.child?.pid, status: w.status })) }, null, 2), { mode: 384, flag: "wx" });
     created = true;
-    assertDirectoryAncestors(rootDir);
-    const currentDir = lstatSync3(rootDir);
-    const currentFile = lstatSync3(statusFile2, { throwIfNoEntry: false });
-    if (currentDir.isSymbolicLink() || !currentDir.isDirectory() || currentFile && (currentFile.isSymbolicLink() || !currentFile.isFile()))
-      throw new Error("Unsafe status destination");
-    renameSync2(tmp, statusFile2);
+    atomicReplaceRegularFile(tmp, statusFile2, () => {
+      assertDirectoryAncestors(rootDir);
+      const currentDir = lstatSync3(rootDir);
+      const currentFile = lstatSync3(statusFile2, { throwIfNoEntry: false });
+      if (currentDir.isSymbolicLink() || !currentDir.isDirectory() || currentFile && (currentFile.isSymbolicLink() || !currentFile.isFile()))
+        throw new Error("Unsafe status destination");
+    });
   } catch {
     if (created)
       try {
@@ -1508,7 +1534,10 @@ async function tick() {
   for (const w of workers.values()) {
     if (stopping)
       break;
-    if (active && !w.child && Date.now() >= w.next)
+    const now = Date.now();
+    if (w.next - now > 60000)
+      w.next = now + 60000;
+    if (active && !w.child && now >= w.next)
       start(w);
     else if (!active && missing >= 2 && w.child)
       await stop(w);

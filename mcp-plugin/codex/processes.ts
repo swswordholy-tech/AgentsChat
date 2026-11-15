@@ -3,8 +3,9 @@ import { promisify } from "node:util";
 
 export interface ProcessRow { pid: number; ppid: number; command: string }
 export function parseProcesses(text: string): ProcessRow[] {
+  if (typeof text !== "string" || !text) return [];
   return text.split(/\r?\n/, 65_536).flatMap(line => {
-    if (/[\x00-\x1f\x7f]/.test(line)) return [];
+    if (/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(line)) return [];
     const m = /^\s*(\d+)\s+(\d+)\s+(.+)$/.exec(line);
     if (!m) return [];
     const pid = Number(m[1]), ppid = Number(m[2]);
@@ -23,12 +24,16 @@ function commandBasename(cmd: string): string {
   return basename(first) === "codex" ? "codex" : basename(trimmed);
 }
 export function externalCodexPresent(rows: ProcessRow[], managerPid: number): boolean {
+  if (!Array.isArray(rows) || rows.length === 0) return false;
   const children = new Set<number>(Number.isSafeInteger(managerPid) && managerPid > 0 ? [managerPid] : []);
   const byParent = new Map<number, number[]>();
   for (const row of rows) {
-    const siblings = byParent.get(row.ppid);
+    if (!row || !Number.isSafeInteger(row.pid) || row.pid <= 0) continue;
+    const ppid = row.ppid;
+    if (!Number.isSafeInteger(ppid) || ppid < 0) continue;
+    const siblings = byParent.get(ppid);
     if (siblings) siblings.push(row.pid);
-    else byParent.set(row.ppid, [row.pid]);
+    else byParent.set(ppid, [row.pid]);
   }
   const queue = [...children];
   for (let i = 0; i < queue.length; i++) {
@@ -37,7 +42,7 @@ export function externalCodexPresent(rows: ProcessRow[], managerPid: number): bo
       children.add(pid); queue.push(pid);
     }
   }
-  return rows.some(r => !children.has(r.pid) && commandBasename(r.command) === "codex");
+  return rows.some(r => Boolean(r) && typeof r.command === "string" && Number.isSafeInteger(r.pid) && r.pid > 0 && !children.has(r.pid) && commandBasename(r.command) === "codex");
 }
 export async function codexPresent(managerPid = process.pid): Promise<boolean> {
   if (process.platform === "win32") {

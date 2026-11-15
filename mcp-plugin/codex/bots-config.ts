@@ -17,7 +17,7 @@ export function loadBots(file = defaultRegistry(), home = homedir()): BotConfig[
   const fields = (x: any, keys: string[]) => {
     if (!object(x) || Object.getOwnPropertyNames(x).some(k => !keys.includes(k))) throw new Error("Unknown or invalid bot registry field");
   };
-  const text = (x: unknown): x is string => typeof x === "string" && x.trim().length > 0 && !/[\x00-\x1f\x7f]/.test(x);
+  const text = (x: unknown): x is string => typeof x === "string" && x.trim().length > 0 && !/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(x);
   const reserved = (s: string) => ["__proto__", "constructor", "prototype"].includes(s.toLowerCase());
   fields(doc, ["version", "default_workdir", "codex_bin", "bots"]);
   if (doc.version !== 1 || !Array.isArray(doc.bots) || doc.bots.length > 128) throw new Error("Registry requires version 1 and bots array");

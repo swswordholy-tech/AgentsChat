@@ -1,6 +1,6 @@
-import { assertDirectoryAncestors } from "./config.ts";
+import { assertDirectoryAncestors, atomicReplaceRegularFile } from "./config.ts";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, writeFileSync, readFileSync, renameSync, readdirSync, rmSync, lstatSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, lstatSync } from "node:fs";
 import { join } from "node:path";
 
 export type GuiTool = "send_message_to_thread" | "read_thread";
@@ -25,7 +25,9 @@ function payload(result: any): any {
 }
 function validTarget(value: unknown): value is string {
   return typeof value === "string" && value.trim() === value && value.length >= 1 && value.length <= 256 && value !== "." && value !== ".." &&
-    !/[\/\\\x00-\x1f\x7f]/.test(value) && !["__proto__", "prototype", "constructor"].includes(value.toLowerCase());
+    !/[\/\\\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(value) &&
+    !/%(?:2e%2e|2f|5c|00)|%25(?:2e|2f|5c|00)/i.test(value) &&
+    !["__proto__", "prototype", "constructor"].includes(value.toLowerCase());
 }
 /** Private durable outbox. An authorized GUI host calls dispatch; enqueue is NOT delivery. */
 export class GuiChannel {
@@ -47,9 +49,10 @@ export class GuiChannel {
     if (stat?.isSymbolicLink() || (stat && !stat.isFile())) throw new Error("GUI receipt must be a regular file, not a symlink");
     try {
       writeFileSync(temp, JSON.stringify(entry), { mode: 0o600, flag: "wx" });
-      const current = lstatSync(path, { throwIfNoEntry: false });
-      if (current && (current.isSymbolicLink() || !current.isFile())) throw new Error("GUI receipt must be a regular file, not a symlink");
-      renameSync(temp, path);
+      atomicReplaceRegularFile(temp, path, () => {
+        const current = lstatSync(path, { throwIfNoEntry: false });
+        if (current && (current.isSymbolicLink() || !current.isFile())) throw new Error("GUI receipt must be a regular file, not a symlink");
+      });
     } catch (error) {
       // An exclusive-create collision belongs to another writer; leave it alone.
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") rmSync(temp, { force: true });
@@ -94,7 +97,8 @@ export class GuiChannel {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       const stat = lstatSync(lock);
       if (stat.isSymbolicLink()) throw new Error("GUI delivery lock must not be a symlink");
-      if (!stat.isDirectory() || Date.now() - stat.mtimeMs <= 5 * 60_000) throw error;
+      const ageMs = Date.now() - stat.mtimeMs;
+      if (!stat.isDirectory() || (ageMs >= -5 * 60_000 && ageMs <= 5 * 60_000)) throw error;
       rmSync(lock, { recursive: true, force: true });
       mkdirSync(lock, { mode: 0o700 });
     }

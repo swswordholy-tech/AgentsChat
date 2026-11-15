@@ -1,12 +1,12 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdirSync, openSync, closeSync, readFileSync, writeFileSync, unlinkSync, lstatSync, renameSync } from "node:fs";
+import { mkdirSync, openSync, closeSync, readFileSync, writeFileSync, unlinkSync, lstatSync } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { homedir } from "node:os";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { loadBots, defaultRegistry, type BotConfig } from "./bots-config.ts";
-import { assertDirectoryAncestors } from "./config.ts";
+import { assertDirectoryAncestors, atomicReplaceRegularFile } from "./config.ts";
 import { codexPresent } from "./processes.ts";
 let values: { config?: string; "watch-codex"?: boolean; check?: boolean; status?: boolean; help?: boolean } = {};
 const root = join(homedir(), ".agentschat/codex-bots");
@@ -24,7 +24,7 @@ export function removeDeadLock(file: string) {
     raw = readFileSync(file, "utf8").trim();
   } catch { return; }
   const pid = Number(raw);
-  if (!raw || !Number.isInteger(pid) || pid <= 0) {
+  if (!/^\d+$/.test(raw) || !Number.isSafeInteger(pid) || pid <= 0) {
     try { unlinkSync(file); } catch {}
     return;
   }
@@ -42,12 +42,13 @@ export function save(rootDir = root) {
     catch (e: any) { if (e.code !== "ENOENT") return; }
     writeFileSync(tmp, JSON.stringify({ pid: process.pid, updated_at: new Date().toISOString(), bots: [...workers.values()].map(w => ({ name: w.config.name, agent_id: w.config.agentId, workdir: w.config.cwd, effort: w.config.effort, model: w.config.model, pid: w.child?.pid, status: w.status })) }, null, 2), { mode: 0o600, flag: "wx" });
     created = true;
-    assertDirectoryAncestors(rootDir);
-    const currentDir = lstatSync(rootDir);
-    const currentFile = lstatSync(statusFile, { throwIfNoEntry: false });
-    if (currentDir.isSymbolicLink() || !currentDir.isDirectory() ||
-      (currentFile && (currentFile.isSymbolicLink() || !currentFile.isFile()))) throw new Error("Unsafe status destination");
-    renameSync(tmp, statusFile);
+    atomicReplaceRegularFile(tmp, statusFile, () => {
+      assertDirectoryAncestors(rootDir);
+      const currentDir = lstatSync(rootDir);
+      const currentFile = lstatSync(statusFile, { throwIfNoEntry: false });
+      if (currentDir.isSymbolicLink() || !currentDir.isDirectory() ||
+        (currentFile && (currentFile.isSymbolicLink() || !currentFile.isFile()))) throw new Error("Unsafe status destination");
+    });
   } catch {
     if (created) try { unlinkSync(tmp); } catch {}
   }
@@ -103,7 +104,9 @@ async function tick() {
   missing = active ? 0 : missing + 1;
   for (const w of workers.values()) {
     if (stopping) break;
-    if (active && !w.child && Date.now() >= w.next) start(w);
+    const now = Date.now();
+    if (w.next - now > 60_000) w.next = now + 60_000;
+    if (active && !w.child && now >= w.next) start(w);
     else if (!active && missing >= 2 && w.child) await stop(w);
   }
   save();
