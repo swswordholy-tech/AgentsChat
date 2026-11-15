@@ -59,8 +59,21 @@ export function verifySignature(payload: string, sigHex: string, secrets: readon
  * Build a signed, optionally-expiring token (mirrors auth.py `make_token`).
  * `base64url(f"{payload}:{exp}:{sig}")`, unpadded; `exp` is unix-seconds, 0 = never.
  */
+const DISALLOWED_TOKEN_PAYLOAD_CTRL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+const PROTOTYPE_PAYLOAD_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
 export function makeToken(payload: string, secret: string, ttlSeconds = 0): string {
-  if (typeof payload !== "string" || /[\x00-\x1f\x7f]/.test(payload)) throw new Error("invalid token payload");
+  if (
+    typeof payload !== "string" ||
+    payload.length > 8192 ||
+    DISALLOWED_TOKEN_PAYLOAD_CTRL_RE.test(payload) ||
+    PROTOTYPE_PAYLOAD_KEYS.has(payload.toLowerCase())
+  ) {
+    throw new Error("invalid token payload");
+  }
+  if (typeof secret !== "string" || secret.length === 0) {
+    throw new Error("invalid token secret");
+  }
   if (!Number.isFinite(ttlSeconds) || ttlSeconds < 0) {
     throw new RangeError("ttlSeconds must be finite and non-negative");
   }
@@ -101,6 +114,12 @@ export function verifyToken(token: string, secrets: readonly string[]): string |
   const exp = Number(expText);
   if (!Number.isSafeInteger(exp) || String(exp) !== expText) return null;
   const payload = parts.slice(0, -2).join(":");
+  if (
+    DISALLOWED_TOKEN_PAYLOAD_CTRL_RE.test(payload) ||
+    PROTOTYPE_PAYLOAD_KEYS.has(payload.toLowerCase())
+  ) {
+    return null;
+  }
   if (exp !== 0 && Math.floor(Date.now() / 1000) > exp) return null;
   const signed = `${payload}:${exp}`;
   return verifySignature(signed, sig, secrets) ? payload : null;

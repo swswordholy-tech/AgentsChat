@@ -60,16 +60,25 @@ function need(name: string): string {
 /** URL has already canonicalized IPv4 shorthand and IPv6 spellings. */
 function isUnsafeConnectorHost(hostname: string): boolean {
   const host = hostname.toLowerCase().replace(/\.$/, "").replace(/^\[|\]$/g, "");
-  if (["metadata", "instance-data", "metadata.google.internal", "metadata.goog"].includes(host) || host.endsWith(".metadata.goog")) return true;
+  if (
+    ["metadata", "instance-data", "metadata.google.internal", "metadata.goog"].includes(host) ||
+    host.endsWith(".metadata.google.internal") ||
+    host.endsWith(".metadata.goog")
+  ) {
+    return true;
+  }
   const unsafeV4 = (ip: string) => ip === "0.0.0.0" || ip.startsWith("169.254.") || ip === "100.100.100.200";
   if (!host.includes(":")) return unsafeV4(host);
   const halves = host.split("::");
   const left = halves[0] ? halves[0].split(":") : [];
   const right = halves[1] ? halves[1].split(":") : [];
-  const words = [...left, ...Array(8 - left.length - right.length).fill("0"), ...right].map(v => parseInt(v, 16));
+  const words = [...left, ...Array(Math.max(0, 8 - left.length - right.length)).fill("0"), ...right].map(v => parseInt(v, 16));
   if (words.every(v => v === 0) || (words[0] & 0xffc0) === 0xfe80 ||
       host === "fd00:ec2::254") return true;
-  if (words.slice(0, 5).every(v => v === 0) && words[5] === 0xffff) {
+  if (
+    (words.slice(0, 5).every(v => v === 0) && words[5] === 0xffff) ||
+    (words.slice(0, 4).every(v => v === 0) && words[4] === 0xffff && words[5] === 0)
+  ) {
     return unsafeV4(`${words[6] >>> 8}.${words[6] & 255}.${words[7] >>> 8}.${words[7] & 255}`);
   }
   return false;
@@ -458,7 +467,8 @@ function connectIdentity(id: Identity) {
   }
 
   let heartbeatForced = false;
-  const ws = new WS(WS_URL);
+  const MAX_PLATFORM_WS_BYTES = 4 * 1024 * 1024;
+  const ws = new WS(WS_URL, { maxPayload: MAX_PLATFORM_WS_BYTES });
   socketsByBot.set(id.botId, ws);
 
   const hb = new HeartbeatMonitor(
@@ -500,6 +510,12 @@ function connectIdentity(id: Identity) {
   });
   ws.on("message", (raw: any) => {
     if (!currentIdentity(id) || socketsByBot.get(id.botId) !== ws) return;
+    const rawBytes = Array.isArray(raw)
+      ? raw.reduce((n: number, chunk: any) => n + (chunk?.byteLength ?? Buffer.byteLength(String(chunk), "utf8")), 0)
+      : typeof raw === "string"
+        ? Buffer.byteLength(raw, "utf8")
+        : (raw?.byteLength ?? 0);
+    if (rawBytes > MAX_PLATFORM_WS_BYTES) return;
     let data: any;
     try { data = JSON.parse(String(raw)); } catch { return; }
     if (!data || typeof data !== "object" || Array.isArray(data) || Object.prototype.hasOwnProperty.call(data, "__proto__")) return;
@@ -642,7 +658,7 @@ const connector = startConnector({
         const tail = selectChannelContextMessages(rawMsgs, sinceTs, excludeId);
         if (!tail.length) return null;
         return tail.map((m: any) => ({
-          text: redactSecrets(String(m.content)).slice(0, 500),
+          text: redactSecrets(String(m.content ?? "").slice(0, 4096)).slice(0, 500),
           user_name: m.sender_name ?? m.sender_id,
           user_id: m.sender_id,
         }));

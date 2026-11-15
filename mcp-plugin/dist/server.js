@@ -2559,11 +2559,11 @@ function annotateTools(tools) {
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { existsSync, lstatSync as lstatSync2, readFileSync as readFileSync3, readlinkSync as readlinkSync2 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
-import { dirname as dirname2, join as join3, parse as parse2, resolve as resolve2, win32 as pathWin32 } from "node:path";
+import { dirname as dirname2, isAbsolute as isAbsolute2, join as join3, parse as parse2, resolve as resolve2, win32 as pathWin32 } from "node:path";
 var WAKE_SIG_HEADER = "x-agentschat-signature";
 var WAKE_ID_HEADER = "X-AgentsChat-Wake-Id";
 var SAFE_WAKE_ID_RE = /^[a-zA-Z0-9_-]{1,128}$/;
-var CREDENTIAL_PREFIX_RE = /^(ac_|mcp_(?:at|rt|code)_|agent_key_|whsec_|sk-|sk_|rk_live_|rk_test_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|AIza|AKIA|ASIA)/i;
+var CREDENTIAL_PREFIX_RE = /^(ac_|mcp_(?:at|rt|code)_|agent_key_|whsec_|mr_|sk-|sk_|rk_live_|rk_test_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|AIza|AKIA|ASIA)/i;
 var MAX_WAKE_TIMER_MS = 2147483647;
 var GROK_GATEWAY_MAX_BYTES = 1048576;
 var DIRECT_CHANNEL_RE = /^dm[-:]/i;
@@ -2574,12 +2574,46 @@ function isAllowedDarwinSystemLink2(dirPath) {
   if (dirPath !== "/var" && dirPath !== "/tmp" && dirPath !== "/etc")
     return false;
   try {
+    const privStat = lstatSync2("/private");
+    if (privStat.isSymbolicLink() || !privStat.isDirectory())
+      return false;
+    const targetStat = lstatSync2(`/private${dirPath}`);
+    if (targetStat.isSymbolicLink() || !targetStat.isDirectory())
+      return false;
     return readlinkSync2(dirPath) === `private${dirPath}`;
   } catch {
     return false;
   }
 }
-function hasSafeDirChain2(dirPath) {
+function hasSafeWakeDirChain(dirPath) {
+  if (typeof dirPath !== "string" || !dirPath.trim() || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(dirPath)) {
+    return false;
+  }
+  if (/(?:^|[\\/])\.\.(?:[\\/]|$)/.test(dirPath)) {
+    const rawBase = isAbsolute2(dirPath) ? parse2(dirPath).root : resolve2(".");
+    const rawRel = isAbsolute2(dirPath) ? dirPath.slice(rawBase.length) : dirPath;
+    let rawCur = rawBase.replace(/[\\/]+$/, "") || "/";
+    for (const seg of rawRel.split(/[\\/]+/).filter(Boolean)) {
+      if (seg === ".")
+        continue;
+      if (seg === "..") {
+        rawCur = dirname2(rawCur);
+        continue;
+      }
+      rawCur = rawCur === "/" ? `/${seg}` : `${rawCur}/${seg}`;
+      try {
+        const st = lstatSync2(rawCur);
+        if (st.isSymbolicLink() && !isAllowedDarwinSystemLink2(rawCur))
+          return false;
+        if (!st.isSymbolicLink() && !st.isDirectory())
+          return false;
+      } catch (err) {
+        if (err && err.code === "ENOENT")
+          break;
+        return false;
+      }
+    }
+  }
   const abs = resolve2(dirPath);
   const root = parse2(abs).root;
   const rel = abs.slice(root.length);
@@ -2607,7 +2641,7 @@ function hasSafeDirChain2(dirPath) {
 }
 function isUnsafeMetadataOrLinkLocalHost2(hostname) {
   const lower = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
-  if (!lower || lower === "0.0.0.0" || lower === "::" || lower === "100.100.100.200" || lower === "fd00:ec2::254" || lower === "metadata.google.internal" || lower === "metadata" || lower === "metadata.goog" || lower.endsWith(".metadata.goog") || lower === "instance-data") {
+  if (!lower || lower === "0.0.0.0" || lower === "::" || lower === "100.100.100.200" || lower === "fd00:ec2::254" || lower === "metadata.google.internal" || lower.endsWith(".metadata.google.internal") || lower === "metadata" || lower === "metadata.goog" || lower.endsWith(".metadata.goog") || lower === "instance-data") {
     return true;
   }
   if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(lower))
@@ -2648,9 +2682,10 @@ function normalizeLoopbackLsAddress(raw) {
 function sanitizeWakeAttachmentUrl(raw) {
   if (typeof raw !== "string")
     return null;
-  const cleaned = raw.trim().replace(/[\x00-\x1f\x7f\r\n]+/g, "");
-  if (!cleaned || cleaned.length > 2048 || /\s/.test(cleaned) || !/^https?:\/\//i.test(cleaned))
+  const cleaned = raw.trim().replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029\r\n]+/g, "");
+  if (!cleaned || cleaned.length > 2048 || /\s/.test(cleaned) || !/^https?:\/\//i.test(cleaned) || /:0(?:\/|$)/.test(cleaned)) {
     return null;
+  }
   let parsed;
   try {
     parsed = new URL(cleaned);
@@ -2661,6 +2696,11 @@ function sanitizeWakeAttachmentUrl(raw) {
     return null;
   if (parsed.username || parsed.password)
     return null;
+  if (parsed.port) {
+    const port = Number(parsed.port);
+    if (!Number.isInteger(port) || port < 1 || port > 65535)
+      return null;
+  }
   if (isUnsafeMetadataOrLinkLocalHost2(parsed.hostname))
     return null;
   return cleaned;
@@ -2699,12 +2739,13 @@ function formatWakeAttachments(attachments) {
 function sanitizeWakeHeaderToken(raw, maxLen = 128) {
   if (typeof raw !== "string")
     return;
-  const cleaned = raw.replace(/[\x00-\x1f\x7f]+/g, "").trim().slice(0, maxLen);
+  const cleaned = raw.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g, "").trim().slice(0, maxLen);
   return cleaned.length > 0 ? cleaned : undefined;
 }
 function isAllowedWakeHttpUrl(rawUrl) {
-  if (!rawUrl || rawUrl.length > 4096 || /[\x00-\x1f\x7f]/.test(rawUrl))
+  if (!rawUrl || rawUrl.length > 4096 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(rawUrl) || /:0(?:\/|$)/.test(rawUrl)) {
     return false;
+  }
   let parsed;
   try {
     parsed = new URL(rawUrl);
@@ -2887,8 +2928,9 @@ async function fireGrokWake(msg, cfg) {
   }
   let gwcfg;
   try {
+    const rawGatewayDir = dirname2(cfg.gatewayConfigPath);
     const resolvedGatewayPath = resolve2(cfg.gatewayConfigPath);
-    if (!hasSafeDirChain2(dirname2(resolvedGatewayPath))) {
+    if (!hasSafeWakeDirChain(rawGatewayDir) || !hasSafeWakeDirChain(dirname2(resolvedGatewayPath))) {
       log(`[agentchat] grok wake: rejected symlinked ancestor directory for ${cfg.gatewayConfigPath}`);
       return;
     }
@@ -2965,7 +3007,7 @@ async function fireAntigravityWake(msg, cfg) {
   const log = cfg.logger ?? (() => {});
   const conversationId = (cfg.conversationId ?? "").trim();
   const csrfToken = (cfg.csrfToken ?? "").trim();
-  if (!conversationId || conversationId.length > 128 || /[\x00-\x1f\x7f]/.test(conversationId) || !csrfToken || csrfToken.length > 1024 || /[\x00-\x1f\x7f]/.test(csrfToken)) {
+  if (!conversationId || conversationId.length > 128 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(conversationId) || !csrfToken || csrfToken.length > 1024 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(csrfToken)) {
     log(`[agentchat] antigravity wake: missing or unsafe conversationId or csrfToken, skipping`);
     return false;
   }
@@ -3126,16 +3168,17 @@ function fireZcodeWake(msg, cfg) {
       const rawArgs = [...prefixArgs, "-p", prompt, "--resume", sessionId];
       if (cfg.workspacePath && cfg.workspacePath.trim()) {
         const wsPath = cfg.workspacePath.trim();
-        if (!wsPath.startsWith("-") && !/[\x00-\x1f\x7f]/.test(wsPath)) {
+        if (!wsPath.startsWith("-") && !/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(wsPath)) {
           rawArgs.push("--cwd", wsPath);
         }
       }
+      const safeProfileName = typeof cfg.profileName === "string" && cfg.profileName.trim().length > 0 && cfg.profileName.trim().length <= 128 && !/[\x00-\x1f\x7f-\x9f\u2028\u2029/\\]/.test(cfg.profileName.trim()) && !["__proto__", "constructor", "prototype"].includes(cfg.profileName.trim().toLowerCase()) ? cfg.profileName.trim() : undefined;
       const env = {
         ...process.env,
         AGENTSCHAT_TOOL_ONLY: "1",
         AGENTSCHAT_LOCK_OWNER_PID: String(cfg.lockOwnerPid ?? process.pid),
         ZCODE_SESSION_ID: sessionId,
-        ...cfg.profileName ? { AGENTSCHAT_PROFILE: cfg.profileName } : {}
+        ...safeProfileName ? { AGENTSCHAT_PROFILE: safeProfileName } : {}
       };
       const resolved = resolveWindowsCliSpawn(cmd, rawArgs, { env });
       const timeoutMs = clampWakeTimerMs(cfg.timeoutMs, 180000);
@@ -3213,7 +3256,7 @@ function fireZcodeWake(msg, cfg) {
 import { createHash } from "node:crypto";
 import { closeSync, lstatSync as lstatSync4, mkdirSync, openSync, readFileSync as readFileSync5, readSync, readdirSync as readdirSync2, readlinkSync as readlinkSync3, realpathSync as realpathSync2, statSync, unlinkSync as unlinkSync2 } from "node:fs";
 import { homedir as homedir3, tmpdir } from "node:os";
-import { isAbsolute as isAbsolute2, join as join5, parse as parse3, resolve as resolve4 } from "node:path";
+import { isAbsolute as isAbsolute3, join as join5, parse as parse3, resolve as resolve4 } from "node:path";
 import { spawnSync } from "node:child_process";
 
 // src/profile-store.ts
@@ -3423,7 +3466,7 @@ function isPidAlive(pid) {
 }
 function resolveLockDir(homeDir, env = process.env) {
   const explicit = env.AGENTSCHAT_LOCK_DIR?.trim();
-  if (explicit && explicit.length <= 4096 && !explicit.startsWith("-") && !CONTROL_CHAR_RE.test(explicit) && isAbsolute2(explicit) && isSafeDirOrMissing(explicit)) {
+  if (explicit && explicit.length <= 4096 && !explicit.startsWith("-") && !CONTROL_CHAR_RE.test(explicit) && isAbsolute3(explicit) && isSafeDirOrMissing(explicit)) {
     return explicit;
   }
   const hash = createHash("sha256").update(homeDir || ".").digest("hex").slice(0, 12);
@@ -3500,7 +3543,7 @@ function isAllowedDarwinSystemLink3(dirPath) {
 function hasSafeRawDotDotSegments(rawPath) {
   if (!rawPath.includes(".."))
     return true;
-  const baseAbs = isAbsolute2(rawPath) ? rawPath : `${process.cwd()}/${rawPath}`;
+  const baseAbs = isAbsolute3(rawPath) ? rawPath : `${process.cwd()}/${rawPath}`;
   const root = parse3(baseAbs).root;
   const rawParts = baseAbs.slice(root.length).split(/[\\/]+/).filter(Boolean);
   let cur = root;
@@ -4515,11 +4558,11 @@ async function detectDshCallerSession(opts) {
 // src/session-route.ts
 import { lstatSync as lstatSync6, readFileSync as readFileSync7, readlinkSync as readlinkSync5, realpathSync as realpathSync4 } from "node:fs";
 import { homedir as homedir4 } from "node:os";
-import { dirname as dirname4, isAbsolute as isAbsolute4, join as join7, parse as parse5, resolve as resolve6, sep } from "node:path";
+import { dirname as dirname4, isAbsolute as isAbsolute5, join as join7, parse as parse5, resolve as resolve6, sep } from "node:path";
 
 // src/session-bind.ts
 import { closeSync as closeSync2, lstatSync as lstatSync5, mkdirSync as mkdirSync2, openSync as openSync2, readFileSync as readFileSync6, readSync as readSync2, readdirSync as readdirSync3, readlinkSync as readlinkSync4, realpathSync as realpathSync3, statSync as statSync2, unlinkSync as unlinkSync3 } from "node:fs";
-import { isAbsolute as isAbsolute3, join as join6, parse as parse4, resolve as resolve5 } from "node:path";
+import { isAbsolute as isAbsolute4, join as join6, parse as parse4, resolve as resolve5 } from "node:path";
 var DEFAULT_SESSION_BINDS_FILENAME2 = "session-binds.json";
 var LEGACY_AGY_BINDS_FILENAME2 = "agy-binds.json";
 var LOCK_FILE_MAX_BYTES2 = 64 * 1024;
@@ -4576,7 +4619,7 @@ function isAllowedDarwinSystemLink4(dirPath) {
 function hasSafeRawDotDotSegments2(rawPath) {
   if (!rawPath.includes(".."))
     return true;
-  const baseAbs = isAbsolute3(rawPath) ? rawPath : `${process.cwd()}/${rawPath}`;
+  const baseAbs = isAbsolute4(rawPath) ? rawPath : `${process.cwd()}/${rawPath}`;
   const root = parse4(baseAbs).root;
   const rawParts = baseAbs.slice(root.length).split(/[\\/]+/).filter(Boolean);
   let cur = root;
@@ -4722,7 +4765,7 @@ function isSafeAbsoluteDirEnv(raw) {
   if (typeof raw !== "string")
     return false;
   const s = raw.trim();
-  return s.length > 0 && s.length <= MAX_DIR_PATH_LENGTH && !s.startsWith("-") && !/[\x00-\x1f\x7f]/.test(s) && isAbsolute4(s);
+  return s.length > 0 && s.length <= MAX_DIR_PATH_LENGTH && !s.startsWith("-") && !/[\x00-\x1f\x7f]/.test(s) && isAbsolute5(s);
 }
 function agentschatConfigDir(env = process.env) {
   if (isSafeAbsoluteDirEnv(env.AGENTSCHAT_CONFIG_DIR)) {
@@ -4758,7 +4801,7 @@ function isAllowedDarwinSystemLink5(dirPath) {
   }
 }
 function hasSafeRawDotDotSegments3(rawPath) {
-  const absRaw = isAbsolute4(rawPath) ? rawPath : `${process.cwd()}${sep}${rawPath}`;
+  const absRaw = isAbsolute5(rawPath) ? rawPath : `${process.cwd()}${sep}${rawPath}`;
   const root = parse5(absRaw).root;
   const segments = absRaw.slice(root.length).split(/[\\/]+/).filter(Boolean);
   if (!segments.includes(".."))
@@ -5514,7 +5557,7 @@ import {
   unlinkSync as unlinkSync5,
   writeFileSync as writeFileSync3
 } from "fs";
-import { dirname as dirname6, isAbsolute as isAbsolute5, join as join9, parse as parse6, resolve as resolve8, sep as sep2 } from "path";
+import { dirname as dirname6, isAbsolute as isAbsolute6, join as join9, parse as parse6, resolve as resolve8, sep as sep2 } from "path";
 var MAX_CURSOR_BYTES = 4 * 1024 * 1024;
 var MAX_CURSOR_ENTRIES = 50000;
 var RESERVED_PROTO_KEY = /^(?:__proto__|constructor|prototype)$/i;
@@ -5533,7 +5576,7 @@ function isDarwinCanonicalRootLink(dir, st) {
   }
 }
 function hasSafeRawDotDotAncestors3(rawDirPath) {
-  const absRaw = isAbsolute5(rawDirPath) ? rawDirPath : `${process.cwd()}${sep2}${rawDirPath}`;
+  const absRaw = isAbsolute6(rawDirPath) ? rawDirPath : `${process.cwd()}${sep2}${rawDirPath}`;
   const root = parse6(absRaw).root;
   const segments = absRaw.slice(root.length).split(/[\\/]+/).filter(Boolean);
   if (!segments.includes(".."))
@@ -5564,7 +5607,7 @@ function hasSafeAncestorDirs3(targetFile) {
   if (typeof targetFile !== "string" || !targetFile || /[\x00-\x1f\x7f]/.test(targetFile)) {
     return false;
   }
-  const rawParent = dirname6(isAbsolute5(targetFile) ? targetFile : `${process.cwd()}${sep2}${targetFile}`);
+  const rawParent = dirname6(isAbsolute6(targetFile) ? targetFile : `${process.cwd()}${sep2}${targetFile}`);
   if (!hasSafeRawDotDotAncestors3(rawParent)) {
     return false;
   }
@@ -5745,7 +5788,7 @@ function flushCursor(state, persist) {
 // src/rest-cli.ts
 import { randomBytes as randomBytes3 } from "node:crypto";
 import { lstatSync as lstatSync10, mkdirSync as mkdirSync3, readFileSync as readFileSync11, readlinkSync as readlinkSync6, renameSync as renameSync5, unlinkSync as unlinkSync7, writeFileSync as writeFileSync5 } from "node:fs";
-import { dirname as dirname9, isAbsolute as isAbsolute7, join as join12, parse as parse9, resolve as resolve11 } from "node:path";
+import { dirname as dirname9, isAbsolute as isAbsolute9, join as join12, parse as parse9, resolve as resolve11 } from "node:path";
 
 // src/mentions.ts
 var MAX_MENTION_ID_CHARS2 = 128;
@@ -5779,7 +5822,7 @@ import {
   unlinkSync as unlinkSync6,
   writeFileSync as writeFileSync4
 } from "fs";
-import { dirname as dirname7, isAbsolute as isAbsolute6, join as join10, parse as parse7, resolve as resolve9, sep as sep3 } from "path";
+import { dirname as dirname7, isAbsolute as isAbsolute7, join as join10, parse as parse7, resolve as resolve9, sep as sep3 } from "path";
 var MAX_CURSOR_BYTES2 = 4 * 1024 * 1024;
 var MAX_CURSOR_ENTRIES2 = 50000;
 var RESERVED_PROTO_KEY2 = /^(?:__proto__|constructor|prototype)$/i;
@@ -5798,7 +5841,7 @@ function isDarwinCanonicalRootLink2(dir, st) {
   }
 }
 function hasSafeRawDotDotAncestors4(rawDirPath) {
-  const absRaw = isAbsolute6(rawDirPath) ? rawDirPath : `${process.cwd()}${sep3}${rawDirPath}`;
+  const absRaw = isAbsolute7(rawDirPath) ? rawDirPath : `${process.cwd()}${sep3}${rawDirPath}`;
   const root = parse7(absRaw).root;
   const segments = absRaw.slice(root.length).split(/[\\/]+/).filter(Boolean);
   if (!segments.includes(".."))
@@ -5829,7 +5872,7 @@ function hasSafeAncestorDirs4(targetFile) {
   if (typeof targetFile !== "string" || !targetFile || /[\x00-\x1f\x7f]/.test(targetFile)) {
     return false;
   }
-  const rawParent = dirname7(isAbsolute6(targetFile) ? targetFile : `${process.cwd()}${sep3}${targetFile}`);
+  const rawParent = dirname7(isAbsolute7(targetFile) ? targetFile : `${process.cwd()}${sep3}${targetFile}`);
   if (!hasSafeRawDotDotAncestors4(rawParent)) {
     return false;
   }
@@ -6056,11 +6099,11 @@ function normalizeTimestampForCursor2(ts, mode) {
 
 // src/wake.ts
 import { homedir as homedir5 } from "node:os";
-import { dirname as dirname8, join as join11, parse as parse8, resolve as resolve10, win32 as pathWin322 } from "node:path";
+import { dirname as dirname8, isAbsolute as isAbsolute8, join as join11, parse as parse8, resolve as resolve10, win32 as pathWin322 } from "node:path";
 var DIRECT_CHANNEL_RE2 = /^dm[-:]/i;
 function isUnsafeMetadataOrLinkLocalHost3(hostname) {
   const lower = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
-  if (!lower || lower === "0.0.0.0" || lower === "::" || lower === "100.100.100.200" || lower === "fd00:ec2::254" || lower === "metadata.google.internal" || lower === "metadata" || lower === "metadata.goog" || lower.endsWith(".metadata.goog") || lower === "instance-data") {
+  if (!lower || lower === "0.0.0.0" || lower === "::" || lower === "100.100.100.200" || lower === "fd00:ec2::254" || lower === "metadata.google.internal" || lower.endsWith(".metadata.google.internal") || lower === "metadata" || lower === "metadata.goog" || lower.endsWith(".metadata.goog") || lower === "instance-data") {
     return true;
   }
   if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(lower))
@@ -6087,9 +6130,10 @@ function isUnsafeMetadataOrLinkLocalHost3(hostname) {
 function sanitizeWakeAttachmentUrl2(raw) {
   if (typeof raw !== "string")
     return null;
-  const cleaned = raw.trim().replace(/[\x00-\x1f\x7f\r\n]+/g, "");
-  if (!cleaned || cleaned.length > 2048 || /\s/.test(cleaned) || !/^https?:\/\//i.test(cleaned))
+  const cleaned = raw.trim().replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029\r\n]+/g, "");
+  if (!cleaned || cleaned.length > 2048 || /\s/.test(cleaned) || !/^https?:\/\//i.test(cleaned) || /:0(?:\/|$)/.test(cleaned)) {
     return null;
+  }
   let parsed;
   try {
     parsed = new URL(cleaned);
@@ -6100,6 +6144,11 @@ function sanitizeWakeAttachmentUrl2(raw) {
     return null;
   if (parsed.username || parsed.password)
     return null;
+  if (parsed.port) {
+    const port = Number(parsed.port);
+    if (!Number.isInteger(port) || port < 1 || port > 65535)
+      return null;
+  }
   if (isUnsafeMetadataOrLinkLocalHost3(parsed.hostname))
     return null;
   return cleaned;
@@ -6131,7 +6180,7 @@ function formatWakeAttachments2(attachments) {
 function sanitizeWakeHeaderToken2(raw, maxLen = 128) {
   if (typeof raw !== "string")
     return;
-  const cleaned = raw.replace(/[\x00-\x1f\x7f]+/g, "").trim().slice(0, maxLen);
+  const cleaned = raw.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g, "").trim().slice(0, maxLen);
   return cleaned.length > 0 ? cleaned : undefined;
 }
 var GROK_GATEWAY_PATH_CANDIDATES2 = [
@@ -6166,7 +6215,10 @@ function parseMaxIdleMs(raw) {
   if (raw === undefined || raw === null)
     return;
   if (typeof raw === "number") {
-    return Number.isFinite(raw) && raw >= 0 ? Math.round(raw * 1000) : undefined;
+    if (!Number.isFinite(raw) || raw < 0)
+      return;
+    const ms2 = Math.round(raw * 1000);
+    return Number.isFinite(ms2) && ms2 <= Number.MAX_SAFE_INTEGER ? ms2 : undefined;
   }
   const s = String(raw).trim().toLowerCase();
   if (!s)
@@ -6181,18 +6233,21 @@ function parseMaxIdleMs(raw) {
   if (!Number.isFinite(val) || val < 0)
     return;
   const unit = m[2] || "s";
+  let ms;
   if (unit === "ms")
-    return Math.round(val);
-  if (unit === "s" || unit === "sec" || unit === "secs")
-    return Math.round(val * 1000);
-  if (unit === "m" || unit === "min" || unit === "mins")
-    return Math.round(val * 60000);
-  if (unit === "h" || unit === "hr" || unit === "hrs" || unit === "hour" || unit === "hours") {
-    return Math.round(val * 3600000);
+    ms = Math.round(val);
+  else if (unit === "s" || unit === "sec" || unit === "secs")
+    ms = Math.round(val * 1000);
+  else if (unit === "m" || unit === "min" || unit === "mins")
+    ms = Math.round(val * 60000);
+  else if (unit === "h" || unit === "hr" || unit === "hrs" || unit === "hour" || unit === "hours") {
+    ms = Math.round(val * 3600000);
+  } else if (unit === "d" || unit === "day" || unit === "days") {
+    ms = Math.round(val * 86400000);
+  } else {
+    return;
   }
-  if (unit === "d" || unit === "day" || unit === "days")
-    return Math.round(val * 86400000);
-  return;
+  return Number.isFinite(ms) && ms <= Number.MAX_SAFE_INTEGER ? ms : undefined;
 }
 var MAX_SSE_STREAMS = 3;
 var MAX_SSE_LINE_CHARS = 512 * 1024;
@@ -6204,13 +6259,15 @@ var MAX_HTTP_JSON_BYTES = 4 * 1024 * 1024;
 var MAX_PID_FILE_BYTES = 64 * 1024;
 var DIRECT_CHANNEL_RE3 = /^dm[-:]/i;
 var PROTOTYPE_KEYS2 = new Set(["__proto__", "constructor", "prototype"]);
+var CLI_CHANNEL_CREDENTIAL_PREFIX_RE = /^(?:ac_|mcp_(?:at|rt|code)_|agent_key_|whsec_|mr_|sk-|sk_|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|AIza|AKIA|ASIA)/i;
+var CLI_ENCODED_TRAVERSAL_RE = /(?:%2f|%5c|%00|%2e%2e)/i;
 function isLoopbackHost2(hostname) {
   const h = hostname.toLowerCase();
   return h === "127.0.0.1" || h === "localhost" || h === "[::1]" || h === "::1";
 }
 function isUnsafeMetadataOrLinkLocalHost4(hostname) {
   const lower = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
-  if (!lower || lower === "0.0.0.0" || lower === "::" || lower === "100.100.100.200" || lower === "fd00:ec2::254" || lower === "metadata.google.internal" || lower === "metadata" || lower === "metadata.goog" || lower.endsWith(".metadata.goog") || lower === "instance-data") {
+  if (!lower || lower === "0.0.0.0" || lower === "::" || lower === "100.100.100.200" || lower === "fd00:ec2::254" || lower === "metadata.google.internal" || lower.endsWith(".metadata.google.internal") || lower === "metadata" || lower === "metadata.goog" || lower.endsWith(".metadata.goog") || lower === "instance-data") {
     return true;
   }
   if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(lower))
@@ -6240,18 +6297,24 @@ function isAllowedDarwinSystemLink6(dirPath) {
   if (dirPath !== "/var" && dirPath !== "/tmp" && dirPath !== "/etc")
     return false;
   try {
+    const privStat = lstatSync10("/private");
+    if (privStat.isSymbolicLink() || !privStat.isDirectory())
+      return false;
+    const targetStat = lstatSync10(`/private${dirPath}`);
+    if (targetStat.isSymbolicLink() || !targetStat.isDirectory())
+      return false;
     return readlinkSync6(dirPath) === `private${dirPath}`;
   } catch {
     return false;
   }
 }
-function hasSafeDirChain3(dirPath) {
-  if (typeof dirPath !== "string" || !dirPath.trim() || /[\x00-\x1f\x7f]/.test(dirPath)) {
+function hasSafeDirChain2(dirPath) {
+  if (typeof dirPath !== "string" || !dirPath.trim() || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(dirPath)) {
     return false;
   }
   if (/(?:^|[\\/])\.\.(?:[\\/]|$)/.test(dirPath)) {
-    const rawBase = isAbsolute7(dirPath) ? parse9(dirPath).root : resolve11(".");
-    const rawRel = isAbsolute7(dirPath) ? dirPath.slice(rawBase.length) : dirPath;
+    const rawBase = isAbsolute9(dirPath) ? parse9(dirPath).root : resolve11(".");
+    const rawRel = isAbsolute9(dirPath) ? dirPath.slice(rawBase.length) : dirPath;
     let rawCur = rawBase.replace(/[\\/]+$/, "") || "/";
     for (const seg of rawRel.split(/[\\/]+/).filter(Boolean)) {
       if (seg === ".")
@@ -6303,7 +6366,7 @@ function validateSafeRestBaseUrl(rawUrl) {
   if (typeof rawUrl !== "string")
     throw new Error("Invalid AgentsChat REST URL");
   const trimmed = rawUrl.trim().replace(/\/+$/, "");
-  if (!trimmed || trimmed.length > 2048 || /[\x00-\x20\x7f"<>\\]/.test(trimmed) || /:0(?:\/|$)/.test(trimmed)) {
+  if (!trimmed || trimmed.length > 2048 || /[\x00-\x20\x7f-\x9f\u2028\u2029"<>\\]/.test(trimmed) || /:0(?:\/|$)/.test(trimmed)) {
     throw new Error("Invalid AgentsChat REST URL");
   }
   let parsed;
@@ -6328,13 +6391,22 @@ function validateSafeRestBaseUrl(rawUrl) {
 function isSafeCliChannelId(channelId) {
   if (typeof channelId !== "string")
     return false;
-  if (channelId.length < 1 || channelId.length > 128 || channelId.trim() !== channelId || /[\x00-\x1f\x7f/\\\s]/.test(channelId) || channelId === "." || channelId.includes("..") || PROTOTYPE_KEYS2.has(channelId.toLowerCase())) {
+  if (channelId.length < 1 || channelId.length > 128 || channelId.trim() !== channelId || /[\x00-\x1f\x7f-\x9f\u2028\u2029/\\\s]/.test(channelId) || channelId === "." || channelId.includes("..") || CLI_ENCODED_TRAVERSAL_RE.test(channelId) || CLI_CHANNEL_CREDENTIAL_PREFIX_RE.test(channelId) || PROTOTYPE_KEYS2.has(channelId.toLowerCase())) {
     return false;
   }
   return true;
 }
+function validateSafeBearerToken(token) {
+  if (typeof token !== "string")
+    throw new Error("Invalid authentication token");
+  const trimmed = token.trim();
+  if (!trimmed || trimmed.length > 4096 || /[\x00-\x20\x7f-\x9f\u2028\u2029]/.test(trimmed)) {
+    throw new Error("Invalid authentication token");
+  }
+  return trimmed;
+}
 function ensureRealDirectory(dir) {
-  if (!hasSafeDirChain3(dir)) {
+  if (!hasSafeDirChain2(dir)) {
     throw new Error("Refusing symlink or non-directory state root");
   }
   const pre = lstatSync10(dir, { throwIfNoEntry: false });
@@ -6343,7 +6415,7 @@ function ensureRealDirectory(dir) {
   }
   mkdirSync3(dir, { recursive: true, mode: 448 });
   const post = lstatSync10(dir);
-  if (post.isSymbolicLink() || !post.isDirectory() || !hasSafeDirChain3(dir)) {
+  if (post.isSymbolicLink() || !post.isDirectory() || !hasSafeDirChain2(dir)) {
     throw new Error("Refusing symlink or non-directory state root");
   }
 }
@@ -6444,7 +6516,7 @@ function sleepAbortable(ms, signal) {
 }
 function loadSeenIds(file) {
   try {
-    if (!hasSafeDirChain3(dirname9(file)))
+    if (!hasSafeDirChain2(dirname9(file)))
       return [];
     const stat = lstatSync10(file);
     if (stat.isSymbolicLink() || !stat.isFile() || stat.size > MAX_STATE_FILE_BYTES)
@@ -6465,7 +6537,7 @@ function saveSeenIds(file, ids) {
 function loadJsonMap(file) {
   const out = Object.create(null);
   try {
-    if (!hasSafeDirChain3(dirname9(file)))
+    if (!hasSafeDirChain2(dirname9(file)))
       return out;
     const stat = lstatSync10(file);
     if (stat.isSymbolicLink() || !stat.isFile() || stat.size > MAX_STATE_FILE_BYTES)
@@ -6488,7 +6560,7 @@ function acquireWakePidFile(wakePidFile, pid = process.pid, killFn = process.kil
   let created = false;
   try {
     const dir = dirname9(wakePidFile);
-    if (!hasSafeDirChain3(dir))
+    if (!hasSafeDirChain2(dir))
       return false;
     const dirStat = lstatSync10(dir);
     if (dirStat.isSymbolicLink() || !dirStat.isDirectory())
@@ -6518,7 +6590,7 @@ function acquireWakePidFile(wakePidFile, pid = process.pid, killFn = process.kil
     created = true;
     const recheckDir = lstatSync10(dir, { throwIfNoEntry: false });
     const recheckTarget = lstatSync10(wakePidFile, { throwIfNoEntry: false });
-    if (!hasSafeDirChain3(dir) || !recheckDir || recheckDir.isSymbolicLink() || !recheckDir.isDirectory() || recheckTarget && (recheckTarget.isSymbolicLink() || !recheckTarget.isFile())) {
+    if (!hasSafeDirChain2(dir) || !recheckDir || recheckDir.isSymbolicLink() || !recheckDir.isDirectory() || recheckTarget && (recheckTarget.isSymbolicLink() || !recheckTarget.isFile())) {
       unlinkSync7(tmp);
       created = false;
       return false;
@@ -6537,7 +6609,7 @@ function acquireWakePidFile(wakePidFile, pid = process.pid, killFn = process.kil
 }
 function releaseWakePidFile(wakePidFile, pid = process.pid) {
   try {
-    if (!hasSafeDirChain3(dirname9(wakePidFile)))
+    if (!hasSafeDirChain2(dirname9(wakePidFile)))
       return;
     const stat = lstatSync10(wakePidFile);
     if (stat.isSymbolicLink() || !stat.isFile() || stat.size > MAX_PID_FILE_BYTES)
@@ -6587,6 +6659,7 @@ async function joinChannelRest(opts) {
   const f = opts.fetchImpl ?? fetch;
   try {
     const baseUrl = validateSafeRestBaseUrl(opts.restUrl);
+    const safeToken = validateSafeBearerToken(opts.token);
     if (!isSafeCliChannelId(opts.channelId)) {
       throw new Error("Invalid channel_id");
     }
@@ -6594,7 +6667,7 @@ async function joinChannelRest(opts) {
     const res = await fetchWithDeadline(f, url, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${opts.token}`,
+        Authorization: `Bearer ${safeToken}`,
         "Content-Type": "application/json"
       },
       body: JSON.stringify({ sender_id: opts.agentId })
@@ -6631,14 +6704,22 @@ async function sendRestMessage(opts) {
   const cleanText = redactSecrets2(opts.text);
   try {
     const baseUrl = validateSafeRestBaseUrl(opts.restUrl);
+    const safeToken = validateSafeBearerToken(opts.token);
     if (!isSafeCliChannelId(opts.channelId)) {
       throw new Error("Invalid channel_id");
+    }
+    let safeReplyTo;
+    if (opts.replyTo !== undefined && opts.replyTo !== "") {
+      if (typeof opts.replyTo !== "string" || opts.replyTo.length > 256 || /[\x00-\x1f\x7f-\x9f\u2028\u2029\s]/.test(opts.replyTo) || PROTOTYPE_KEYS2.has(opts.replyTo.toLowerCase())) {
+        throw new Error("Invalid in_reply_to message_id");
+      }
+      safeReplyTo = opts.replyTo;
     }
     const url = `${baseUrl}/api/channels/${encodeURIComponent(opts.channelId)}/messages`;
     const res = await fetchWithDeadline(f, url, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${opts.token}`,
+        Authorization: `Bearer ${safeToken}`,
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
@@ -6646,7 +6727,7 @@ async function sendRestMessage(opts) {
         sender_type: "agent",
         content_type: "text",
         content: cleanText,
-        ...opts.replyTo ? { in_reply_to: opts.replyTo } : {}
+        ...safeReplyTo ? { in_reply_to: safeReplyTo } : {}
       })
     }, opts.timeoutMs ?? DEFAULT_HTTP_TIMEOUT_MS);
     const data = await readBoundedResponseJson(res).catch(() => ({}));
@@ -6719,7 +6800,8 @@ async function wakeOnce(opts) {
   const warn = opts.warn ?? ((m) => process.stderr.write(m));
   const nowIso = opts.nowIso ?? (() => new Date().toISOString());
   const baseUrl = validateSafeRestBaseUrl(opts.restUrl);
-  const { configDir, agentId, displayName, token } = opts;
+  const token = validateSafeBearerToken(opts.token);
+  const { configDir, agentId, displayName } = opts;
   const timeoutMs = opts.timeoutMs !== undefined && Number.isFinite(opts.timeoutMs) ? opts.timeoutMs > 0 ? Math.min(MAX_TIMER_MS, Math.floor(opts.timeoutMs)) : 0 : 240000;
   const requestTimeoutMs = clampTimerMs(opts.requestTimeoutMs, DEFAULT_HTTP_TIMEOUT_MS, 0);
   const pollIntervalMs = clampTimerMs(opts.pollIntervalMs, 15000, 10);

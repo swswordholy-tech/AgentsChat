@@ -1325,7 +1325,7 @@ function resolveSessionForAgent(agentId, opts = {}) {
 // src/wake.ts
 import { existsSync as existsSync2, lstatSync as lstatSync5, readFileSync as readFileSync5, readlinkSync as readlinkSync3 } from "node:fs";
 import { homedir as homedir3 } from "node:os";
-import { dirname as dirname4, join as join4, parse as parse3, resolve as resolve3, win32 as pathWin32 } from "node:path";
+import { dirname as dirname4, isAbsolute as isAbsolute4, join as join4, parse as parse3, resolve as resolve3, win32 as pathWin32 } from "node:path";
 var GROK_GATEWAY_PATH_CANDIDATES = [
   join4(process.env.HOME || process.env.USERPROFILE || homedir3(), ".grok", "gateway.json"),
   "/home/box/sand-data/gateway.json"
@@ -1398,7 +1398,7 @@ function resolveWindowsCliSpawn(cmd, args, opts) {
 // dsh/src/patch.ts
 import { randomBytes as randomBytes2 } from "node:crypto";
 import { chmodSync as chmodSync2, copyFileSync, lstatSync as lstatSync6, mkdirSync as mkdirSync3, readFileSync as readFileSync6, realpathSync as realpathSync4, renameSync as renameSync2, statSync as statSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2 } from "node:fs";
-import { dirname as dirname5, isAbsolute as isAbsolute4, join as join5, resolve as resolve4 } from "node:path";
+import { dirname as dirname5, isAbsolute as isAbsolute5, join as join5, resolve as resolve4 } from "node:path";
 import { homedir as homedir4 } from "node:os";
 var FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 var DARWIN_ROOT_LINKS = new Set(["/var", "/tmp", "/etc"]);
@@ -1414,7 +1414,7 @@ function isAllowedDarwinSystemLink3(dirPath) {
 }
 function checkRawDotDotAncestors(rawPath) {
   const trimmed = rawPath.trim();
-  if (!trimmed || !isAbsolute4(trimmed))
+  if (!trimmed || !isAbsolute5(trimmed))
     return;
   const normalizedSep = process.platform === "win32" ? trimmed.replace(/\//g, "\\") : trimmed;
   const sepChar = process.platform === "win32" ? "\\" : "/";
@@ -1495,7 +1495,7 @@ function isBlockedDshHost(hostname) {
 }
 function resolveDshPatchPath(opts = {}) {
   const home = opts.dshHome ?? process.env.DSH_HOME ?? join5(homedir4(), ".dsh");
-  if (!home || home.length > 4096 || home.startsWith("-") || !isAbsolute4(home) || /[\x00-\x1f\x7f]/.test(home)) {
+  if (!home || home.length > 4096 || home.startsWith("-") || !isAbsolute5(home) || /[\x00-\x1f\x7f]/.test(home)) {
     throw new Error("Invalid DSH home path");
   }
   if (opts.dshProfile !== undefined) {

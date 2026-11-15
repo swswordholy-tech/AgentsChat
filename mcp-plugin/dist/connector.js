@@ -40,6 +40,8 @@ function verifySignature(payload, sigHex, secrets) {
   }
   return false;
 }
+var DISALLOWED_TOKEN_PAYLOAD_CTRL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+var PROTOTYPE_PAYLOAD_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 function verifyToken(token, secrets) {
   if (typeof token !== "string" || token.length === 0 || token.length > 4096)
     return null;
@@ -60,6 +62,9 @@ function verifyToken(token, secrets) {
   if (!Number.isSafeInteger(exp) || String(exp) !== expText)
     return null;
   const payload = parts.slice(0, -2).join(":");
+  if (DISALLOWED_TOKEN_PAYLOAD_CTRL_RE.test(payload) || PROTOTYPE_PAYLOAD_KEYS.has(payload.toLowerCase())) {
+    return null;
+  }
   if (exp !== 0 && Math.floor(Date.now() / 1000) > exp)
     return null;
   const signed = `${payload}:${exp}`;
@@ -109,7 +114,7 @@ function toWireEvent(msg, platform = "agentschat") {
   const content = typeof msg.content === "string" ? msg.content : "";
   if (content === "__typing__")
     return null;
-  const metadata = (value) => typeof value === "string" ? value.replace(/[\x00-\x1f\x7f]/g, "") : undefined;
+  const metadata = (value) => typeof value === "string" ? value.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, "") : undefined;
   const chatId = metadata(msg.channel_id) ?? "";
   if (!chatId)
     return null;
@@ -215,7 +220,7 @@ var PROTOTYPE_MENTION_IDS = new Set(["__proto__", "constructor", "prototype"]);
 
 // connector/identities.ts
 function validIdentityId(value) {
-  return typeof value === "string" && value.length > 0 && value.length <= 128 && value !== "." && value !== ".." && !/[/\\\s\x00-\x1f\x7f]/.test(value) && !["__proto__", "constructor", "prototype"].includes(value.toLowerCase());
+  return typeof value === "string" && value.length > 0 && value.length <= 128 && value !== "." && value !== ".." && !value.includes("..") && !/(?:%2f|%5c|%00|%2e%2e)/i.test(value) && !/[/\\\s\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(value) && !["__proto__", "constructor", "prototype"].includes(value.toLowerCase());
 }
 function validateIdentities(identities, allowEmptyCredentials = false) {
   const bots = new Set;
@@ -455,15 +460,18 @@ function startConnector(config) {
     if (identity && (!legacy && (identity.gatewayId !== conn.gatewayId || identity.secret !== conn.secret) || frame.platform !== undefined && frame.platform !== "agentschat"))
       identity = null;
     if (!identity) {
-      log(`[connector] outbound failed: no usable identity for botId=${requested ?? "?"}`);
-      return { success: false, error: `no usable identity for outbound (botId=${requested ?? "?"})` };
+      const safeReq = redactSecrets(String(requested ?? "?")).replace(/[\x00-\x1f\x7f-\x9f]+/g, "").slice(0, 128);
+      log(`[connector] outbound failed: no usable identity for botId=${safeReq}`);
+      return { success: false, error: `no usable identity for outbound (botId=${safeReq})` };
     }
-    if (typeof chatId !== "string" || chatId !== chatId.trim() || chatId.length < 1 || chatId.length > 128 || /[\s\x00-\x1f\x7f/\\]/.test(chatId) || chatId === "." || chatId.includes("..") || ["__proto__", "constructor", "prototype"].includes(chatId.toLowerCase())) {
+    if (typeof chatId !== "string" || chatId !== chatId.trim() || chatId.length < 1 || chatId.length > 128 || /[\s\x00-\x1f\x7f-\x9f\u2028\u2029/\\]/.test(chatId) || /(?:%2f|%5c|%00|%2e%2e)/i.test(chatId) || chatId === "." || chatId.includes("..") || ["__proto__", "constructor", "prototype"].includes(chatId.toLowerCase())) {
       return { success: false, error: "invalid chat_id" };
     }
     switch (op) {
       case "send": {
-        const r = await hooks.sendMessage(identity.botId, chatId, action.content ?? "", action.reply_to);
+        const rawReplyTo = action.reply_to;
+        const safeReplyTo = typeof rawReplyTo === "string" && rawReplyTo.length > 0 && rawReplyTo.length <= 256 && !/[\s\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(rawReplyTo) && !["__proto__", "constructor", "prototype"].includes(rawReplyTo.toLowerCase()) ? rawReplyTo : undefined;
+        const r = await hooks.sendMessage(identity.botId, chatId, action.content ?? "", safeReplyTo);
         return { success: true, message_id: r?.id };
       }
       case "typing": {
@@ -474,9 +482,11 @@ function startConnector(config) {
         const info = await hooks.getChatInfo(identity.botId, chatId);
         return info ?? {};
       }
-      default:
-        log(`[connector] outbound failed: unsupported op ${String(op)}`);
-        return { success: false, error: `unsupported op: ${String(op)}` };
+      default: {
+        const safeOp = redactSecrets(String(op)).replace(/[\x00-\x1f\x7f-\x9f]+/g, "").slice(0, 64);
+        log(`[connector] outbound failed: unsupported op ${safeOp}`);
+        return { success: false, error: `unsupported op: ${safeOp}` };
+      }
     }
   }
   function send(ws, obj) {
@@ -567,7 +577,7 @@ function startConnector(config) {
                 ]);
                 if (ctx && ctx.length) {
                   baseEvent.context = ctx.slice(-10).map((c) => ({
-                    text: String(c?.text ?? "").slice(0, 500),
+                    text: redactSecrets(String(c?.text ?? "").slice(0, 4096)).slice(0, 500),
                     source: { user_name: c?.user_name, user_id: c?.user_id }
                   }));
                 }
@@ -1186,18 +1196,19 @@ function need(name) {
 }
 function isUnsafeConnectorHost(hostname) {
   const host = hostname.toLowerCase().replace(/\.$/, "").replace(/^\[|\]$/g, "");
-  if (["metadata", "instance-data", "metadata.google.internal", "metadata.goog"].includes(host) || host.endsWith(".metadata.goog"))
+  if (["metadata", "instance-data", "metadata.google.internal", "metadata.goog"].includes(host) || host.endsWith(".metadata.google.internal") || host.endsWith(".metadata.goog")) {
     return true;
+  }
   const unsafeV4 = (ip) => ip === "0.0.0.0" || ip.startsWith("169.254.") || ip === "100.100.100.200";
   if (!host.includes(":"))
     return unsafeV4(host);
   const halves = host.split("::");
   const left = halves[0] ? halves[0].split(":") : [];
   const right = halves[1] ? halves[1].split(":") : [];
-  const words = [...left, ...Array(8 - left.length - right.length).fill("0"), ...right].map((v) => parseInt(v, 16));
+  const words = [...left, ...Array(Math.max(0, 8 - left.length - right.length)).fill("0"), ...right].map((v) => parseInt(v, 16));
   if (words.every((v) => v === 0) || (words[0] & 65472) === 65152 || host === "fd00:ec2::254")
     return true;
-  if (words.slice(0, 5).every((v) => v === 0) && words[5] === 65535) {
+  if (words.slice(0, 5).every((v) => v === 0) && words[5] === 65535 || words.slice(0, 4).every((v) => v === 0) && words[4] === 65535 && words[5] === 0) {
     return unsafeV4(`${words[6] >>> 8}.${words[6] & 255}.${words[7] >>> 8}.${words[7] & 255}`);
   }
   return false;
@@ -1572,7 +1583,8 @@ async function main() {
       socketsByBot.delete(id.botId);
     }
     let heartbeatForced = false;
-    const ws = new WS(WS_URL);
+    const MAX_PLATFORM_WS_BYTES = 4 * 1024 * 1024;
+    const ws = new WS(WS_URL, { maxPayload: MAX_PLATFORM_WS_BYTES });
     socketsByBot.set(id.botId, ws);
     const hb = new HeartbeatMonitor({
       sendPing: () => {
@@ -1611,6 +1623,9 @@ async function main() {
     });
     ws.on("message", (raw) => {
       if (!currentIdentity(id) || socketsByBot.get(id.botId) !== ws)
+        return;
+      const rawBytes = Array.isArray(raw) ? raw.reduce((n, chunk) => n + (chunk?.byteLength ?? Buffer.byteLength(String(chunk), "utf8")), 0) : typeof raw === "string" ? Buffer.byteLength(raw, "utf8") : raw?.byteLength ?? 0;
+      if (rawBytes > MAX_PLATFORM_WS_BYTES)
         return;
       let data;
       try {
@@ -1764,7 +1779,7 @@ async function main() {
           if (!tail.length)
             return null;
           return tail.map((m) => ({
-            text: redactSecrets(String(m.content)).slice(0, 500),
+            text: redactSecrets(String(m.content ?? "").slice(0, 4096)).slice(0, 500),
             user_name: m.sender_name ?? m.sender_id,
             user_id: m.sender_id
           }));

@@ -25,7 +25,7 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, readlinkSync, type Stats } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, parse, resolve, win32 as pathWin32 } from "node:path";
+import { dirname, isAbsolute, join, parse, resolve, win32 as pathWin32 } from "node:path";
 import { redactSecrets } from "./redact.ts";
 
 /** Signature header the receiver reads to verify a wake POST. */
@@ -34,7 +34,7 @@ export const WAKE_SIG_HEADER = "x-agentschat-signature";
 export const WAKE_ID_HEADER = "X-AgentsChat-Wake-Id";
 const SAFE_WAKE_ID_RE = /^[a-zA-Z0-9_-]{1,128}$/;
 const CREDENTIAL_PREFIX_RE =
-  /^(ac_|mcp_(?:at|rt|code)_|agent_key_|whsec_|sk-|sk_|rk_live_|rk_test_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|AIza|AKIA|ASIA)/i;
+  /^(ac_|mcp_(?:at|rt|code)_|agent_key_|whsec_|mr_|sk-|sk_|rk_live_|rk_test_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|AIza|AKIA|ASIA)/i;
 const MAX_WAKE_TIMER_MS = 2_147_483_647;
 const GROK_GATEWAY_MAX_BYTES = 1_048_576;
 const DIRECT_CHANNEL_RE = /^dm[-:]/i;
@@ -44,13 +44,41 @@ function isAllowedDarwinSystemLink(dirPath: string): boolean {
   if (process.platform !== "darwin") return false;
   if (dirPath !== "/var" && dirPath !== "/tmp" && dirPath !== "/etc") return false;
   try {
+    const privStat = lstatSync("/private");
+    if (privStat.isSymbolicLink() || !privStat.isDirectory()) return false;
+    const targetStat = lstatSync(`/private${dirPath}`);
+    if (targetStat.isSymbolicLink() || !targetStat.isDirectory()) return false;
     return readlinkSync(dirPath) === `private${dirPath}`;
   } catch {
     return false;
   }
 }
 
-function hasSafeDirChain(dirPath: string): boolean {
+export function hasSafeWakeDirChain(dirPath: string): boolean {
+  if (typeof dirPath !== "string" || !dirPath.trim() || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(dirPath)) {
+    return false;
+  }
+  if (/(?:^|[\\/])\.\.(?:[\\/]|$)/.test(dirPath)) {
+    const rawBase = isAbsolute(dirPath) ? parse(dirPath).root : resolve(".");
+    const rawRel = isAbsolute(dirPath) ? dirPath.slice(rawBase.length) : dirPath;
+    let rawCur = rawBase.replace(/[\\/]+$/, "") || "/";
+    for (const seg of rawRel.split(/[\\/]+/).filter(Boolean)) {
+      if (seg === ".") continue;
+      if (seg === "..") {
+        rawCur = dirname(rawCur);
+        continue;
+      }
+      rawCur = rawCur === "/" ? `/${seg}` : `${rawCur}/${seg}`;
+      try {
+        const st = lstatSync(rawCur);
+        if (st.isSymbolicLink() && !isAllowedDarwinSystemLink(rawCur)) return false;
+        if (!st.isSymbolicLink() && !st.isDirectory()) return false;
+      } catch (err: any) {
+        if (err && err.code === "ENOENT") break;
+        return false;
+      }
+    }
+  }
   const abs = resolve(dirPath);
   const root = parse(abs).root;
   const rel = abs.slice(root.length);
@@ -83,6 +111,7 @@ function isUnsafeMetadataOrLinkLocalHost(hostname: string): boolean {
     lower === "100.100.100.200" ||
     lower === "fd00:ec2::254" ||
     lower === "metadata.google.internal" ||
+    lower.endsWith(".metadata.google.internal") ||
     lower === "metadata" ||
     lower === "metadata.goog" ||
     lower.endsWith(".metadata.goog") ||
@@ -129,8 +158,10 @@ export function normalizeLoopbackLsAddress(raw: unknown): string | null {
 
 function sanitizeWakeAttachmentUrl(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
-  const cleaned = raw.trim().replace(/[\x00-\x1f\x7f\r\n]+/g, "");
-  if (!cleaned || cleaned.length > 2048 || /\s/.test(cleaned) || !/^https?:\/\//i.test(cleaned)) return null;
+  const cleaned = raw.trim().replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029\r\n]+/g, "");
+  if (!cleaned || cleaned.length > 2048 || /\s/.test(cleaned) || !/^https?:\/\//i.test(cleaned) || /:0(?:\/|$)/.test(cleaned)) {
+    return null;
+  }
   let parsed: URL;
   try {
     parsed = new URL(cleaned);
@@ -139,6 +170,10 @@ function sanitizeWakeAttachmentUrl(raw: unknown): string | null {
   }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
   if (parsed.username || parsed.password) return null;
+  if (parsed.port) {
+    const port = Number(parsed.port);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+  }
   if (isUnsafeMetadataOrLinkLocalHost(parsed.hostname)) return null;
   return cleaned;
 }
@@ -226,12 +261,14 @@ export function formatWakeAttachments(attachments: unknown): string {
 
 function sanitizeWakeHeaderToken(raw: unknown, maxLen = 128): string | undefined {
   if (typeof raw !== "string") return undefined;
-  const cleaned = raw.replace(/[\x00-\x1f\x7f]+/g, "").trim().slice(0, maxLen);
+  const cleaned = raw.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g, "").trim().slice(0, maxLen);
   return cleaned.length > 0 ? cleaned : undefined;
 }
 
 function isAllowedWakeHttpUrl(rawUrl: string): boolean {
-  if (!rawUrl || rawUrl.length > 4096 || /[\x00-\x1f\x7f]/.test(rawUrl)) return false;
+  if (!rawUrl || rawUrl.length > 4096 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(rawUrl) || /:0(?:\/|$)/.test(rawUrl)) {
+    return false;
+  }
   let parsed: URL;
   try {
     parsed = new URL(rawUrl);
@@ -551,8 +588,9 @@ export async function fireGrokWake(msg: WakeMessage, cfg: GrokWakeConfig): Promi
   }
   let gwcfg: any;
   try {
+    const rawGatewayDir = dirname(cfg.gatewayConfigPath);
     const resolvedGatewayPath = resolve(cfg.gatewayConfigPath);
-    if (!hasSafeDirChain(dirname(resolvedGatewayPath))) {
+    if (!hasSafeWakeDirChain(rawGatewayDir) || !hasSafeWakeDirChain(dirname(resolvedGatewayPath))) {
       log(`[agentchat] grok wake: rejected symlinked ancestor directory for ${cfg.gatewayConfigPath}`);
       return;
     }
@@ -673,10 +711,10 @@ export async function fireAntigravityWake(msg: WakeMessage, cfg: AntigravityWake
   if (
     !conversationId ||
     conversationId.length > 128 ||
-    /[\x00-\x1f\x7f]/.test(conversationId) ||
+    /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(conversationId) ||
     !csrfToken ||
     csrfToken.length > 1024 ||
-    /[\x00-\x1f\x7f]/.test(csrfToken)
+    /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(csrfToken)
   ) {
     log(`[agentchat] antigravity wake: missing or unsafe conversationId or csrfToken, skipping`);
     return false;
@@ -905,16 +943,24 @@ export function fireZcodeWake(msg: WakeMessage, cfg: ZcodeWakeConfig): Promise<b
       const rawArgs = [...prefixArgs, "-p", prompt, "--resume", sessionId];
       if (cfg.workspacePath && cfg.workspacePath.trim()) {
         const wsPath = cfg.workspacePath.trim();
-        if (!wsPath.startsWith("-") && !/[\x00-\x1f\x7f]/.test(wsPath)) {
+        if (!wsPath.startsWith("-") && !/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(wsPath)) {
           rawArgs.push("--cwd", wsPath);
         }
       }
+      const safeProfileName =
+        typeof cfg.profileName === "string" &&
+        cfg.profileName.trim().length > 0 &&
+        cfg.profileName.trim().length <= 128 &&
+        !/[\x00-\x1f\x7f-\x9f\u2028\u2029/\\]/.test(cfg.profileName.trim()) &&
+        !["__proto__", "constructor", "prototype"].includes(cfg.profileName.trim().toLowerCase())
+          ? cfg.profileName.trim()
+          : undefined;
       const env: Record<string, string | undefined> = {
         ...process.env,
         AGENTSCHAT_TOOL_ONLY: "1",
         AGENTSCHAT_LOCK_OWNER_PID: String(cfg.lockOwnerPid ?? process.pid),
         ZCODE_SESSION_ID: sessionId,
-        ...(cfg.profileName ? { AGENTSCHAT_PROFILE: cfg.profileName } : {}),
+        ...(safeProfileName ? { AGENTSCHAT_PROFILE: safeProfileName } : {}),
       };
       const resolved = resolveWindowsCliSpawn(cmd, rawArgs, { env });
       const timeoutMs = clampWakeTimerMs(cfg.timeoutMs, 180_000);

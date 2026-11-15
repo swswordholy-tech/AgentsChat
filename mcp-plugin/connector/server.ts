@@ -255,17 +255,25 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
     if (identity && ((!legacy && (identity.gatewayId !== conn.gatewayId || identity.secret !== conn.secret)) ||
         (frame.platform !== undefined && frame.platform !== "agentschat"))) identity = null;
     if (!identity) {
-      log(`[connector] outbound failed: no usable identity for botId=${requested ?? "?"}`);
-      return { success: false, error: `no usable identity for outbound (botId=${requested ?? "?"})` };
+      const safeReq = redactSecrets(String(requested ?? "?")).replace(/[\x00-\x1f\x7f-\x9f]+/g, "").slice(0, 128);
+      log(`[connector] outbound failed: no usable identity for botId=${safeReq}`);
+      return { success: false, error: `no usable identity for outbound (botId=${safeReq})` };
     }
     if (typeof chatId !== "string" || chatId !== chatId.trim() || chatId.length < 1 || chatId.length > 128 ||
-        /[\s\x00-\x1f\x7f/\\]/.test(chatId) || chatId === "." || chatId.includes("..") ||
+        /[\s\x00-\x1f\x7f-\x9f\u2028\u2029/\\]/.test(chatId) || /(?:%2f|%5c|%00|%2e%2e)/i.test(chatId) ||
+        chatId === "." || chatId.includes("..") ||
         ["__proto__", "constructor", "prototype"].includes(chatId.toLowerCase())) {
       return { success: false, error: "invalid chat_id" };
     }
     switch (op) {
       case "send": {
-        const r = await hooks.sendMessage(identity.botId, chatId, action.content ?? "", action.reply_to);
+        const rawReplyTo = action.reply_to;
+        const safeReplyTo = typeof rawReplyTo === "string" && rawReplyTo.length > 0 && rawReplyTo.length <= 256 &&
+          !/[\s\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(rawReplyTo) &&
+          !["__proto__", "constructor", "prototype"].includes(rawReplyTo.toLowerCase())
+          ? rawReplyTo
+          : undefined;
+        const r = await hooks.sendMessage(identity.botId, chatId, action.content ?? "", safeReplyTo);
         return { success: true, message_id: r?.id };
       }
       case "typing": {
@@ -276,9 +284,11 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
         const info = await hooks.getChatInfo(identity.botId, chatId);
         return info ?? {};
       }
-      default:
-        log(`[connector] outbound failed: unsupported op ${String(op)}`);
-        return { success: false, error: `unsupported op: ${String(op)}` };
+      default: {
+        const safeOp = redactSecrets(String(op)).replace(/[\x00-\x1f\x7f-\x9f]+/g, "").slice(0, 64);
+        log(`[connector] outbound failed: unsupported op ${safeOp}`);
+        return { success: false, error: `unsupported op: ${safeOp}` };
+      }
     }
   }
 
@@ -383,7 +393,7 @@ export function startConnector(config: ConnectorConfig): ConnectorHandle {
                 ]);
                 if (ctx && ctx.length) {
                   baseEvent.context = ctx.slice(-10).map((c) => ({
-                    text: String(c?.text ?? "").slice(0, 500),
+                    text: redactSecrets(String(c?.text ?? "").slice(0, 4096)).slice(0, 500),
                     source: { user_name: c?.user_name, user_id: c?.user_id },
                   }));
                 }

@@ -39,7 +39,9 @@ export const DEFAULT_MAX_IDLE_MS = 0; // never auto-hibernate unless --max-idle 
 export function parseMaxIdleMs(raw: string | number | undefined): number | undefined {
   if (raw === undefined || raw === null) return undefined;
   if (typeof raw === "number") {
-    return Number.isFinite(raw) && raw >= 0 ? Math.round(raw * 1000) : undefined;
+    if (!Number.isFinite(raw) || raw < 0) return undefined;
+    const ms = Math.round(raw * 1000);
+    return Number.isFinite(ms) && ms <= Number.MAX_SAFE_INTEGER ? ms : undefined;
   }
   const s = String(raw).trim().toLowerCase();
   if (!s) return undefined;
@@ -51,14 +53,18 @@ export function parseMaxIdleMs(raw: string | number | undefined): number | undef
   const val = Number(m[1]);
   if (!Number.isFinite(val) || val < 0) return undefined;
   const unit = m[2] || "s";
-  if (unit === "ms") return Math.round(val);
-  if (unit === "s" || unit === "sec" || unit === "secs") return Math.round(val * 1000);
-  if (unit === "m" || unit === "min" || unit === "mins") return Math.round(val * 60_000);
-  if (unit === "h" || unit === "hr" || unit === "hrs" || unit === "hour" || unit === "hours") {
-    return Math.round(val * 3_600_000);
+  let ms: number;
+  if (unit === "ms") ms = Math.round(val);
+  else if (unit === "s" || unit === "sec" || unit === "secs") ms = Math.round(val * 1000);
+  else if (unit === "m" || unit === "min" || unit === "mins") ms = Math.round(val * 60_000);
+  else if (unit === "h" || unit === "hr" || unit === "hrs" || unit === "hour" || unit === "hours") {
+    ms = Math.round(val * 3_600_000);
+  } else if (unit === "d" || unit === "day" || unit === "days") {
+    ms = Math.round(val * 86_400_000);
+  } else {
+    return undefined;
   }
-  if (unit === "d" || unit === "day" || unit === "days") return Math.round(val * 86_400_000);
-  return undefined;
+  return Number.isFinite(ms) && ms <= Number.MAX_SAFE_INTEGER ? ms : undefined;
 }
 const MAX_SSE_STREAMS = 3;
 const MAX_SSE_LINE_CHARS = 512 * 1024;
@@ -70,6 +76,9 @@ const MAX_HTTP_JSON_BYTES = 4 * 1024 * 1024;
 const MAX_PID_FILE_BYTES = 64 * 1024;
 const DIRECT_CHANNEL_RE = /^dm[-:]/i;
 const PROTOTYPE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+const CLI_CHANNEL_CREDENTIAL_PREFIX_RE =
+  /^(?:ac_|mcp_(?:at|rt|code)_|agent_key_|whsec_|mr_|sk-|sk_|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|AIza|AKIA|ASIA)/i;
+const CLI_ENCODED_TRAVERSAL_RE = /(?:%2f|%5c|%00|%2e%2e)/i;
 
 function isLoopbackHost(hostname: string): boolean {
   const h = hostname.toLowerCase();
@@ -85,6 +94,7 @@ function isUnsafeMetadataOrLinkLocalHost(hostname: string): boolean {
     lower === "100.100.100.200" ||
     lower === "fd00:ec2::254" ||
     lower === "metadata.google.internal" ||
+    lower.endsWith(".metadata.google.internal") ||
     lower === "metadata" ||
     lower === "metadata.goog" ||
     lower.endsWith(".metadata.goog") ||
@@ -124,6 +134,10 @@ function isAllowedDarwinSystemLink(dirPath: string): boolean {
   if (process.platform !== "darwin") return false;
   if (dirPath !== "/var" && dirPath !== "/tmp" && dirPath !== "/etc") return false;
   try {
+    const privStat = lstatSync("/private");
+    if (privStat.isSymbolicLink() || !privStat.isDirectory()) return false;
+    const targetStat = lstatSync(`/private${dirPath}`);
+    if (targetStat.isSymbolicLink() || !targetStat.isDirectory()) return false;
     return readlinkSync(dirPath) === `private${dirPath}`;
   } catch {
     return false;
@@ -131,7 +145,7 @@ function isAllowedDarwinSystemLink(dirPath: string): boolean {
 }
 
 export function hasSafeDirChain(dirPath: string): boolean {
-  if (typeof dirPath !== "string" || !dirPath.trim() || /[\x00-\x1f\x7f]/.test(dirPath)) {
+  if (typeof dirPath !== "string" || !dirPath.trim() || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(dirPath)) {
     return false;
   }
   // Guard against `symlink_dir/..` lexical collapse before `resolve(dirPath)`.
@@ -182,7 +196,7 @@ export function hasSafeDirChain(dirPath: string): boolean {
 export function validateSafeRestBaseUrl(rawUrl: string): string {
   if (typeof rawUrl !== "string") throw new Error("Invalid AgentsChat REST URL");
   const trimmed = rawUrl.trim().replace(/\/+$/, "");
-  if (!trimmed || trimmed.length > 2048 || /[\x00-\x20\x7f"<>\\]/.test(trimmed) || /:0(?:\/|$)/.test(trimmed)) {
+  if (!trimmed || trimmed.length > 2048 || /[\x00-\x20\x7f-\x9f\u2028\u2029"<>\\]/.test(trimmed) || /:0(?:\/|$)/.test(trimmed)) {
     throw new Error("Invalid AgentsChat REST URL");
   }
   let parsed: URL;
@@ -213,14 +227,25 @@ export function isSafeCliChannelId(channelId: unknown): channelId is string {
     channelId.length < 1 ||
     channelId.length > 128 ||
     channelId.trim() !== channelId ||
-    /[\x00-\x1f\x7f/\\\s]/.test(channelId) ||
+    /[\x00-\x1f\x7f-\x9f\u2028\u2029/\\\s]/.test(channelId) ||
     channelId === "." ||
     channelId.includes("..") ||
+    CLI_ENCODED_TRAVERSAL_RE.test(channelId) ||
+    CLI_CHANNEL_CREDENTIAL_PREFIX_RE.test(channelId) ||
     PROTOTYPE_KEYS.has(channelId.toLowerCase())
   ) {
     return false;
   }
   return true;
+}
+
+function validateSafeBearerToken(token: unknown): string {
+  if (typeof token !== "string") throw new Error("Invalid authentication token");
+  const trimmed = token.trim();
+  if (!trimmed || trimmed.length > 4096 || /[\x00-\x20\x7f-\x9f\u2028\u2029]/.test(trimmed)) {
+    throw new Error("Invalid authentication token");
+  }
+  return trimmed;
 }
 
 function ensureRealDirectory(dir: string): void {
@@ -559,6 +584,7 @@ export async function joinChannelRest(opts: {
   const f = opts.fetchImpl ?? fetch;
   try {
     const baseUrl = validateSafeRestBaseUrl(opts.restUrl);
+    const safeToken = validateSafeBearerToken(opts.token);
     if (!isSafeCliChannelId(opts.channelId)) {
       throw new Error("Invalid channel_id");
     }
@@ -569,7 +595,7 @@ export async function joinChannelRest(opts: {
       {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${opts.token}`,
+          Authorization: `Bearer ${safeToken}`,
           "Content-Type": "application/json",
         },
         body: JSON.stringify({ sender_id: opts.agentId }),
@@ -622,8 +648,21 @@ export async function sendRestMessage(opts: {
   const cleanText = redactSecrets(opts.text);
   try {
     const baseUrl = validateSafeRestBaseUrl(opts.restUrl);
+    const safeToken = validateSafeBearerToken(opts.token);
     if (!isSafeCliChannelId(opts.channelId)) {
       throw new Error("Invalid channel_id");
+    }
+    let safeReplyTo: string | undefined;
+    if (opts.replyTo !== undefined && opts.replyTo !== "") {
+      if (
+        typeof opts.replyTo !== "string" ||
+        opts.replyTo.length > 256 ||
+        /[\x00-\x1f\x7f-\x9f\u2028\u2029\s]/.test(opts.replyTo) ||
+        PROTOTYPE_KEYS.has(opts.replyTo.toLowerCase())
+      ) {
+        throw new Error("Invalid in_reply_to message_id");
+      }
+      safeReplyTo = opts.replyTo;
     }
     const url = `${baseUrl}/api/channels/${encodeURIComponent(opts.channelId)}/messages`;
     const res = await fetchWithDeadline(
@@ -632,7 +671,7 @@ export async function sendRestMessage(opts: {
       {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${opts.token}`,
+          Authorization: `Bearer ${safeToken}`,
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
@@ -640,7 +679,7 @@ export async function sendRestMessage(opts: {
           sender_type: "agent",
           content_type: "text",
           content: cleanText,
-          ...(opts.replyTo ? { in_reply_to: opts.replyTo } : {}),
+          ...(safeReplyTo ? { in_reply_to: safeReplyTo } : {}),
         }),
       },
       opts.timeoutMs ?? DEFAULT_HTTP_TIMEOUT_MS,
@@ -737,7 +776,8 @@ export async function wakeOnce(opts: {
   const warn = opts.warn ?? ((m: string) => process.stderr.write(m));
   const nowIso = opts.nowIso ?? (() => new Date().toISOString());
   const baseUrl = validateSafeRestBaseUrl(opts.restUrl);
-  const { configDir, agentId, displayName, token } = opts;
+  const token = validateSafeBearerToken(opts.token);
+  const { configDir, agentId, displayName } = opts;
   const timeoutMs =
     opts.timeoutMs !== undefined && Number.isFinite(opts.timeoutMs)
       ? opts.timeoutMs > 0

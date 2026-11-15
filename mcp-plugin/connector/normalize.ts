@@ -65,7 +65,8 @@ export function toWireEvent(msg: AgentsChatMessage, platform = "agentschat"): Wi
   const content = typeof msg.content === "string" ? msg.content : "";
   if (content === "__typing__") return null;
 
-  const metadata = (value: string | undefined) => typeof value === "string" ? value.replace(/[\x00-\x1f\x7f]/g, "") : undefined;
+  const metadata = (value: string | undefined) =>
+    typeof value === "string" ? value.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, "") : undefined;
   const chatId = metadata(msg.channel_id) ?? "";
   if (!chatId) return null;
 

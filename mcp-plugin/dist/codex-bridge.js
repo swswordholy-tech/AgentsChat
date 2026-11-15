@@ -1763,7 +1763,7 @@ import { createInterface } from "node:readline";
 // src/wake.ts
 import { existsSync as existsSync2, lstatSync as lstatSync5, readFileSync as readFileSync4, readlinkSync as readlinkSync2 } from "node:fs";
 import { homedir as homedir4 } from "node:os";
-import { dirname as dirname3, join as join5, parse as parse2, resolve as resolve4, win32 as pathWin32 } from "node:path";
+import { dirname as dirname3, isAbsolute as isAbsolute4, join as join5, parse as parse2, resolve as resolve4, win32 as pathWin32 } from "node:path";
 var GROK_GATEWAY_PATH_CANDIDATES = [
   join5(process.env.HOME || process.env.USERPROFILE || homedir4(), ".grok", "gateway.json"),
   "/home/box/sand-data/gateway.json"
@@ -2396,7 +2396,7 @@ async function verifyLoopTick(raw, config, owner, list, opts) {
 import { createHash as createHash3 } from "node:crypto";
 import { closeSync, lstatSync as lstatSync9, mkdirSync as mkdirSync5, openSync, readFileSync as readFileSync8, readSync, readdirSync as readdirSync4, readlinkSync as readlinkSync3, realpathSync as realpathSync5, statSync, unlinkSync as unlinkSync3 } from "node:fs";
 import { homedir as homedir5, tmpdir } from "node:os";
-import { isAbsolute as isAbsolute4, join as join9, parse as parse3, resolve as resolve6 } from "node:path";
+import { isAbsolute as isAbsolute5, join as join9, parse as parse3, resolve as resolve6 } from "node:path";
 
 // src/profile-store.ts
 import {
@@ -2603,7 +2603,7 @@ function isPidAlive(pid) {
 }
 function resolveLockDir(homeDir, env = process.env) {
   const explicit = env.AGENTSCHAT_LOCK_DIR?.trim();
-  if (explicit && explicit.length <= 4096 && !explicit.startsWith("-") && !CONTROL_CHAR_RE.test(explicit) && isAbsolute4(explicit) && isSafeDirOrMissing(explicit)) {
+  if (explicit && explicit.length <= 4096 && !explicit.startsWith("-") && !CONTROL_CHAR_RE.test(explicit) && isAbsolute5(explicit) && isSafeDirOrMissing(explicit)) {
     return explicit;
   }
   const hash = createHash3("sha256").update(homeDir || ".").digest("hex").slice(0, 12);
@@ -2672,7 +2672,7 @@ function isAllowedDarwinSystemLink(dirPath) {
 function hasSafeRawDotDotSegments(rawPath) {
   if (!rawPath.includes(".."))
     return true;
-  const baseAbs = isAbsolute4(rawPath) ? rawPath : `${process.cwd()}/${rawPath}`;
+  const baseAbs = isAbsolute5(rawPath) ? rawPath : `${process.cwd()}/${rawPath}`;
   const root = parse3(baseAbs).root;
   const rawParts = baseAbs.slice(root.length).split(/[\\/]+/).filter(Boolean);
   let cur = root;

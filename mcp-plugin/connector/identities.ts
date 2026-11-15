@@ -36,7 +36,9 @@ export interface Identity {
 }
 
 export function validIdentityId(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0 && value.length <= 128 && value !== "." && value !== ".." && !/[/\\\s\x00-\x1f\x7f]/.test(value) &&
+  return typeof value === "string" && value.length > 0 && value.length <= 128 && value !== "." && value !== ".." &&
+    !value.includes("..") && !/(?:%2f|%5c|%00|%2e%2e)/i.test(value) &&
+    !/[/\\\s\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(value) &&
     !["__proto__", "constructor", "prototype"].includes(value.toLowerCase());
 }
 
