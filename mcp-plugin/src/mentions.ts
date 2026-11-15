@@ -20,6 +20,7 @@ const PROTOTYPE_MENTION_IDS = new Set(["__proto__", "constructor", "prototype"])
 
 export function matchesMention(content: string, agentId: string): boolean {
   if (typeof content !== "string" || typeof agentId !== "string") return false;
+  if (/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(agentId)) return false;
   const trimmedId = agentId.trim();
   if (
     !content ||
@@ -27,7 +28,7 @@ export function matchesMention(content: string, agentId: string): boolean {
     trimmedId.length > MAX_MENTION_ID_CHARS ||
     trimmedId === "." ||
     trimmedId === ".." ||
-    /[\/\\\s\x00-\x1f\x7f]/.test(trimmedId) ||
+    /[\/\\\s\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(trimmedId) ||
     PROTOTYPE_MENTION_IDS.has(trimmedId.toLowerCase())
   ) {
     return false;

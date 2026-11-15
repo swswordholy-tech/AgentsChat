@@ -23,12 +23,17 @@ function isLoopbackHost(hostname: string): boolean {
 
 /** URL.hostname is already canonicalized by the WHATWG URL parser. */
 export function isUnsafeEndpointHost(hostname: string): boolean {
-  const host = hostname.toLowerCase().replace(/\.+$/, "");
+  let host = hostname.toLowerCase().replace(/\.+$/, "");
   if (["metadata.google.internal", "metadata.goog", "metadata", "instance-data"].includes(host) ||
-      host.endsWith(".metadata.goog")) return true;
-  const unsafeV4 = (ip: string) => ip === "0.0.0.0" || ip === "100.100.100.200" || ip.startsWith("169.254.");
+      host.endsWith(".metadata.google.internal") || host.endsWith(".metadata.goog")) return true;
+  const unsafeV4 = (ip: string) => ip.startsWith("0.") || ip === "100.100.100.200" || ip.startsWith("169.254.");
   if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) return unsafeV4(host);
   if (!host.startsWith("[")) return false;
+  try {
+    host = new URL(`http://${host}`).hostname.toLowerCase();
+  } catch {
+    return true;
+  }
   const address = host.slice(1, -1);
   const [left, right = ""] = address.split("::");
   const head = left ? left.split(":") : [];
@@ -47,11 +52,14 @@ export function isUnsafeEndpointHost(hostname: string): boolean {
 export function isSafeAgentId(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= 128 &&
     ![".", "..", "__proto__", "constructor", "prototype"].includes(value.toLowerCase()) &&
-    !/[\/\\\s\x00-\x1f\x7f]/.test(value);
+    !/[\/\\\s\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(value);
 }
 
 /** Inspect existing ancestors before recursive mkdir can follow a symlink. */
 export function assertSafeParentDirectories(file: string): void {
+  if (!file || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(file)) {
+    throw new Error("Refusing to write Muse file inside symlinked or non-directory parent");
+  }
   // Preserve lexical .. components so a symlink before /../ is still inspected.
   const parent = dirname(isAbsolute(file) ? file : `${process.cwd()}${sep}${file}`);
   // Check from root to leaf, before a later /.. can hide a symlink.
@@ -62,7 +70,9 @@ export function assertSafeParentDirectories(file: string): void {
       const st = lstatSync(dir);
       const systemLink = process.platform === "darwin" &&
         ["/var", "/tmp", "/etc"].includes(dir) && st.isSymbolicLink() &&
-        realpathSync(dir) === `/private${dir}` && !lstatSync(`/private${dir}`).isSymbolicLink() &&
+        realpathSync(dir) === `/private${dir}` &&
+        !lstatSync("/private").isSymbolicLink() && lstatSync("/private").isDirectory() &&
+        !lstatSync(`/private${dir}`).isSymbolicLink() &&
         lstatSync(`/private${dir}`).isDirectory();
       if ((!systemLink && st.isSymbolicLink()) || (!st.isDirectory() && !systemLink)) {
         throw new Error("Refusing to write Muse file inside symlinked or non-directory parent");
@@ -74,7 +84,7 @@ export function assertSafeParentDirectories(file: string): void {
 }
 
 export function validateEndpointUrl(raw: string, kind: "ws" | "rest"): string {
-  if (raw !== raw.trim() || /["<>\\\x00-\x20\x7f]/.test(raw)) {
+  if (raw !== raw.trim() || /["<>\\\x00-\x20\x7f-\x9f\u2028\u2029]/.test(raw)) {
     throw new Error(`Invalid Muse ${kind} URL`);
   }
   const trimmed = raw;
@@ -163,7 +173,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, profilePath?: s
   const profile = readProfile(profilePath);
   const rawAgentId = (env.AGENTCHAT_AGENT_ID ?? profile.agentId ?? "").trim();
   const rawToken = (env.AGENTCHAT_TOKEN ?? profile.token ?? "").trim();
-  if (!isSafeAgentId(rawAgentId) || !rawToken || /[\x00-\x1f\x7f]/.test(rawAgentId) || /[\x00-\x1f\x7f]/.test(rawToken)) {
+  if (!isSafeAgentId(rawAgentId) || !rawToken || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(rawAgentId) || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(rawToken)) {
     throw new Error(
       "Missing AgentsChat identity: set AGENTCHAT_AGENT_ID and AGENTCHAT_TOKEN, " +
         `or create ${profilePath ?? PROFILE_PATH} via 'muse-agentchat --register-only --name <name>'. ` +

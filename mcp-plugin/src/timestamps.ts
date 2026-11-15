@@ -36,7 +36,7 @@ export function normalizeTimestampForCursor(
   mode: "before" | "after",
 ): string | undefined {
   if (!ts || typeof ts !== "string" || ts.length > 128) return ts;
-  if (/[\x00-\x1f\x7f]/.test(ts)) return undefined;
+  if (/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(ts)) return undefined;
   if (mode !== "before" && mode !== "after") return ts;
   const padChar = mode === "before" ? "9" : "0";
   const trimmed = ts.trim();

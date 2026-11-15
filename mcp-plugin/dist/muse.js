@@ -205,14 +205,19 @@ function isLoopbackHost(hostname) {
   return h === "localhost" || h === "127.0.0.1" || h === "[::1]" || h === "::1";
 }
 function isUnsafeEndpointHost(hostname) {
-  const host = hostname.toLowerCase().replace(/\.+$/, "");
-  if (["metadata.google.internal", "metadata.goog", "metadata", "instance-data"].includes(host) || host.endsWith(".metadata.goog"))
+  let host = hostname.toLowerCase().replace(/\.+$/, "");
+  if (["metadata.google.internal", "metadata.goog", "metadata", "instance-data"].includes(host) || host.endsWith(".metadata.google.internal") || host.endsWith(".metadata.goog"))
     return true;
-  const unsafeV4 = (ip) => ip === "0.0.0.0" || ip === "100.100.100.200" || ip.startsWith("169.254.");
+  const unsafeV4 = (ip) => ip.startsWith("0.") || ip === "100.100.100.200" || ip.startsWith("169.254.");
   if (/^\d+\.\d+\.\d+\.\d+$/.test(host))
     return unsafeV4(host);
   if (!host.startsWith("["))
     return false;
+  try {
+    host = new URL(`http://${host}`).hostname.toLowerCase();
+  } catch {
+    return true;
+  }
   const address = host.slice(1, -1);
   const [left, right = ""] = address.split("::");
   const head = left ? left.split(":") : [];
@@ -226,16 +231,19 @@ function isUnsafeEndpointHost(hostname) {
   return words.every((x) => x === 0) || (words[0] & 65472) === 65152 || words[0] === 64768 && words[1] === 3778 && words.slice(2, 7).every((x) => x === 0) && words[7] === 596;
 }
 function isSafeAgentId(value) {
-  return typeof value === "string" && value.length > 0 && value.length <= 128 && ![".", "..", "__proto__", "constructor", "prototype"].includes(value.toLowerCase()) && !/[\/\\\s\x00-\x1f\x7f]/.test(value);
+  return typeof value === "string" && value.length > 0 && value.length <= 128 && ![".", "..", "__proto__", "constructor", "prototype"].includes(value.toLowerCase()) && !/[\/\\\s\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(value);
 }
 function assertSafeParentDirectories(file) {
+  if (!file || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(file)) {
+    throw new Error("Refusing to write Muse file inside symlinked or non-directory parent");
+  }
   const parent = dirname(isAbsolute(file) ? file : `${process.cwd()}${sep}${file}`);
   const parts = parent.split(sep);
   for (let i = 1;i <= parts.length; i++) {
     const dir = parts.slice(0, i).join(sep) || sep;
     try {
       const st = lstatSync(dir);
-      const systemLink = process.platform === "darwin" && ["/var", "/tmp", "/etc"].includes(dir) && st.isSymbolicLink() && realpathSync(dir) === `/private${dir}` && !lstatSync(`/private${dir}`).isSymbolicLink() && lstatSync(`/private${dir}`).isDirectory();
+      const systemLink = process.platform === "darwin" && ["/var", "/tmp", "/etc"].includes(dir) && st.isSymbolicLink() && realpathSync(dir) === `/private${dir}` && !lstatSync("/private").isSymbolicLink() && lstatSync("/private").isDirectory() && !lstatSync(`/private${dir}`).isSymbolicLink() && lstatSync(`/private${dir}`).isDirectory();
       if (!systemLink && st.isSymbolicLink() || !st.isDirectory() && !systemLink) {
         throw new Error("Refusing to write Muse file inside symlinked or non-directory parent");
       }
@@ -246,7 +254,7 @@ function assertSafeParentDirectories(file) {
   }
 }
 function validateEndpointUrl(raw, kind) {
-  if (raw !== raw.trim() || /["<>\\\x00-\x20\x7f]/.test(raw)) {
+  if (raw !== raw.trim() || /["<>\\\x00-\x20\x7f-\x9f\u2028\u2029]/.test(raw)) {
     throw new Error(`Invalid Muse ${kind} URL`);
   }
   const trimmed = raw;
@@ -317,7 +325,7 @@ function loadConfig(env = process.env, profilePath) {
   const profile = readProfile(profilePath);
   const rawAgentId = (env.AGENTCHAT_AGENT_ID ?? profile.agentId ?? "").trim();
   const rawToken = (env.AGENTCHAT_TOKEN ?? profile.token ?? "").trim();
-  if (!isSafeAgentId(rawAgentId) || !rawToken || /[\x00-\x1f\x7f]/.test(rawAgentId) || /[\x00-\x1f\x7f]/.test(rawToken)) {
+  if (!isSafeAgentId(rawAgentId) || !rawToken || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(rawAgentId) || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(rawToken)) {
     throw new Error("Missing AgentsChat identity: set AGENTCHAT_AGENT_ID and AGENTCHAT_TOKEN, " + `or create ${profilePath ?? PROFILE_PATH} via 'muse-agentchat --register-only --name <name>'. ` + "Tokens are never printed; see README for registration.");
   }
   const wsUrl = validateEndpointUrl(env.AGENTCHAT_WS_URL ?? profile.wsUrl ?? DEFAULT_WS_URL, "ws");
@@ -336,15 +344,15 @@ function loadConfig(env = process.env, profilePath) {
 
 // muse/src/wake.ts
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { appendFileSync, chmodSync, lstatSync as lstatSync2, mkdirSync, readFileSync as readFileSync2, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, copyFileSync, lstatSync as lstatSync2, mkdirSync, readFileSync as readFileSync2, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname as dirname2 } from "node:path";
 var WAKE_SIG_HEADER = "x-agentschat-signature";
 var WAKE_CONTENT_MAX = 500;
 function redactSecrets(text) {
-  return text.replace(/-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)/g, "[redacted]").replace(/\b(?:Bearer|Basic)\s+[^\s"'<>\\]+/gi, "[redacted]").replace(/(?:ac_|agent_key_|mcp_(?:at|rt|code)_|sk-|sk_|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|whsec_|AIza)[A-Za-z0-9_-]+/g, "[redacted]").replace(/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, "[redacted]").replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[redacted]");
+  return text.replace(/-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)/g, "[redacted]").replace(/\b(https?:\/\/)([^/\s@]*@)/gi, "$1[redacted]@").replace(/\b(?:Bearer|Basic)\s+[^\s"'<>\\]+/gi, "[redacted]").replace(/(?:ac_|agent_key_|mcp_(?:at|rt|code)_|sk-|sk_|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|mr_|whsec_|AIza)[A-Za-z0-9_-]+/g, "[redacted]").replace(/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, "[redacted]").replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[redacted]");
 }
 function sanitizeMuseText(text) {
-  return redactSecrets(redactSecrets(text).replace(/[\x00-\x1f\x7f]/g, ""));
+  return redactSecrets(redactSecrets(text).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ""));
 }
 function buildWakePayload(msg, opts = {}) {
   const clean = (value, cap = 128) => typeof value === "string" ? sanitizeMuseText(value).slice(0, cap) : undefined;
@@ -460,7 +468,50 @@ async function fireWake(msg, cfg) {
 var MAX_WAKE_QUEUE_LINES = 500;
 var MAX_WAKE_QUEUE_BYTES = 16 * 1024 * 1024;
 var wakeTmpSeq = 0;
-function appendWakeQueue(queueFile, payload, maxLines = MAX_WAKE_QUEUE_LINES) {
+function atomicReplaceWakeFile(tmp, queueFile, fsOps) {
+  const renameFn = fsOps?.renameSync ?? renameSync;
+  const copyFn = fsOps?.copyFileSync ?? copyFileSync;
+  const unlinkFn = fsOps?.unlinkSync ?? unlinkSync;
+  assertSafeParentDirectories(queueFile);
+  try {
+    const st = lstatSync2(queueFile);
+    if (st.isSymbolicLink() || !st.isFile()) {
+      throw new Error("Refusing to use symlink or non-regular file for Muse wake queue");
+    }
+  } catch (err) {
+    if (err?.code !== "ENOENT")
+      throw err;
+  }
+  try {
+    renameFn(tmp, queueFile);
+  } catch (renameErr) {
+    const code = renameErr?.code;
+    if (code === "EPERM" || code === "EACCES") {
+      assertSafeParentDirectories(queueFile);
+      try {
+        const st = lstatSync2(queueFile);
+        if (st.isSymbolicLink() || !st.isFile()) {
+          throw new Error("Refusing to use symlink or non-regular file for Muse wake queue");
+        }
+      } catch (err) {
+        if (err?.code !== "ENOENT")
+          throw err;
+      }
+      copyFn(tmp, queueFile);
+      if (process.platform !== "win32") {
+        try {
+          chmodSync(queueFile, 384);
+        } catch {}
+      }
+      try {
+        unlinkFn(tmp);
+      } catch {}
+      return;
+    }
+    throw renameErr;
+  }
+}
+function appendWakeQueue(queueFile, payload, maxLines = MAX_WAKE_QUEUE_LINES, fsOps) {
   const dir = dirname2(queueFile);
   assertSafeParentDirectories(queueFile);
   mkdirSync(dir, { recursive: true, mode: 448 });
@@ -504,16 +555,7 @@ function appendWakeQueue(queueFile, payload, maxLines = MAX_WAKE_QUEUE_LINES) {
       writeFileSync(tmp, `${kept.join(`
 `)}
 `, { mode: 384, flag: "wx" });
-      try {
-        const st = lstatSync2(queueFile);
-        if (st.isSymbolicLink() || !st.isFile()) {
-          throw new Error("Refusing to use symlink or non-regular file for Muse wake queue");
-        }
-      } catch (err) {
-        if (err?.code !== "ENOENT")
-          throw err;
-      }
-      renameSync(tmp, queueFile);
+      atomicReplaceWakeFile(tmp, queueFile, fsOps);
     } catch (err) {
       try {
         unlinkSync(tmp);
@@ -578,6 +620,21 @@ function resolveDrainReconnectDelay(frame, rand = Math.random) {
 // muse/src/client.ts
 var MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 var MAX_JOINED_CHANNELS = 256;
+var MAX_WS_FRAME_BYTES = 1048576;
+function rawFrameByteLength(data) {
+  if (typeof data === "string") {
+    if (data.length > MAX_WS_FRAME_BYTES)
+      return data.length;
+    if (data.length * 3 <= MAX_WS_FRAME_BYTES)
+      return data.length;
+    return Buffer.byteLength(data, "utf8");
+  }
+  if (data instanceof ArrayBuffer)
+    return data.byteLength;
+  if (ArrayBuffer.isView(data))
+    return data.byteLength;
+  return 0;
+}
 function safeDelayMs(value, fallback, min = 0) {
   if (typeof value !== "number" || !Number.isFinite(value) || value < min)
     return fallback;
@@ -587,7 +644,7 @@ function normalizeChannelId(raw) {
   if (typeof raw !== "string")
     return null;
   const trimmed = raw.trim();
-  if (!trimmed || trimmed.length > 128 || /[\/\\\x00-\x20\x7f]/.test(trimmed) || [".", "..", "__proto__", "constructor", "prototype"].includes(trimmed.toLowerCase()))
+  if (!trimmed || trimmed.length > 128 || /[\/\\\x00-\x20\x7f-\x9f\u2028\u2029]/.test(trimmed) || [".", "..", "__proto__", "constructor", "prototype"].includes(trimmed.toLowerCase()))
     return null;
   return trimmed;
 }
@@ -747,7 +804,7 @@ class MuseAgentChatClient {
   }
   sendMessage(channelId, content, contentType = "text", replyTo) {
     const clean = normalizeChannelId(channelId);
-    if (!clean || replyTo !== undefined && (typeof replyTo !== "string" || replyTo.length > 256 || /[\x00-\x1f\x7f]/.test(replyTo)))
+    if (!clean || replyTo !== undefined && (typeof replyTo !== "string" || replyTo.length > 256 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(replyTo)))
       return;
     this.send({
       type: "message",
@@ -841,6 +898,8 @@ class MuseAgentChatClient {
     };
     ws.onmessage = (event) => {
       if (this.ws !== ws)
+        return;
+      if (rawFrameByteLength(event.data) > MAX_WS_FRAME_BYTES)
         return;
       this.handleMessage(String(event.data));
     };

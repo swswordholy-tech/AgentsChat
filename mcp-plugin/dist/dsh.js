@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // dsh/src/cli.ts
-import { chmodSync as chmodSync3, copyFileSync as copyFileSync2, lstatSync as lstatSync7, mkdirSync as mkdirSync4, readFileSync as readFileSync7, renameSync as renameSync3, unlinkSync as unlinkSync4, writeFileSync as writeFileSync3 } from "node:fs";
+import { chmodSync as chmodSync3, copyFileSync as copyFileSync3, lstatSync as lstatSync7, mkdirSync as mkdirSync4, readFileSync as readFileSync7, renameSync as renameSync3, unlinkSync as unlinkSync4, writeFileSync as writeFileSync3 } from "node:fs";
 import { randomBytes as randomBytes3 } from "node:crypto";
 import { spawn } from "node:child_process";
 import { dirname as dirname6, join as join6 } from "node:path";
@@ -203,14 +203,19 @@ function isLoopbackHost(hostname) {
   return h === "localhost" || h === "127.0.0.1" || h === "[::1]" || h === "::1";
 }
 function isUnsafeEndpointHost(hostname) {
-  const host = hostname.toLowerCase().replace(/\.+$/, "");
-  if (["metadata.google.internal", "metadata.goog", "metadata", "instance-data"].includes(host) || host.endsWith(".metadata.goog"))
+  let host = hostname.toLowerCase().replace(/\.+$/, "");
+  if (["metadata.google.internal", "metadata.goog", "metadata", "instance-data"].includes(host) || host.endsWith(".metadata.google.internal") || host.endsWith(".metadata.goog"))
     return true;
-  const unsafeV4 = (ip) => ip === "0.0.0.0" || ip === "100.100.100.200" || ip.startsWith("169.254.");
+  const unsafeV4 = (ip) => ip.startsWith("0.") || ip === "100.100.100.200" || ip.startsWith("169.254.");
   if (/^\d+\.\d+\.\d+\.\d+$/.test(host))
     return unsafeV4(host);
   if (!host.startsWith("["))
     return false;
+  try {
+    host = new URL(`http://${host}`).hostname.toLowerCase();
+  } catch {
+    return true;
+  }
   const address = host.slice(1, -1);
   const [left, right = ""] = address.split("::");
   const head = left ? left.split(":") : [];
@@ -224,13 +229,16 @@ function isUnsafeEndpointHost(hostname) {
   return words.every((x) => x === 0) || (words[0] & 65472) === 65152 || words[0] === 64768 && words[1] === 3778 && words.slice(2, 7).every((x) => x === 0) && words[7] === 596;
 }
 function assertSafeParentDirectories(file) {
+  if (!file || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(file)) {
+    throw new Error("Refusing to write Muse file inside symlinked or non-directory parent");
+  }
   const parent = dirname(isAbsolute(file) ? file : `${process.cwd()}${sep}${file}`);
   const parts = parent.split(sep);
   for (let i = 1;i <= parts.length; i++) {
     const dir = parts.slice(0, i).join(sep) || sep;
     try {
       const st = lstatSync(dir);
-      const systemLink = process.platform === "darwin" && ["/var", "/tmp", "/etc"].includes(dir) && st.isSymbolicLink() && realpathSync(dir) === `/private${dir}` && !lstatSync(`/private${dir}`).isSymbolicLink() && lstatSync(`/private${dir}`).isDirectory();
+      const systemLink = process.platform === "darwin" && ["/var", "/tmp", "/etc"].includes(dir) && st.isSymbolicLink() && realpathSync(dir) === `/private${dir}` && !lstatSync("/private").isSymbolicLink() && lstatSync("/private").isDirectory() && !lstatSync(`/private${dir}`).isSymbolicLink() && lstatSync(`/private${dir}`).isDirectory();
       if (!systemLink && st.isSymbolicLink() || !st.isDirectory() && !systemLink) {
         throw new Error("Refusing to write Muse file inside symlinked or non-directory parent");
       }
@@ -241,7 +249,7 @@ function assertSafeParentDirectories(file) {
   }
 }
 function validateEndpointUrl(raw, kind) {
-  if (raw !== raw.trim() || /["<>\\\x00-\x20\x7f]/.test(raw)) {
+  if (raw !== raw.trim() || /["<>\\\x00-\x20\x7f-\x9f\u2028\u2029]/.test(raw)) {
     throw new Error(`Invalid Muse ${kind} URL`);
   }
   const trimmed = raw;
@@ -287,15 +295,15 @@ function redact(value) {
 
 // muse/src/wake.ts
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { appendFileSync, chmodSync, lstatSync as lstatSync2, mkdirSync, readFileSync as readFileSync2, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, copyFileSync, lstatSync as lstatSync2, mkdirSync, readFileSync as readFileSync2, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname as dirname2 } from "node:path";
 var WAKE_SIG_HEADER = "x-agentschat-signature";
 var WAKE_CONTENT_MAX = 500;
 function redactSecrets(text) {
-  return text.replace(/-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)/g, "[redacted]").replace(/\b(?:Bearer|Basic)\s+[^\s"'<>\\]+/gi, "[redacted]").replace(/(?:ac_|agent_key_|mcp_(?:at|rt|code)_|sk-|sk_|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|whsec_|AIza)[A-Za-z0-9_-]+/g, "[redacted]").replace(/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, "[redacted]").replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[redacted]");
+  return text.replace(/-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)/g, "[redacted]").replace(/\b(https?:\/\/)([^/\s@]*@)/gi, "$1[redacted]@").replace(/\b(?:Bearer|Basic)\s+[^\s"'<>\\]+/gi, "[redacted]").replace(/(?:ac_|agent_key_|mcp_(?:at|rt|code)_|sk-|sk_|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|mr_|whsec_|AIza)[A-Za-z0-9_-]+/g, "[redacted]").replace(/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, "[redacted]").replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[redacted]");
 }
 function sanitizeMuseText(text) {
-  return redactSecrets(redactSecrets(text).replace(/[\x00-\x1f\x7f]/g, ""));
+  return redactSecrets(redactSecrets(text).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ""));
 }
 function buildWakePayload(msg, opts = {}) {
   const clean = (value, cap = 128) => typeof value === "string" ? sanitizeMuseText(value).slice(0, cap) : undefined;
@@ -411,7 +419,50 @@ async function fireWake(msg, cfg) {
 var MAX_WAKE_QUEUE_LINES = 500;
 var MAX_WAKE_QUEUE_BYTES = 16 * 1024 * 1024;
 var wakeTmpSeq = 0;
-function appendWakeQueue(queueFile, payload, maxLines = MAX_WAKE_QUEUE_LINES) {
+function atomicReplaceWakeFile(tmp, queueFile, fsOps) {
+  const renameFn = fsOps?.renameSync ?? renameSync;
+  const copyFn = fsOps?.copyFileSync ?? copyFileSync;
+  const unlinkFn = fsOps?.unlinkSync ?? unlinkSync;
+  assertSafeParentDirectories(queueFile);
+  try {
+    const st = lstatSync2(queueFile);
+    if (st.isSymbolicLink() || !st.isFile()) {
+      throw new Error("Refusing to use symlink or non-regular file for Muse wake queue");
+    }
+  } catch (err) {
+    if (err?.code !== "ENOENT")
+      throw err;
+  }
+  try {
+    renameFn(tmp, queueFile);
+  } catch (renameErr) {
+    const code = renameErr?.code;
+    if (code === "EPERM" || code === "EACCES") {
+      assertSafeParentDirectories(queueFile);
+      try {
+        const st = lstatSync2(queueFile);
+        if (st.isSymbolicLink() || !st.isFile()) {
+          throw new Error("Refusing to use symlink or non-regular file for Muse wake queue");
+        }
+      } catch (err) {
+        if (err?.code !== "ENOENT")
+          throw err;
+      }
+      copyFn(tmp, queueFile);
+      if (process.platform !== "win32") {
+        try {
+          chmodSync(queueFile, 384);
+        } catch {}
+      }
+      try {
+        unlinkFn(tmp);
+      } catch {}
+      return;
+    }
+    throw renameErr;
+  }
+}
+function appendWakeQueue(queueFile, payload, maxLines = MAX_WAKE_QUEUE_LINES, fsOps) {
   const dir = dirname2(queueFile);
   assertSafeParentDirectories(queueFile);
   mkdirSync(dir, { recursive: true, mode: 448 });
@@ -455,16 +506,7 @@ function appendWakeQueue(queueFile, payload, maxLines = MAX_WAKE_QUEUE_LINES) {
       writeFileSync(tmp, `${kept.join(`
 `)}
 `, { mode: 384, flag: "wx" });
-      try {
-        const st = lstatSync2(queueFile);
-        if (st.isSymbolicLink() || !st.isFile()) {
-          throw new Error("Refusing to use symlink or non-regular file for Muse wake queue");
-        }
-      } catch (err) {
-        if (err?.code !== "ENOENT")
-          throw err;
-      }
-      renameSync(tmp, queueFile);
+      atomicReplaceWakeFile(tmp, queueFile, fsOps);
     } catch (err) {
       try {
         unlinkSync(tmp);
@@ -529,6 +571,21 @@ function resolveDrainReconnectDelay(frame, rand = Math.random) {
 // muse/src/client.ts
 var MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 var MAX_JOINED_CHANNELS = 256;
+var MAX_WS_FRAME_BYTES = 1048576;
+function rawFrameByteLength(data) {
+  if (typeof data === "string") {
+    if (data.length > MAX_WS_FRAME_BYTES)
+      return data.length;
+    if (data.length * 3 <= MAX_WS_FRAME_BYTES)
+      return data.length;
+    return Buffer.byteLength(data, "utf8");
+  }
+  if (data instanceof ArrayBuffer)
+    return data.byteLength;
+  if (ArrayBuffer.isView(data))
+    return data.byteLength;
+  return 0;
+}
 function safeDelayMs(value, fallback, min = 0) {
   if (typeof value !== "number" || !Number.isFinite(value) || value < min)
     return fallback;
@@ -538,7 +595,7 @@ function normalizeChannelId(raw) {
   if (typeof raw !== "string")
     return null;
   const trimmed = raw.trim();
-  if (!trimmed || trimmed.length > 128 || /[\/\\\x00-\x20\x7f]/.test(trimmed) || [".", "..", "__proto__", "constructor", "prototype"].includes(trimmed.toLowerCase()))
+  if (!trimmed || trimmed.length > 128 || /[\/\\\x00-\x20\x7f-\x9f\u2028\u2029]/.test(trimmed) || [".", "..", "__proto__", "constructor", "prototype"].includes(trimmed.toLowerCase()))
     return null;
   return trimmed;
 }
@@ -698,7 +755,7 @@ class MuseAgentChatClient {
   }
   sendMessage(channelId, content, contentType = "text", replyTo) {
     const clean = normalizeChannelId(channelId);
-    if (!clean || replyTo !== undefined && (typeof replyTo !== "string" || replyTo.length > 256 || /[\x00-\x1f\x7f]/.test(replyTo)))
+    if (!clean || replyTo !== undefined && (typeof replyTo !== "string" || replyTo.length > 256 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(replyTo)))
       return;
     this.send({
       type: "message",
@@ -792,6 +849,8 @@ class MuseAgentChatClient {
     };
     ws.onmessage = (event) => {
       if (this.ws !== ws)
+        return;
+      if (rawFrameByteLength(event.data) > MAX_WS_FRAME_BYTES)
         return;
       this.handleMessage(String(event.data));
     };
@@ -955,17 +1014,25 @@ var DARWIN_SYSTEM_SYMLINKS = new Set(["/var", "/tmp", "/etc"]);
 var NON_PROFILE_JSON_FILES = new Set([
   "session-binds.json",
   "session-binds.meta.json",
+  "session-binds-meta.json",
+  "session-binds_meta.json",
   "agy-session-binds.json",
+  "agy-session-binds.meta.json",
+  "agy-session-binds_meta.json",
   "agy-binds.json",
   "agy-binds.meta.json",
+  "agy-binds-meta.json",
+  "agy-binds_meta.json",
   "grok-binds.json",
   "grok-binds-meta.json",
   "grok-binds.meta.json",
+  "grok-binds_meta.json",
   "identity-guard.json",
   "cursor.json",
   "read-cursors.json",
   "mention-timestamps.json",
   "wake-pids.json",
+  "codex-bots.json",
   "dsh.json",
   "config.json",
   "muse.json"
@@ -1174,7 +1241,7 @@ function isSafeAbsoluteDirEnv(raw) {
   if (typeof raw !== "string")
     return false;
   const s = raw.trim();
-  return s.length > 0 && s.length <= MAX_DIR_PATH_LENGTH && !s.startsWith("-") && !/[\x00-\x1f\x7f]/.test(s) && isAbsolute3(s);
+  return s.length > 0 && s.length <= MAX_DIR_PATH_LENGTH && !s.startsWith("-") && !/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(s) && isAbsolute3(s);
 }
 function agentschatConfigDir(env = process.env) {
   if (isSafeAbsoluteDirEnv(env.AGENTSCHAT_CONFIG_DIR)) {
@@ -1185,7 +1252,7 @@ function agentschatConfigDir(env = process.env) {
   return join3(home, ".agentschat");
 }
 function isSafeAgentId(id) {
-  return id.length > 0 && id.length <= 128 && id !== "." && id !== ".." && !RESERVED_PROFILE_KEY.test(id) && !/[/\\\s\x00-\x1f\x7f]/.test(id);
+  return id.length > 0 && id.length <= 128 && id !== "." && id !== ".." && !RESERVED_PROFILE_KEY.test(id) && !/[/\\\s\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(id);
 }
 function isSafeRegularProfileFile(path) {
   try {
@@ -1196,7 +1263,7 @@ function isSafeRegularProfileFile(path) {
   }
 }
 function isSafeSessionId(sessionId) {
-  return sessionId.length > 0 && sessionId.length <= MAX_SESSION_ID_LENGTH && sessionId !== "." && sessionId !== ".." && !RESERVED_PROFILE_KEY.test(sessionId) && !/[\x00-\x1f\x7f]/.test(sessionId);
+  return sessionId.length > 0 && sessionId.length <= MAX_SESSION_ID_LENGTH && sessionId !== "." && sessionId !== ".." && !RESERVED_PROFILE_KEY.test(sessionId) && !/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(sessionId);
 }
 function isAllowedDarwinSystemLink2(dirPath) {
   if (process.platform !== "darwin")
@@ -1239,7 +1306,7 @@ function hasSafeRawDotDotSegments2(rawPath) {
 }
 function isSafeRealDir(path) {
   try {
-    if (!path || /[\x00-\x1f\x7f]/.test(path) || !hasSafeRawDotDotSegments2(path)) {
+    if (!path || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(path) || !hasSafeRawDotDotSegments2(path)) {
       return false;
     }
     const st = lstatSync4(path);
@@ -1266,7 +1333,7 @@ function isSafeRealDir(path) {
   }
 }
 function profilePathForName(configDir, name) {
-  if (typeof name !== "string" || !name || name.length > 133 || name === "." || name === ".." || name.includes("/") || name.includes("\\") || /[\x00-\x1f\x7f]/.test(name) || !isSafeRealDir(configDir)) {
+  if (typeof name !== "string" || !name || name.length > 133 || name === "." || name === ".." || name.includes("/") || name.includes("\\") || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(name) || !isSafeRealDir(configDir)) {
     return;
   }
   const base = name.replace(/\.json$/i, "").replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -1297,7 +1364,9 @@ function readAgentId(path) {
   }
 }
 function resolveSessionForAgent(agentId, opts = {}) {
-  const targetAgentId = typeof agentId === "string" ? agentId.trim() : "";
+  if (typeof agentId !== "string" || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(agentId))
+    return;
+  const targetAgentId = agentId.trim();
   if (!isSafeAgentId(targetAgentId))
     return;
   const configDir = opts.configDir ?? agentschatConfigDir(opts.env);
@@ -1397,7 +1466,7 @@ function resolveWindowsCliSpawn(cmd, args, opts) {
 
 // dsh/src/patch.ts
 import { randomBytes as randomBytes2 } from "node:crypto";
-import { chmodSync as chmodSync2, copyFileSync, lstatSync as lstatSync6, mkdirSync as mkdirSync3, readFileSync as readFileSync6, realpathSync as realpathSync4, renameSync as renameSync2, statSync as statSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2 } from "node:fs";
+import { chmodSync as chmodSync2, copyFileSync as copyFileSync2, lstatSync as lstatSync6, mkdirSync as mkdirSync3, readFileSync as readFileSync6, realpathSync as realpathSync4, renameSync as renameSync2, statSync as statSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2 } from "node:fs";
 import { dirname as dirname5, isAbsolute as isAbsolute5, join as join5, resolve as resolve4 } from "node:path";
 import { homedir as homedir4 } from "node:os";
 var FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
@@ -1665,7 +1734,7 @@ function applyDshCordisPatchFile(opts = {}) {
           throw err;
       }
       const doRename = opts.fsOps?.renameSync ?? renameSync2;
-      const doCopy = opts.fsOps?.copyFileSync ?? copyFileSync;
+      const doCopy = opts.fsOps?.copyFileSync ?? copyFileSync2;
       try {
         doRename(tmp, patchPath);
       } catch (renameErr) {
@@ -1916,7 +1985,7 @@ async function registerOnly(name, restUrl, profilePath = DSH_PROFILE_PATH) {
         if (err?.code !== "ENOENT")
           throw err;
       }
-      copyFileSync2(tmp, profilePath);
+      copyFileSync3(tmp, profilePath);
       try {
         unlinkSync4(tmp);
       } catch {}

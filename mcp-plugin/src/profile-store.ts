@@ -35,14 +35,15 @@ export type Warn = (message: string) => void;
 
 const defaultWarn: Warn = (m) => process.stderr.write(m);
 const MAX_PROFILE_JSON_BYTES = 64 * 1024;
-const CONTROL_CHAR_GLOBAL_RE = /[\x00-\x1f\x7f]/g;
+const CONTROL_CHAR_GLOBAL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/g;
 const DARWIN_SYSTEM_SYMLINKS = new Set(["/var", "/tmp", "/etc"]);
 
 function sanitizeWarnPart(value: unknown): string {
   return redactSecrets(String(value ?? ""))
+    .replace(/\b(https?:\/\/?)([^/\s@]*@)/gi, "$1[REDACTED]@")
     .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED]")
     .replace(
-      /\b(?:agent_key_|sk-|whsec_|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g,
+      /\b(?:agent_key_|sk-|whsec_|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|mr_|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g,
       "[REDACTED]",
     )
     .replace(CONTROL_CHAR_GLOBAL_RE, "?");
@@ -62,6 +63,8 @@ function isAllowedDarwinSystemSymlink(dirPath: string): boolean {
   try {
     const resolved = realpathSync(dirPath);
     if (resolved !== `/private${dirPath}`) return false;
+    const privSt = lstatSync("/private");
+    if (!privSt.isDirectory() || privSt.isSymbolicLink()) return false;
     const realSt = lstatSync(resolved);
     return realSt.isDirectory() && !realSt.isSymbolicLink();
   } catch {
@@ -211,17 +214,25 @@ export interface DefaultProfileCollision {
 const NON_PROFILE_JSON_FILES = new Set([
   "session-binds.json",
   "session-binds.meta.json",
+  "session-binds-meta.json",
+  "session-binds_meta.json",
   "agy-session-binds.json",
+  "agy-session-binds.meta.json",
+  "agy-session-binds_meta.json",
   "agy-binds.json",
   "agy-binds.meta.json",
+  "agy-binds-meta.json",
+  "agy-binds_meta.json",
   "grok-binds.json",
   "grok-binds-meta.json",
   "grok-binds.meta.json",
+  "grok-binds_meta.json",
   "identity-guard.json",
   "cursor.json",
   "read-cursors.json",
   "mention-timestamps.json",
   "wake-pids.json",
+  "codex-bots.json",
   "dsh.json",
   "config.json",
   "muse.json",

@@ -174,7 +174,7 @@ function messageDedupKey(data) {
   }
   const channelTrim = data.channel_id.trim();
   const idTrim = data.id.trim();
-  if (!idTrim || !channelTrim || channelTrim === "." || channelTrim === ".." || idTrim === "." || idTrim === ".." || RESERVED_DEDUP_KEY.test(channelTrim) || RESERVED_DEDUP_KEY.test(idTrim) || data.id.length > MAX_DEDUP_ID_CHARS || data.channel_id.length > MAX_DEDUP_ID_CHARS || /[\x00-\x1f\x7f]/.test(data.id) || /[\x00-\x1f\x7f]/.test(data.channel_id)) {
+  if (!idTrim || !channelTrim || channelTrim === "." || channelTrim === ".." || idTrim === "." || idTrim === ".." || RESERVED_DEDUP_KEY.test(channelTrim) || RESERVED_DEDUP_KEY.test(idTrim) || data.id.length > MAX_DEDUP_ID_CHARS || data.channel_id.length > MAX_DEDUP_ID_CHARS || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(data.id) || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(data.channel_id)) {
     return null;
   }
   const safeChannel = data.channel_id.replace(/\\/g, "\\\\").replace(/:/g, "\\:");
@@ -192,7 +192,7 @@ class MessageDedup {
     this.dropOnEvict = safeDrop;
   }
   recordOrSkip(key) {
-    if (typeof key !== "string" || key.length === 0 || key.length > MAX_DEDUP_KEY_CHARS || /[\x00-\x1f\x7f]/.test(key)) {
+    if (typeof key !== "string" || key.length === 0 || key.length > MAX_DEDUP_KEY_CHARS || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(key)) {
       return false;
     }
     if (this.seen.has(key))
@@ -684,7 +684,7 @@ var MAX_CURSOR_ENTRIES = 50000;
 var RESERVED_PROTO_KEY = /^(?:__proto__|constructor|prototype)$/i;
 var tmpCounter = 0;
 function scrubDiag(value) {
-  return redactSecrets(String(value ?? "")).replace(/\b(https?:\/\/)([^/\s@]*@)/gi, "$1[REDACTED]@").replace(/\b(?:Bearer|Basic)\s+[^\s"'<>\\]+/gi, "[REDACTED]").replace(/(?:ac_|mcp_at_|mcp_rt_|mcp_|agent_key_|sk-|rk_live_|rk_test_|whsec_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|AIza|AKIA|ASIA)[A-Za-z0-9+/=._-]{8,}/g, "[REDACTED]").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
+  return redactSecrets(String(value ?? "")).replace(/\b(https?:\/\/)([^/\s@]*@)/gi, "$1[REDACTED]@").replace(/\b(?:Bearer|Basic)\s+[^\s"'<>\\]+/gi, "[REDACTED]").replace(/(?:ac_|mcp_at_|mcp_rt_|mcp_|agent_key_|sk-|rk_live_|rk_test_|whsec_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|mr_|AIza|AKIA|ASIA)[A-Za-z0-9+/=._-]{8,}/g, "[REDACTED]").replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, " ");
 }
 function isDarwinCanonicalRootLink(dir, st) {
   if (process.platform !== "darwin" || dir !== "/var" && dir !== "/tmp" && dir !== "/etc" || !st.isSymbolicLink()) {
@@ -725,7 +725,7 @@ function hasSafeRawDotDotAncestors(rawDirPath) {
   return true;
 }
 function hasSafeAncestorDirs(targetFile) {
-  if (typeof targetFile !== "string" || !targetFile || /[\x00-\x1f\x7f]/.test(targetFile)) {
+  if (typeof targetFile !== "string" || !targetFile || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(targetFile)) {
     return false;
   }
   const rawParent = dirname(isAbsolute(targetFile) ? targetFile : `${process.cwd()}${sep}${targetFile}`);
@@ -784,7 +784,7 @@ function loadCursor(file, warn) {
       if (typeof v !== "string") {
         throw new Error(`cursor value for ${scrubDiag(k)} must be a string`);
       }
-      if (!k || k.length > 256 || /[\x00-\x1f\x7f]/.test(k) || /[\x00-\x1f\x7f]/.test(v) || v.length > 256) {
+      if (!k || k.length > 256 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(k) || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(v) || v.length > 256) {
         throw new Error(`cursor entry for ${scrubDiag(k)} contains invalid characters or length`);
       }
       if (entries.length >= MAX_CURSOR_ENTRIES) {
@@ -830,7 +830,7 @@ function persistCursor(file, cursor, warn, fsOps) {
   }
   const validEntries = [];
   for (const [k, v] of cursor) {
-    if (!k || k.length > 256 || RESERVED_PROTO_KEY.test(k) || /[\x00-\x1f\x7f]/.test(k) || typeof v !== "string" || /[\x00-\x1f\x7f]/.test(v) || v.length > 256) {
+    if (!k || k.length > 256 || RESERVED_PROTO_KEY.test(k) || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(k) || typeof v !== "string" || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(v) || v.length > 256) {
       continue;
     }
     validEntries.push([k, v]);
@@ -923,7 +923,7 @@ function isValidCalendarDateTime(datePart, timePart, tzPart) {
 function normalizeTimestampForCursor(ts, mode) {
   if (!ts || typeof ts !== "string" || ts.length > 128)
     return ts;
-  if (/[\x00-\x1f\x7f]/.test(ts))
+  if (/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(ts))
     return;
   if (mode !== "before" && mode !== "after")
     return ts;

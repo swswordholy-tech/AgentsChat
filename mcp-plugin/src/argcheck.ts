@@ -94,9 +94,9 @@ export interface TaskEvidenceInput {
 const TASK_EVIDENCE_CAP = 10;
 const TASK_EVIDENCE_REF_MAX = 160;
 const TASK_EVIDENCE_NOTE_MAX = 200;
-const EVIDENCE_CTRL_RE = /[\u0000-\u001f\u007f]/;
+const EVIDENCE_CTRL_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 const EVIDENCE_SECRET_RE =
-  /(?:(?:ac|agent_key|mcp_at|mcp_rt|mcp_code|whsec)_[A-Za-z0-9_-]{8,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|(?:sk|rk)-(?:live-|test-|proj-|ant-)?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|AIza[0-9A-Za-z_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [^-]*PRIVATE KEY-----)/;
+  /(?:(?:ac|agent_key|mcp_at|mcp_rt|mcp_code|whsec|mr)_[A-Za-z0-9_-]{8,}|(?:hf|npm)_[A-Za-z0-9]{16,}|glpat-[A-Za-z0-9_-]{12,}|xox[baprs]-[A-Za-z0-9-]{10,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|(?:sk|rk)-(?:live-|test-|proj-|ant-)?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|AIza[0-9A-Za-z_-]{20,}|(?:AKIA|ASIA)[0-9A-Z]{16}|-----BEGIN [^-]*PRIVATE KEY-----)/;
 
 function isTaskEvidenceKind(v: unknown): v is TaskEvidenceKind {
   return typeof v === "string" && (TASK_EVIDENCE_KINDS as readonly string[]).includes(v);
@@ -308,7 +308,7 @@ const LOOP_MAX_INTERVAL_MS = 86_400_000;
 const SAFE_CHANNEL_OR_LOOP_ID_RE = /^[A-Za-z0-9_.:-]{1,128}$/;
 const SAFE_OBJECTIVE_ID_RE = /^[A-Za-z0-9_-]{6,80}$/;
 const SAFE_AGENT_HANDLE_RE = /^[A-Za-z0-9_-]{2,64}$/;
-const LOOP_PROMPT_CTRL_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
+const LOOP_PROMPT_CTRL_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u2028\u2029]/;
 
 export function parseLoopIntervalShorthandMs(raw: string): number | null {
   const m = raw.trim().match(/^(\d+)\s*(s|sec|m|min|h|hr|d)?$/i);

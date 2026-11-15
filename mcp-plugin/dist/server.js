@@ -215,8 +215,10 @@ var PROTOTYPE_MENTION_IDS = new Set(["__proto__", "constructor", "prototype"]);
 function matchesMention(content, agentId) {
   if (typeof content !== "string" || typeof agentId !== "string")
     return false;
+  if (/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(agentId))
+    return false;
   const trimmedId = agentId.trim();
-  if (!content || !trimmedId || trimmedId.length > MAX_MENTION_ID_CHARS || trimmedId === "." || trimmedId === ".." || /[\/\\\s\x00-\x1f\x7f]/.test(trimmedId) || PROTOTYPE_MENTION_IDS.has(trimmedId.toLowerCase())) {
+  if (!content || !trimmedId || trimmedId.length > MAX_MENTION_ID_CHARS || trimmedId === "." || trimmedId === ".." || /[\/\\\s\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(trimmedId) || PROTOTYPE_MENTION_IDS.has(trimmedId.toLowerCase())) {
     return false;
   }
   const hay = content.length > MAX_MENTION_CONTENT_CHARS ? content.slice(0, MAX_MENTION_CONTENT_CHARS) : content;
@@ -239,7 +241,7 @@ function messageDedupKey(data) {
   }
   const channelTrim = data.channel_id.trim();
   const idTrim = data.id.trim();
-  if (!idTrim || !channelTrim || channelTrim === "." || channelTrim === ".." || idTrim === "." || idTrim === ".." || RESERVED_DEDUP_KEY.test(channelTrim) || RESERVED_DEDUP_KEY.test(idTrim) || data.id.length > MAX_DEDUP_ID_CHARS || data.channel_id.length > MAX_DEDUP_ID_CHARS || /[\x00-\x1f\x7f]/.test(data.id) || /[\x00-\x1f\x7f]/.test(data.channel_id)) {
+  if (!idTrim || !channelTrim || channelTrim === "." || channelTrim === ".." || idTrim === "." || idTrim === ".." || RESERVED_DEDUP_KEY.test(channelTrim) || RESERVED_DEDUP_KEY.test(idTrim) || data.id.length > MAX_DEDUP_ID_CHARS || data.channel_id.length > MAX_DEDUP_ID_CHARS || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(data.id) || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(data.channel_id)) {
     return null;
   }
   const safeChannel = data.channel_id.replace(/\\/g, "\\\\").replace(/:/g, "\\:");
@@ -257,7 +259,7 @@ class MessageDedup {
     this.dropOnEvict = safeDrop;
   }
   recordOrSkip(key) {
-    if (typeof key !== "string" || key.length === 0 || key.length > MAX_DEDUP_KEY_CHARS || /[\x00-\x1f\x7f]/.test(key)) {
+    if (typeof key !== "string" || key.length === 0 || key.length > MAX_DEDUP_KEY_CHARS || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(key)) {
       return false;
     }
     if (this.seen.has(key))
@@ -376,7 +378,7 @@ function isValidCalendarDateTime(datePart, timePart, tzPart) {
 function normalizeTimestampForCursor(ts, mode) {
   if (!ts || typeof ts !== "string" || ts.length > 128)
     return ts;
-  if (/[\x00-\x1f\x7f]/.test(ts))
+  if (/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(ts))
     return;
   if (mode !== "before" && mode !== "after")
     return ts;
@@ -479,8 +481,8 @@ var TASK_EVIDENCE_KINDS = [
 var TASK_EVIDENCE_CAP = 10;
 var TASK_EVIDENCE_REF_MAX = 160;
 var TASK_EVIDENCE_NOTE_MAX = 200;
-var EVIDENCE_CTRL_RE = /[\u0000-\u001f\u007f]/;
-var EVIDENCE_SECRET_RE = /(?:(?:ac|agent_key|mcp_at|mcp_rt|mcp_code|whsec)_[A-Za-z0-9_-]{8,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|(?:sk|rk)-(?:live-|test-|proj-|ant-)?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|AIza[0-9A-Za-z_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [^-]*PRIVATE KEY-----)/;
+var EVIDENCE_CTRL_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+var EVIDENCE_SECRET_RE = /(?:(?:ac|agent_key|mcp_at|mcp_rt|mcp_code|whsec|mr)_[A-Za-z0-9_-]{8,}|(?:hf|npm)_[A-Za-z0-9]{16,}|glpat-[A-Za-z0-9_-]{12,}|xox[baprs]-[A-Za-z0-9-]{10,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|(?:sk|rk)-(?:live-|test-|proj-|ant-)?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|AIza[0-9A-Za-z_-]{20,}|(?:AKIA|ASIA)[0-9A-Z]{16}|-----BEGIN [^-]*PRIVATE KEY-----)/;
 function isTaskEvidenceKind(v) {
   return typeof v === "string" && TASK_EVIDENCE_KINDS.includes(v);
 }
@@ -653,7 +655,7 @@ var LOOP_MAX_INTERVAL_MS = 86400000;
 var SAFE_CHANNEL_OR_LOOP_ID_RE = /^[A-Za-z0-9_.:-]{1,128}$/;
 var SAFE_OBJECTIVE_ID_RE = /^[A-Za-z0-9_-]{6,80}$/;
 var SAFE_AGENT_HANDLE_RE = /^[A-Za-z0-9_-]{2,64}$/;
-var LOOP_PROMPT_CTRL_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
+var LOOP_PROMPT_CTRL_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u2028\u2029]/;
 function parseLoopIntervalShorthandMs(raw) {
   const m = raw.trim().match(/^(\d+)\s*(s|sec|m|min|h|hr|d)?$/i);
   if (!m)
@@ -3335,10 +3337,10 @@ import {
 import { dirname as dirname3, join as join4, resolve as resolve3 } from "path";
 var defaultWarn = (m) => process.stderr.write(m);
 var MAX_PROFILE_JSON_BYTES = 64 * 1024;
-var CONTROL_CHAR_GLOBAL_RE = /[\x00-\x1f\x7f]/g;
+var CONTROL_CHAR_GLOBAL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/g;
 var DARWIN_SYSTEM_SYMLINKS = new Set(["/var", "/tmp", "/etc"]);
 function sanitizeWarnPart(value) {
-  return redactSecrets2(String(value ?? "")).replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED]").replace(/\b(?:agent_key_|sk-|whsec_|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g, "[REDACTED]").replace(CONTROL_CHAR_GLOBAL_RE, "?");
+  return redactSecrets2(String(value ?? "")).replace(/\b(https?:\/\/?)([^/\s@]*@)/gi, "$1[REDACTED]@").replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED]").replace(/\b(?:agent_key_|sk-|whsec_|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|mr_|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g, "[REDACTED]").replace(CONTROL_CHAR_GLOBAL_RE, "?");
 }
 function safeLstat2(target) {
   try {
@@ -3355,6 +3357,9 @@ function isAllowedDarwinSystemSymlink(dirPath) {
   try {
     const resolved = realpathSync2(dirPath);
     if (resolved !== `/private${dirPath}`)
+      return false;
+    const privSt = lstatSync3("/private");
+    if (!privSt.isDirectory() || privSt.isSymbolicLink())
       return false;
     const realSt = lstatSync3(resolved);
     return realSt.isDirectory() && !realSt.isSymbolicLink();
@@ -3494,17 +3499,25 @@ function safeWriteProfile(path, data, warn = defaultWarn) {
 var NON_PROFILE_JSON_FILES = new Set([
   "session-binds.json",
   "session-binds.meta.json",
+  "session-binds-meta.json",
+  "session-binds_meta.json",
   "agy-session-binds.json",
+  "agy-session-binds.meta.json",
+  "agy-session-binds_meta.json",
   "agy-binds.json",
   "agy-binds.meta.json",
+  "agy-binds-meta.json",
+  "agy-binds_meta.json",
   "grok-binds.json",
   "grok-binds-meta.json",
   "grok-binds.meta.json",
+  "grok-binds_meta.json",
   "identity-guard.json",
   "cursor.json",
   "read-cursors.json",
   "mention-timestamps.json",
   "wake-pids.json",
+  "codex-bots.json",
   "dsh.json",
   "config.json",
   "muse.json"
@@ -4834,7 +4847,7 @@ function isSafeAbsoluteDirEnv(raw) {
   if (typeof raw !== "string")
     return false;
   const s = raw.trim();
-  return s.length > 0 && s.length <= MAX_DIR_PATH_LENGTH && !s.startsWith("-") && !/[\x00-\x1f\x7f]/.test(s) && isAbsolute5(s);
+  return s.length > 0 && s.length <= MAX_DIR_PATH_LENGTH && !s.startsWith("-") && !/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(s) && isAbsolute5(s);
 }
 function agentschatConfigDir(env = process.env) {
   if (isSafeAbsoluteDirEnv(env.AGENTSCHAT_CONFIG_DIR)) {
@@ -4845,7 +4858,7 @@ function agentschatConfigDir(env = process.env) {
   return join7(home, ".agentschat");
 }
 function isSafeAgentId(id) {
-  return id.length > 0 && id.length <= 128 && id !== "." && id !== ".." && !RESERVED_PROFILE_KEY.test(id) && !/[/\\\s\x00-\x1f\x7f]/.test(id);
+  return id.length > 0 && id.length <= 128 && id !== "." && id !== ".." && !RESERVED_PROFILE_KEY.test(id) && !/[/\\\s\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(id);
 }
 function isSafeRegularProfileFile(path) {
   try {
@@ -4856,7 +4869,7 @@ function isSafeRegularProfileFile(path) {
   }
 }
 function isSafeSessionId(sessionId) {
-  return sessionId.length > 0 && sessionId.length <= MAX_SESSION_ID_LENGTH && sessionId !== "." && sessionId !== ".." && !RESERVED_PROFILE_KEY.test(sessionId) && !/[\x00-\x1f\x7f]/.test(sessionId);
+  return sessionId.length > 0 && sessionId.length <= MAX_SESSION_ID_LENGTH && sessionId !== "." && sessionId !== ".." && !RESERVED_PROFILE_KEY.test(sessionId) && !/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(sessionId);
 }
 function isAllowedDarwinSystemLink5(dirPath) {
   if (process.platform !== "darwin")
@@ -4899,7 +4912,7 @@ function hasSafeRawDotDotSegments4(rawPath) {
 }
 function isSafeRealDir(path) {
   try {
-    if (!path || /[\x00-\x1f\x7f]/.test(path) || !hasSafeRawDotDotSegments4(path)) {
+    if (!path || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(path) || !hasSafeRawDotDotSegments4(path)) {
       return false;
     }
     const st = lstatSync6(path);
@@ -4926,7 +4939,7 @@ function isSafeRealDir(path) {
   }
 }
 function profilePathForName(configDir, name) {
-  if (typeof name !== "string" || !name || name.length > 133 || name === "." || name === ".." || name.includes("/") || name.includes("\\") || /[\x00-\x1f\x7f]/.test(name) || !isSafeRealDir(configDir)) {
+  if (typeof name !== "string" || !name || name.length > 133 || name === "." || name === ".." || name.includes("/") || name.includes("\\") || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(name) || !isSafeRealDir(configDir)) {
     return;
   }
   const base = name.replace(/\.json$/i, "").replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -4957,7 +4970,9 @@ function readAgentId(path) {
   }
 }
 function resolveSessionForAgent(agentId, opts = {}) {
-  const targetAgentId = typeof agentId === "string" ? agentId.trim() : "";
+  if (typeof agentId !== "string" || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(agentId))
+    return;
+  const targetAgentId = agentId.trim();
   if (!isSafeAgentId(targetAgentId))
     return;
   const configDir = opts.configDir ?? agentschatConfigDir(opts.env);
@@ -5246,10 +5261,10 @@ import {
 import { dirname as dirname5, join as join8, resolve as resolve7 } from "path";
 var defaultWarn2 = (m) => process.stderr.write(m);
 var MAX_PROFILE_JSON_BYTES2 = 64 * 1024;
-var CONTROL_CHAR_GLOBAL_RE2 = /[\x00-\x1f\x7f]/g;
+var CONTROL_CHAR_GLOBAL_RE2 = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/g;
 var DARWIN_SYSTEM_SYMLINKS2 = new Set(["/var", "/tmp", "/etc"]);
 function sanitizeWarnPart2(value) {
-  return redactSecrets2(String(value ?? "")).replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED]").replace(/\b(?:agent_key_|sk-|whsec_|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g, "[REDACTED]").replace(CONTROL_CHAR_GLOBAL_RE2, "?");
+  return redactSecrets2(String(value ?? "")).replace(/\b(https?:\/\/?)([^/\s@]*@)/gi, "$1[REDACTED]@").replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED]").replace(/\b(?:agent_key_|sk-|whsec_|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|mr_|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g, "[REDACTED]").replace(CONTROL_CHAR_GLOBAL_RE2, "?");
 }
 function safeLstat4(target) {
   try {
@@ -5266,6 +5281,9 @@ function isAllowedDarwinSystemSymlink2(dirPath) {
   try {
     const resolved = realpathSync6(dirPath);
     if (resolved !== `/private${dirPath}`)
+      return false;
+    const privSt = lstatSync7("/private");
+    if (!privSt.isDirectory() || privSt.isSymbolicLink())
       return false;
     const realSt = lstatSync7(resolved);
     return realSt.isDirectory() && !realSt.isSymbolicLink();
@@ -5405,17 +5423,25 @@ function safeWriteProfile2(path, data, warn = defaultWarn2) {
 var NON_PROFILE_JSON_FILES2 = new Set([
   "session-binds.json",
   "session-binds.meta.json",
+  "session-binds-meta.json",
+  "session-binds_meta.json",
   "agy-session-binds.json",
+  "agy-session-binds.meta.json",
+  "agy-session-binds_meta.json",
   "agy-binds.json",
   "agy-binds.meta.json",
+  "agy-binds-meta.json",
+  "agy-binds_meta.json",
   "grok-binds.json",
   "grok-binds-meta.json",
   "grok-binds.meta.json",
+  "grok-binds_meta.json",
   "identity-guard.json",
   "cursor.json",
   "read-cursors.json",
   "mention-timestamps.json",
   "wake-pids.json",
+  "codex-bots.json",
   "dsh.json",
   "config.json",
   "muse.json"
@@ -5637,7 +5663,7 @@ var MAX_CURSOR_ENTRIES = 50000;
 var RESERVED_PROTO_KEY = /^(?:__proto__|constructor|prototype)$/i;
 var tmpCounter = 0;
 function scrubDiag(value) {
-  return redactSecrets2(String(value ?? "")).replace(/\b(https?:\/\/)([^/\s@]*@)/gi, "$1[REDACTED]@").replace(/\b(?:Bearer|Basic)\s+[^\s"'<>\\]+/gi, "[REDACTED]").replace(/(?:ac_|mcp_at_|mcp_rt_|mcp_|agent_key_|sk-|rk_live_|rk_test_|whsec_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|AIza|AKIA|ASIA)[A-Za-z0-9+/=._-]{8,}/g, "[REDACTED]").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
+  return redactSecrets2(String(value ?? "")).replace(/\b(https?:\/\/)([^/\s@]*@)/gi, "$1[REDACTED]@").replace(/\b(?:Bearer|Basic)\s+[^\s"'<>\\]+/gi, "[REDACTED]").replace(/(?:ac_|mcp_at_|mcp_rt_|mcp_|agent_key_|sk-|rk_live_|rk_test_|whsec_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|mr_|AIza|AKIA|ASIA)[A-Za-z0-9+/=._-]{8,}/g, "[REDACTED]").replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, " ");
 }
 function isDarwinCanonicalRootLink(dir, st) {
   if (process.platform !== "darwin" || dir !== "/var" && dir !== "/tmp" && dir !== "/etc" || !st.isSymbolicLink()) {
@@ -5678,7 +5704,7 @@ function hasSafeRawDotDotAncestors3(rawDirPath) {
   return true;
 }
 function hasSafeAncestorDirs3(targetFile) {
-  if (typeof targetFile !== "string" || !targetFile || /[\x00-\x1f\x7f]/.test(targetFile)) {
+  if (typeof targetFile !== "string" || !targetFile || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(targetFile)) {
     return false;
   }
   const rawParent = dirname6(isAbsolute6(targetFile) ? targetFile : `${process.cwd()}${sep2}${targetFile}`);
@@ -5746,7 +5772,7 @@ function loadCursor(file, warn) {
       if (typeof v !== "string") {
         throw new Error(`cursor value for ${scrubDiag(k)} must be a string`);
       }
-      if (!k || k.length > 256 || /[\x00-\x1f\x7f]/.test(k) || /[\x00-\x1f\x7f]/.test(v) || v.length > 256) {
+      if (!k || k.length > 256 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(k) || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(v) || v.length > 256) {
         throw new Error(`cursor entry for ${scrubDiag(k)} contains invalid characters or length`);
       }
       if (entries.length >= MAX_CURSOR_ENTRIES) {
@@ -5792,7 +5818,7 @@ function persistCursor(file, cursor, warn, fsOps) {
   }
   const validEntries = [];
   for (const [k, v] of cursor) {
-    if (!k || k.length > 256 || RESERVED_PROTO_KEY.test(k) || /[\x00-\x1f\x7f]/.test(k) || typeof v !== "string" || /[\x00-\x1f\x7f]/.test(v) || v.length > 256) {
+    if (!k || k.length > 256 || RESERVED_PROTO_KEY.test(k) || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(k) || typeof v !== "string" || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(v) || v.length > 256) {
       continue;
     }
     validEntries.push([k, v]);
@@ -5871,8 +5897,10 @@ var PROTOTYPE_MENTION_IDS2 = new Set(["__proto__", "constructor", "prototype"]);
 function matchesMention2(content, agentId) {
   if (typeof content !== "string" || typeof agentId !== "string")
     return false;
+  if (/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(agentId))
+    return false;
   const trimmedId = agentId.trim();
-  if (!content || !trimmedId || trimmedId.length > MAX_MENTION_ID_CHARS2 || trimmedId === "." || trimmedId === ".." || /[\/\\\s\x00-\x1f\x7f]/.test(trimmedId) || PROTOTYPE_MENTION_IDS2.has(trimmedId.toLowerCase())) {
+  if (!content || !trimmedId || trimmedId.length > MAX_MENTION_ID_CHARS2 || trimmedId === "." || trimmedId === ".." || /[\/\\\s\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(trimmedId) || PROTOTYPE_MENTION_IDS2.has(trimmedId.toLowerCase())) {
     return false;
   }
   const hay = content.length > MAX_MENTION_CONTENT_CHARS2 ? content.slice(0, MAX_MENTION_CONTENT_CHARS2) : content;
@@ -5902,7 +5930,7 @@ var MAX_CURSOR_ENTRIES2 = 50000;
 var RESERVED_PROTO_KEY2 = /^(?:__proto__|constructor|prototype)$/i;
 var tmpCounter2 = 0;
 function scrubDiag2(value) {
-  return redactSecrets2(String(value ?? "")).replace(/\b(https?:\/\/)([^/\s@]*@)/gi, "$1[REDACTED]@").replace(/\b(?:Bearer|Basic)\s+[^\s"'<>\\]+/gi, "[REDACTED]").replace(/(?:ac_|mcp_at_|mcp_rt_|mcp_|agent_key_|sk-|rk_live_|rk_test_|whsec_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|AIza|AKIA|ASIA)[A-Za-z0-9+/=._-]{8,}/g, "[REDACTED]").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
+  return redactSecrets2(String(value ?? "")).replace(/\b(https?:\/\/)([^/\s@]*@)/gi, "$1[REDACTED]@").replace(/\b(?:Bearer|Basic)\s+[^\s"'<>\\]+/gi, "[REDACTED]").replace(/(?:ac_|mcp_at_|mcp_rt_|mcp_|agent_key_|sk-|rk_live_|rk_test_|whsec_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|mr_|AIza|AKIA|ASIA)[A-Za-z0-9+/=._-]{8,}/g, "[REDACTED]").replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, " ");
 }
 function isDarwinCanonicalRootLink2(dir, st) {
   if (process.platform !== "darwin" || dir !== "/var" && dir !== "/tmp" && dir !== "/etc" || !st.isSymbolicLink()) {
@@ -5943,7 +5971,7 @@ function hasSafeRawDotDotAncestors4(rawDirPath) {
   return true;
 }
 function hasSafeAncestorDirs4(targetFile) {
-  if (typeof targetFile !== "string" || !targetFile || /[\x00-\x1f\x7f]/.test(targetFile)) {
+  if (typeof targetFile !== "string" || !targetFile || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(targetFile)) {
     return false;
   }
   const rawParent = dirname7(isAbsolute7(targetFile) ? targetFile : `${process.cwd()}${sep3}${targetFile}`);
@@ -6011,7 +6039,7 @@ function loadCursor2(file, warn) {
       if (typeof v !== "string") {
         throw new Error(`cursor value for ${scrubDiag2(k)} must be a string`);
       }
-      if (!k || k.length > 256 || /[\x00-\x1f\x7f]/.test(k) || /[\x00-\x1f\x7f]/.test(v) || v.length > 256) {
+      if (!k || k.length > 256 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(k) || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(v) || v.length > 256) {
         throw new Error(`cursor entry for ${scrubDiag2(k)} contains invalid characters or length`);
       }
       if (entries.length >= MAX_CURSOR_ENTRIES2) {
@@ -6057,7 +6085,7 @@ function persistCursor2(file, cursor, warn, fsOps) {
   }
   const validEntries = [];
   for (const [k, v] of cursor) {
-    if (!k || k.length > 256 || RESERVED_PROTO_KEY2.test(k) || /[\x00-\x1f\x7f]/.test(k) || typeof v !== "string" || /[\x00-\x1f\x7f]/.test(v) || v.length > 256) {
+    if (!k || k.length > 256 || RESERVED_PROTO_KEY2.test(k) || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(k) || typeof v !== "string" || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(v) || v.length > 256) {
       continue;
     }
     validEntries.push([k, v]);
@@ -6142,7 +6170,7 @@ function isValidCalendarDateTime2(datePart, timePart, tzPart) {
 function normalizeTimestampForCursor2(ts, mode) {
   if (!ts || typeof ts !== "string" || ts.length > 128)
     return ts;
-  if (/[\x00-\x1f\x7f]/.test(ts))
+  if (/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(ts))
     return;
   if (mode !== "before" && mode !== "after")
     return ts;

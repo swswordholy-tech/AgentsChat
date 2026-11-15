@@ -14,6 +14,19 @@ import type { ChatMessage, MessageHandler, MuseAgentChatOptions, WireMessage } f
  */
 const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 const MAX_JOINED_CHANNELS = 256;
+const MAX_WS_FRAME_BYTES = 1_048_576;
+
+function rawFrameByteLength(data: unknown): number {
+  if (typeof data === "string") {
+    // Upper bound is data.length * 3 in UTF-8; only call Buffer.byteLength when length > MAX_WS_FRAME_BYTES / 3
+    if (data.length > MAX_WS_FRAME_BYTES) return data.length;
+    if (data.length * 3 <= MAX_WS_FRAME_BYTES) return data.length;
+    return Buffer.byteLength(data, "utf8");
+  }
+  if (data instanceof ArrayBuffer) return data.byteLength;
+  if (ArrayBuffer.isView(data)) return data.byteLength;
+  return 0;
+}
 
 function safeDelayMs(value: number | undefined, fallback: number, min = 0): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value < min) return fallback;
@@ -23,7 +36,7 @@ function safeDelayMs(value: number | undefined, fallback: number, min = 0): numb
 function normalizeChannelId(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
   const trimmed = raw.trim();
-  if (!trimmed || trimmed.length > 128 || /[\/\\\x00-\x20\x7f]/.test(trimmed) ||
+  if (!trimmed || trimmed.length > 128 || /[\/\\\x00-\x20\x7f-\x9f\u2028\u2029]/.test(trimmed) ||
       [".", "..", "__proto__", "constructor", "prototype"].includes(trimmed.toLowerCase())) return null;
   return trimmed;
 }
@@ -196,7 +209,7 @@ export class MuseAgentChatClient {
   ): void {
     const clean = normalizeChannelId(channelId);
     if (!clean || (replyTo !== undefined &&
-        (typeof replyTo !== "string" || replyTo.length > 256 || /[\x00-\x1f\x7f]/.test(replyTo)))) return;
+        (typeof replyTo !== "string" || replyTo.length > 256 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(replyTo)))) return;
     this.send({
       type: "message",
       id: crypto.randomUUID(),
@@ -282,6 +295,7 @@ export class MuseAgentChatClient {
     };
     ws.onmessage = (event) => {
       if (this.ws !== ws) return;
+      if (rawFrameByteLength(event.data) > MAX_WS_FRAME_BYTES) return;
       this.handleMessage(String(event.data));
     };
     ws.onerror = () => {

@@ -37,8 +37,8 @@ export function messageDedupKey(data: any): string | null {
     RESERVED_DEDUP_KEY.test(idTrim) ||
     data.id.length > MAX_DEDUP_ID_CHARS ||
     data.channel_id.length > MAX_DEDUP_ID_CHARS ||
-    /[\x00-\x1f\x7f]/.test(data.id) ||
-    /[\x00-\x1f\x7f]/.test(data.channel_id)
+    /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(data.id) ||
+    /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(data.channel_id)
   ) {
     return null;
   }
@@ -67,7 +67,7 @@ export class MessageDedup {
 
   /** Returns true if `key` was already delivered (skip), false if newly recorded. */
   recordOrSkip(key: string): boolean {
-    if (typeof key !== "string" || key.length === 0 || key.length > MAX_DEDUP_KEY_CHARS || /[\x00-\x1f\x7f]/.test(key)) {
+    if (typeof key !== "string" || key.length === 0 || key.length > MAX_DEDUP_KEY_CHARS || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(key)) {
       return false;
     }
     if (this.seen.has(key)) return true;

@@ -62,7 +62,7 @@ function isSafeAbsoluteDirEnv(raw: unknown): raw is string {
     s.length > 0 &&
     s.length <= MAX_DIR_PATH_LENGTH &&
     !s.startsWith("-") &&
-    !/[\x00-\x1f\x7f]/.test(s) &&
+    !/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(s) &&
     isAbsolute(s)
   );
 }
@@ -84,7 +84,7 @@ function isSafeAgentId(id: string): boolean {
     id !== "." &&
     id !== ".." &&
     !RESERVED_PROFILE_KEY.test(id) &&
-    !/[/\\\s\x00-\x1f\x7f]/.test(id)
+    !/[/\\\s\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(id)
   );
 }
 
@@ -112,7 +112,7 @@ function isSafeSessionId(sessionId: string): boolean {
     sessionId !== "." &&
     sessionId !== ".." &&
     !RESERVED_PROFILE_KEY.test(sessionId) &&
-    !/[\x00-\x1f\x7f]/.test(sessionId)
+    !/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(sessionId)
   );
 }
 
@@ -161,7 +161,7 @@ function hasSafeRawDotDotSegments(rawPath: string): boolean {
 
 function isSafeRealDir(path: string): boolean {
   try {
-    if (!path || /[\x00-\x1f\x7f]/.test(path) || !hasSafeRawDotDotSegments(path)) {
+    if (!path || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(path) || !hasSafeRawDotDotSegments(path)) {
       return false;
     }
     const st = lstatSync(path);
@@ -194,7 +194,7 @@ function profilePathForName(configDir: string, name: string): string | undefined
     name === ".." ||
     name.includes("/") ||
     name.includes("\\") ||
-    /[\x00-\x1f\x7f]/.test(name) ||
+    /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(name) ||
     !isSafeRealDir(configDir)
   ) {
     return undefined;
@@ -241,7 +241,8 @@ export function resolveSessionForAgent(
     filter?: (sessionId: string) => boolean;
   } = {},
 ): AgentSessionRoute | undefined {
-  const targetAgentId = typeof agentId === "string" ? agentId.trim() : "";
+  if (typeof agentId !== "string" || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(agentId)) return undefined;
+  const targetAgentId = agentId.trim();
   if (!isSafeAgentId(targetAgentId)) return undefined;
   const configDir = opts.configDir ?? agentschatConfigDir(opts.env);
   let binds: Record<string, string>;

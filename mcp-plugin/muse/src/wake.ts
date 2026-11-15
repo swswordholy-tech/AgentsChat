@@ -1,5 +1,5 @@
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { appendFileSync, chmodSync, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, copyFileSync, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { assertSafeParentDirectories, isUnsafeEndpointHost } from "./config.ts";
 
@@ -61,9 +61,10 @@ export interface WakePayload {
 export function redactSecrets(text: string): string {
   return text
     .replace(/-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)/g, "[redacted]")
+    .replace(/\b(https?:\/\/)([^/\s@]*@)/gi, "$1[redacted]@")
     .replace(/\b(?:Bearer|Basic)\s+[^\s"'<>\\]+/gi, "[redacted]")
     .replace(
-      /(?:ac_|agent_key_|mcp_(?:at|rt|code)_|sk-|sk_|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|whsec_|AIza)[A-Za-z0-9_-]+/g,
+      /(?:ac_|agent_key_|mcp_(?:at|rt|code)_|sk-|sk_|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|mr_|whsec_|AIza)[A-Za-z0-9_-]+/g,
       "[redacted]",
     )
     .replace(/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, "[redacted]")
@@ -72,7 +73,7 @@ export function redactSecrets(text: string): string {
 
 /** Redact before stripping controls (PEM/header syntax), then catch joined fragments. */
 export function sanitizeMuseText(text: string): string {
-  return redactSecrets(redactSecrets(text).replace(/[\x00-\x1f\x7f]/g, ""));
+  return redactSecrets(redactSecrets(text).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ""));
 }
 
 export function buildWakePayload(
@@ -133,7 +134,7 @@ export function verifyWakeSignature(body: string, sigHex: string, secrets: reado
 
 /** Prompt text a Muse host can inject into a turn, mirroring buildGrokPrompt. */
 export function buildMuseWakePrompt(payload: WakePayload): string {
-  const clean = (value: string) => value.replace(/[\x00-\x1f\x7f]/g, " ").slice(0, 128);
+  const clean = (value: string) => value.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, " ").slice(0, 128);
   const sender = clean(payload.sender_id ?? "someone");
   const channel = clean(payload.channel_id ?? "?");
   const message = clean(payload.message_id ?? "");
@@ -244,13 +245,62 @@ export const MAX_WAKE_QUEUE_LINES = 500;
 export const MAX_WAKE_QUEUE_BYTES = 16 * 1024 * 1024;
 let wakeTmpSeq = 0;
 
+export interface AtomicWakeFsOps {
+  renameSync?: (oldPath: string, newPath: string) => void;
+  copyFileSync?: (src: string, dest: string) => void;
+  unlinkSync?: (path: string) => void;
+}
+
+export function atomicReplaceWakeFile(tmp: string, queueFile: string, fsOps?: AtomicWakeFsOps): void {
+  const renameFn = fsOps?.renameSync ?? renameSync;
+  const copyFn = fsOps?.copyFileSync ?? copyFileSync;
+  const unlinkFn = fsOps?.unlinkSync ?? unlinkSync;
+  assertSafeParentDirectories(queueFile);
+  try {
+    const st = lstatSync(queueFile);
+    if (st.isSymbolicLink() || !st.isFile()) {
+      throw new Error("Refusing to use symlink or non-regular file for Muse wake queue");
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err;
+  }
+  try {
+    renameFn(tmp, queueFile);
+  } catch (renameErr) {
+    const code = (renameErr as NodeJS.ErrnoException)?.code;
+    if (code === "EPERM" || code === "EACCES") {
+      assertSafeParentDirectories(queueFile);
+      try {
+        const st = lstatSync(queueFile);
+        if (st.isSymbolicLink() || !st.isFile()) {
+          throw new Error("Refusing to use symlink or non-regular file for Muse wake queue");
+        }
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err;
+      }
+      copyFn(tmp, queueFile);
+      if (process.platform !== "win32") {
+        try { chmodSync(queueFile, 0o600); } catch {}
+      }
+      try { unlinkFn(tmp); } catch {}
+      return;
+    }
+    throw renameErr;
+  }
+}
+
 /**
  * Append a wake payload to the queue file, deduplicated by message_id,
  * auto-creating missing parent directories (0700), enforcing private 0600
  * file permissions, and bounding retained lines to MAX_WAKE_QUEUE_LINES.
  * Returns true if appended, false if it was already queued.
  */
-export function appendWakeQueue(queueFile: string, payload: WakePayload, maxLines = MAX_WAKE_QUEUE_LINES): boolean {
+export function appendWakeQueue(
+  queueFile: string,
+  payload: WakePayload,
+  maxLines = MAX_WAKE_QUEUE_LINES,
+  fsOps?: AtomicWakeFsOps,
+): boolean {
   const dir = dirname(queueFile);
   assertSafeParentDirectories(queueFile);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -293,15 +343,7 @@ export function appendWakeQueue(queueFile: string, payload: WakePayload, maxLine
     try {
       assertSafeParentDirectories(queueFile);
       writeFileSync(tmp, `${kept.join("\n")}\n`, { mode: 0o600, flag: "wx" });
-      try {
-        const st = lstatSync(queueFile);
-        if (st.isSymbolicLink() || !st.isFile()) {
-          throw new Error("Refusing to use symlink or non-regular file for Muse wake queue");
-        }
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err;
-      }
-      renameSync(tmp, queueFile);
+      atomicReplaceWakeFile(tmp, queueFile, fsOps);
     } catch (err) {
       try { unlinkSync(tmp); } catch {}
       throw err;

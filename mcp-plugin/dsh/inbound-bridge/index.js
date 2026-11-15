@@ -46,6 +46,7 @@ import {
   appendFileSync,
   closeSync,
   constants,
+  copyFileSync,
   fstatSync,
   openSync,
   chmodSync,
@@ -54,12 +55,13 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   statSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, parse, resolve, sep } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
@@ -116,6 +118,34 @@ export function isAllowedLocalOrigin(origin) {
   return false;
 }
 
+const RESERVED_PROFILE_SIDECARS = new Set([
+  'profile',
+  'session-binds',
+  'session-binds.meta',
+  'session-binds_meta',
+  'session-binds-meta',
+  'agy-binds',
+  'agy-binds.meta',
+  'agy-binds_meta',
+  'agy-binds-meta',
+  'agy-session-binds',
+  'agy-session-binds.meta',
+  'agy-session-binds_meta',
+  'grok-binds',
+  'grok-binds.meta',
+  'grok-binds_meta',
+  'grok-binds-meta',
+  'identity-guard',
+  'cursor',
+  'read-cursors',
+  'mention-timestamps',
+  'wake-pids',
+  'config',
+  'codex-bots',
+  'dsh',
+  'muse',
+]);
+
 function isSafeKey(value) {
   return (
     typeof value === 'string' &&
@@ -123,16 +153,59 @@ function isSafeKey(value) {
     value.length <= 128 &&
     !FORBIDDEN_KEYS.has(value.toLowerCase()) &&
     value !== '.' && value !== '..' && !/[\/\\]/.test(value) &&
-    !/[\x00-\x1f\x7f]/.test(value)
+    !/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(value)
+  );
+}
+
+export function isBlockedInboundHost(rawHostname) {
+  if (typeof rawHostname !== 'string' || !rawHostname) return true;
+  let host = rawHostname.toLowerCase().replace(/\.+$/, '');
+  if (
+    ['metadata.google.internal', 'metadata.goog', 'metadata', 'instance-data'].includes(host) ||
+    host.endsWith('.metadata.google.internal') ||
+    host.endsWith('.metadata.goog')
+  ) {
+    return true;
+  }
+  const unsafeV4 = (ip) => ip.startsWith('0.') || ip === '100.100.100.200' || ip.startsWith('169.254.');
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) return unsafeV4(host);
+  if (!host.startsWith('[')) return false;
+  try {
+    host = new URL(`http://${host}`).hostname.toLowerCase();
+  } catch {
+    return true;
+  }
+  const address = host.slice(1, -1);
+  const [left, right = ''] = address.split('::');
+  const head = left ? left.split(':') : [];
+  const tail = right ? right.split(':') : [];
+  const words = (
+    address.includes('::')
+      ? [...head, ...Array(Math.max(0, 8 - head.length - tail.length)).fill('0'), ...tail]
+      : head
+  ).map((x) => parseInt(x, 16));
+  if (words.length !== 8 || words.some((x) => !Number.isInteger(x) || x < 0 || x > 0xffff)) return true;
+  const mapped =
+    (words.slice(0, 5).every((x) => x === 0) && words[5] === 0xffff) ||
+    (words.slice(0, 4).every((x) => x === 0) && words[4] === 0xffff && words[5] === 0);
+  if (mapped) return unsafeV4(`${words[6] >> 8}.${words[6] & 255}.${words[7] >> 8}.${words[7] & 255}`);
+  return (
+    words.every((x) => x === 0) ||
+    (words[0] & 0xffc0) === 0xfe80 ||
+    (words[0] === 0xfd00 && words[1] === 0xec2 && words.slice(2, 7).every((x) => x === 0) && words[7] === 0x254)
   );
 }
 
 function scrubSecrets(text) {
   if (typeof text !== 'string' || text.length === 0) return '';
   return text
-    .replace(/Bearer\s+[^\s"',;]+/gi, 'Bearer [REDACTED]')
+    .replace(/\b(https?:\/\/)([^/\s@]*@)/gi, '$1[REDACTED]@')
+    .replace(/\b(?:Bearer|Basic)\s+[^\s"',;]+/gi, 'Bearer [REDACTED]')
     .replace(/\bac_[A-Za-z0-9_-]{8,}/g, 'ac_[REDACTED]')
+    .replace(/\bagent_key_[A-Za-z0-9_-]{8,}/g, 'agent_key_[REDACTED]')
     .replace(/\bsk-[A-Za-z0-9_-]{8,}/g, 'sk-[REDACTED]')
+    .replace(/\b(?:hf_|npm_|mr_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|AIza)[A-Za-z0-9_-]{8,}/g, '[REDACTED]')
+    .replace(/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, '[REDACTED]')
     .replace(/mcp_(?:at|rt|code)_[A-Za-z0-9_-]{8,}/g, '[REDACTED]')
     .replace(/whsec_[A-Za-z0-9_-]{8,}/g, '[REDACTED]')
     .replace(/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, '[REDACTED]');
@@ -169,16 +242,63 @@ function settleWithin(promise, ms) {
   ]).finally(() => clearTimeout(timer));
 }
 
-function checkParentDirectory(path) {
-  let parent = dirname(resolve(path));
-  for (;;) {
-    if (!(process.platform === 'darwin' && ['/var', '/tmp', '/etc'].includes(parent))) {
+function isDarwinCanonicalSystemLink(dirPath) {
+  if (process.platform !== 'darwin' || !['/var', '/tmp', '/etc'].includes(dirPath)) return false;
+  try {
+    return (
+      realpathSync(dirPath) === `/private${dirPath}` &&
+      !lstatSync('/private').isSymbolicLink() &&
+      lstatSync('/private').isDirectory() &&
+      !lstatSync(`/private${dirPath}`).isSymbolicLink() &&
+      lstatSync(`/private${dirPath}`).isDirectory()
+    );
+  } catch {
+    return false;
+  }
+}
+
+export function checkParentDirectory(targetPath) {
+  if (typeof targetPath !== 'string' || !targetPath || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(targetPath)) {
+    throw new Error('Refusing unsafe parent directory');
+  }
+  const absRaw = isAbsolute(targetPath) ? targetPath : `${process.cwd()}${sep}${targetPath}`;
+  const rawParent = dirname(absRaw);
+  const root = parse(rawParent).root;
+  const rawSegments = rawParent.slice(root.length).split(/[\\/]+/).filter(Boolean);
+  if (rawSegments.includes('..')) {
+    let cur = root;
+    for (const seg of rawSegments) {
+      if (seg === '.') continue;
+      if (seg === '..') {
+        cur = dirname(cur);
+        continue;
+      }
+      const next = join(cur, seg);
       try {
-        const lst = lstatSync(parent);
-        if (lst.isSymbolicLink() || !lst.isDirectory()) throw new Error('Refusing unsafe parent directory');
+        const lst = lstatSync(next);
+        if (lst.isSymbolicLink() && !isDarwinCanonicalSystemLink(next)) {
+          throw new Error('Refusing unsafe parent directory');
+        }
+        if (!lst.isSymbolicLink() && !lst.isDirectory()) {
+          throw new Error('Refusing unsafe parent directory');
+        }
       } catch (error) {
         if (error?.code !== 'ENOENT') throw error;
       }
+      cur = next;
+    }
+  }
+  let parent = dirname(resolve(targetPath));
+  for (;;) {
+    try {
+      const lst = lstatSync(parent);
+      if (lst.isSymbolicLink()) {
+        if (!isDarwinCanonicalSystemLink(parent)) throw new Error('Refusing unsafe parent directory');
+      } else if (!lst.isDirectory()) {
+        throw new Error('Refusing unsafe parent directory');
+      }
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
     }
     const next = dirname(parent);
     if (next === parent) break;
@@ -192,6 +312,28 @@ function checkTarget(path) {
     if (lst.isSymbolicLink() || !lst.isFile()) throw new Error('Refusing non-regular target');
   } catch (error) {
     if (error?.code !== 'ENOENT') throw error;
+  }
+}
+
+export function atomicReplaceRegular(tmp, target, fsOps) {
+  const renameFn = fsOps?.renameSync ?? renameSync;
+  const copyFn = fsOps?.copyFileSync ?? copyFileSync;
+  const unlinkFn = fsOps?.unlinkSync ?? unlinkSync;
+  checkParentDirectory(target);
+  checkTarget(target);
+  try {
+    renameFn(tmp, target);
+  } catch (err) {
+    if (err?.code === 'EPERM' || err?.code === 'EACCES') {
+      checkParentDirectory(target);
+      checkTarget(target);
+      copyFn(tmp, target);
+      try {
+        unlinkFn(tmp);
+      } catch {}
+      return;
+    }
+    throw err;
   }
 }
 
@@ -220,8 +362,8 @@ async function readRegistrationText(res) {
 }
 
 function isSafeAgentId(value) {
-  return typeof value === "string" && !!value && value !== "." && value !== ".." &&
-    !FORBIDDEN_KEYS.has(value.toLowerCase()) && !/[\s\x00-\x1f\x7f/\\]/.test(value);
+  return typeof value === "string" && value.length > 0 && value.length <= 128 && value !== "." && value !== ".." &&
+    !FORBIDDEN_KEYS.has(value.toLowerCase()) && !/[\s\x00-\x1f\x7f-\x9f\u2028\u2029/\\]/.test(value);
 }
 
 function writeLog(logPath, line) {
@@ -242,9 +384,7 @@ function writeLog(logPath, line) {
       try {
         writeFileSync(tmp, '', { flag: 'wx', mode: 0o600 });
         created = true;
-        checkParentDirectory(logPath);
-        checkTarget(logPath);
-        renameSync(tmp, logPath);
+        atomicReplaceRegular(tmp, logPath);
       } finally {
         if (created) { try { unlinkSync(tmp); } catch {} }
       }
@@ -279,9 +419,7 @@ function loadSecret(secretPath, logFn) {
     try {
       writeFileSync(tmp, `${secret}\n`, { flag: 'wx', mode: 0o600 });
       created = true;
-      checkParentDirectory(secretPath);
-      checkTarget(secretPath);
-      renameSync(tmp, secretPath);
+      atomicReplaceRegular(tmp, secretPath);
       try {
         chmodSync(secretPath, 0o600);
       } catch (error) {
@@ -312,7 +450,7 @@ export function verifySignature(body, sigHex, secret) {
 
 /** Render the inbound message as a normal user turn for the agent. */
 function renderInbound(payload) {
-  const header = (value) => String(value ?? '(unknown)').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 128);
+  const header = (value) => String(value ?? '(unknown)').replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ').slice(0, 128);
   const channel = header(payload.channel_id);
   const kind = /^dm[-:]/i.test(channel) ? 'direct message' : 'channel message';
   return [
@@ -384,8 +522,10 @@ export function apply(ctx, config = {}) {
   const mcpBin = config.mcpBin ?? process.env.AGENTSCHAT_DSH_BRIDGE_BIN ?? defaultBundledMcpBin;
   const nodeBin = config.nodeBin ?? process.env.DSH_NODE_BIN ?? 'node';
   const channels = Array.isArray(config.channels) && config.channels.length > 0 ? config.channels : ['welcome'];
-  const retryMs = Number(config.retryMs ?? DEFAULT_RETRY_MS);
-  const flushTimeoutMs = Number(config.flushTimeoutMs ?? DEFAULT_FLUSH_TIMEOUT_MS);
+  const rawRetryMs = Number(config.retryMs ?? DEFAULT_RETRY_MS);
+  const retryMs = Number.isFinite(rawRetryMs) && rawRetryMs >= 10 ? Math.min(Math.floor(rawRetryMs), 300_000) : DEFAULT_RETRY_MS;
+  const rawFlushTimeoutMs = Number(config.flushTimeoutMs ?? DEFAULT_FLUSH_TIMEOUT_MS);
+  const flushTimeoutMs = Number.isFinite(rawFlushTimeoutMs) && rawFlushTimeoutMs >= 10 ? Math.min(Math.floor(rawFlushTimeoutMs), 300_000) : DEFAULT_FLUSH_TIMEOUT_MS;
 
   const secret = loadSecret(secretPath, log);
   if (secret === undefined) {
@@ -582,6 +722,12 @@ export function apply(ctx, config = {}) {
     const out = [];
     const seenNames = new Set();
     const scan = (dir) => {
+      try {
+        const dirStat = lstatSync(dir);
+        if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) return;
+      } catch {
+        return;
+      }
       let files;
       try {
         files = readdirSync(dir).filter((file) => /\.json$/i.test(file));
@@ -590,7 +736,7 @@ export function apply(ctx, config = {}) {
       }
       for (const file of files) {
         const name = file.replace(/\.json$/i, '');
-        if (!isSafeKey(name) || seenNames.has(name)) continue;
+        if (!isSafeKey(name) || RESERVED_PROFILE_SIDECARS.has(name.toLowerCase()) || seenNames.has(name)) continue;
         const path = join(dir, file);
         try {
           const lst = lstatSync(path);
@@ -598,7 +744,7 @@ export function apply(ctx, config = {}) {
           const parsed = JSON.parse(readFileSync(path, 'utf8'));
           if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed) || Object.prototype.hasOwnProperty.call(parsed, '__proto__')) continue;
           const agentId = typeof parsed.agent_id === 'string' ? parsed.agent_id.trim() : '';
-          if (!agentId || /[\x00-\x1f\x7f]/.test(agentId)) continue;
+          if (!isSafeAgentId(agentId)) continue;
           seenNames.add(name);
           out.push({
             name,
@@ -652,9 +798,7 @@ export function apply(ctx, config = {}) {
     try {
       writeFileSync(tmp, `${JSON.stringify(binds, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
       created = true;
-      checkParentDirectory(bindsPath);
-      checkTarget(bindsPath);
-      renameSync(tmp, bindsPath);
+      atomicReplaceRegular(tmp, bindsPath);
       try {
         chmodSync(bindsPath, 0o600);
       } catch {}
@@ -795,10 +939,13 @@ export function apply(ctx, config = {}) {
         }
         const sessionId = rawSessionId;
         const rawName = typeof body?.name === 'string' && body.name.trim()
-          ? body.name.trim().replace(/[\x00-\x1f\x7f]/g, '').slice(0, 48)
+          ? body.name.trim().replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, '').slice(0, 48)
           : `DSH_${sessionId ? sessionId.replace(/^session-/, '').slice(0, 6) : randomBytes(3).toString('hex')}`;
         const sanitizedBase = rawName.replace(/[^a-zA-Z0-9_-]/g, '_').replace(/^_+|_+$/g, '');
-        const baseName = isSafeKey(sanitizedBase) ? sanitizedBase : `DSH_${randomBytes(3).toString('hex')}`;
+        const baseName =
+          isSafeKey(sanitizedBase) && !RESERVED_PROFILE_SIDECARS.has(sanitizedBase.toLowerCase())
+            ? sanitizedBase
+            : `DSH_${randomBytes(3).toString('hex')}`;
         let profileName = baseName;
         let suffix = 2;
         try {
@@ -826,11 +973,12 @@ export function apply(ctx, config = {}) {
           sendJson(res, 400, { ok: false, error: 'invalid API URL' }, corsHeaders);
           return;
         }
-        const host = parsedRest.hostname.toLowerCase().replace(/\.$/, '');
+        const host = parsedRest.hostname.toLowerCase().replace(/\.+$/, '');
         const loopback = ['localhost', '127.0.0.1', '::1', '[::1]'].includes(host);
         if ((parsedRest.protocol !== 'https:' && !(parsedRest.protocol === 'http:' && loopback)) ||
+            isBlockedInboundHost(parsedRest.hostname) ||
             parsedRest.username || parsedRest.password || parsedRest.port === '0' || parsedRest.search || parsedRest.hash ||
-            /[\x00-\x20\x7f"<>\\]/.test(restBase)) {
+            /[\x00-\x20\x7f-\x9f\u2028\u2029"<>\\]/.test(restBase)) {
           sendJson(res, 400, { ok: false, error: 'unsupported API URL protocol' }, corsHeaders);
           return;
         }
@@ -859,7 +1007,7 @@ export function apply(ctx, config = {}) {
           const rawToken = data?.agentKey ?? data?.token ?? data?.key;
           const agentId = typeof rawAgentId === 'string' ? rawAgentId.trim() : '';
           const token = typeof rawToken === 'string' ? rawToken.trim() : '';
-          if (!isSafeAgentId(rawAgentId) || !token || /[\x00-\x1f\x7f]/.test(agentId) || /[\x00-\x1f\x7f]/.test(token)) {
+          if (!isSafeAgentId(rawAgentId) || !token || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(agentId) || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(token)) {
             sendJson(res, 502, { ok: false, error: 'register response missing agent_id/token' }, corsHeaders);
             return;
           }
@@ -887,9 +1035,7 @@ export function apply(ctx, config = {}) {
           try {
             writeFileSync(tmp, `${JSON.stringify(record, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
             created = true;
-            checkParentDirectory(profilePath);
-            checkTarget(profilePath);
-            renameSync(tmp, profilePath);
+            atomicReplaceRegular(tmp, profilePath);
             try {
               chmodSync(profilePath, 0o600);
             } catch {}
