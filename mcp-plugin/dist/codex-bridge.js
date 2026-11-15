@@ -1,134 +1,12 @@
 #!/usr/bin/env node
 // codex/runtime-home.ts
-import { existsSync, mkdirSync, readdirSync, accessSync, constants, lstatSync, readlinkSync, realpathSync, symlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, accessSync, constants, lstatSync as lstatSync2, readlinkSync, realpathSync as realpathSync2, symlinkSync } from "node:fs";
+
+// codex/config.ts
+import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
-function executablePath(bin) {
-  if (!bin || /[\x00-\x1f\x7f]/.test(bin))
-    return;
-  const exts = process.platform === "win32" && !/\.[A-Za-z0-9]+$/.test(bin) ? ["", ...(process.env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";").filter(Boolean)] : [""];
-  const bases = isAbsolute(bin) || bin.includes("/") || bin.includes("\\") ? [resolve(bin)] : (process.env.PATH ?? "").split(delimiter).filter(Boolean).map((dir) => join(dir, bin));
-  for (const base of bases) {
-    for (const ext of exts) {
-      const candidate = base + ext;
-      try {
-        accessSync(candidate, constants.X_OK);
-        return realpathSync(candidate);
-      } catch {}
-    }
-  }
-}
-function assertDirectoryLeaf(path, label) {
-  const info = lstatSync(path, { throwIfNoEntry: false });
-  if (info?.isSymbolicLink())
-    throw new Error(`${label} must not be a symlink`);
-  if (info && !info.isDirectory())
-    throw new Error(`${label} must be a directory`);
-}
-function prepareHomeDirectory(stateDir, home) {
-  assertDirectoryLeaf(stateDir, "Bot state directory");
-  assertDirectoryLeaf(home, "Bot runtime home");
-  mkdirSync(home, { recursive: true, mode: 448 });
-}
-function assertIndependentTree(home, allowedAuthOrigin, codexExecutable) {
-  if (lstatSync(home).isSymbolicLink())
-    throw new Error("Independent Codex home must not be a symlink");
-  const inspect = (dir, depth = 0) => {
-    if (depth > 32)
-      throw new Error("Independent Codex home directory depth exceeds 32");
-    for (const name of readdirSync(dir)) {
-      const path = join(dir, name), info = lstatSync(path);
-      if (info.isSymbolicLink()) {
-        if (dir === home && name === "auth.json" && allowedAuthOrigin && resolve(home, readlinkSync(path)) === allowedAuthOrigin)
-          continue;
-        const local = relative(home, path).split(sep).join("/");
-        if (codexExecutable && /^tmp\/arg0\/codex-arg0[A-Za-z0-9_-]+\/(apply_patch|applypatch|codex-execve-wrapper|codex-linux-sandbox)$/.test(local)) {
-          try {
-            if (realpathSync(path) === codexExecutable)
-              continue;
-          } catch {}
-        }
-        throw new Error("Independent Codex home must not link configuration or runtime state");
-      }
-      if (info.isDirectory())
-        inspect(path, depth + 1);
-      else if (!info.isFile())
-        throw new Error("Independent Codex home must contain only regular files and directories");
-    }
-  };
-  inspect(home);
-}
-function prepareRuntimeHome(stateDir, source = process.env.CODEX_HOME || join(homedir(), ".codex"), mode = "linked", codexBin = "codex") {
-  if (mode !== "linked" && mode !== "isolated" && mode !== "auth-only")
-    throw new Error("Invalid Codex home mode");
-  if (mode === "isolated") {
-    const home2 = join(stateDir, "codex-home-isolated");
-    prepareHomeDirectory(stateDir, home2);
-    assertIndependentTree(home2, undefined, executablePath(codexBin));
-    return { home: realpathSync(home2) };
-  }
-  if (mode === "auth-only") {
-    const legacyHome2 = realpathSync(source);
-    const origin = join(legacyHome2, "auth.json");
-    if (!lstatSync(origin).isFile())
-      throw new Error("auth-only requires an existing regular auth.json; authorize its use explicitly");
-    const home2 = join(stateDir, "codex-home-auth-only");
-    prepareHomeDirectory(stateDir, home2);
-    if (lstatSync(home2).isSymbolicLink() || realpathSync(home2) === legacyHome2)
-      throw new Error("auth-only home must be independent");
-    for (const name of ["config.toml", "AGENTS.md", "rules", "plugins", "hooks.json"]) {
-      try {
-        lstatSync(join(home2, name));
-      } catch (e) {
-        if (e.code === "ENOENT")
-          continue;
-        throw e;
-      }
-      throw new Error("auth-only home contains unexpected configuration; use a fresh state root");
-    }
-    const skills = join(home2, "skills");
-    const skillsInfo = lstatSync(skills, { throwIfNoEntry: false });
-    if (skillsInfo && (skillsInfo.isSymbolicLink() || !skillsInfo.isDirectory() || readdirSync(skills).some((name) => name !== ".system")))
-      throw new Error("auth-only home contains unexpected custom skills");
-    assertIndependentTree(home2, origin, executablePath(codexBin));
-    const target = join(home2, "auth.json");
-    try {
-      if (!lstatSync(target).isSymbolicLink() || resolve(home2, readlinkSync(target)) !== origin)
-        throw new Error("Unexpected auth-only login binding");
-    } catch (e) {
-      if (e.code !== "ENOENT")
-        throw e;
-      symlinkSync(origin, target);
-    }
-    assertIndependentTree(home2, origin, executablePath(codexBin));
-    return { home: realpathSync(home2) };
-  }
-  const legacyHome = existsSync(source) ? realpathSync(source) : resolve(source);
-  const home = join(stateDir, "codex-home");
-  prepareHomeDirectory(stateDir, home);
-  if (realpathSync(home) === legacyHome)
-    throw new Error("Bot runtime home must differ from desktop Codex home");
-  if (lstatSync(home).isSymbolicLink())
-    throw new Error("Bot runtime home must not be a symlink");
-  for (const name of ["config.toml", "auth.json", "AGENTS.md", "skills", "rules", "plugins", "hooks.json", "models_cache.json"]) {
-    const origin = join(legacyHome, name), target = join(home, name);
-    if (!existsSync(origin))
-      continue;
-    let current;
-    try {
-      current = lstatSync(target);
-    } catch (e) {
-      if (e.code !== "ENOENT")
-        throw e;
-    }
-    if (current) {
-      if (!current.isSymbolicLink() || resolve(home, readlinkSync(target)) !== origin)
-        throw new Error(`Unexpected bot runtime configuration: ${name}`);
-    } else
-      symlinkSync(origin, target);
-  }
-  return { home, legacyHome };
-}
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import { createHash } from "node:crypto";
 
 // src/redact.ts
 function redactSecrets(text, opts) {
@@ -137,410 +15,6 @@ function redactSecrets(text, opts) {
   const step = opts?.preserveAcKeys ? text : text.replace(/ac_[A-Za-z0-9_-]{16,}/g, "ac_***REDACTED***");
   return step.replace(/mcp_(?:at|rt|code)_[A-Za-z0-9_-]{16,}/g, "mcp_***REDACTED***").replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***JWT_REDACTED***");
 }
-
-// codex/owner.ts
-async function ownerJson(response) {
-  if (!response.body)
-    throw new Error("Missing owner response");
-  const reader = response.body.getReader();
-  const chunks = [];
-  let size = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done)
-        break;
-      size += value.byteLength;
-      if (size > 65536) {
-        reader.cancel().catch(() => {});
-        throw new Error("Owner response exceeds size limit");
-      }
-      chunks.push(value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  const bytes = new Uint8Array(size);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
-}
-async function getBotOwner(base, agentId, token, request = fetch) {
-  try {
-    if (!base || base !== base.trim() || /[\x00-\x1f\x7f]/.test(base) || !agentId || agentId !== agentId.trim() || /[\x00-\x1f\x7f]/.test(agentId) || [".", "..", "__proto__", "constructor", "prototype"].includes(agentId.toLowerCase()) || /[\/\\\s]/.test(agentId) || !token || token !== token.trim() || /[\x00-\x1f\x7f]/.test(token))
-      return null;
-    const parsed = new URL(base);
-    const loopback = ["127.0.0.1", "localhost", "[::1]", "::1"].includes(parsed.hostname.toLowerCase().replace(/\.$/, ""));
-    if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && loopback) || parsed.username || parsed.password || parsed.search || parsed.hash || parsed.port === "0")
-      return null;
-    const origin = parsed.href.replace(/\/+$/, "");
-    const options = {
-      method: "GET",
-      headers: { Authorization: `Bearer ${token}` },
-      cache: "no-store",
-      redirect: "error",
-      signal: AbortSignal.timeout(8000)
-    };
-    const [statusSettled, entitlementSettled] = await Promise.allSettled([
-      request(`${origin}/api/account/onboarding`, options),
-      request(`${origin}/api/me/entitlements`, options)
-    ]);
-    const statusResponse = statusSettled.status === "fulfilled" ? statusSettled.value : null;
-    const entitlementResponse = entitlementSettled.status === "fulfilled" ? entitlementSettled.value : null;
-    if (!statusResponse?.ok || !entitlementResponse?.ok) {
-      await Promise.allSettled([
-        statusResponse?.body?.cancel(),
-        entitlementResponse?.body?.cancel()
-      ]);
-      return null;
-    }
-    const [statusValue, entitlementValue] = await Promise.all([
-      ownerJson(statusResponse),
-      ownerJson(entitlementResponse)
-    ]);
-    const status = statusValue;
-    const entitlement = entitlementValue;
-    if (!status || typeof status !== "object" || Array.isArray(status) || status.agent_id !== agentId || status.claimed !== true)
-      return null;
-    if (!entitlement || typeof entitlement !== "object" || Array.isArray(entitlement))
-      return null;
-    const owner = entitlement.owner_account_id;
-    return typeof owner === "string" && owner.trim().length > 0 && owner === owner.trim() && !/[\x00-\x1f\x7f]/.test(owner) && owner !== agentId && !["__proto__", "constructor", "prototype"].includes(owner.toLowerCase()) ? owner : null;
-  } catch {
-    return null;
-  }
-}
-
-// src/onboarding-status.ts
-var DEFAULT_PUBLIC_BASE = "https://agents-chat.com";
-function isForbiddenMetadataOrLinkLocalHost(host) {
-  if (host === "metadata.google.internal" || host.endsWith(".metadata.google.internal") || host === "metadata.goog" || host.endsWith(".metadata.goog") || host === "169.254.169.254") {
-    return true;
-  }
-  if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) {
-    const [a, b] = host.split(".").map(Number);
-    if (a === 0 || a === 169 && b === 254)
-      return true;
-  }
-  if (host.startsWith("[") && host.endsWith("]")) {
-    const inner = host.slice(1, -1).toLowerCase();
-    if (inner === "::" || /^fe[89ab][0-9a-f]*:/i.test(inner))
-      return true;
-    if (/^::ffff:(?:0:)?(?:169\.254\.|a9fe:)/i.test(inner))
-      return true;
-  }
-  return false;
-}
-function isSafeOnboardingBase(base) {
-  try {
-    if (!base || base !== base.trim() || /[\x00-\x20\x7f"<>\\]/.test(base))
-      return false;
-    const parsed = new URL(base);
-    const host = parsed.hostname.toLowerCase().replace(/\.$/, "");
-    if (!host || isForbiddenMetadataOrLinkLocalHost(host))
-      return false;
-    if (parsed.port !== "") {
-      const p = Number(parsed.port);
-      if (!Number.isInteger(p) || p < 1 || p > 65535)
-        return false;
-    }
-    const isLoopback = host === "127.0.0.1" || host === "localhost" || host === "[::1]" || host === "::1";
-    if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && isLoopback))
-      return false;
-    if (parsed.username || parsed.password || parsed.search || parsed.hash)
-      return false;
-    return true;
-  } catch {
-    return false;
-  }
-}
-function isSafeOnboardingAgentId(id) {
-  if (!id || id.length > 128 || /[\x00-\x1f\x7f\s/\\]/.test(id))
-    return false;
-  if (id === "." || id.includes(".."))
-    return false;
-  const lower = id.toLowerCase();
-  if (lower === "__proto__" || lower === "constructor" || lower === "prototype")
-    return false;
-  return true;
-}
-var MAX_ONBOARDING_JSON_BYTES = 64 * 1024;
-async function readBoundedJson(r, maxBytes = MAX_ONBOARDING_JSON_BYTES) {
-  const declaredLen = Number(r.headers?.get?.("content-length"));
-  if (Number.isFinite(declaredLen) && declaredLen > maxBytes) {
-    try {
-      await r.body?.cancel?.();
-    } catch {}
-    throw new Error("onboarding response too large");
-  }
-  if (!r.body) {
-    const txt = await r.text();
-    if (Buffer.byteLength(txt, "utf8") > maxBytes)
-      throw new Error("onboarding response too large");
-    return JSON.parse(txt);
-  }
-  const reader = r.body.getReader();
-  const chunks = [];
-  let total = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done)
-        break;
-      if (value) {
-        total += value.byteLength;
-        if (total > maxBytes) {
-          await reader.cancel().catch(() => {});
-          throw new Error("onboarding response too large");
-        }
-        chunks.push(value);
-      }
-    }
-  } finally {
-    try {
-      reader.releaseLock();
-    } catch {}
-  }
-  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
-}
-async function getOnboardingStatus(base, agentId, token, request = fetch) {
-  const cleanBase = typeof base === "string" ? base.trim().replace(/\/+$/, "") : "";
-  const rawAgentId = typeof agentId === "string" ? agentId.trim() : "";
-  const validAgent = isSafeOnboardingAgentId(rawAgentId);
-  const safeAgentId = validAgent ? rawAgentId : "";
-  const validBase = Boolean(cleanBase && !/[\x00-\x1f\x7f]/.test(cleanBase) && isSafeOnboardingBase(cleanBase));
-  const safeDisplayBase = validBase ? cleanBase : DEFAULT_PUBLIC_BASE;
-  const chat = `${safeDisplayBase}/chat/${encodeURIComponent(safeAgentId)}`;
-  const result = {
-    agent_id: safeAgentId,
-    claimed: null,
-    authentication: "unknown",
-    chat_url: chat,
-    claim_url: `${chat}?claim=1`,
-    next_step: "check_identity"
-  };
-  if (!validBase || !validAgent || typeof token !== "string" || !token.trim() || /[\x00-\x1f\x7f]/.test(token)) {
-    return result;
-  }
-  try {
-    const r = await request(`${cleanBase}/api/account/onboarding`, {
-      headers: { Authorization: `Bearer ${token.trim()}` },
-      cache: "no-store",
-      signal: AbortSignal.timeout(8000),
-      redirect: "error"
-    });
-    if (r.status === 401 || r.status === 403) {
-      try {
-        await r.body?.cancel?.();
-      } catch {}
-      result.authentication = "failed";
-      return result;
-    }
-    if (!r.ok) {
-      try {
-        await r.body?.cancel?.();
-      } catch {}
-      return result;
-    }
-    const data = await readBoundedJson(r);
-    if (!data || typeof data !== "object" || Array.isArray(data) || Object.prototype.hasOwnProperty.call(data, "__proto__") || data.agent_id !== safeAgentId || typeof data.claimed !== "boolean")
-      return result;
-    result.authentication = "ok";
-    result.claimed = data.claimed;
-    result.next_step = data.claimed ? "verify_reply" : "join_public_chat";
-  } catch {}
-  return result;
-}
-
-// codex/gui-channel.ts
-import { randomUUID } from "node:crypto";
-import { mkdirSync as mkdirSync2, writeFileSync, readFileSync, renameSync, readdirSync as readdirSync2, rmSync, lstatSync as lstatSync2 } from "node:fs";
-import { join as join2 } from "node:path";
-function payload(result) {
-  if (result?.isError || result?.success === false || result?.error)
-    throw new Error("GUI tool rejected request");
-  if (Array.isArray(result?.content)) {
-    const text = result.content.find((c) => c.type === "text")?.text;
-    if (!text)
-      throw new Error("GUI tool returned no receipt");
-    if (typeof text !== "string" || text.length > 1048576)
-      throw new Error("GUI receipt exceeds size limit");
-    return JSON.parse(text);
-  }
-  return result;
-}
-function validTarget(value) {
-  return typeof value === "string" && value.trim() === value && value.length >= 1 && value.length <= 256 && !/[\x00-\x1f\x7f]/.test(value) && !["__proto__", "prototype", "constructor"].includes(value.toLowerCase());
-}
-
-class GuiChannel {
-  directory;
-  allowedThreads;
-  constructor(directory, allowedThreads) {
-    this.directory = directory;
-    this.allowedThreads = allowedThreads;
-    const existing = lstatSync2(directory, { throwIfNoEntry: false });
-    if (existing && (existing.isSymbolicLink() || !existing.isDirectory()))
-      throw new Error("GUI outbox must be a real directory, not a symlink");
-    mkdirSync2(directory, { recursive: true, mode: 448 });
-    const stat = lstatSync2(directory);
-    if (stat.isSymbolicLink() || !stat.isDirectory())
-      throw new Error("GUI outbox must be a real directory, not a symlink");
-  }
-  path(id) {
-    if (!/^[0-9a-f-]{36}$/.test(id))
-      throw new Error("Invalid delivery ID");
-    return join2(this.directory, `${id}.json`);
-  }
-  save(entry) {
-    const path = this.path(entry.id), temp = `${path}.${randomUUID()}.tmp`;
-    const stat = lstatSync2(path, { throwIfNoEntry: false });
-    if (stat?.isSymbolicLink() || stat && !stat.isFile())
-      throw new Error("GUI receipt must be a regular file, not a symlink");
-    try {
-      writeFileSync(temp, JSON.stringify(entry), { mode: 384, flag: "wx" });
-      const current = lstatSync2(path, { throwIfNoEntry: false });
-      if (current && (current.isSymbolicLink() || !current.isFile()))
-        throw new Error("GUI receipt must be a regular file, not a symlink");
-      renameSync(temp, path);
-    } catch (error) {
-      if (error.code !== "EEXIST")
-        rmSync(temp, { force: true });
-      throw error;
-    }
-  }
-  get(id) {
-    const path = this.path(id), stat = lstatSync2(path);
-    if (stat.isSymbolicLink() || !stat.isFile())
-      throw new Error("GUI receipt must be a regular file, not a symlink");
-    if (stat.size > 1048576)
-      throw new Error("GUI receipt exceeds size limit");
-    const entry = JSON.parse(readFileSync(path, "utf8"));
-    if (!entry || typeof entry !== "object" || Array.isArray(entry) || Object.prototype.hasOwnProperty.call(entry, "__proto__") || entry.id !== id || !validTarget(entry.threadId) || typeof entry.prompt !== "string" || typeof entry.createdAt !== "string" || !["pending", "sending", "submitted", "delivered", "uncertain"].includes(entry.status) || entry.hostId !== undefined && !validTarget(entry.hostId) || entry.turnId !== undefined && typeof entry.turnId !== "string" || entry.deliveredAt !== undefined && typeof entry.deliveredAt !== "string")
-      throw new Error("Invalid GUI receipt");
-    return entry;
-  }
-  list() {
-    const entries = [];
-    for (const file of readdirSync2(this.directory)) {
-      if (!/^[0-9a-f-]{36}\.json$/.test(file))
-        continue;
-      try {
-        entries.push(this.get(file.slice(0, -5)));
-      } catch {}
-    }
-    return entries;
-  }
-  enqueue(threadId, text, hostId) {
-    if (!validTarget(threadId) || hostId !== undefined && !validTarget(hostId))
-      throw new Error("Invalid GUI target");
-    if (!this.allowedThreads.includes(threadId))
-      throw new Error("GUI target is not allowed");
-    if (!text.trim() || text.length > 24000)
-      throw new Error("GUI message must contain 1–24000 characters");
-    const id = randomUUID();
-    const entry = {
-      id,
-      threadId,
-      ...hostId ? { hostId } : {},
-      prompt: `[AgentsChat delivery ${id}]
-${text}`,
-      status: "pending",
-      createdAt: new Date().toISOString()
-    };
-    this.save(entry);
-    return entry;
-  }
-  async dispatch(id, call) {
-    const lock = `${this.path(id)}.lock`;
-    try {
-      mkdirSync2(lock, { mode: 448 });
-    } catch (error) {
-      if (error.code !== "EEXIST")
-        throw error;
-      const stat = lstatSync2(lock);
-      if (stat.isSymbolicLink())
-        throw new Error("GUI delivery lock must not be a symlink");
-      if (!stat.isDirectory() || Date.now() - stat.mtimeMs <= 5 * 60000)
-        throw error;
-      rmSync(lock, { recursive: true, force: true });
-      mkdirSync2(lock, { mode: 448 });
-    }
-    try {
-      const entry = this.get(id);
-      if (!this.allowedThreads.includes(entry.threadId))
-        throw new Error("GUI target is no longer allowed");
-      if (entry.status === "delivered")
-        return entry;
-      const target = { threadId: entry.threadId, ...entry.hostId ? { hostId: entry.hostId } : {} };
-      if (entry.status === "pending") {
-        entry.status = "sending";
-        this.save(entry);
-        try {
-          payload(await call("send_message_to_thread", { ...target, prompt: entry.prompt }));
-          entry.status = "submitted";
-          this.save(entry);
-        } catch {
-          entry.status = "uncertain";
-          this.save(entry);
-        }
-      }
-      if (entry.status === "sending") {
-        entry.status = "uncertain";
-        this.save(entry);
-      }
-      try {
-        let cursor;
-        const seenCursors = new Set;
-        for (let page = 0;page < 5; page++) {
-          const history = payload(await call("read_thread", {
-            ...target,
-            turnLimit: 10,
-            maxOutputCharsPerItem: 32000,
-            ...cursor ? { cursor } : {}
-          }));
-          if (history?.thread?.id !== entry.threadId)
-            throw new Error("Wrong GUI thread in receipt");
-          const turn = history.turns?.find((t) => t.items?.some((item) => item.type === "userMessage" && item.content?.some((c) => c.type === "text" && c.text === entry.prompt)));
-          if (turn) {
-            entry.status = "delivered";
-            entry.deliveredAt = new Date().toISOString();
-            entry.turnId = turn.id;
-            this.save(entry);
-            break;
-          }
-          const nextCursor = history.page?.nextCursor;
-          if (typeof nextCursor !== "string" || !nextCursor.length || seenCursors.has(nextCursor))
-            break;
-          seenCursors.add(nextCursor);
-          cursor = nextCursor;
-        }
-      } catch {}
-      return entry;
-    } finally {
-      rmSync(lock, { recursive: true, force: true });
-    }
-  }
-}
-
-// codex/run.ts
-import { readFileSync as readFileSync11, lstatSync as lstatSync12 } from "node:fs";
-import { homedir as homedir6 } from "node:os";
-import { join as join12 } from "node:path";
-
-// codex/bots-config.ts
-import { readFileSync as readFileSync3, realpathSync as realpathSync3, mkdirSync as mkdirSync3, lstatSync as lstatSync4 } from "node:fs";
-import { homedir as homedir3 } from "node:os";
-import { dirname, isAbsolute as isAbsolute3, join as join4, resolve as resolve3 } from "node:path";
-
-// codex/config.ts
-import { lstatSync as lstatSync3, readFileSync as readFileSync2, realpathSync as realpathSync2 } from "node:fs";
-import { homedir as homedir2 } from "node:os";
-import { isAbsolute as isAbsolute2, join as join3, resolve as resolve2 } from "node:path";
-import { createHash } from "node:crypto";
 
 // src/identity.ts
 var RESERVED_IDENTITY_IDS = new Set(["__proto__", "constructor", "prototype"]);
@@ -818,7 +292,7 @@ function skipVoid(ctx, banNewLines, banComments) {
     skipComment(ctx);
   }
 }
-function skipUntil(ctx, sep2, end) {
+function skipUntil(ctx, sep, end) {
   let ptr = ctx.p;
   if (!end) {
     ptr = indexOfNewline(ctx.s, ptr);
@@ -829,7 +303,7 @@ function skipUntil(ctx, sep2, end) {
     let c = ctx.s.charCodeAt(ctx.p);
     if (c === 35) {
       skipComment(ctx);
-    } else if (c === end || c === sep2) {
+    } else if (c === end || c === sep) {
       return;
     }
   }
@@ -1443,6 +917,86 @@ function parse(toml, { maxDepth = 1000, integersAsBigInt } = {}) {
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+// codex/owner.ts
+function blockedServerHost(url) {
+  const host = url.hostname.toLowerCase().replace(/\.+$/, "").replace(/^\[|\]$/g, "");
+  return /^169\.254\./.test(host) || host === "metadata.google.internal" || host === "metadata.goog" || host.endsWith(".metadata.goog") || /^fe[89ab][0-9a-f]:/.test(host) || /^::ffff:(?:0:)?a9fe:/.test(host);
+}
+async function ownerJson(response) {
+  if (!response.body)
+    throw new Error("Missing owner response");
+  const reader = response.body.getReader();
+  const chunks = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done)
+        break;
+      size += value.byteLength;
+      if (size > 65536) {
+        reader.cancel().catch(() => {});
+        throw new Error("Owner response exceeds size limit");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+}
+async function getBotOwner(base, agentId, token, request = fetch) {
+  try {
+    if (!base || base !== base.trim() || /[\x00-\x1f\x7f]/.test(base) || !agentId || agentId !== agentId.trim() || /[\x00-\x1f\x7f]/.test(agentId) || [".", "..", "__proto__", "constructor", "prototype"].includes(agentId.toLowerCase()) || /[\/\\\s]/.test(agentId) || !token || token !== token.trim() || /[\x00-\x1f\x7f]/.test(token))
+      return null;
+    const parsed = new URL(base);
+    const loopback = ["127.0.0.1", "localhost", "[::1]", "::1"].includes(parsed.hostname.toLowerCase().replace(/\.$/, ""));
+    if (blockedServerHost(parsed) || parsed.protocol !== "https:" && !(parsed.protocol === "http:" && loopback) || parsed.username || parsed.password || parsed.search || parsed.hash || parsed.port === "0")
+      return null;
+    const origin = parsed.href.replace(/\/+$/, "");
+    const options = {
+      method: "GET",
+      headers: { Authorization: `Bearer ${token}` },
+      cache: "no-store",
+      redirect: "error",
+      signal: AbortSignal.timeout(8000)
+    };
+    const [statusSettled, entitlementSettled] = await Promise.allSettled([
+      request(`${origin}/api/account/onboarding`, options),
+      request(`${origin}/api/me/entitlements`, options)
+    ]);
+    const statusResponse = statusSettled.status === "fulfilled" ? statusSettled.value : null;
+    const entitlementResponse = entitlementSettled.status === "fulfilled" ? entitlementSettled.value : null;
+    if (!statusResponse?.ok || !entitlementResponse?.ok) {
+      await Promise.allSettled([
+        statusResponse?.body?.cancel(),
+        entitlementResponse?.body?.cancel()
+      ]);
+      return null;
+    }
+    const [statusValue, entitlementValue] = await Promise.all([
+      ownerJson(statusResponse),
+      ownerJson(entitlementResponse)
+    ]);
+    const status = statusValue;
+    const entitlement = entitlementValue;
+    if (!status || typeof status !== "object" || Array.isArray(status) || Object.hasOwn(status, "__proto__") || status.agent_id !== agentId || status.claimed !== true)
+      return null;
+    if (!entitlement || typeof entitlement !== "object" || Array.isArray(entitlement) || Object.hasOwn(entitlement, "__proto__"))
+      return null;
+    const owner = entitlement.owner_account_id;
+    return typeof owner === "string" && owner.trim().length > 0 && owner === owner.trim() && !/[\/\\\x00-\x1f\x7f]/.test(owner) && owner !== agentId && ![".", "..", "__proto__", "constructor", "prototype"].includes(owner.toLowerCase()) ? owner : null;
+  } catch {
+    return null;
+  }
+}
+
 // codex/config.ts
 function reasoningEffort(value) {
   if (value === undefined)
@@ -1473,10 +1027,49 @@ function codexHomeMode(value) {
   return value;
 }
 var MAX_CONFIG_BYTES = 1048576;
+function reservedProfileStem(selector) {
+  return [
+    "__proto__",
+    "constructor",
+    "prototype",
+    "grok-binds",
+    "session-binds",
+    "agy-binds",
+    "cursor",
+    "read-cursors",
+    "wake-pids",
+    "config",
+    "codex-bots"
+  ].includes(selector.replace(/\.json$/i, "").toLowerCase());
+}
+function assertDirectoryAncestors(directory) {
+  const paths = [];
+  for (let path = resolve(directory);; path = dirname(path)) {
+    paths.unshift(path);
+    if (dirname(path) === path)
+      break;
+  }
+  for (const path of paths) {
+    const stat = lstatSync(path, { throwIfNoEntry: false });
+    if (!stat)
+      continue;
+    if (stat.isSymbolicLink()) {
+      const target = `/private${path}`;
+      if (process.platform === "darwin" && ["/var", "/tmp", "/etc"].includes(path) && realpathSync(path) === target) {
+        assertDirectoryAncestors(target);
+        continue;
+      }
+      throw new Error(`Config path must be a non-symlink directory: ${path}`);
+    }
+    if (!stat.isDirectory())
+      throw new Error(`Config path must be a non-symlink directory: ${path}`);
+  }
+}
 function checkedPath(path, directory = false) {
+  assertDirectoryAncestors(dirname(path));
   let stat;
   try {
-    stat = lstatSync3(path);
+    stat = lstatSync(path);
   } catch (error) {
     if (error.code === "ENOENT")
       return;
@@ -1489,11 +1082,15 @@ function checkedPath(path, directory = false) {
   return stat;
 }
 function readJson(file) {
+  let value;
   try {
-    return JSON.parse(readFileSync2(file, "utf8"));
+    value = JSON.parse(readFileSync(file, "utf8"));
   } catch {
     throw new Error(`Cannot read valid JSON: ${file}`);
   }
+  if (value && typeof value === "object" && Object.hasOwn(value, "__proto__"))
+    throw new Error("Invalid JSON prototype key");
+  return value;
 }
 function strings(value, name) {
   if (value === undefined)
@@ -1502,11 +1099,12 @@ function strings(value, name) {
     throw new Error(`${name} must be an array of nonempty strings`);
   return value;
 }
-function resolveConfig(opts, env = process.env, home = homedir2()) {
-  const cwd = realpathSync2(opts.cwd ?? process.cwd());
-  const configFile = join3(cwd, ".agentschat/config.json");
+function resolveConfig(opts, env = process.env, home = homedir()) {
+  assertDirectoryAncestors(opts.cwd ?? process.cwd());
+  const cwd = realpathSync(opts.cwd ?? process.cwd());
+  const configFile = join(cwd, ".agentschat/config.json");
   if (opts.settings === undefined)
-    checkedPath(join3(cwd, ".agentschat"), true);
+    checkedPath(join(cwd, ".agentschat"), true);
   const project = opts.settings ?? (checkedPath(configFile) ? readJson(configFile) : {});
   if (!project || typeof project !== "object" || Array.isArray(project))
     throw new Error("Invalid project config");
@@ -1518,15 +1116,15 @@ function resolveConfig(opts, env = process.env, home = homedir2()) {
   for (const k of ["profile", "agent_id", "api_url", "ws_url", "state_root"])
     if (project[k] !== undefined && (typeof project[k] !== "string" || !project[k].trim()))
       throw new Error(`Invalid project ${k}`);
-  const localProfile = join3(cwd, ".agentschat/profile.json");
+  const localProfile = join(cwd, ".agentschat/profile.json");
   let codexProfile;
-  const codexFile = join3(cwd, ".codex/config.toml");
+  const codexFile = join(cwd, ".codex/config.toml");
   if (opts.settings === undefined)
-    checkedPath(join3(cwd, ".codex"), true);
+    checkedPath(join(cwd, ".codex"), true);
   if (opts.settings === undefined && checkedPath(codexFile)) {
     let doc;
     try {
-      doc = parse(readFileSync2(codexFile, "utf8"));
+      doc = parse(readFileSync(codexFile, "utf8"));
     } catch {
       throw new Error("Invalid project .codex/config.toml");
     }
@@ -1554,20 +1152,20 @@ function resolveConfig(opts, env = process.env, home = homedir2()) {
     throw new Error("Invalid profile selector");
   let profileFile;
   if (/^~[\\/]/.test(selector))
-    profileFile = join3(home, selector.slice(2));
-  else if (isAbsolute2(selector) || selector.includes("/") || selector.includes("\\"))
-    profileFile = resolve2(cwd, selector);
+    profileFile = join(home, selector.slice(2));
+  else if (isAbsolute(selector) || selector.includes("/") || selector.includes("\\"))
+    profileFile = resolve(cwd, selector);
   else {
     const stem = selector.replace(/\.json$/i, "");
-    if (!stem || selector.includes("..") || ["__proto__", "constructor", "prototype"].includes(stem.toLowerCase())) {
+    if (!stem || selector.includes("..") || reservedProfileStem(selector)) {
       throw new Error("Invalid central profile selector");
     }
-    const name = selector.endsWith(".json") ? selector : `${selector}.json`;
-    profileFile = join3(home, ".agentschat/profiles", name);
+    const name = /\.json$/i.test(selector) ? selector : `${selector}.json`;
+    profileFile = join(home, ".agentschat/profiles", name);
     if (!checkedPath(profileFile))
-      profileFile = join3(home, ".agentschat", name);
+      profileFile = join(home, ".agentschat", name);
     if (!checkedPath(profileFile))
-      profileFile = join3(home, ".agentchat", name);
+      profileFile = join(home, ".agentchat", name);
   }
   if (!checkedPath(profileFile))
     throw new Error(`Selected profile missing: ${profileFile}; no identity fallback or registration`);
@@ -1584,7 +1182,7 @@ function resolveConfig(opts, env = process.env, home = homedir2()) {
   const wsUrl = project.ws_url ?? `${apiUrl.replace(/^http/, "ws").replace(/\/$/, "")}/ws`;
   for (const [raw, protocols] of [[apiUrl, ["https:", "http:"]], [wsUrl, ["wss:", "ws:"]]]) {
     const url = new URL(raw);
-    if (!protocols.includes(url.protocol) || url.username || url.password || url.search || url.hash || url.port === "0" || !url.protocol.endsWith("s:") && !["127.0.0.1", "localhost", "[::1]", "::1"].includes(url.hostname.toLowerCase().replace(/\.$/, "")))
+    if (blockedServerHost(url) || !protocols.includes(url.protocol) || url.username || url.password || url.search || url.hash || url.port === "0" || !url.protocol.endsWith("s:") && !["127.0.0.1", "localhost", "[::1]", "::1"].includes(url.hostname.toLowerCase().replace(/\.$/, "")))
       throw new Error("Server URLs must use TLS (except loopback) and contain no credentials/query");
   }
   const canonicalApi = new URL(apiUrl).href.replace(/\/$/, "");
@@ -1595,7 +1193,7 @@ function resolveConfig(opts, env = process.env, home = homedir2()) {
   const codexBin = opts.codexBin ?? "codex";
   if (typeof codexBin !== "string" || !codexBin.trim() || /[\x00-\x1f\x7f]/.test(codexBin))
     throw new Error("Invalid codex_bin");
-  const stateRoot = root === undefined ? join3(home, ".agentschat/codex-bridge") : /^~[\\/]/.test(root) ? join3(home, root.slice(2)) : resolve2(cwd, root);
+  const stateRoot = root === undefined ? join(home, ".agentschat/codex-bridge") : /^~[\\/]/.test(root) ? join(home, root.slice(2)) : resolve(cwd, root);
   return {
     cwd,
     profileFile,
@@ -1611,15 +1209,468 @@ function resolveConfig(opts, env = process.env, home = homedir2()) {
     channels: strings(project.channels, "channels"),
     senders: strings(project.senders, "senders"),
     codexBin,
-    stateDir: join3(stateRoot, key)
+    stateDir: join(stateRoot, key)
   };
 }
 
+// codex/runtime-home.ts
+import { homedir as homedir2 } from "node:os";
+import { delimiter, isAbsolute as isAbsolute2, join as join2, relative, resolve as resolve2, sep } from "node:path";
+function executablePath(bin) {
+  if (!bin || /[\x00-\x1f\x7f]/.test(bin))
+    return;
+  const exts = process.platform === "win32" && !/\.[A-Za-z0-9]+$/.test(bin) ? ["", ...(process.env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";").filter(Boolean)] : [""];
+  const bases = isAbsolute2(bin) || bin.includes("/") || bin.includes("\\") ? [resolve2(bin)] : (process.env.PATH ?? "").split(delimiter).filter(Boolean).map((dir) => join2(dir, bin));
+  for (const base of bases) {
+    for (const ext of exts) {
+      const candidate = base + ext;
+      try {
+        accessSync(candidate, constants.X_OK);
+        return realpathSync2(candidate);
+      } catch {}
+    }
+  }
+}
+function assertDirectoryLeaf(path, label) {
+  const info = lstatSync2(path, { throwIfNoEntry: false });
+  if (info?.isSymbolicLink())
+    throw new Error(`${label} must not be a symlink`);
+  if (info && !info.isDirectory())
+    throw new Error(`${label} must be a directory`);
+}
+function prepareHomeDirectory(stateDir, home) {
+  assertDirectoryLeaf(stateDir, "Bot state directory");
+  assertDirectoryLeaf(home, "Bot runtime home");
+  assertDirectoryAncestors(stateDir);
+  assertDirectoryAncestors(home);
+  mkdirSync(home, { recursive: true, mode: 448 });
+}
+function assertIndependentTree(home, allowedAuthOrigin, codexExecutable) {
+  if (lstatSync2(home).isSymbolicLink())
+    throw new Error("Independent Codex home must not be a symlink");
+  const inspect = (dir, depth = 0) => {
+    if (depth > 32)
+      throw new Error("Independent Codex home directory depth exceeds 32");
+    for (const name of readdirSync(dir)) {
+      const path = join2(dir, name), info = lstatSync2(path);
+      if (info.isSymbolicLink()) {
+        if (dir === home && name === "auth.json" && allowedAuthOrigin && resolve2(home, readlinkSync(path)) === allowedAuthOrigin)
+          continue;
+        const local = relative(home, path).split(sep).join("/");
+        if (codexExecutable && /^tmp\/arg0\/codex-arg0[A-Za-z0-9_-]+\/(apply_patch|applypatch|codex-execve-wrapper|codex-linux-sandbox)$/.test(local)) {
+          try {
+            if (realpathSync2(path) === codexExecutable)
+              continue;
+          } catch {}
+        }
+        throw new Error("Independent Codex home must not link configuration or runtime state");
+      }
+      if (info.isDirectory())
+        inspect(path, depth + 1);
+      else if (!info.isFile())
+        throw new Error("Independent Codex home must contain only regular files and directories");
+    }
+  };
+  inspect(home);
+}
+function prepareRuntimeHome(stateDir, source = process.env.CODEX_HOME || join2(homedir2(), ".codex"), mode = "linked", codexBin = "codex") {
+  if (mode !== "linked" && mode !== "isolated" && mode !== "auth-only")
+    throw new Error("Invalid Codex home mode");
+  if (mode === "isolated") {
+    const home2 = join2(stateDir, "codex-home-isolated");
+    prepareHomeDirectory(stateDir, home2);
+    assertIndependentTree(home2, undefined, executablePath(codexBin));
+    return { home: realpathSync2(home2) };
+  }
+  if (mode === "auth-only") {
+    const legacyHome2 = realpathSync2(source);
+    const origin = join2(legacyHome2, "auth.json");
+    if (!lstatSync2(origin).isFile())
+      throw new Error("auth-only requires an existing regular auth.json; authorize its use explicitly");
+    const home2 = join2(stateDir, "codex-home-auth-only");
+    prepareHomeDirectory(stateDir, home2);
+    if (lstatSync2(home2).isSymbolicLink() || realpathSync2(home2) === legacyHome2)
+      throw new Error("auth-only home must be independent");
+    for (const name of ["config.toml", "AGENTS.md", "rules", "plugins", "hooks.json"]) {
+      try {
+        lstatSync2(join2(home2, name));
+      } catch (e) {
+        if (e.code === "ENOENT")
+          continue;
+        throw e;
+      }
+      throw new Error("auth-only home contains unexpected configuration; use a fresh state root");
+    }
+    const skills = join2(home2, "skills");
+    const skillsInfo = lstatSync2(skills, { throwIfNoEntry: false });
+    if (skillsInfo && (skillsInfo.isSymbolicLink() || !skillsInfo.isDirectory() || readdirSync(skills).some((name) => name !== ".system")))
+      throw new Error("auth-only home contains unexpected custom skills");
+    assertIndependentTree(home2, origin, executablePath(codexBin));
+    const target = join2(home2, "auth.json");
+    try {
+      if (!lstatSync2(target).isSymbolicLink() || resolve2(home2, readlinkSync(target)) !== origin)
+        throw new Error("Unexpected auth-only login binding");
+    } catch (e) {
+      if (e.code !== "ENOENT")
+        throw e;
+      symlinkSync(origin, target);
+    }
+    assertIndependentTree(home2, origin, executablePath(codexBin));
+    return { home: realpathSync2(home2) };
+  }
+  const legacyHome = existsSync(source) ? realpathSync2(source) : resolve2(source);
+  const home = join2(stateDir, "codex-home");
+  prepareHomeDirectory(stateDir, home);
+  if (realpathSync2(home) === legacyHome)
+    throw new Error("Bot runtime home must differ from desktop Codex home");
+  if (lstatSync2(home).isSymbolicLink())
+    throw new Error("Bot runtime home must not be a symlink");
+  for (const name of ["config.toml", "auth.json", "AGENTS.md", "skills", "rules", "plugins", "hooks.json", "models_cache.json"]) {
+    const origin = join2(legacyHome, name), target = join2(home, name);
+    if (!existsSync(origin))
+      continue;
+    let current;
+    try {
+      current = lstatSync2(target);
+    } catch (e) {
+      if (e.code !== "ENOENT")
+        throw e;
+    }
+    if (current) {
+      if (!current.isSymbolicLink() || resolve2(home, readlinkSync(target)) !== origin)
+        throw new Error(`Unexpected bot runtime configuration: ${name}`);
+    } else
+      symlinkSync(origin, target);
+  }
+  return { home, legacyHome };
+}
+
+// src/onboarding-status.ts
+var DEFAULT_PUBLIC_BASE = "https://agents-chat.com";
+function isForbiddenMetadataOrLinkLocalHost(host) {
+  if (host === "metadata.google.internal" || host.endsWith(".metadata.google.internal") || host === "metadata.goog" || host.endsWith(".metadata.goog") || host === "169.254.169.254") {
+    return true;
+  }
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) {
+    const [a, b] = host.split(".").map(Number);
+    if (a === 0 || a === 169 && b === 254)
+      return true;
+  }
+  if (host.startsWith("[") && host.endsWith("]")) {
+    const inner = host.slice(1, -1).toLowerCase();
+    if (inner === "::" || /^fe[89ab][0-9a-f]*:/i.test(inner))
+      return true;
+    if (/^::ffff:(?:0:)?(?:169\.254\.|a9fe:)/i.test(inner))
+      return true;
+  }
+  return false;
+}
+function isSafeOnboardingBase(base) {
+  try {
+    if (!base || base !== base.trim() || /[\x00-\x20\x7f"<>\\]/.test(base))
+      return false;
+    const parsed = new URL(base);
+    const host = parsed.hostname.toLowerCase().replace(/\.$/, "");
+    if (!host || isForbiddenMetadataOrLinkLocalHost(host))
+      return false;
+    if (parsed.port !== "") {
+      const p = Number(parsed.port);
+      if (!Number.isInteger(p) || p < 1 || p > 65535)
+        return false;
+    }
+    const isLoopback = host === "127.0.0.1" || host === "localhost" || host === "[::1]" || host === "::1";
+    if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && isLoopback))
+      return false;
+    if (parsed.username || parsed.password || parsed.search || parsed.hash)
+      return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+function isSafeOnboardingAgentId(id) {
+  if (!id || id.length > 128 || /[\x00-\x1f\x7f\s/\\]/.test(id))
+    return false;
+  if (id === "." || id.includes(".."))
+    return false;
+  const lower = id.toLowerCase();
+  if (lower === "__proto__" || lower === "constructor" || lower === "prototype")
+    return false;
+  return true;
+}
+var MAX_ONBOARDING_JSON_BYTES = 64 * 1024;
+async function readBoundedJson(r, maxBytes = MAX_ONBOARDING_JSON_BYTES) {
+  const declaredLen = Number(r.headers?.get?.("content-length"));
+  if (Number.isFinite(declaredLen) && declaredLen > maxBytes) {
+    try {
+      await r.body?.cancel?.();
+    } catch {}
+    throw new Error("onboarding response too large");
+  }
+  if (!r.body) {
+    const txt = await r.text();
+    if (Buffer.byteLength(txt, "utf8") > maxBytes)
+      throw new Error("onboarding response too large");
+    return JSON.parse(txt);
+  }
+  const reader = r.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done)
+        break;
+      if (value) {
+        total += value.byteLength;
+        if (total > maxBytes) {
+          await reader.cancel().catch(() => {});
+          throw new Error("onboarding response too large");
+        }
+        chunks.push(value);
+      }
+    }
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {}
+  }
+  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
+async function getOnboardingStatus(base, agentId, token, request = fetch) {
+  const cleanBase = typeof base === "string" ? base.trim().replace(/\/+$/, "") : "";
+  const rawAgentId = typeof agentId === "string" ? agentId.trim() : "";
+  const validAgent = isSafeOnboardingAgentId(rawAgentId);
+  const safeAgentId = validAgent ? rawAgentId : "";
+  const validBase = Boolean(cleanBase && !/[\x00-\x1f\x7f]/.test(cleanBase) && isSafeOnboardingBase(cleanBase));
+  const safeDisplayBase = validBase ? cleanBase : DEFAULT_PUBLIC_BASE;
+  const chat = `${safeDisplayBase}/chat/${encodeURIComponent(safeAgentId)}`;
+  const result = {
+    agent_id: safeAgentId,
+    claimed: null,
+    authentication: "unknown",
+    chat_url: chat,
+    claim_url: `${chat}?claim=1`,
+    next_step: "check_identity"
+  };
+  if (!validBase || !validAgent || typeof token !== "string" || !token.trim() || /[\x00-\x1f\x7f]/.test(token)) {
+    return result;
+  }
+  try {
+    const r = await request(`${cleanBase}/api/account/onboarding`, {
+      headers: { Authorization: `Bearer ${token.trim()}` },
+      cache: "no-store",
+      signal: AbortSignal.timeout(8000),
+      redirect: "error"
+    });
+    if (r.status === 401 || r.status === 403) {
+      try {
+        await r.body?.cancel?.();
+      } catch {}
+      result.authentication = "failed";
+      return result;
+    }
+    if (!r.ok) {
+      try {
+        await r.body?.cancel?.();
+      } catch {}
+      return result;
+    }
+    const data = await readBoundedJson(r);
+    if (!data || typeof data !== "object" || Array.isArray(data) || Object.prototype.hasOwnProperty.call(data, "__proto__") || data.agent_id !== safeAgentId || typeof data.claimed !== "boolean")
+      return result;
+    result.authentication = "ok";
+    result.claimed = data.claimed;
+    result.next_step = data.claimed ? "verify_reply" : "join_public_chat";
+  } catch {}
+  return result;
+}
+
+// codex/gui-channel.ts
+import { randomUUID } from "node:crypto";
+import { mkdirSync as mkdirSync2, writeFileSync, readFileSync as readFileSync2, renameSync, readdirSync as readdirSync2, rmSync, lstatSync as lstatSync3 } from "node:fs";
+import { join as join3 } from "node:path";
+function payload(result) {
+  if (result?.isError || result?.success === false || result?.error)
+    throw new Error("GUI tool rejected request");
+  if (Array.isArray(result?.content)) {
+    const text = result.content.find((c) => c.type === "text")?.text;
+    if (!text)
+      throw new Error("GUI tool returned no receipt");
+    if (typeof text !== "string" || text.length > 1048576)
+      throw new Error("GUI receipt exceeds size limit");
+    return JSON.parse(text);
+  }
+  return result;
+}
+function validTarget(value) {
+  return typeof value === "string" && value.trim() === value && value.length >= 1 && value.length <= 256 && !/[\x00-\x1f\x7f]/.test(value) && !["__proto__", "prototype", "constructor"].includes(value.toLowerCase());
+}
+
+class GuiChannel {
+  directory;
+  allowedThreads;
+  constructor(directory, allowedThreads) {
+    this.directory = directory;
+    this.allowedThreads = allowedThreads;
+    const existing = lstatSync3(directory, { throwIfNoEntry: false });
+    if (existing && (existing.isSymbolicLink() || !existing.isDirectory()))
+      throw new Error("GUI outbox must be a real directory, not a symlink");
+    mkdirSync2(directory, { recursive: true, mode: 448 });
+    const stat = lstatSync3(directory);
+    if (stat.isSymbolicLink() || !stat.isDirectory())
+      throw new Error("GUI outbox must be a real directory, not a symlink");
+  }
+  path(id) {
+    if (!/^[0-9a-f-]{36}$/.test(id))
+      throw new Error("Invalid delivery ID");
+    return join3(this.directory, `${id}.json`);
+  }
+  save(entry) {
+    const path = this.path(entry.id), temp = `${path}.${randomUUID()}.tmp`;
+    const stat = lstatSync3(path, { throwIfNoEntry: false });
+    if (stat?.isSymbolicLink() || stat && !stat.isFile())
+      throw new Error("GUI receipt must be a regular file, not a symlink");
+    try {
+      writeFileSync(temp, JSON.stringify(entry), { mode: 384, flag: "wx" });
+      const current = lstatSync3(path, { throwIfNoEntry: false });
+      if (current && (current.isSymbolicLink() || !current.isFile()))
+        throw new Error("GUI receipt must be a regular file, not a symlink");
+      renameSync(temp, path);
+    } catch (error) {
+      if (error.code !== "EEXIST")
+        rmSync(temp, { force: true });
+      throw error;
+    }
+  }
+  get(id) {
+    const path = this.path(id), stat = lstatSync3(path);
+    if (stat.isSymbolicLink() || !stat.isFile())
+      throw new Error("GUI receipt must be a regular file, not a symlink");
+    if (stat.size > 1048576)
+      throw new Error("GUI receipt exceeds size limit");
+    const entry = JSON.parse(readFileSync2(path, "utf8"));
+    if (!entry || typeof entry !== "object" || Array.isArray(entry) || Object.prototype.hasOwnProperty.call(entry, "__proto__") || entry.id !== id || !validTarget(entry.threadId) || typeof entry.prompt !== "string" || typeof entry.createdAt !== "string" || !["pending", "sending", "submitted", "delivered", "uncertain"].includes(entry.status) || entry.hostId !== undefined && !validTarget(entry.hostId) || entry.turnId !== undefined && typeof entry.turnId !== "string" || entry.deliveredAt !== undefined && typeof entry.deliveredAt !== "string")
+      throw new Error("Invalid GUI receipt");
+    return entry;
+  }
+  list() {
+    const entries = [];
+    for (const file of readdirSync2(this.directory)) {
+      if (!/^[0-9a-f-]{36}\.json$/.test(file))
+        continue;
+      try {
+        entries.push(this.get(file.slice(0, -5)));
+      } catch {}
+    }
+    return entries;
+  }
+  enqueue(threadId, text, hostId) {
+    if (!validTarget(threadId) || hostId !== undefined && !validTarget(hostId))
+      throw new Error("Invalid GUI target");
+    if (!this.allowedThreads.includes(threadId))
+      throw new Error("GUI target is not allowed");
+    if (!text.trim() || text.length > 24000)
+      throw new Error("GUI message must contain 1–24000 characters");
+    const id = randomUUID();
+    const entry = {
+      id,
+      threadId,
+      ...hostId ? { hostId } : {},
+      prompt: `[AgentsChat delivery ${id}]
+${text}`,
+      status: "pending",
+      createdAt: new Date().toISOString()
+    };
+    this.save(entry);
+    return entry;
+  }
+  async dispatch(id, call) {
+    const lock = `${this.path(id)}.lock`;
+    try {
+      mkdirSync2(lock, { mode: 448 });
+    } catch (error) {
+      if (error.code !== "EEXIST")
+        throw error;
+      const stat = lstatSync3(lock);
+      if (stat.isSymbolicLink())
+        throw new Error("GUI delivery lock must not be a symlink");
+      if (!stat.isDirectory() || Date.now() - stat.mtimeMs <= 5 * 60000)
+        throw error;
+      rmSync(lock, { recursive: true, force: true });
+      mkdirSync2(lock, { mode: 448 });
+    }
+    try {
+      const entry = this.get(id);
+      if (!this.allowedThreads.includes(entry.threadId))
+        throw new Error("GUI target is no longer allowed");
+      if (entry.status === "delivered")
+        return entry;
+      const target = { threadId: entry.threadId, ...entry.hostId ? { hostId: entry.hostId } : {} };
+      if (entry.status === "pending") {
+        entry.status = "sending";
+        this.save(entry);
+        try {
+          payload(await call("send_message_to_thread", { ...target, prompt: entry.prompt }));
+          entry.status = "submitted";
+          this.save(entry);
+        } catch {
+          entry.status = "uncertain";
+          this.save(entry);
+        }
+      }
+      if (entry.status === "sending") {
+        entry.status = "uncertain";
+        this.save(entry);
+      }
+      try {
+        let cursor;
+        const seenCursors = new Set;
+        for (let page = 0;page < 5; page++) {
+          const history = payload(await call("read_thread", {
+            ...target,
+            turnLimit: 10,
+            maxOutputCharsPerItem: 32000,
+            ...cursor ? { cursor } : {}
+          }));
+          if (history?.thread?.id !== entry.threadId)
+            throw new Error("Wrong GUI thread in receipt");
+          const turn = history.turns?.find((t) => t.items?.some((item) => item.type === "userMessage" && item.content?.some((c) => c.type === "text" && c.text === entry.prompt)));
+          if (turn) {
+            entry.status = "delivered";
+            entry.deliveredAt = new Date().toISOString();
+            entry.turnId = turn.id;
+            this.save(entry);
+            break;
+          }
+          const nextCursor = history.page?.nextCursor;
+          if (typeof nextCursor !== "string" || !nextCursor.length || seenCursors.has(nextCursor))
+            break;
+          seenCursors.add(nextCursor);
+          cursor = nextCursor;
+        }
+      } catch {}
+      return entry;
+    } finally {
+      rmSync(lock, { recursive: true, force: true });
+    }
+  }
+}
+
+// codex/run.ts
+import { readFileSync as readFileSync11, lstatSync as lstatSync12 } from "node:fs";
+import { homedir as homedir6 } from "node:os";
+import { join as join12 } from "node:path";
+
 // codex/bots-config.ts
+import { readFileSync as readFileSync3, realpathSync as realpathSync3, mkdirSync as mkdirSync3, lstatSync as lstatSync4 } from "node:fs";
+import { homedir as homedir3 } from "node:os";
+import { dirname as dirname2, isAbsolute as isAbsolute3, join as join4, resolve as resolve3 } from "node:path";
 function defaultRegistry(home = homedir3()) {
   return join4(home, ".agentschat/codex-bots.json");
 }
 function loadBots(file = defaultRegistry(), home = homedir3()) {
+  assertDirectoryAncestors(dirname2(file));
   let doc;
   try {
     const info = lstatSync4(file);
@@ -1642,7 +1693,7 @@ function loadBots(file = defaultRegistry(), home = homedir3()) {
   for (const k of ["default_workdir", "codex_bin"])
     if (doc[k] !== undefined && !text(doc[k]))
       throw new Error(`Invalid ${k}`);
-  const path = (value) => /^~[\\/]/.test(value) ? join4(home, value.slice(2)) : isAbsolute3(value) ? value : resolve3(dirname(file), value);
+  const path = (value) => /^~[\\/]/.test(value) ? join4(home, value.slice(2)) : isAbsolute3(value) ? value : resolve3(dirname2(file), value);
   const defaultDir = doc.default_workdir ? path(doc.default_workdir) : join4(home, ".agentschat/workspace");
   const names = new Set, identities = new Set;
   const bots = [];
@@ -1657,13 +1708,14 @@ function loadBots(file = defaultRegistry(), home = homedir3()) {
       continue;
     if (!text(bot.profile) || bot.workdir !== undefined && !text(bot.workdir))
       throw new Error(`Bot ${bot.name} needs a profile and valid optional workdir`);
-    if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/.test(bot.profile) || bot.profile.includes("..") || reserved(bot.profile) || reserved(bot.profile.replace(/\.json$/i, ""))) {
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/.test(bot.profile) || bot.profile.includes("..") || reservedProfileStem(bot.profile)) {
       throw new Error(`Bot ${bot.name}: profile must be a central profile name`);
     }
     const directoryLeaf = (dir) => {
       const info = lstatSync4(dir, { throwIfNoEntry: false });
       if (info && (info.isSymbolicLink() || !info.isDirectory()))
         throw new Error("Bot workdir must be a directory, not a symlink");
+      assertDirectoryAncestors(dir);
     };
     if (!doc.default_workdir && !bot.workdir) {
       directoryLeaf(join4(home, ".agentschat"));
@@ -2152,6 +2204,7 @@ function preserveChannelHistory(directory, channel, histories, redact) {
         throw error;
     }
   };
+  assertDirectoryAncestors(directory);
   const root = join6(directory, "history");
   checkDirectory(directory);
   checkDirectory(root);
@@ -2161,8 +2214,9 @@ function preserveChannelHistory(directory, channel, histories, redact) {
     chmodSync(root, 448);
   const file = join6(root, createHash2("sha256").update(channel).digest("hex").slice(0, 24) + ".json");
   try {
-    if (lstatSync6(file).isSymbolicLink())
-      throw new Error("History archive must not be a symlink");
+    const stat = lstatSync6(file);
+    if (stat.isSymbolicLink() || !stat.isFile())
+      throw new Error("History archive must be a regular file, not a symlink");
   } catch (e) {
     if (e.code !== "ENOENT")
       throw e;
@@ -2173,8 +2227,9 @@ function preserveChannelHistory(directory, channel, histories, redact) {
     if (process.platform !== "win32")
       chmodSync(tmp, 384);
     try {
-      if (lstatSync6(file).isSymbolicLink())
-        throw new Error("History archive must not be a symlink");
+      const stat = lstatSync6(file);
+      if (stat.isSymbolicLink() || !stat.isFile())
+        throw new Error("History archive must be a regular file, not a symlink");
     } catch (error) {
       if (error.code !== "ENOENT")
         throw error;
@@ -2206,10 +2261,9 @@ function preserveChannelHistory(directory, channel, histories, redact) {
 `;
           if (text.includes(marker)) {
             try {
-              const message = JSON.parse(text.slice(text.lastIndexOf(marker) + marker.length));
+              let message = JSON.parse(text.slice(text.lastIndexOf(marker) + marker.length));
               if (message && typeof message === "object" && !Array.isArray(message)) {
-                for (const key of ["__proto__", "constructor", "prototype"])
-                  delete message[key];
+                message = Object.fromEntries(Object.entries(message).filter(([key]) => !["__proto__", "constructor", "prototype"].includes(key.toLowerCase())));
                 if (message.channel_id === channel)
                   records.push({ order, sequence: sequence++, value: { ...message, role: "user" } });
                 continue;
@@ -2339,7 +2393,7 @@ import {
   readdirSync as readdirSync3,
   readFileSync as readFileSync7
 } from "fs";
-import { dirname as dirname2, join as join8, resolve as resolve4 } from "path";
+import { dirname as dirname3, join as join8, resolve as resolve4 } from "path";
 var defaultWarn = (m) => process.stderr.write(m);
 var MAX_PROFILE_JSON_BYTES = 64 * 1024;
 var CONTROL_CHAR_GLOBAL_RE = /[\x00-\x1f\x7f]/g;
@@ -2370,7 +2424,7 @@ function isAllowedDarwinSystemSymlink(dirPath) {
   }
 }
 function hasSafeAncestorDirs(targetPath) {
-  let cur = dirname2(resolve4(targetPath));
+  let cur = dirname3(resolve4(targetPath));
   for (let depth = 0;depth < 64; depth += 1) {
     const st = safeLstat(cur);
     if (st) {
@@ -2381,7 +2435,7 @@ function hasSafeAncestorDirs(targetPath) {
         return false;
       }
     }
-    const parent = dirname2(cur);
+    const parent = dirname3(cur);
     if (parent === cur)
       break;
     cur = parent;
@@ -2389,7 +2443,7 @@ function hasSafeAncestorDirs(targetPath) {
   return true;
 }
 function safeWriteProfile(path, data, warn = defaultWarn) {
-  const parentDir = dirname2(path);
+  const parentDir = dirname3(path);
   const parentStat = safeLstat(parentDir);
   if (!parentStat || parentStat.isSymbolicLink() || !parentStat.isDirectory() || !hasSafeAncestorDirs(path)) {
     throw new Error(`Refusing to write profile into invalid or symlinked parent directory: ${sanitizeWarnPart(parentDir)}`);
@@ -3202,7 +3256,7 @@ function timestamp(value) {
   return normalized;
 }
 function validChannel(channel) {
-  return typeof channel === "string" && channel.trim().length > 0 && channel.trim().length <= 128 && !channel.includes("..") && !/[\/\\]/.test(channel) && !/[\x00-\x1f\x7f-\x9f]/.test(channel) && !["__proto__", "constructor", "prototype"].includes(channel.trim().toLowerCase());
+  return typeof channel === "string" && channel.length > 0 && channel.length <= 128 && channel === channel.trim() && channel !== "." && !channel.includes("..") && !/[\/\\]/.test(channel) && !/[\x00-\x1f\x7f-\x9f]/.test(channel) && !["__proto__", "constructor", "prototype"].includes(channel.trim().toLowerCase());
 }
 function validateChannel(channel) {
   if (!validChannel(channel))
@@ -3226,6 +3280,7 @@ class InboxSync {
     const existing = lstatSync11(stateDir, { throwIfNoEntry: false });
     if (existing && (existing.isSymbolicLink() || !existing.isDirectory()))
       throw new Error("Invalid inbound state directory");
+    assertDirectoryAncestors(stateDir);
     mkdirSync7(stateDir, { recursive: true, mode: 448 });
     const dirStat = lstatSync11(stateDir);
     if (dirStat.isSymbolicLink() || !dirStat.isDirectory())
@@ -3245,7 +3300,7 @@ class InboxSync {
     if (fileStat && fileStat.size > 1048576)
       throw new Error("Inbound cursors exceed size limit");
     this.state = fileStat ? JSON.parse(readFileSync10(this.file, "utf8")) : { version: 1, channels: {} };
-    if (!this.state || this.state.version !== 1 || !this.state.channels || typeof this.state.channels !== "object" || Array.isArray(this.state.channels))
+    if (!this.state || typeof this.state !== "object" || Array.isArray(this.state) || Object.hasOwn(this.state, "__proto__") || this.state.version !== 1 || !this.state.channels || typeof this.state.channels !== "object" || Array.isArray(this.state.channels) || Object.hasOwn(this.state.channels, "__proto__") || Object.keys(this.state.channels).length > 1024)
       throw new Error("Invalid inbound cursors; refusing to discard checkpoint");
     const channels = Object.create(null);
     for (const [channel, value] of Object.entries(this.state.channels)) {
@@ -3277,6 +3332,8 @@ class InboxSync {
   }
   watch(channel) {
     validateChannel(channel);
+    if (!Object.hasOwn(this.state.channels, channel) && Object.keys(this.state.channels).length >= 1024)
+      throw new Error("Inbound channel limit exceeded");
     this.channels.add(channel);
     if (!Object.hasOwn(this.state.channels, channel)) {
       this.state.channels[channel] = timestamp(new Date().toISOString());
@@ -3286,6 +3343,8 @@ class InboxSync {
   memberships(channels) {
     for (const channel of channels)
       validateChannel(channel);
+    if (new Set([...Object.keys(this.state.channels), ...channels]).size > 1024)
+      throw new Error("Inbound channel limit exceeded");
     this.channels = new Set(channels);
     let changed = false;
     for (const channel of this.channels) {
@@ -3360,7 +3419,7 @@ class InboxSync {
 
 // codex/transport.ts
 function safeChannel(channel) {
-  return typeof channel === "string" && channel.trim().length > 0 && channel.length <= 128 && !/[.\/\\\x00-\x1f\x7f]/.test(channel) && !/^(?:__proto__|constructor|prototype)$/i.test(channel);
+  return typeof channel === "string" && channel.trim().length > 0 && channel === channel.trim() && channel.length <= 128 && !/[.\/\\\x00-\x1f\x7f]/.test(channel) && !/^(?:__proto__|constructor|prototype)$/i.test(channel);
 }
 function requireChannel(channel) {
   if (!safeChannel(channel))
@@ -3433,22 +3492,25 @@ class AgentsChatTransport {
       reader = response.body?.getReader();
       if (!reader)
         throw new Error("Missing response body");
-      const decoder = new TextDecoder;
+      const decoder = new TextDecoder("utf-8", { fatal: true });
       let bytes = 0, text = "";
       while (true) {
-        const { done, value } = await reader.read();
+        const { done, value: value2 } = await reader.read();
         if (done)
           break;
-        bytes += value.byteLength;
+        bytes += value2.byteLength;
         if (bytes > 4 * 1024 * 1024) {
           try {
             await reader.cancel();
           } catch {}
           throw new Error("Response too large");
         }
-        text += decoder.decode(value, { stream: true });
+        text += decoder.decode(value2, { stream: true });
       }
-      return JSON.parse(text + decoder.decode());
+      const value = JSON.parse(text + decoder.decode());
+      if (value && typeof value === "object" && Object.hasOwn(value, "__proto__"))
+        throw new Error("Invalid JSON prototype key");
+      return value;
     } catch {
       throw new Error("Invalid AgentsChat response");
     } finally {
@@ -3577,7 +3639,7 @@ class AgentsChatTransport {
       } catch {
         return;
       }
-      if (!data || typeof data !== "object" || Array.isArray(data))
+      if (!data || typeof data !== "object" || Array.isArray(data) || Object.hasOwn(data, "__proto__"))
         return;
       if (data.type !== "auth_error")
         this.heartbeat?.receivedPong();

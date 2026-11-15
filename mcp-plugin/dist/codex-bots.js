@@ -14,12 +14,12 @@ import { parseArgs } from "node:util";
 // codex/bots-config.ts
 import { readFileSync as readFileSync2, realpathSync as realpathSync2, mkdirSync, lstatSync as lstatSync2 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
-import { dirname, isAbsolute as isAbsolute2, join as join2, resolve as resolve2 } from "node:path";
+import { dirname as dirname2, isAbsolute as isAbsolute2, join as join2, resolve as resolve2 } from "node:path";
 
 // codex/config.ts
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 
 // src/redact.ts
@@ -931,6 +931,12 @@ function parse(toml, { maxDepth = 1000, integersAsBigInt } = {}) {
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+// codex/owner.ts
+function blockedServerHost(url) {
+  const host = url.hostname.toLowerCase().replace(/\.+$/, "").replace(/^\[|\]$/g, "");
+  return /^169\.254\./.test(host) || host === "metadata.google.internal" || host === "metadata.goog" || host.endsWith(".metadata.goog") || /^fe[89ab][0-9a-f]:/.test(host) || /^::ffff:(?:0:)?a9fe:/.test(host);
+}
+
 // codex/config.ts
 function reasoningEffort(value) {
   if (value === undefined)
@@ -961,7 +967,46 @@ function codexHomeMode(value) {
   return value;
 }
 var MAX_CONFIG_BYTES = 1048576;
+function reservedProfileStem(selector) {
+  return [
+    "__proto__",
+    "constructor",
+    "prototype",
+    "grok-binds",
+    "session-binds",
+    "agy-binds",
+    "cursor",
+    "read-cursors",
+    "wake-pids",
+    "config",
+    "codex-bots"
+  ].includes(selector.replace(/\.json$/i, "").toLowerCase());
+}
+function assertDirectoryAncestors(directory) {
+  const paths = [];
+  for (let path = resolve(directory);; path = dirname(path)) {
+    paths.unshift(path);
+    if (dirname(path) === path)
+      break;
+  }
+  for (const path of paths) {
+    const stat = lstatSync(path, { throwIfNoEntry: false });
+    if (!stat)
+      continue;
+    if (stat.isSymbolicLink()) {
+      const target = `/private${path}`;
+      if (process.platform === "darwin" && ["/var", "/tmp", "/etc"].includes(path) && realpathSync(path) === target) {
+        assertDirectoryAncestors(target);
+        continue;
+      }
+      throw new Error(`Config path must be a non-symlink directory: ${path}`);
+    }
+    if (!stat.isDirectory())
+      throw new Error(`Config path must be a non-symlink directory: ${path}`);
+  }
+}
 function checkedPath(path, directory = false) {
+  assertDirectoryAncestors(dirname(path));
   let stat;
   try {
     stat = lstatSync(path);
@@ -977,11 +1022,15 @@ function checkedPath(path, directory = false) {
   return stat;
 }
 function readJson(file) {
+  let value;
   try {
-    return JSON.parse(readFileSync(file, "utf8"));
+    value = JSON.parse(readFileSync(file, "utf8"));
   } catch {
     throw new Error(`Cannot read valid JSON: ${file}`);
   }
+  if (value && typeof value === "object" && Object.hasOwn(value, "__proto__"))
+    throw new Error("Invalid JSON prototype key");
+  return value;
 }
 function strings(value, name) {
   if (value === undefined)
@@ -991,6 +1040,7 @@ function strings(value, name) {
   return value;
 }
 function resolveConfig(opts, env = process.env, home = homedir()) {
+  assertDirectoryAncestors(opts.cwd ?? process.cwd());
   const cwd = realpathSync(opts.cwd ?? process.cwd());
   const configFile = join(cwd, ".agentschat/config.json");
   if (opts.settings === undefined)
@@ -1047,10 +1097,10 @@ function resolveConfig(opts, env = process.env, home = homedir()) {
     profileFile = resolve(cwd, selector);
   else {
     const stem = selector.replace(/\.json$/i, "");
-    if (!stem || selector.includes("..") || ["__proto__", "constructor", "prototype"].includes(stem.toLowerCase())) {
+    if (!stem || selector.includes("..") || reservedProfileStem(selector)) {
       throw new Error("Invalid central profile selector");
     }
-    const name = selector.endsWith(".json") ? selector : `${selector}.json`;
+    const name = /\.json$/i.test(selector) ? selector : `${selector}.json`;
     profileFile = join(home, ".agentschat/profiles", name);
     if (!checkedPath(profileFile))
       profileFile = join(home, ".agentschat", name);
@@ -1072,7 +1122,7 @@ function resolveConfig(opts, env = process.env, home = homedir()) {
   const wsUrl = project.ws_url ?? `${apiUrl.replace(/^http/, "ws").replace(/\/$/, "")}/ws`;
   for (const [raw, protocols] of [[apiUrl, ["https:", "http:"]], [wsUrl, ["wss:", "ws:"]]]) {
     const url = new URL(raw);
-    if (!protocols.includes(url.protocol) || url.username || url.password || url.search || url.hash || url.port === "0" || !url.protocol.endsWith("s:") && !["127.0.0.1", "localhost", "[::1]", "::1"].includes(url.hostname.toLowerCase().replace(/\.$/, "")))
+    if (blockedServerHost(url) || !protocols.includes(url.protocol) || url.username || url.password || url.search || url.hash || url.port === "0" || !url.protocol.endsWith("s:") && !["127.0.0.1", "localhost", "[::1]", "::1"].includes(url.hostname.toLowerCase().replace(/\.$/, "")))
       throw new Error("Server URLs must use TLS (except loopback) and contain no credentials/query");
   }
   const canonicalApi = new URL(apiUrl).href.replace(/\/$/, "");
@@ -1108,6 +1158,7 @@ function defaultRegistry(home = homedir2()) {
   return join2(home, ".agentschat/codex-bots.json");
 }
 function loadBots(file = defaultRegistry(), home = homedir2()) {
+  assertDirectoryAncestors(dirname2(file));
   let doc;
   try {
     const info = lstatSync2(file);
@@ -1130,7 +1181,7 @@ function loadBots(file = defaultRegistry(), home = homedir2()) {
   for (const k of ["default_workdir", "codex_bin"])
     if (doc[k] !== undefined && !text(doc[k]))
       throw new Error(`Invalid ${k}`);
-  const path = (value) => /^~[\\/]/.test(value) ? join2(home, value.slice(2)) : isAbsolute2(value) ? value : resolve2(dirname(file), value);
+  const path = (value) => /^~[\\/]/.test(value) ? join2(home, value.slice(2)) : isAbsolute2(value) ? value : resolve2(dirname2(file), value);
   const defaultDir = doc.default_workdir ? path(doc.default_workdir) : join2(home, ".agentschat/workspace");
   const names = new Set, identities = new Set;
   const bots = [];
@@ -1145,13 +1196,14 @@ function loadBots(file = defaultRegistry(), home = homedir2()) {
       continue;
     if (!text(bot.profile) || bot.workdir !== undefined && !text(bot.workdir))
       throw new Error(`Bot ${bot.name} needs a profile and valid optional workdir`);
-    if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/.test(bot.profile) || bot.profile.includes("..") || reserved(bot.profile) || reserved(bot.profile.replace(/\.json$/i, ""))) {
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/.test(bot.profile) || bot.profile.includes("..") || reservedProfileStem(bot.profile)) {
       throw new Error(`Bot ${bot.name}: profile must be a central profile name`);
     }
     const directoryLeaf = (dir) => {
       const info = lstatSync2(dir, { throwIfNoEntry: false });
       if (info && (info.isSymbolicLink() || !info.isDirectory()))
         throw new Error("Bot workdir must be a directory, not a symlink");
+      assertDirectoryAncestors(dir);
     };
     if (!doc.default_workdir && !bot.workdir) {
       directoryLeaf(join2(home, ".agentschat"));
