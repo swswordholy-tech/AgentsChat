@@ -6,11 +6,15 @@ const DEFAULT_PUBLIC_BASE = "https://agents-chat.com";
 
 function isForbiddenMetadataOrLinkLocalHost(host: string): boolean {
   if (
+    host === "metadata" ||
+    host === "instance-data" ||
     host === "metadata.google.internal" ||
     host.endsWith(".metadata.google.internal") ||
     host === "metadata.goog" ||
     host.endsWith(".metadata.goog") ||
-    host === "169.254.169.254"
+    host === "169.254.169.254" ||
+    host === "100.100.100.200" ||
+    host === "0.0.0.0"
   ) {
     return true;
   }
@@ -20,8 +24,17 @@ function isForbiddenMetadataOrLinkLocalHost(host: string): boolean {
   }
   if (host.startsWith("[") && host.endsWith("]")) {
     const inner = host.slice(1, -1).toLowerCase();
-    if (inner === "::" || /^fe[89ab][0-9a-f]*:/i.test(inner)) return true;
-    if (/^::ffff:(?:0:)?(?:169\.254\.|a9fe:)/i.test(inner)) return true;
+    if (
+      inner === "::" ||
+      inner === "0:0:0:0:0:0:0:0" ||
+      inner === "fd00:ec2::254" ||
+      /^fe[89ab][0-9a-f]*:/i.test(inner)
+    ) {
+      return true;
+    }
+    if (/^::ffff:(?:0:)?(?:0\.0\.0\.0|0:0|169\.254\.|a9fe:|100\.100\.100\.200$|6464:64c8$)/i.test(inner)) {
+      return true;
+    }
   }
   return false;
 }
@@ -29,6 +42,7 @@ function isForbiddenMetadataOrLinkLocalHost(host: string): boolean {
 function isSafeOnboardingBase(base: string): boolean {
   try {
     if (!base || base !== base.trim() || /[\x00-\x20\x7f"<>\\]/.test(base)) return false;
+    if (/:0(?:\/|$)/.test(base)) return false;
     const parsed = new URL(base);
     const host = parsed.hostname.toLowerCase().replace(/\.$/, "");
     if (!host || isForbiddenMetadataOrLinkLocalHost(host)) return false;

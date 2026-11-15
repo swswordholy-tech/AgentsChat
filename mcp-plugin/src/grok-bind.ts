@@ -25,6 +25,7 @@
  */
 
 import { join } from "node:path";
+import { redactSecrets } from "./redact.ts";
 
 export const DEFAULT_GROK_BINDS_FILENAME = "grok-binds.json";
 /** Sidecar written by grok-bind-register.sh ({profile, registered_by, ts} per uuid). Not a profile. */
@@ -63,9 +64,21 @@ const MAX_GROK_BINDS_PATH_LEN = 4096;
 const RESERVED_BIND_BASENAMES = new Set([
   "profile",
   "grok-binds",
+  "grok-binds-meta",
   "grok-binds.meta",
   "session-binds",
+  "session-binds.meta",
   "agy-session-binds",
+  "agy-binds",
+  "agy-binds.meta",
+  "identity-guard",
+  "cursor",
+  "read-cursors",
+  "mention-timestamps",
+  "wake-pids",
+  "dsh",
+  "config",
+  "muse",
 ]);
 
 function hasPathOrTraversalSyntax(s: string): boolean {
@@ -327,7 +340,7 @@ export const WAKE_MODE_ENV = "AGENTCHAT_WAKE_MODE";
  */
 export function nonGrokWakeReason(env: Record<string, string | undefined>): string | null {
   if (!env || typeof env !== "object") return null;
-  const clean = (v: string) => v.replace(/[\x00-\x1f\x7f]+/g, "").slice(0, 64);
+  const clean = (v: string) => redactSecrets(v.replace(/[\x00-\x1f\x7f]+/g, "")).slice(0, 64);
   const anti = clean((env[ANTIGRAVITY_WAKE_ENV] ?? "").trim());
   if (anti) return `${ANTIGRAVITY_WAKE_ENV}=${anti}`;
   const kind = clean((env[WAKE_KIND_ENV] ?? "").trim());

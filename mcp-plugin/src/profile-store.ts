@@ -41,7 +41,10 @@ const DARWIN_SYSTEM_SYMLINKS = new Set(["/var", "/tmp", "/etc"]);
 function sanitizeWarnPart(value: unknown): string {
   return redactSecrets(String(value ?? ""))
     .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED]")
-    .replace(/\b(?:agent_key_|sk-|whsec_|gh[pousr]_|github_pat_|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g, "[REDACTED]")
+    .replace(
+      /\b(?:agent_key_|sk-|whsec_|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g,
+      "[REDACTED]",
+    )
     .replace(CONTROL_CHAR_GLOBAL_RE, "?");
 }
 
@@ -66,7 +69,30 @@ function isAllowedDarwinSystemSymlink(dirPath: string): boolean {
   }
 }
 
+function hasSafeRawDotDotAncestors(targetPath: string): boolean {
+  if (!targetPath.includes("..")) return true;
+  const rawParent = dirname(targetPath);
+  const parts = rawParent.split(/[\\/]+/);
+  let acc = rawParent.startsWith("/") ? "/" : /^[A-Za-z]:/.test(rawParent) ? parts[0] + "\\" : process.cwd();
+  const startIdx = rawParent.startsWith("/") ? 1 : /^[A-Za-z]:/.test(rawParent) ? 1 : 0;
+  for (let i = startIdx; i < parts.length; i++) {
+    const seg = parts[i];
+    if (!seg || seg === ".") continue;
+    acc = seg === ".." ? dirname(acc) : join(acc, seg);
+    const st = safeLstat(acc);
+    if (st) {
+      if (st.isSymbolicLink()) {
+        if (!isAllowedDarwinSystemSymlink(acc)) return false;
+      } else if (!st.isDirectory()) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 function hasSafeAncestorDirs(targetPath: string): boolean {
+  if (!hasSafeRawDotDotAncestors(targetPath)) return false;
   let cur = dirname(resolve(targetPath));
   for (let depth = 0; depth < 64; depth += 1) {
     const st = safeLstat(cur);
@@ -185,6 +211,7 @@ export interface DefaultProfileCollision {
 const NON_PROFILE_JSON_FILES = new Set([
   "session-binds.json",
   "session-binds.meta.json",
+  "agy-session-binds.json",
   "agy-binds.json",
   "agy-binds.meta.json",
   "grok-binds.json",
@@ -193,9 +220,11 @@ const NON_PROFILE_JSON_FILES = new Set([
   "identity-guard.json",
   "cursor.json",
   "read-cursors.json",
+  "mention-timestamps.json",
   "wake-pids.json",
   "dsh.json",
   "config.json",
+  "muse.json",
 ]);
 
 /**
