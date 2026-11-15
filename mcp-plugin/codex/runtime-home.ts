@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readdirSync, accessSync, constants, lstatSync, readlinkSync, realpathSync, symlinkSync } from "node:fs";
-import type { CodexHomeMode } from "./config.ts";
+import { assertDirectoryAncestors, type CodexHomeMode } from "./config.ts";
 import { homedir } from "node:os";
 import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
 
@@ -28,6 +28,8 @@ function assertDirectoryLeaf(path: string, label: string) {
 function prepareHomeDirectory(stateDir: string, home: string) {
   assertDirectoryLeaf(stateDir, "Bot state directory");
   assertDirectoryLeaf(home, "Bot runtime home");
+  assertDirectoryAncestors(stateDir);
+  assertDirectoryAncestors(home);
   mkdirSync(home, { recursive: true, mode: 0o700 });
 }
 

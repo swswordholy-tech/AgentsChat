@@ -92,7 +92,7 @@ test('only a missing checkpoint permits cold start; malformed structures fail cl
 
 test('legacy invalid channel keys are filtered before timestamp validation', () => {
   const f=fixture(), channels=Object.create(null);
-  for(const key of ['__proto__','constructor','prototype','','  ','bad\u0000key','bad\u007fkey']) channels[key]='bad';
+  for(const key of ['constructor','prototype','','  ','bad\u0000key','bad\u007fkey']) channels[key]='bad';
   channels.group=f.seed;
   writeFileSync(f.file,JSON.stringify({version:1,channels}));
   idle(f.dir).watch('new');

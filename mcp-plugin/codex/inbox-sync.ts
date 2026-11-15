@@ -1,6 +1,7 @@
 import { chmodSync, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { join } from "node:path";
+import { assertDirectoryAncestors } from "./config.ts";
 import { normalizeTimestampForCursor } from "../src/timestamps.ts";
 
 interface Snapshot {
@@ -17,7 +18,7 @@ function timestamp(value: unknown): string {
   return normalized;
 }
 function validChannel(channel: unknown): channel is string {
-  return typeof channel === "string" && channel.trim().length > 0 && channel.trim().length <= 128
+  return typeof channel === "string" && channel.length > 0 && channel.length <= 128 && channel === channel.trim() && channel !== "."
     && !channel.includes("..") && !/[\/\\]/.test(channel)
     && !/[\x00-\x1f\x7f-\x9f]/.test(channel)
     && !["__proto__", "constructor", "prototype"].includes(channel.trim().toLowerCase());
@@ -38,6 +39,7 @@ export class InboxSync {
     private log: (message: string) => void = console.error) {
     const existing = lstatSync(stateDir, { throwIfNoEntry: false });
     if (existing && (existing.isSymbolicLink() || !existing.isDirectory())) throw new Error("Invalid inbound state directory");
+    assertDirectoryAncestors(stateDir);
     mkdirSync(stateDir, {recursive:true, mode:0o700});
     const dirStat = lstatSync(stateDir);
     if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) throw new Error("Invalid inbound state directory");
@@ -49,7 +51,8 @@ export class InboxSync {
     if (fileStat && (fileStat.isSymbolicLink() || !fileStat.isFile())) throw new Error("Invalid inbound cursors file");
     if (fileStat && fileStat.size > 1_048_576) throw new Error("Inbound cursors exceed size limit");
     this.state = fileStat ? JSON.parse(readFileSync(this.file, "utf8")) : {version:1, channels:{}};
-    if (!this.state || this.state.version !== 1 || !this.state.channels || typeof this.state.channels !== "object" || Array.isArray(this.state.channels))
+    if (!this.state || typeof this.state !== "object" || Array.isArray(this.state) || Object.hasOwn(this.state, "__proto__") || this.state.version !== 1 || !this.state.channels || typeof this.state.channels !== "object" || Array.isArray(this.state.channels) ||
+      Object.hasOwn(this.state.channels, "__proto__") || Object.keys(this.state.channels).length > 1024)
       throw new Error("Invalid inbound cursors; refusing to discard checkpoint");
     const channels: Record<string, string> = Object.create(null);
     for (const [channel, value] of Object.entries(this.state.channels)) {
@@ -75,6 +78,7 @@ export class InboxSync {
   }
   watch(channel: string) {
     validateChannel(channel);
+    if (!Object.hasOwn(this.state.channels, channel) && Object.keys(this.state.channels).length >= 1024) throw new Error("Inbound channel limit exceeded");
     this.channels.add(channel);
     // First installation/new membership starts now, never replays old requests.
     if (!Object.hasOwn(this.state.channels, channel)) {
@@ -83,6 +87,7 @@ export class InboxSync {
   }
   memberships(channels: string[]) {
     for (const channel of channels) validateChannel(channel);
+    if (new Set([...Object.keys(this.state.channels), ...channels]).size > 1024) throw new Error("Inbound channel limit exceeded");
     this.channels = new Set(channels);
     let changed = false;
     for (const channel of this.channels) {

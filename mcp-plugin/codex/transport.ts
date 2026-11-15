@@ -6,7 +6,7 @@ import { resolveDrainReconnectDelay } from "../src/reconnect.ts";
 import { InboxSync } from "./inbox-sync.ts";
 
 function safeChannel(channel: unknown): channel is string {
-  return typeof channel === "string" && channel.trim().length > 0 && channel.length <= 128 &&
+  return typeof channel === "string" && channel.trim().length > 0 && channel === channel.trim() && channel.length <= 128 &&
     !/[.\/\\\x00-\x1f\x7f]/.test(channel) && !/^(?:__proto__|constructor|prototype)$/i.test(channel);
 }
 function requireChannel(channel: unknown): asserts channel is string {
@@ -59,7 +59,7 @@ export class AgentsChatTransport {
     try {
       reader = response.body?.getReader();
       if (!reader) throw new Error("Missing response body");
-      const decoder = new TextDecoder();
+      const decoder = new TextDecoder("utf-8", { fatal: true });
       let bytes = 0, text = "";
       while (true) {
         const { done, value } = await reader.read();
@@ -71,7 +71,9 @@ export class AgentsChatTransport {
         }
         text += decoder.decode(value, { stream: true });
       }
-      return JSON.parse(text + decoder.decode());
+      const value = JSON.parse(text + decoder.decode());
+      if (value && typeof value === "object" && Object.hasOwn(value, "__proto__")) throw new Error("Invalid JSON prototype key");
+      return value;
     } catch { throw new Error("Invalid AgentsChat response"); }
     finally { reader?.releaseLock(); }
   }
@@ -150,7 +152,7 @@ export class AgentsChatTransport {
     socket.on("message", raw => {
       if (!current()) return;
       let data: any; try { data = JSON.parse(String(raw)); } catch { return; }
-      if (!data || typeof data !== "object" || Array.isArray(data)) return;
+      if (!data || typeof data !== "object" || Array.isArray(data) || Object.hasOwn(data, "__proto__")) return;
       if (data.type !== "auth_error") this.heartbeat?.receivedPong();
       if (data.type === "auth_ok") {
         this.authenticated = true; this.delay = 1000; this.log(`AgentsChat connected as ${this.config.agentId}`);

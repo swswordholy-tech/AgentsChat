@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { chmodSync, lstatSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { assertDirectoryAncestors } from "./config.ts";
 
 export interface ThreadHistory { id: string; createdAt?: number; turns: any[] }
 export function priorChannelThreads(threads: Record<string, string>, channel: string): string[] {
@@ -22,6 +23,7 @@ export function preserveChannelHistory(directory: string, channel: string, histo
       if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("History directory must be a non-symlink directory");
     } catch (error: any) { if (error.code !== "ENOENT") throw error; }
   };
+  assertDirectoryAncestors(directory);
   const root = join(directory, "history");
   checkDirectory(directory);
   checkDirectory(root);
@@ -30,7 +32,8 @@ export function preserveChannelHistory(directory: string, channel: string, histo
   if (process.platform !== "win32") chmodSync(root, 0o700);
   const file = join(root, createHash("sha256").update(channel).digest("hex").slice(0,24) + ".json");
   try {
-    if (lstatSync(file).isSymbolicLink()) throw new Error("History archive must not be a symlink");
+    const stat = lstatSync(file);
+    if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("History archive must be a regular file, not a symlink");
   } catch (e: any) {
     if (e.code !== "ENOENT") throw e;
   }
@@ -39,7 +42,8 @@ export function preserveChannelHistory(directory: string, channel: string, histo
     writeFileSync(tmp, redact(JSON.stringify({channel_id:channel, threads:histories})), {flag:"wx", mode:0o600});
     if (process.platform !== "win32") chmodSync(tmp, 0o600);
     try {
-      if (lstatSync(file).isSymbolicLink()) throw new Error("History archive must not be a symlink");
+      const stat = lstatSync(file);
+      if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("History archive must be a regular file, not a symlink");
     } catch (error: any) { if (error.code !== "ENOENT") throw error; }
     renameSync(tmp, file);
   } catch (err) {
@@ -62,9 +66,10 @@ export function preserveChannelHistory(directory: string, channel: string, histo
           const marker = "AgentsChat message:\n";
           if (text.includes(marker)) {
             try {
-              const message = JSON.parse(text.slice(text.lastIndexOf(marker) + marker.length));
+              let message = JSON.parse(text.slice(text.lastIndexOf(marker) + marker.length));
               if (message && typeof message === "object" && !Array.isArray(message)) {
-                for (const key of ["__proto__", "constructor", "prototype"]) delete message[key];
+                message = Object.fromEntries(Object.entries(message).filter(([key]) =>
+                  !["__proto__", "constructor", "prototype"].includes(key.toLowerCase())));
                 if (message.channel_id === channel) records.push({order,sequence:sequence++,value:{...message,role:"user"}});
                 continue;
               }

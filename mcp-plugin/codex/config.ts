@@ -1,9 +1,10 @@
 import { lstatSync, readFileSync, realpathSync, type Stats } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { validateIdentityProfile } from "../src/identity.ts";
 import { parse as parseToml } from "smol-toml";
+import { blockedServerHost } from "./owner.ts";
 
 export type PermissionMode = "full-access" | "read-only";
 // App Server advertises model-specific, nonempty effort names via model/list.
@@ -38,7 +39,34 @@ export interface BridgeConfig {
 }
 export interface IdentitySettings { state_root?: string; codex_home_mode?: CodexHomeMode; permissions?: PermissionMode; effort?: ReasoningEffort; model?: string; profile?: string; agent_id?: string; channels?: string[]; senders?: string[]; api_url?: string; ws_url?: string }
 const MAX_CONFIG_BYTES = 1_048_576;
+export function reservedProfileStem(selector: string): boolean {
+  return ["__proto__", "constructor", "prototype", "grok-binds", "session-binds", "agy-binds",
+    "cursor", "read-cursors", "wake-pids", "config", "codex-bots"].includes(selector.replace(/\.json$/i, "").toLowerCase());
+}
+/** Inspect every existing directory before reads or recursive creation. */
+export function assertDirectoryAncestors(directory: string): void {
+  const paths: string[] = [];
+  for (let path = resolve(directory);; path = dirname(path)) {
+    paths.unshift(path);
+    if (dirname(path) === path) break;
+  }
+  for (const path of paths) {
+    const stat = lstatSync(path, { throwIfNoEntry: false });
+    if (!stat) continue;
+    if (stat.isSymbolicLink()) {
+      // These exact Darwin system aliases are safe; arbitrary user links are not.
+      const target = `/private${path}`;
+      if (process.platform === "darwin" && ["/var", "/tmp", "/etc"].includes(path) && realpathSync(path) === target) {
+        assertDirectoryAncestors(target);
+        continue;
+      }
+      throw new Error(`Config path must be a non-symlink directory: ${path}`);
+    }
+    if (!stat.isDirectory()) throw new Error(`Config path must be a non-symlink directory: ${path}`);
+  }
+}
 function checkedPath(path: string, directory = false): Stats | undefined {
+  assertDirectoryAncestors(dirname(path));
   let stat: Stats;
   try { stat = lstatSync(path); }
   catch (error: any) { if (error.code === "ENOENT") return undefined; throw error; }
@@ -48,8 +76,11 @@ function checkedPath(path: string, directory = false): Stats | undefined {
   return stat;
 }
 function readJson(file: string): any {
-  try { return JSON.parse(readFileSync(file, "utf8")); }
+  let value: any;
+  try { value = JSON.parse(readFileSync(file, "utf8")); }
   catch { throw new Error(`Cannot read valid JSON: ${file}`); }
+  if (value && typeof value === "object" && Object.hasOwn(value, "__proto__")) throw new Error("Invalid JSON prototype key");
+  return value;
 }
 function strings(value: unknown, name: string): string[] {
   if (value === undefined) return [];
@@ -59,6 +90,7 @@ function strings(value: unknown, name: string): string[] {
 }
 export function resolveConfig(opts: { cwd?: string; profile?: string; codexBin?: string; stateRoot?: string; codexHomeMode?: string; settings?: IdentitySettings },
   env: NodeJS.ProcessEnv = process.env, home = homedir()): BridgeConfig {
+  assertDirectoryAncestors(opts.cwd ?? process.cwd());
   const cwd = realpathSync(opts.cwd ?? process.cwd());
   const configFile = join(cwd, ".agentschat/config.json");
   if (opts.settings === undefined) checkedPath(join(cwd, ".agentschat"), true);
@@ -101,10 +133,10 @@ export function resolveConfig(opts: { cwd?: string; profile?: string; codexBin?:
   else if (isAbsolute(selector) || selector.includes("/") || selector.includes("\\")) profileFile = resolve(cwd, selector);
   else {
     const stem = selector.replace(/\.json$/i, "");
-    if (!stem || selector.includes("..") || ["__proto__", "constructor", "prototype"].includes(stem.toLowerCase())) {
+    if (!stem || selector.includes("..") || reservedProfileStem(selector)) {
       throw new Error("Invalid central profile selector");
     }
-    const name = selector.endsWith(".json") ? selector : `${selector}.json`;
+    const name = /\.json$/i.test(selector) ? selector : `${selector}.json`;
     profileFile = join(home, ".agentschat/profiles", name);
     if (!checkedPath(profileFile)) profileFile = join(home, ".agentschat", name);
     if (!checkedPath(profileFile)) profileFile = join(home, ".agentchat", name);
@@ -120,7 +152,7 @@ export function resolveConfig(opts: { cwd?: string; profile?: string; codexBin?:
   const wsUrl = project.ws_url ?? `${apiUrl.replace(/^http/, "ws").replace(/\/$/, "")}/ws`;
   for (const [raw, protocols] of [[apiUrl, ["https:", "http:"]], [wsUrl, ["wss:", "ws:"]]] as const) {
     const url = new URL(raw);
-    if (!(protocols as readonly string[]).includes(url.protocol) || url.username || url.password || url.search || url.hash || url.port === "0" ||
+    if (blockedServerHost(url) || !(protocols as readonly string[]).includes(url.protocol) || url.username || url.password || url.search || url.hash || url.port === "0" ||
       (!url.protocol.endsWith("s:") && !["127.0.0.1", "localhost", "[::1]", "::1"].includes(url.hostname.toLowerCase().replace(/\.$/, "")))) throw new Error("Server URLs must use TLS (except loopback) and contain no credentials/query");
   }
   const canonicalApi = new URL(apiUrl).href.replace(/\/$/, "");
