@@ -35,7 +35,16 @@ export type Warn = (message: string) => void;
 
 const defaultWarn: Warn = (m) => process.stderr.write(m);
 const MAX_PROFILE_JSON_BYTES = 64 * 1024;
+const MAX_PROFILE_PATH_LEN = 4096;
+const CONTROL_CHAR_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
 const CONTROL_CHAR_GLOBAL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/g;
+const WINDOWS_DEVICE_STEM_RE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
+const RESERVED_PROTO_STEMS = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase()),
+]);
 const DARWIN_SYSTEM_SYMLINKS = new Set(["/var", "/tmp", "/etc"]);
 
 function sanitizeWarnPart(value: unknown): string {
@@ -43,7 +52,7 @@ function sanitizeWarnPart(value: unknown): string {
     .replace(/\b(https?:\/\/?)([^/\s@]*@)/gi, "$1[REDACTED]@")
     .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED]")
     .replace(
-      /\b(?:agent_key_|sk-|whsec_|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|mr_|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g,
+      /(?:ac_|mcp_at_|mcp_rt_|mcp_|agent_key_|sk-|whsec_|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|mr_|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g,
       "[REDACTED]",
     )
     .replace(CONTROL_CHAR_GLOBAL_RE, "?");
@@ -114,6 +123,9 @@ function hasSafeAncestorDirs(targetPath: string): boolean {
 }
 
 export function safeWriteProfile(path: string, data: unknown, warn: Warn = defaultWarn): void {
+  if (typeof path !== "string" || !path || path.length > MAX_PROFILE_PATH_LEN || path.includes("\x00")) {
+    throw new Error(`Refusing to write profile into invalid path: ${sanitizeWarnPart(path)}`);
+  }
   const parentDir = dirname(path);
   const parentStat = safeLstat(parentDir);
   if (!parentStat || parentStat.isSymbolicLink() || !parentStat.isDirectory() || !hasSafeAncestorDirs(path)) {
@@ -123,6 +135,9 @@ export function safeWriteProfile(path: string, data: unknown, warn: Warn = defau
   const pathStat = safeLstat(path);
   if (pathStat?.isSymbolicLink()) {
     throw new Error(`Refusing to write profile through symlink: ${sanitizeWarnPart(path)}`);
+  }
+  if (pathStat && !pathStat.isFile() && !pathStat.isDirectory()) {
+    throw new Error(`Refusing to write profile into non-regular target: ${sanitizeWarnPart(path)}`);
   }
 
   const tmp = path + ".tmp";
@@ -292,7 +307,14 @@ export function findDefaultProfileCollision(
       const candidatePath = join(dir, file);
       if (resolve(candidatePath) === resolvedDefault) continue;
       const baseName = file.replace(/\.json$/i, "");
-      if (baseName.toLowerCase() === "profile") continue;
+      const baseLower = baseName.toLowerCase();
+      if (
+        baseLower === "profile" ||
+        RESERVED_PROTO_STEMS.has(baseLower) ||
+        WINDOWS_DEVICE_STEM_RE.test(baseName)
+      ) {
+        continue;
+      }
 
       const candStat = safeLstat(candidatePath);
       if (!candStat || candStat.isSymbolicLink() || !candStat.isFile() || candStat.size > MAX_PROFILE_JSON_BYTES) {
@@ -314,7 +336,9 @@ export function findDefaultProfileCollision(
       }
       const candAgentId = typeof candidate.agent_id === "string" ? candidate.agent_id.trim() : "";
       const candToken = typeof candidate.token === "string" ? candidate.token.trim() : "";
-      if (!candAgentId || !candToken) continue;
+      if (!candAgentId || !candToken || CONTROL_CHAR_RE.test(candAgentId) || RESERVED_PROTO_STEMS.has(candAgentId.toLowerCase())) {
+        continue;
+      }
 
       if (defAgentId && candAgentId === defAgentId) {
         return { collidingName: baseName, collidingPath: candidatePath, reason: "agent_id" };

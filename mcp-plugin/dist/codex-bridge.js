@@ -2563,10 +2563,17 @@ import {
 import { dirname as dirname4, join as join8, resolve as resolve5 } from "path";
 var defaultWarn = (m) => process.stderr.write(m);
 var MAX_PROFILE_JSON_BYTES = 64 * 1024;
+var MAX_PROFILE_PATH_LEN = 4096;
 var CONTROL_CHAR_GLOBAL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/g;
+var RESERVED_PROTO_STEMS = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase())
+]);
 var DARWIN_SYSTEM_SYMLINKS = new Set(["/var", "/tmp", "/etc"]);
 function sanitizeWarnPart(value) {
-  return redactSecrets(String(value ?? "")).replace(/\b(https?:\/\/?)([^/\s@]*@)/gi, "$1[REDACTED]@").replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED]").replace(/\b(?:agent_key_|sk-|whsec_|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|mr_|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g, "[REDACTED]").replace(CONTROL_CHAR_GLOBAL_RE, "?");
+  return redactSecrets(String(value ?? "")).replace(/\b(https?:\/\/?)([^/\s@]*@)/gi, "$1[REDACTED]@").replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED]").replace(/(?:ac_|mcp_at_|mcp_rt_|mcp_|agent_key_|sk-|whsec_|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|mr_|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g, "[REDACTED]").replace(CONTROL_CHAR_GLOBAL_RE, "?");
 }
 function safeLstat(target) {
   try {
@@ -2639,6 +2646,9 @@ function hasSafeAncestorDirs(targetPath) {
   return true;
 }
 function safeWriteProfile(path, data, warn = defaultWarn) {
+  if (typeof path !== "string" || !path || path.length > MAX_PROFILE_PATH_LEN || path.includes("\x00")) {
+    throw new Error(`Refusing to write profile into invalid path: ${sanitizeWarnPart(path)}`);
+  }
   const parentDir = dirname4(path);
   const parentStat = safeLstat(parentDir);
   if (!parentStat || parentStat.isSymbolicLink() || !parentStat.isDirectory() || !hasSafeAncestorDirs(path)) {
@@ -2647,6 +2657,9 @@ function safeWriteProfile(path, data, warn = defaultWarn) {
   const pathStat = safeLstat(path);
   if (pathStat?.isSymbolicLink()) {
     throw new Error(`Refusing to write profile through symlink: ${sanitizeWarnPart(path)}`);
+  }
+  if (pathStat && !pathStat.isFile() && !pathStat.isDirectory()) {
+    throw new Error(`Refusing to write profile into non-regular target: ${sanitizeWarnPart(path)}`);
   }
   const tmp = path + ".tmp";
   const tmpStat = safeLstat(tmp);
@@ -2775,6 +2788,12 @@ var LOCK_FILE_MAX_BYTES = 64 * 1024;
 var LOCK_KEY_MAX_CHARS = 128;
 var SESSION_BINDS_MAX_BYTES = 1024 * 1024;
 var CONTROL_CHAR_RE2 = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+var UNSAFE_BIND_KEYS = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase())
+]);
 var RESERVED_BIND_SIDECARS = new Set([
   "session-binds",
   "session-binds.meta",
@@ -2999,8 +3018,7 @@ function releaseAgentLock(opts) {
   }
 }
 function isUnsafeBindKey(key) {
-  const lower = key.toLowerCase();
-  return lower === "__proto__" || lower === "constructor" || lower === "prototype";
+  return UNSAFE_BIND_KEYS.has(key.toLowerCase());
 }
 var DSH_HEALTH_MAX_BYTES = 256 * 1024;
 

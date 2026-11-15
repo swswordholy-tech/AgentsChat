@@ -2030,16 +2030,38 @@ var FORBIDDEN_CREDENTIAL_KEYS = new Set([
   "bearer",
   "cookie"
 ]);
-var PROTOTYPE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+var PROTOTYPE_KEYS = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase())
+]);
+var WINDOWS_DEVICE_STEM_RE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
 var RESERVED_SIDECAR_STEMS = new Set([
   "grok-binds",
+  "grok-binds.meta",
+  "grok-binds-meta",
+  "grok-binds_meta",
   "session-binds",
+  "session-binds.meta",
+  "session-binds-meta",
+  "session-binds_meta",
   "agy-binds",
+  "agy-binds.meta",
+  "agy-binds-meta",
+  "agy-binds_meta",
+  "agy-session-binds",
+  "agy-session-binds.meta",
+  "agy-session-binds_meta",
+  "identity-guard",
   "cursor",
   "read-cursors",
+  "mention-timestamps",
   "wake-pids",
   "config",
-  "codex-bots"
+  "codex-bots",
+  "dsh",
+  "muse"
 ]);
 function safeLstat(target) {
   try {
@@ -2141,9 +2163,13 @@ function isUnsafeMetadataOrLinkLocalHost(hostname) {
   }
   if (/^fe[89ab][0-9a-f]*:/.test(lower))
     return true;
-  if (lower.startsWith("::ffff:")) {
-    const tail = lower.slice("::ffff:".length);
-    const afterZero = tail.startsWith("0:") ? tail.slice(2) : "";
+  const mappedPrefix = lower.match(/^(?:::ffff:|0:0:0:0:0:ffff:|0:0:0:0:ffff:0:)(.+)$/);
+  if (mappedPrefix) {
+    const tail = mappedPrefix[1];
+    if (/^[0-9a-f]{1,4}$/.test(tail))
+      return true;
+    const zeroMatch = tail.match(/^0+:(.+)$/);
+    const afterZero = zeroMatch ? zeroMatch[1] : "";
     const tailParts = afterZero && (afterZero.includes(".") || afterZero.includes(":")) ? afterZero : tail;
     if (tailParts === "0.0.0.0" || tailParts === "100.100.100.200" || /^0\.\d+\.\d+\.\d+$/.test(tailParts))
       return true;
@@ -2228,8 +2254,10 @@ function projectProfileSelector(cwd) {
   };
   if (doc.profile !== undefined) {
     const value = doc.profile.trim();
-    const stemLower = value.replace(/\.json$/i, "").toLowerCase();
-    if (value === "." || value === ".." || PROTOTYPE_KEYS.has(stemLower) || !value.includes("/") && !value.includes("\\") && RESERVED_SIDECAR_STEMS.has(stemLower)) {
+    const basePart = value.replace(/\\/g, "/").split("/").pop() || "";
+    const stemLower = basePart.replace(/\.json$/i, "").toLowerCase();
+    const isBareName = !value.includes("/") && !value.includes("\\");
+    if (value === "." || value === ".." || isBareName && value.includes("..") || !stemLower || PROTOTYPE_KEYS.has(stemLower) || WINDOWS_DEVICE_STEM_RE.test(stemLower) || isBareName && RESERVED_SIDECAR_STEMS.has(stemLower)) {
       throw new Error("Invalid project profile");
     }
     if (value.startsWith("~/") || value.startsWith("~\\")) {
@@ -2270,7 +2298,17 @@ function projectProfileSelector(cwd) {
 import { join as join2 } from "node:path";
 var DEFAULT_GROK_BINDS_FILENAME = "grok-binds.json";
 var GROK_BINDS_META_FILENAME = "grok-binds.meta.json";
+var UNSAFE_GROK_OBJECT_KEYS = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase())
+]);
+var WINDOWS_DEVICE_STEM_RE2 = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
 function isUnsafeObjectKey(key) {
+  return UNSAFE_GROK_OBJECT_KEYS.has(key.toLowerCase());
+}
+function isUnsafeProtoSlot(key) {
   const lower = key.toLowerCase();
   return lower === "__proto__" || lower === "constructor" || lower === "prototype";
 }
@@ -2290,16 +2328,24 @@ var RESERVED_BIND_BASENAMES = new Set([
   "grok-binds",
   "grok-binds-meta",
   "grok-binds.meta",
+  "grok-binds_meta",
   "session-binds",
   "session-binds.meta",
+  "session-binds-meta",
+  "session-binds_meta",
   "agy-session-binds",
+  "agy-session-binds.meta",
+  "agy-session-binds_meta",
   "agy-binds",
   "agy-binds.meta",
+  "agy-binds-meta",
+  "agy-binds_meta",
   "identity-guard",
   "cursor",
   "read-cursors",
   "mention-timestamps",
   "wake-pids",
+  "codex-bots",
   "dsh",
   "config",
   "muse"
@@ -2313,8 +2359,9 @@ function isSafeProfileBindName(name) {
   if (isUnsafeObjectKey(name) || hasPathOrTraversalSyntax(name))
     return false;
   const base = name.replace(/\.json$/i, "").trim().toLowerCase();
-  if (!base || isUnsafeObjectKey(base) || RESERVED_BIND_BASENAMES.has(base))
+  if (!base || isUnsafeObjectKey(base) || WINDOWS_DEVICE_STEM_RE2.test(base) || RESERVED_BIND_BASENAMES.has(base)) {
     return false;
+  }
   return true;
 }
 function parseGrokBinds(raw) {
@@ -2360,7 +2407,7 @@ function decideGrokBind(input) {
   if (input.explicitIdentity || input.hasToken)
     return { kind: "skip" };
   const id = typeof input.conversationId === "string" ? input.conversationId.trim() : "";
-  if (!id || isUnsafeObjectKey(id) || hasControlChars(id))
+  if (!id || isUnsafeProtoSlot(id) || hasControlChars(id))
     return { kind: "skip" };
   const binds = input.binds && typeof input.binds === "object" ? input.binds : {};
   const profileName = Object.hasOwn(binds, id) ? binds[id] : undefined;
@@ -3342,10 +3389,17 @@ import {
 import { dirname as dirname3, join as join4, resolve as resolve3 } from "path";
 var defaultWarn = (m) => process.stderr.write(m);
 var MAX_PROFILE_JSON_BYTES = 64 * 1024;
+var MAX_PROFILE_PATH_LEN = 4096;
 var CONTROL_CHAR_GLOBAL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/g;
+var RESERVED_PROTO_STEMS = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase())
+]);
 var DARWIN_SYSTEM_SYMLINKS = new Set(["/var", "/tmp", "/etc"]);
 function sanitizeWarnPart(value) {
-  return redactSecrets2(String(value ?? "")).replace(/\b(https?:\/\/?)([^/\s@]*@)/gi, "$1[REDACTED]@").replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED]").replace(/\b(?:agent_key_|sk-|whsec_|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|mr_|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g, "[REDACTED]").replace(CONTROL_CHAR_GLOBAL_RE, "?");
+  return redactSecrets2(String(value ?? "")).replace(/\b(https?:\/\/?)([^/\s@]*@)/gi, "$1[REDACTED]@").replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED]").replace(/(?:ac_|mcp_at_|mcp_rt_|mcp_|agent_key_|sk-|whsec_|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|mr_|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g, "[REDACTED]").replace(CONTROL_CHAR_GLOBAL_RE, "?");
 }
 function safeLstat2(target) {
   try {
@@ -3418,6 +3472,9 @@ function hasSafeAncestorDirs(targetPath) {
   return true;
 }
 function safeWriteProfile(path, data, warn = defaultWarn) {
+  if (typeof path !== "string" || !path || path.length > MAX_PROFILE_PATH_LEN || path.includes("\x00")) {
+    throw new Error(`Refusing to write profile into invalid path: ${sanitizeWarnPart(path)}`);
+  }
   const parentDir = dirname3(path);
   const parentStat = safeLstat2(parentDir);
   if (!parentStat || parentStat.isSymbolicLink() || !parentStat.isDirectory() || !hasSafeAncestorDirs(path)) {
@@ -3426,6 +3483,9 @@ function safeWriteProfile(path, data, warn = defaultWarn) {
   const pathStat = safeLstat2(path);
   if (pathStat?.isSymbolicLink()) {
     throw new Error(`Refusing to write profile through symlink: ${sanitizeWarnPart(path)}`);
+  }
+  if (pathStat && !pathStat.isFile() && !pathStat.isDirectory()) {
+    throw new Error(`Refusing to write profile into non-regular target: ${sanitizeWarnPart(path)}`);
   }
   const tmp = path + ".tmp";
   const tmpStat = safeLstat2(tmp);
@@ -3557,6 +3617,13 @@ var LOCK_KEY_MAX_CHARS = 128;
 var SESSION_BINDS_MAX_BYTES = 1024 * 1024;
 var MAX_SESSION_BINDS_ENTRIES = 1024;
 var CONTROL_CHAR_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+var WINDOWS_DEVICE_STEM_RE3 = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
+var UNSAFE_BIND_KEYS = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase())
+]);
 var RESERVED_BIND_SIDECARS = new Set([
   "session-binds",
   "session-binds.meta",
@@ -3683,12 +3750,13 @@ function isValidBindToken(value) {
   return value.length > 0 && value.length <= 256 && !CONTROL_CHAR_RE.test(value);
 }
 function isValidBoundProfileName(value) {
-  if (!isValidBindToken(value) || value === "." || value === ".." || value.includes("/") || value.includes("\\")) {
+  if (!isValidBindToken(value) || value === "." || value.includes("..") || value.includes("/") || value.includes("\\")) {
     return false;
   }
-  const stem = value.replace(/\.json$/i, "").toLowerCase();
+  const rawStem = value.replace(/\.json$/i, "");
+  const stem = rawStem.toLowerCase();
   const normalizedStem = stem.replace(/[^a-z0-9_-]/g, "_");
-  return Boolean(stem) && !isUnsafeBindKey(value) && !isUnsafeBindKey(stem) && !RESERVED_BIND_SIDECARS.has(stem) && !RESERVED_BIND_SIDECARS.has(normalizedStem);
+  return Boolean(stem) && !WINDOWS_DEVICE_STEM_RE3.test(rawStem) && !isUnsafeBindKey(value) && !isUnsafeBindKey(stem) && !RESERVED_BIND_SIDECARS.has(stem) && !RESERVED_BIND_SIDECARS.has(normalizedStem);
 }
 function lockFilePath(lockDir, agentId) {
   const trimmed = String(agentId || "").trim();
@@ -3799,8 +3867,7 @@ function releaseAgentLock(opts) {
   }
 }
 function isUnsafeBindKey(key) {
-  const lower = key.toLowerCase();
-  return lower === "__proto__" || lower === "constructor" || lower === "prototype";
+  return UNSAFE_BIND_KEYS.has(key.toLowerCase());
 }
 function parseSessionBinds(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw))
@@ -3843,13 +3910,14 @@ function loadSessionBinds(configDir) {
   return merged;
 }
 function resolveAgentIdForProfileName(configDir, name) {
-  if (!name || name === "." || name === ".." || name.includes("/") || name.includes("\\") || CONTROL_CHAR_RE.test(name))
+  if (!name || name === "." || name.includes("..") || name.includes("/") || name.includes("\\") || CONTROL_CHAR_RE.test(name))
     return null;
   if (!isSafeDirOrMissing(configDir))
     return null;
-  const stem = name.replace(/\.json$/i, "").toLowerCase();
-  const base = name.replace(/\.json$/i, "").replace(/[^a-zA-Z0-9_-]/g, "_");
-  if (!base || base.length > LOCK_KEY_MAX_CHARS || isUnsafeBindKey(base) || RESERVED_BIND_SIDECARS.has(stem) || RESERVED_BIND_SIDECARS.has(base.toLowerCase())) {
+  const rawStem = name.replace(/\.json$/i, "");
+  const stem = rawStem.toLowerCase();
+  const base = rawStem.replace(/[^a-zA-Z0-9_-]/g, "_");
+  if (!base || base.length > LOCK_KEY_MAX_CHARS || WINDOWS_DEVICE_STEM_RE3.test(rawStem) || WINDOWS_DEVICE_STEM_RE3.test(base) || isUnsafeBindKey(base) || RESERVED_BIND_SIDECARS.has(stem) || RESERVED_BIND_SIDECARS.has(base.toLowerCase())) {
     return null;
   }
   const profilesDir = join5(configDir, "profiles");
@@ -3954,7 +4022,7 @@ function findBoundSessionForProfile(configDir, profileName, filter) {
   return matches.length > 0 ? matches[matches.length - 1] : null;
 }
 function isSafeDetectedSessionId(sid) {
-  return isValidBindToken(sid) && sid !== "." && sid !== ".." && !sid.includes("/") && !sid.includes("\\") && !isUnsafeBindKey(sid);
+  return isValidBindToken(sid) && sid !== "." && !sid.includes("..") && !sid.includes("/") && !sid.includes("\\") && !isUnsafeBindKey(sid);
 }
 function cleanDetectedWorkspacePath(raw) {
   if (typeof raw !== "string")
@@ -4211,8 +4279,10 @@ function discoverAntigravityHost(opts) {
     }
   }
   const now = Date.now();
-  const cacheMs = opts?.cacheMs ?? 5000;
-  if (cachedAgyHost && now >= cachedAgyHost.at && now - cachedAgyHost.at < cacheMs)
+  const cacheMs = typeof opts?.cacheMs === "number" && Number.isFinite(opts.cacheMs) && opts.cacheMs >= 0 ? opts.cacheMs : 5000;
+  if (cachedAgyHost && now < cachedAgyHost.at)
+    cachedAgyHost = null;
+  if (cachedAgyHost && now - cachedAgyHost.at < cacheMs)
     return cachedAgyHost.info;
   try {
     const startPid = opts?.currentPid ?? process.pid;
@@ -4375,8 +4445,10 @@ function isDshHostProcess(opts) {
     return true;
   }
   const now = Date.now();
-  const cacheMs = opts?.cacheMs ?? 15000;
-  if (cachedIsDshHost && now >= cachedIsDshHost.at && now - cachedIsDshHost.at < cacheMs)
+  const cacheMs = typeof opts?.cacheMs === "number" && Number.isFinite(opts.cacheMs) && opts.cacheMs >= 0 ? opts.cacheMs : 15000;
+  if (cachedIsDshHost && now < cachedIsDshHost.at)
+    cachedIsDshHost = null;
+  if (cachedIsDshHost && now - cachedIsDshHost.at < cacheMs)
     return cachedIsDshHost.value;
   try {
     let pid = opts?.currentPid ?? process.pid;
@@ -4656,6 +4728,13 @@ var LOCK_FILE_MAX_BYTES2 = 64 * 1024;
 var SESSION_BINDS_MAX_BYTES2 = 1024 * 1024;
 var MAX_SESSION_BINDS_ENTRIES2 = 1024;
 var CONTROL_CHAR_RE2 = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+var WINDOWS_DEVICE_STEM_RE4 = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
+var UNSAFE_BIND_KEYS2 = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase())
+]);
 var RESERVED_BIND_SIDECARS2 = new Set([
   "session-binds",
   "session-binds.meta",
@@ -4767,16 +4846,16 @@ function isValidBindToken2(value) {
   return value.length > 0 && value.length <= 256 && !CONTROL_CHAR_RE2.test(value);
 }
 function isValidBoundProfileName2(value) {
-  if (!isValidBindToken2(value) || value === "." || value === ".." || value.includes("/") || value.includes("\\")) {
+  if (!isValidBindToken2(value) || value === "." || value.includes("..") || value.includes("/") || value.includes("\\")) {
     return false;
   }
-  const stem = value.replace(/\.json$/i, "").toLowerCase();
+  const rawStem = value.replace(/\.json$/i, "");
+  const stem = rawStem.toLowerCase();
   const normalizedStem = stem.replace(/[^a-z0-9_-]/g, "_");
-  return Boolean(stem) && !isUnsafeBindKey2(value) && !isUnsafeBindKey2(stem) && !RESERVED_BIND_SIDECARS2.has(stem) && !RESERVED_BIND_SIDECARS2.has(normalizedStem);
+  return Boolean(stem) && !WINDOWS_DEVICE_STEM_RE4.test(rawStem) && !isUnsafeBindKey2(value) && !isUnsafeBindKey2(stem) && !RESERVED_BIND_SIDECARS2.has(stem) && !RESERVED_BIND_SIDECARS2.has(normalizedStem);
 }
 function isUnsafeBindKey2(key) {
-  const lower = key.toLowerCase();
-  return lower === "__proto__" || lower === "constructor" || lower === "prototype";
+  return UNSAFE_BIND_KEYS2.has(key.toLowerCase());
 }
 function parseSessionBinds2(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw))
@@ -5266,10 +5345,19 @@ import {
 import { dirname as dirname5, join as join8, resolve as resolve7 } from "path";
 var defaultWarn2 = (m) => process.stderr.write(m);
 var MAX_PROFILE_JSON_BYTES2 = 64 * 1024;
+var MAX_PROFILE_PATH_LEN2 = 4096;
+var CONTROL_CHAR_RE3 = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
 var CONTROL_CHAR_GLOBAL_RE2 = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/g;
+var WINDOWS_DEVICE_STEM_RE5 = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
+var RESERVED_PROTO_STEMS2 = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase())
+]);
 var DARWIN_SYSTEM_SYMLINKS2 = new Set(["/var", "/tmp", "/etc"]);
 function sanitizeWarnPart2(value) {
-  return redactSecrets2(String(value ?? "")).replace(/\b(https?:\/\/?)([^/\s@]*@)/gi, "$1[REDACTED]@").replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED]").replace(/\b(?:agent_key_|sk-|whsec_|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|mr_|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g, "[REDACTED]").replace(CONTROL_CHAR_GLOBAL_RE2, "?");
+  return redactSecrets2(String(value ?? "")).replace(/\b(https?:\/\/?)([^/\s@]*@)/gi, "$1[REDACTED]@").replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "[REDACTED]").replace(/(?:ac_|mcp_at_|mcp_rt_|mcp_|agent_key_|sk-|whsec_|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|mr_|AIza|(?:AKIA|ASIA))[A-Za-z0-9_+/=.-]{8,}/g, "[REDACTED]").replace(CONTROL_CHAR_GLOBAL_RE2, "?");
 }
 function safeLstat4(target) {
   try {
@@ -5342,6 +5430,9 @@ function hasSafeAncestorDirs2(targetPath) {
   return true;
 }
 function safeWriteProfile2(path, data, warn = defaultWarn2) {
+  if (typeof path !== "string" || !path || path.length > MAX_PROFILE_PATH_LEN2 || path.includes("\x00")) {
+    throw new Error(`Refusing to write profile into invalid path: ${sanitizeWarnPart2(path)}`);
+  }
   const parentDir = dirname5(path);
   const parentStat = safeLstat4(parentDir);
   if (!parentStat || parentStat.isSymbolicLink() || !parentStat.isDirectory() || !hasSafeAncestorDirs2(path)) {
@@ -5350,6 +5441,9 @@ function safeWriteProfile2(path, data, warn = defaultWarn2) {
   const pathStat = safeLstat4(path);
   if (pathStat?.isSymbolicLink()) {
     throw new Error(`Refusing to write profile through symlink: ${sanitizeWarnPart2(path)}`);
+  }
+  if (pathStat && !pathStat.isFile() && !pathStat.isDirectory()) {
+    throw new Error(`Refusing to write profile into non-regular target: ${sanitizeWarnPart2(path)}`);
   }
   const tmp = path + ".tmp";
   const tmpStat = safeLstat4(tmp);
@@ -5493,8 +5587,10 @@ function findDefaultProfileCollision(configDir, defaultProfilePath) {
       if (resolve7(candidatePath) === resolvedDefault)
         continue;
       const baseName = file.replace(/\.json$/i, "");
-      if (baseName.toLowerCase() === "profile")
+      const baseLower = baseName.toLowerCase();
+      if (baseLower === "profile" || RESERVED_PROTO_STEMS2.has(baseLower) || WINDOWS_DEVICE_STEM_RE5.test(baseName)) {
         continue;
+      }
       const candStat = safeLstat4(candidatePath);
       if (!candStat || candStat.isSymbolicLink() || !candStat.isFile() || candStat.size > MAX_PROFILE_JSON_BYTES2) {
         continue;
@@ -5510,8 +5606,9 @@ function findDefaultProfileCollision(configDir, defaultProfilePath) {
       }
       const candAgentId = typeof candidate.agent_id === "string" ? candidate.agent_id.trim() : "";
       const candToken = typeof candidate.token === "string" ? candidate.token.trim() : "";
-      if (!candAgentId || !candToken)
+      if (!candAgentId || !candToken || CONTROL_CHAR_RE3.test(candAgentId) || RESERVED_PROTO_STEMS2.has(candAgentId.toLowerCase())) {
         continue;
+      }
       if (defAgentId && candAgentId === defAgentId) {
         return { collidingName: baseName, collidingPath: candidatePath, reason: "agent_id" };
       }
@@ -5665,8 +5762,18 @@ import {
 import { dirname as dirname6, isAbsolute as isAbsolute6, join as join9, parse as parse6, resolve as resolve8, sep as sep2 } from "path";
 var MAX_CURSOR_BYTES = 4 * 1024 * 1024;
 var MAX_CURSOR_ENTRIES = 50000;
-var RESERVED_PROTO_KEY = /^(?:__proto__|constructor|prototype)$/i;
+var MAX_CURSOR_PATH_LEN = 4096;
+var WINDOWS_DEVICE_STEM_RE6 = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
+var RESERVED_PROTO_KEYS = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase())
+]);
 var tmpCounter = 0;
+function isReservedCursorKey(key) {
+  return RESERVED_PROTO_KEYS.has(key.toLowerCase());
+}
 function scrubDiag(value) {
   return redactSecrets2(String(value ?? "")).replace(/\b(https?:\/\/)([^/\s@]*@)/gi, "$1[REDACTED]@").replace(/\b(?:Bearer|Basic)\s+[^\s"'<>\\]+/gi, "[REDACTED]").replace(/(?:ac_|mcp_at_|mcp_rt_|mcp_|agent_key_|sk-|rk_live_|rk_test_|whsec_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|mr_|AIza|AKIA|ASIA)[A-Za-z0-9+/=._-]{8,}/g, "[REDACTED]").replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, " ");
 }
@@ -5736,9 +5843,10 @@ function hasSafeAncestorDirs3(targetFile) {
   return true;
 }
 function safeAgentCursorSlug(agentId) {
-  const cleaned = String(agentId || "").trim().replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 128);
-  if (!cleaned || cleaned === "." || cleaned === ".." || RESERVED_PROTO_KEY.test(cleaned))
+  const cleaned = String(agentId || "").trim().replace(/[^A-Za-z0-9._-]/g, "_").replace(/\.+$/g, "").slice(0, 128);
+  if (!cleaned || cleaned === "." || cleaned.includes("..") || WINDOWS_DEVICE_STEM_RE6.test(cleaned) || isReservedCursorKey(cleaned)) {
     return "_";
+  }
   return cleaned;
 }
 function cursorFileForAgent(configDir, agentId) {
@@ -5772,7 +5880,7 @@ function loadCursor(file, warn) {
     }
     const entries = [];
     for (const [k, v] of Object.entries(parsed)) {
-      if (RESERVED_PROTO_KEY.test(k))
+      if (isReservedCursorKey(k))
         continue;
       if (typeof v !== "string") {
         throw new Error(`cursor value for ${scrubDiag(k)} must be a string`);
@@ -5795,6 +5903,11 @@ function loadCursor(file, warn) {
   }
 }
 function persistCursor(file, cursor, warn, fsOps) {
+  if (typeof file !== "string" || !file || file.length > MAX_CURSOR_PATH_LEN || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(file)) {
+    warn(`[agentchat] WARNING: failed to persist read cursor to ${scrubDiag(file)}: invalid cursor file path
+`);
+    return false;
+  }
   try {
     const parentStat = lstatSync8(dirname6(file));
     if (parentStat.isSymbolicLink() || !parentStat.isDirectory() || !hasSafeAncestorDirs3(file)) {
@@ -5823,7 +5936,7 @@ function persistCursor(file, cursor, warn, fsOps) {
   }
   const validEntries = [];
   for (const [k, v] of cursor) {
-    if (!k || k.length > 256 || RESERVED_PROTO_KEY.test(k) || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(k) || typeof v !== "string" || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(v) || v.length > 256) {
+    if (!k || k.length > 256 || isReservedCursorKey(k) || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(k) || typeof v !== "string" || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(v) || v.length > 256) {
       continue;
     }
     validEntries.push([k, v]);
@@ -5932,8 +6045,18 @@ import {
 import { dirname as dirname7, isAbsolute as isAbsolute7, join as join10, parse as parse7, resolve as resolve9, sep as sep3 } from "path";
 var MAX_CURSOR_BYTES2 = 4 * 1024 * 1024;
 var MAX_CURSOR_ENTRIES2 = 50000;
-var RESERVED_PROTO_KEY2 = /^(?:__proto__|constructor|prototype)$/i;
+var MAX_CURSOR_PATH_LEN2 = 4096;
+var WINDOWS_DEVICE_STEM_RE7 = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
+var RESERVED_PROTO_KEYS2 = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase())
+]);
 var tmpCounter2 = 0;
+function isReservedCursorKey2(key) {
+  return RESERVED_PROTO_KEYS2.has(key.toLowerCase());
+}
 function scrubDiag2(value) {
   return redactSecrets2(String(value ?? "")).replace(/\b(https?:\/\/)([^/\s@]*@)/gi, "$1[REDACTED]@").replace(/\b(?:Bearer|Basic)\s+[^\s"'<>\\]+/gi, "[REDACTED]").replace(/(?:ac_|mcp_at_|mcp_rt_|mcp_|agent_key_|sk-|rk_live_|rk_test_|whsec_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|mr_|AIza|AKIA|ASIA)[A-Za-z0-9+/=._-]{8,}/g, "[REDACTED]").replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, " ");
 }
@@ -6003,9 +6126,10 @@ function hasSafeAncestorDirs4(targetFile) {
   return true;
 }
 function safeAgentCursorSlug2(agentId) {
-  const cleaned = String(agentId || "").trim().replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 128);
-  if (!cleaned || cleaned === "." || cleaned === ".." || RESERVED_PROTO_KEY2.test(cleaned))
+  const cleaned = String(agentId || "").trim().replace(/[^A-Za-z0-9._-]/g, "_").replace(/\.+$/g, "").slice(0, 128);
+  if (!cleaned || cleaned === "." || cleaned.includes("..") || WINDOWS_DEVICE_STEM_RE7.test(cleaned) || isReservedCursorKey2(cleaned)) {
     return "_";
+  }
   return cleaned;
 }
 function cursorFileForAgent2(configDir, agentId) {
@@ -6039,7 +6163,7 @@ function loadCursor2(file, warn) {
     }
     const entries = [];
     for (const [k, v] of Object.entries(parsed)) {
-      if (RESERVED_PROTO_KEY2.test(k))
+      if (isReservedCursorKey2(k))
         continue;
       if (typeof v !== "string") {
         throw new Error(`cursor value for ${scrubDiag2(k)} must be a string`);
@@ -6062,6 +6186,11 @@ function loadCursor2(file, warn) {
   }
 }
 function persistCursor2(file, cursor, warn, fsOps) {
+  if (typeof file !== "string" || !file || file.length > MAX_CURSOR_PATH_LEN2 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(file)) {
+    warn(`[agentchat] WARNING: failed to persist read cursor to ${scrubDiag2(file)}: invalid cursor file path
+`);
+    return false;
+  }
   try {
     const parentStat = lstatSync9(dirname7(file));
     if (parentStat.isSymbolicLink() || !parentStat.isDirectory() || !hasSafeAncestorDirs4(file)) {
@@ -6090,7 +6219,7 @@ function persistCursor2(file, cursor, warn, fsOps) {
   }
   const validEntries = [];
   for (const [k, v] of cursor) {
-    if (!k || k.length > 256 || RESERVED_PROTO_KEY2.test(k) || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(k) || typeof v !== "string" || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(v) || v.length > 256) {
+    if (!k || k.length > 256 || isReservedCursorKey2(k) || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(k) || typeof v !== "string" || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(v) || v.length > 256) {
       continue;
     }
     validEntries.push([k, v]);

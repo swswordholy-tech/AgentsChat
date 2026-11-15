@@ -81,6 +81,13 @@ const LOCK_KEY_MAX_CHARS = 128;
 const SESSION_BINDS_MAX_BYTES = 1024 * 1024;
 const MAX_SESSION_BINDS_ENTRIES = 1024;
 const CONTROL_CHAR_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+const WINDOWS_DEVICE_STEM_RE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
+const UNSAFE_BIND_KEYS = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase()),
+]);
 // NOTE: "profile" MUST NEVER be added here — `profile.json` is the default boot identity slot.
 const RESERVED_BIND_SIDECARS = new Set([
   "session-binds",
@@ -210,13 +217,21 @@ function isValidBindToken(value: string): boolean {
 }
 
 function isValidBoundProfileName(value: string): boolean {
-  if (!isValidBindToken(value) || value === "." || value === ".." || value.includes("/") || value.includes("\\")) {
+  if (
+    !isValidBindToken(value) ||
+    value === "." ||
+    value.includes("..") ||
+    value.includes("/") ||
+    value.includes("\\")
+  ) {
     return false;
   }
-  const stem = value.replace(/\.json$/i, "").toLowerCase();
+  const rawStem = value.replace(/\.json$/i, "");
+  const stem = rawStem.toLowerCase();
   const normalizedStem = stem.replace(/[^a-z0-9_-]/g, "_");
   return (
     Boolean(stem) &&
+    !WINDOWS_DEVICE_STEM_RE.test(rawStem) &&
     !isUnsafeBindKey(value) &&
     !isUnsafeBindKey(stem) &&
     !RESERVED_BIND_SIDECARS.has(stem) &&
@@ -361,8 +376,7 @@ export function releaseAgentLock(opts: {
 }
 
 function isUnsafeBindKey(key: string): boolean {
-  const lower = key.toLowerCase();
-  return lower === "__proto__" || lower === "constructor" || lower === "prototype";
+  return UNSAFE_BIND_KEYS.has(key.toLowerCase());
 }
 
 /** Parse a `session-binds.json` (or `agy-binds.json`) payload into `sessionId -> profileName`. */
@@ -405,13 +419,16 @@ export function loadSessionBinds(configDir: string): Record<string, string> {
 }
 
 function resolveAgentIdForProfileName(configDir: string, name: string): string | null {
-  if (!name || name === "." || name === ".." || name.includes("/") || name.includes("\\") || CONTROL_CHAR_RE.test(name)) return null;
+  if (!name || name === "." || name.includes("..") || name.includes("/") || name.includes("\\") || CONTROL_CHAR_RE.test(name)) return null;
   if (!isSafeDirOrMissing(configDir)) return null;
-  const stem = name.replace(/\.json$/i, "").toLowerCase();
-  const base = name.replace(/\.json$/i, "").replace(/[^a-zA-Z0-9_-]/g, "_");
+  const rawStem = name.replace(/\.json$/i, "");
+  const stem = rawStem.toLowerCase();
+  const base = rawStem.replace(/[^a-zA-Z0-9_-]/g, "_");
   if (
     !base ||
     base.length > LOCK_KEY_MAX_CHARS ||
+    WINDOWS_DEVICE_STEM_RE.test(rawStem) ||
+    WINDOWS_DEVICE_STEM_RE.test(base) ||
     isUnsafeBindKey(base) ||
     RESERVED_BIND_SIDECARS.has(stem) ||
     RESERVED_BIND_SIDECARS.has(base.toLowerCase())
@@ -523,7 +540,7 @@ export function findBoundSessionForProfile(
 }
 
 function isSafeDetectedSessionId(sid: string): boolean {
-  return isValidBindToken(sid) && sid !== "." && sid !== ".." && !sid.includes("/") && !sid.includes("\\") && !isUnsafeBindKey(sid);
+  return isValidBindToken(sid) && sid !== "." && !sid.includes("..") && !sid.includes("/") && !sid.includes("\\") && !isUnsafeBindKey(sid);
 }
 
 function cleanDetectedWorkspacePath(raw: unknown): string | undefined {
@@ -893,8 +910,12 @@ export function discoverAntigravityHost(opts?: {
   }
 
   const now = Date.now();
-  const cacheMs = opts?.cacheMs ?? 5_000;
-  if (cachedAgyHost && now >= cachedAgyHost.at && now - cachedAgyHost.at < cacheMs) return cachedAgyHost.info;
+  const cacheMs =
+    typeof opts?.cacheMs === "number" && Number.isFinite(opts.cacheMs) && opts.cacheMs >= 0
+      ? opts.cacheMs
+      : 5_000;
+  if (cachedAgyHost && now < cachedAgyHost.at) cachedAgyHost = null;
+  if (cachedAgyHost && now - cachedAgyHost.at < cacheMs) return cachedAgyHost.info;
 
   try {
     const startPid = opts?.currentPid ?? process.pid;
@@ -1107,8 +1128,12 @@ export function isDshHostProcess(opts?: {
     return true;
   }
   const now = Date.now();
-  const cacheMs = opts?.cacheMs ?? 15_000;
-  if (cachedIsDshHost && now >= cachedIsDshHost.at && now - cachedIsDshHost.at < cacheMs) return cachedIsDshHost.value;
+  const cacheMs =
+    typeof opts?.cacheMs === "number" && Number.isFinite(opts.cacheMs) && opts.cacheMs >= 0
+      ? opts.cacheMs
+      : 15_000;
+  if (cachedIsDshHost && now < cachedIsDshHost.at) cachedIsDshHost = null;
+  if (cachedIsDshHost && now - cachedIsDshHost.at < cacheMs) return cachedIsDshHost.value;
   try {
     let pid = opts?.currentPid ?? process.pid;
     if (process.platform === "win32") {

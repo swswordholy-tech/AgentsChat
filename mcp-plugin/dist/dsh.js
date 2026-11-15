@@ -1022,6 +1022,12 @@ import { isAbsolute as isAbsolute2, join as join2, parse, resolve } from "node:p
 
 // src/profile-store.ts
 var MAX_PROFILE_JSON_BYTES = 64 * 1024;
+var RESERVED_PROTO_STEMS = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase())
+]);
 var DARWIN_SYSTEM_SYMLINKS = new Set(["/var", "/tmp", "/etc"]);
 var NON_PROFILE_JSON_FILES = new Set([
   "session-binds.json",
@@ -1057,6 +1063,13 @@ var LOCK_FILE_MAX_BYTES = 64 * 1024;
 var SESSION_BINDS_MAX_BYTES = 1024 * 1024;
 var MAX_SESSION_BINDS_ENTRIES = 1024;
 var CONTROL_CHAR_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+var WINDOWS_DEVICE_STEM_RE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
+var UNSAFE_BIND_KEYS = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase())
+]);
 var RESERVED_BIND_SIDECARS = new Set([
   "session-binds",
   "session-binds.meta",
@@ -1168,16 +1181,16 @@ function isValidBindToken(value) {
   return value.length > 0 && value.length <= 256 && !CONTROL_CHAR_RE.test(value);
 }
 function isValidBoundProfileName(value) {
-  if (!isValidBindToken(value) || value === "." || value === ".." || value.includes("/") || value.includes("\\")) {
+  if (!isValidBindToken(value) || value === "." || value.includes("..") || value.includes("/") || value.includes("\\")) {
     return false;
   }
-  const stem = value.replace(/\.json$/i, "").toLowerCase();
+  const rawStem = value.replace(/\.json$/i, "");
+  const stem = rawStem.toLowerCase();
   const normalizedStem = stem.replace(/[^a-z0-9_-]/g, "_");
-  return Boolean(stem) && !isUnsafeBindKey(value) && !isUnsafeBindKey(stem) && !RESERVED_BIND_SIDECARS.has(stem) && !RESERVED_BIND_SIDECARS.has(normalizedStem);
+  return Boolean(stem) && !WINDOWS_DEVICE_STEM_RE.test(rawStem) && !isUnsafeBindKey(value) && !isUnsafeBindKey(stem) && !RESERVED_BIND_SIDECARS.has(stem) && !RESERVED_BIND_SIDECARS.has(normalizedStem);
 }
 function isUnsafeBindKey(key) {
-  const lower = key.toLowerCase();
-  return lower === "__proto__" || lower === "constructor" || lower === "prototype";
+  return UNSAFE_BIND_KEYS.has(key.toLowerCase());
 }
 function parseSessionBinds(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw))

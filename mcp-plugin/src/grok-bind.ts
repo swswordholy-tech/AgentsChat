@@ -45,7 +45,19 @@ export type GrokBindDecision =
   /** Bind hit — caller resolves `<profileName>` the same way `--profile` does. */
   | { kind: "hit"; conversationId: string; profileName: string };
 
+const UNSAFE_GROK_OBJECT_KEYS = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase()),
+]);
+const WINDOWS_DEVICE_STEM_RE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
+
 function isUnsafeObjectKey(key: string): boolean {
+  return UNSAFE_GROK_OBJECT_KEYS.has(key.toLowerCase());
+}
+
+function isUnsafeProtoSlot(key: string): boolean {
   const lower = key.toLowerCase();
   return lower === "__proto__" || lower === "constructor" || lower === "prototype";
 }
@@ -69,16 +81,24 @@ const RESERVED_BIND_BASENAMES = new Set([
   "grok-binds",
   "grok-binds-meta",
   "grok-binds.meta",
+  "grok-binds_meta",
   "session-binds",
   "session-binds.meta",
+  "session-binds-meta",
+  "session-binds_meta",
   "agy-session-binds",
+  "agy-session-binds.meta",
+  "agy-session-binds_meta",
   "agy-binds",
   "agy-binds.meta",
+  "agy-binds-meta",
+  "agy-binds_meta",
   "identity-guard",
   "cursor",
   "read-cursors",
   "mention-timestamps",
   "wake-pids",
+  "codex-bots",
   "dsh",
   "config",
   "muse",
@@ -92,7 +112,9 @@ function isSafeProfileBindName(name: string): boolean {
   if (!name || name.length > 256 || hasControlChars(name)) return false;
   if (isUnsafeObjectKey(name) || hasPathOrTraversalSyntax(name)) return false;
   const base = name.replace(/\.json$/i, "").trim().toLowerCase();
-  if (!base || isUnsafeObjectKey(base) || RESERVED_BIND_BASENAMES.has(base)) return false;
+  if (!base || isUnsafeObjectKey(base) || WINDOWS_DEVICE_STEM_RE.test(base) || RESERVED_BIND_BASENAMES.has(base)) {
+    return false;
+  }
   return true;
 }
 
@@ -146,7 +168,7 @@ export function decideGrokBind(input: {
 }): GrokBindDecision {
   if (input.explicitIdentity || input.hasToken) return { kind: "skip" };
   const id = typeof input.conversationId === "string" ? input.conversationId.trim() : "";
-  if (!id || isUnsafeObjectKey(id) || hasControlChars(id)) return { kind: "skip" };
+  if (!id || isUnsafeProtoSlot(id) || hasControlChars(id)) return { kind: "skip" };
   const binds = input.binds && typeof input.binds === "object" ? input.binds : {};
   const profileName = Object.hasOwn(binds, id) ? binds[id] : undefined;
   if (typeof profileName === "string" && isSafeProfileBindName(profileName.trim())) {

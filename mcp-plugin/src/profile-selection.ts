@@ -31,16 +31,38 @@ const FORBIDDEN_CREDENTIAL_KEYS = new Set([
   "bearer",
   "cookie",
 ]);
-const PROTOTYPE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+const PROTOTYPE_KEYS = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase()),
+]);
+const WINDOWS_DEVICE_STEM_RE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
 const RESERVED_SIDECAR_STEMS = new Set([
   "grok-binds",
+  "grok-binds.meta",
+  "grok-binds-meta",
+  "grok-binds_meta",
   "session-binds",
+  "session-binds.meta",
+  "session-binds-meta",
+  "session-binds_meta",
   "agy-binds",
+  "agy-binds.meta",
+  "agy-binds-meta",
+  "agy-binds_meta",
+  "agy-session-binds",
+  "agy-session-binds.meta",
+  "agy-session-binds_meta",
+  "identity-guard",
   "cursor",
   "read-cursors",
+  "mention-timestamps",
   "wake-pids",
   "config",
   "codex-bots",
+  "dsh",
+  "muse",
 ]);
 
 function safeLstat(target: string): Stats | undefined {
@@ -153,9 +175,12 @@ function isUnsafeMetadataOrLinkLocalHost(hostname: string): boolean {
     if (a === 0 || (a === 169 && b === 254)) return true;
   }
   if (/^fe[89ab][0-9a-f]*:/.test(lower)) return true;
-  if (lower.startsWith("::ffff:")) {
-    const tail = lower.slice("::ffff:".length);
-    const afterZero = tail.startsWith("0:") ? tail.slice(2) : "";
+  const mappedPrefix = lower.match(/^(?:::ffff:|0:0:0:0:0:ffff:|0:0:0:0:ffff:0:)(.+)$/);
+  if (mappedPrefix) {
+    const tail = mappedPrefix[1]!;
+    if (/^[0-9a-f]{1,4}$/.test(tail)) return true;
+    const zeroMatch = tail.match(/^0+:(.+)$/);
+    const afterZero = zeroMatch ? zeroMatch[1]! : "";
     const tailParts = afterZero && (afterZero.includes(".") || afterZero.includes(":")) ? afterZero : tail;
     if (tailParts === "0.0.0.0" || tailParts === "100.100.100.200" || /^0\.\d+\.\d+\.\d+$/.test(tailParts)) return true;
     if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(tailParts)) return true;
@@ -252,12 +277,17 @@ export function projectProfileSelector(cwd: string): ProjectProfileSelection | u
   };
   if (doc.profile !== undefined) {
     const value = (doc.profile as string).trim();
-    const stemLower = value.replace(/\.json$/i, "").toLowerCase();
+    const basePart = value.replace(/\\/g, "/").split("/").pop() || "";
+    const stemLower = basePart.replace(/\.json$/i, "").toLowerCase();
+    const isBareName = !value.includes("/") && !value.includes("\\");
     if (
       value === "." ||
       value === ".." ||
+      (isBareName && value.includes("..")) ||
+      !stemLower ||
       PROTOTYPE_KEYS.has(stemLower) ||
-      (!value.includes("/") && !value.includes("\\") && RESERVED_SIDECAR_STEMS.has(stemLower))
+      WINDOWS_DEVICE_STEM_RE.test(stemLower) ||
+      (isBareName && RESERVED_SIDECAR_STEMS.has(stemLower))
     ) {
       throw new Error("Invalid project profile");
     }

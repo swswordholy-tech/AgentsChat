@@ -744,8 +744,17 @@ import {
 import { dirname, isAbsolute, join, parse, resolve, sep } from "path";
 var MAX_CURSOR_BYTES = 4 * 1024 * 1024;
 var MAX_CURSOR_ENTRIES = 50000;
-var RESERVED_PROTO_KEY = /^(?:__proto__|constructor|prototype)$/i;
+var MAX_CURSOR_PATH_LEN = 4096;
+var RESERVED_PROTO_KEYS = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase())
+]);
 var tmpCounter = 0;
+function isReservedCursorKey(key) {
+  return RESERVED_PROTO_KEYS.has(key.toLowerCase());
+}
 function scrubDiag(value) {
   return redactSecrets(String(value ?? "")).replace(/\b(https?:\/\/)([^/\s@]*@)/gi, "$1[REDACTED]@").replace(/\b(?:Bearer|Basic)\s+[^\s"'<>\\]+/gi, "[REDACTED]").replace(/(?:ac_|mcp_at_|mcp_rt_|mcp_|agent_key_|sk-|rk_live_|rk_test_|whsec_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|hf_|npm_|mr_|AIza|AKIA|ASIA)[A-Za-z0-9+/=._-]{8,}/g, "[REDACTED]").replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, " ");
 }
@@ -842,7 +851,7 @@ function loadCursor(file, warn) {
     }
     const entries = [];
     for (const [k, v] of Object.entries(parsed)) {
-      if (RESERVED_PROTO_KEY.test(k))
+      if (isReservedCursorKey(k))
         continue;
       if (typeof v !== "string") {
         throw new Error(`cursor value for ${scrubDiag(k)} must be a string`);
@@ -865,6 +874,11 @@ function loadCursor(file, warn) {
   }
 }
 function persistCursor(file, cursor, warn, fsOps) {
+  if (typeof file !== "string" || !file || file.length > MAX_CURSOR_PATH_LEN || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(file)) {
+    warn(`[agentchat] WARNING: failed to persist read cursor to ${scrubDiag(file)}: invalid cursor file path
+`);
+    return false;
+  }
   try {
     const parentStat = lstatSync(dirname(file));
     if (parentStat.isSymbolicLink() || !parentStat.isDirectory() || !hasSafeAncestorDirs(file)) {
@@ -893,7 +907,7 @@ function persistCursor(file, cursor, warn, fsOps) {
   }
   const validEntries = [];
   for (const [k, v] of cursor) {
-    if (!k || k.length > 256 || RESERVED_PROTO_KEY.test(k) || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(k) || typeof v !== "string" || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(v) || v.length > 256) {
+    if (!k || k.length > 256 || isReservedCursorKey(k) || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(k) || typeof v !== "string" || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(v) || v.length > 256) {
       continue;
     }
     validEntries.push([k, v]);

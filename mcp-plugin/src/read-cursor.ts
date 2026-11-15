@@ -38,8 +38,19 @@ export interface PersistCursorFsOps {
 
 const MAX_CURSOR_BYTES = 4 * 1024 * 1024;
 const MAX_CURSOR_ENTRIES = 50_000;
-const RESERVED_PROTO_KEY = /^(?:__proto__|constructor|prototype)$/i;
+const MAX_CURSOR_PATH_LEN = 4096;
+const WINDOWS_DEVICE_STEM_RE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
+const RESERVED_PROTO_KEYS = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+  ...Object.getOwnPropertyNames(Object.prototype).map((k) => k.toLowerCase()),
+]);
 let tmpCounter = 0;
+
+function isReservedCursorKey(key: string): boolean {
+  return RESERVED_PROTO_KEYS.has(key.toLowerCase());
+}
 
 function scrubDiag(value: unknown): string {
   return redactSecrets(String(value ?? ""))
@@ -135,8 +146,17 @@ export function safeAgentCursorSlug(agentId: string): string {
   const cleaned = String(agentId || "")
     .trim()
     .replace(/[^A-Za-z0-9._-]/g, "_")
+    .replace(/\.+$/g, "")
     .slice(0, 128);
-  if (!cleaned || cleaned === "." || cleaned === ".." || RESERVED_PROTO_KEY.test(cleaned)) return "_";
+  if (
+    !cleaned ||
+    cleaned === "." ||
+    cleaned.includes("..") ||
+    WINDOWS_DEVICE_STEM_RE.test(cleaned) ||
+    isReservedCursorKey(cleaned)
+  ) {
+    return "_";
+  }
   return cleaned;
 }
 
@@ -177,7 +197,7 @@ export function loadCursor(file: string, warn: Warn): Map<string, string> {
     }
     const entries: Array<[string, string]> = [];
     for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-      if (RESERVED_PROTO_KEY.test(k)) continue;
+      if (isReservedCursorKey(k)) continue;
       if (typeof v !== "string") {
         throw new Error(`cursor value for ${scrubDiag(k)} must be a string`);
       }
@@ -205,6 +225,10 @@ export function persistCursor(
   warn: Warn,
   fsOps?: PersistCursorFsOps,
 ): boolean {
+  if (typeof file !== "string" || !file || file.length > MAX_CURSOR_PATH_LEN || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(file)) {
+    warn(`[agentchat] WARNING: failed to persist read cursor to ${scrubDiag(file)}: invalid cursor file path\n`);
+    return false;
+  }
   try {
     const parentStat = lstatSync(dirname(file));
     if (parentStat.isSymbolicLink() || !parentStat.isDirectory() || !hasSafeAncestorDirs(file)) {
@@ -229,7 +253,7 @@ export function persistCursor(
   }
   const validEntries: Array<[string, string]> = [];
   for (const [k, v] of cursor) {
-    if (!k || k.length > 256 || RESERVED_PROTO_KEY.test(k) || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(k) || typeof v !== "string" || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(v) || v.length > 256) {
+    if (!k || k.length > 256 || isReservedCursorKey(k) || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(k) || typeof v !== "string" || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(v) || v.length > 256) {
       continue;
     }
     validEntries.push([k, v]);
