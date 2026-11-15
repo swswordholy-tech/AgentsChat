@@ -21,8 +21,31 @@ function isLoopbackHost(hostname: string): boolean {
   return h === "localhost" || h === "127.0.0.1" || h === "[::1]" || h === "::1";
 }
 
+/** URL.hostname is already canonicalized by the WHATWG URL parser. */
+export function isUnsafeEndpointHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/\.+$/, "");
+  if (["metadata.google.internal", "metadata.goog", "metadata", "instance-data"].includes(host) ||
+      host.endsWith(".metadata.goog")) return true;
+  const unsafeV4 = (ip: string) => ip === "0.0.0.0" || ip === "100.100.100.200" || ip.startsWith("169.254.");
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) return unsafeV4(host);
+  if (!host.startsWith("[")) return false;
+  const address = host.slice(1, -1);
+  const [left, right = ""] = address.split("::");
+  const head = left ? left.split(":") : [];
+  const tail = right ? right.split(":") : [];
+  const words = (address.includes("::")
+    ? [...head, ...Array(8 - head.length - tail.length).fill("0"), ...tail]
+    : head).map(x => parseInt(x, 16));
+  if (words.length !== 8) return true;
+  const mapped = (words.slice(0, 5).every(x => x === 0) && words[5] === 0xffff) ||
+    (words.slice(0, 4).every(x => x === 0) && words[4] === 0xffff && words[5] === 0);
+  if (mapped) return unsafeV4(`${words[6]! >> 8}.${words[6]! & 255}.${words[7]! >> 8}.${words[7]! & 255}`);
+  return words.every(x => x === 0) || (words[0]! & 0xffc0) === 0xfe80 ||
+    (words[0] === 0xfd00 && words[1] === 0xec2 && words.slice(2, 7).every(x => x === 0) && words[7] === 0x254);
+}
+
 export function isSafeAgentId(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0 &&
+  return typeof value === "string" && value.length > 0 && value.length <= 128 &&
     ![".", "..", "__proto__", "constructor", "prototype"].includes(value.toLowerCase()) &&
     !/[\/\\\s\x00-\x1f\x7f]/.test(value);
 }
@@ -30,8 +53,11 @@ export function isSafeAgentId(value: unknown): value is string {
 /** Inspect existing ancestors before recursive mkdir can follow a symlink. */
 export function assertSafeParentDirectories(file: string): void {
   // Preserve lexical .. components so a symlink before /../ is still inspected.
-  let dir = dirname(isAbsolute(file) ? file : `${process.cwd()}${sep}${file}`);
-  while (true) {
+  const parent = dirname(isAbsolute(file) ? file : `${process.cwd()}${sep}${file}`);
+  // Check from root to leaf, before a later /.. can hide a symlink.
+  const parts = parent.split(sep);
+  for (let i = 1; i <= parts.length; i++) {
+    const dir = parts.slice(0, i).join(sep) || sep;
     try {
       const st = lstatSync(dir);
       const systemLink = process.platform === "darwin" &&
@@ -44,9 +70,6 @@ export function assertSafeParentDirectories(file: string): void {
     } catch (err) {
       if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err;
     }
-    const parent = dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
   }
 }
 
@@ -60,6 +83,9 @@ export function validateEndpointUrl(raw: string, kind: "ws" | "rest"): string {
     parsed = new URL(trimmed);
   } catch {
     throw new Error(`Invalid Muse ${kind} URL`);
+  }
+  if (isUnsafeEndpointHost(parsed.hostname)) {
+    throw new Error(`Unsafe Muse ${kind} URL host`);
   }
   if (parsed.port === "0" || parsed.search || parsed.hash || raw.includes("?") || raw.includes("#")) {
     throw new Error(`Invalid Muse ${kind} URL port/query/hash`);
@@ -114,6 +140,7 @@ interface ProfileFile {
 
 function readProfile(path = PROFILE_PATH): ProfileFile {
   try {
+    assertSafeParentDirectories(path);
     if (!existsSync(path)) return {};
     const st = lstatSync(path);
     if (!st.isFile() || st.isSymbolicLink() || st.size > MAX_PROFILE_BYTES) return {};

@@ -25,7 +25,11 @@ import { MuseAgentChatClient } from "./client.ts";
 import { assertSafeParentDirectories, isSafeAgentId, loadConfig, PROFILE_PATH, safeConfig, validateEndpointUrl } from "./config.ts";
 import { shouldDispatch } from "./policy.ts";
 import { TypingHeartbeat } from "./typing.ts";
-import { appendWakeQueue, buildWakePayload, fireWake, redactSecrets } from "./wake.ts";
+import { appendWakeQueue, buildWakePayload, fireWake, redactSecrets, sanitizeMuseText } from "./wake.ts";
+
+function safeLogText(text: string): string {
+  return sanitizeMuseText(text);
+}
 
 const MAX_REGISTRATION_BYTES = 1024 * 1024;
 
@@ -145,7 +149,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     return;
   }
   const config = loadConfig();
-  console.log("Muse AgentsChat:", JSON.stringify(safeConfig(config)));
+  console.log("Muse AgentsChat:", safeLogText(JSON.stringify(safeConfig(config))));
   const client = new MuseAgentChatClient({
     url: config.wsUrl,
     agentId: config.agentId,
@@ -188,8 +192,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       typing.start(m.channel_id);
       const payload = buildWakePayload({ ...m, type: "message" });
       const queued = appendWakeQueue(queueFile, payload);
-      void fireWake({ ...m, type: "message" }, { url: wakeUrl, secret: wakeSecret, logger: console.error });
-      console.log(`[wake] ${m.channel_id} ${m.sender_id} ${m.id} queued=${queued}`);
+      void fireWake({ ...m, type: "message" }, { url: wakeUrl, secret: wakeSecret, logger: (text) => console.error(safeLogText(text)) });
+      console.log(`[wake] ${safeLogText(m.channel_id)} ${safeLogText(m.sender_id)} ${safeLogText(m.id)} queued=${queued}`);
     });
     client.onReconnect = () => {
       for (const c of uniqueWakeChannels) client.joinChannel(c);
@@ -197,7 +201,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     try {
       await client.connect();
       for (const c of uniqueWakeChannels) client.joinChannel(c);
-      console.log(`Wake daemon listening on ${uniqueWakeChannels.join(", ") || "(no channels — pass --channel <id>)"}, queue=${queueFile}. Press Ctrl+C to stop.`);
+      console.log(`Wake daemon listening on ${safeLogText(uniqueWakeChannels.join(", ")) || "(no channels — pass --channel <id>)"}, queue=${safeLogText(queueFile)}. Press Ctrl+C to stop.`);
       await client.waitUntilClosed();
     } finally {
       process.removeListener("SIGINT", shutdownWake);
@@ -231,7 +235,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     displayName: config.displayName,
     channels: uniqueChannels,
     responder: async (ctx) => {
-      console.log(`[${ctx.message.channel_id}] ${ctx.message.sender_id}: ${ctx.message.content}`);
+      console.log(`[${safeLogText(ctx.message.channel_id)}] ${safeLogText(ctx.message.sender_id)}: ${safeLogText(ctx.message.content)}`);
       // Without a host responder, --auto-reply is the only reply path.
       // A real Muse host should inject its own responder via the API.
       return autoReply ?? null;
@@ -245,7 +249,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   client.onReconnect = () => bridge.rejoin();
   try {
     await bridge.start();
-    console.log(`Listening on ${uniqueChannels.join(", ") || "(no channels — pass --channel <id>)"}. Press Ctrl+C to stop.`);
+    console.log(`Listening on ${safeLogText(uniqueChannels.join(", ")) || "(no channels — pass --channel <id>)"}. Press Ctrl+C to stop.`);
     await client.waitUntilClosed();
   } finally {
     process.removeListener("SIGINT", shutdownListen);
@@ -262,7 +266,7 @@ const invokedDirectly =
 
 if (invokedDirectly) {
   main().catch((err: unknown) => {
-    console.error(err instanceof Error ? err.message : String(err));
+    console.error(safeLogText(err instanceof Error ? err.message : String(err)));
     process.exit(1);
   });
 }
