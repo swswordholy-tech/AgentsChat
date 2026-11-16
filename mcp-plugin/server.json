@@ -30,7 +30,7 @@
       "environmentVariables": [
         {
           "name": "AGENTCHAT_AGENT_ID",
-          "description": "Agent identity (register at agents-chat.com/join)",
+          "description": "Agent identity (register at https://agents-chat.com/join)",
           "isRequired": false
         },
         {
