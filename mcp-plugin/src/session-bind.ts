@@ -555,6 +555,10 @@ export function detectRuntimeSession(
   env: Record<string, string | undefined> = process.env,
   meta?: Record<string, any> | null,
 ): DetectedSession | null {
+  if (env.AGENTSCHAT_DSH_HEALTH_URL?.trim() || env.AGENTSCHAT_DSH_HOME?.trim()) {
+    return null;
+  }
+
   // 1. ZCode MCP request `_meta` (injected on every tools/call by ZCode's NodeMcpAdapter)
   const zcodeCtx = meta?.["com.zcode/request-context"];
   const metaSessionId =
@@ -886,6 +890,13 @@ export function discoverAntigravityHost(opts?: {
   cacheMs?: number;
 }): AntigravityHostInfo | null {
   if (!opts?.currentPid) {
+    if (
+      process.env.AGENTSCHAT_DSH_HEALTH_URL?.trim() ||
+      process.env.AGENTSCHAT_DSH_HOME?.trim() ||
+      process.env.DSH_HOME?.trim()
+    ) {
+      return null;
+    }
     const envAddr = process.env.ANTIGRAVITY_LS_ADDRESS?.trim() || "";
     const envCsrf = process.env.ANTIGRAVITY_CSRF_TOKEN?.trim() || "";
     if (envAddr && envCsrf) {
@@ -939,7 +950,7 @@ export function discoverAntigravityHost(opts?: {
       if (!m) break;
       const ppid = Number(m[1]);
       const cmd = m[2]!;
-      if (hop > 0 && (cmd.includes("bun test") || cmd.includes("node --test"))) break;
+      if (hop > 0 && (cmd.includes("bun test") || cmd.includes("node --test") || matchesDshCommandLine(cmd))) break;
       if (cmd.includes("language_server") && cmd.includes("--csrf_token")) {
         lsPid = pid;
         lsCmd = cmd;
@@ -1109,6 +1120,7 @@ function matchesDshCommandLine(cmd: string): boolean {
     cmd.includes("@deepseek-ai") ||
     cmd.includes("/.dsh/") ||
     cmd.toLowerCase().includes("\\.dsh\\") ||
+    /deepseek[- ]harness/i.test(cmd) ||
     /\bdsh(?:\.cmd|\.exe)?\b/i.test(cmd)
   );
 }
@@ -1287,7 +1299,14 @@ function sessionDirMtime(dir: string): number {
   const dirStat = safeLstat(dir);
   if (!dirStat || dirStat.isSymbolicLink() || !dirStat.isDirectory()) return 0;
   let newest = 0;
-  for (const file of ["session.v4.jsonl.zstd", "session.v4.jsonl"]) {
+  let entries: string[] = [];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    entries = ["session.v4.jsonl.zstd", "session.v4.jsonl"];
+  }
+  for (const file of entries) {
+    if (!/^session(?:\.v\d+)?\.jsonl(?:\.zstd)?$/.test(file)) continue;
     const st = safeLstat(join(dir, file));
     if (st && !st.isSymbolicLink() && st.isFile() && st.mtimeMs > newest) {
       newest = st.mtimeMs;

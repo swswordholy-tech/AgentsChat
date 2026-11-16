@@ -87,8 +87,8 @@ const MAX_PENDING = 100;
 export const MAX_HTTP_BODY_BYTES = 64 * 1024;
 const WAKE_PATH = '/agentschat/wake';
 const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
-const LOCAL_HTTP_ORIGIN_RE = /^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::(\d{1,5}))?$/i;
-const LOCAL_SCHEME_ORIGIN_RE = /^(?:app|tauri|dsh):\/\/[a-z0-9._-]+(?::(\d{1,5}))?$/i;
+const LOCAL_HTTP_ORIGIN_RE = /^https?:\/\/(?:127\.0\.0\.1|localhost|(?:tauri|dsh|dsh-app)\.localhost|\[::1\])(?::(\d{1,5}))?$/i;
+const LOCAL_SCHEME_ORIGIN_RE = /^(?:app|tauri|dsh|dsh-app):\/\/[a-z0-9._-]+(?::(\d{1,5}))?$/i;
 let inboundTmpSeq = 0;
 
 /**
@@ -219,7 +219,7 @@ function scrubSecrets(text) {
  * is no way to tell which version is live from the outside, which is how a
  * "fixed" build once delivered into a busy Session. `/health` reports it.
  */
-const BUILD = 'inbound/2026-10-29.21-bundled';
+const BUILD = 'inbound/2026-11-16.22-rc3-compat';
 /** Producer-owned source kind; a bare `plugin` wrapper is refused by session format v4. */
 const SOURCE_KIND = 'plugin:agentschat-inbound';
 /** Poll interval while wakes wait for a root agent to finish its turn. */
@@ -520,7 +520,11 @@ export function apply(ctx, config = {}) {
     }
   })();
   const mcpBin = config.mcpBin ?? process.env.AGENTSCHAT_DSH_BRIDGE_BIN ?? defaultBundledMcpBin;
-  const nodeBin = config.nodeBin ?? process.env.DSH_NODE_BIN ?? 'node';
+  const nodeBin =
+    config.nodeBin ??
+    process.env.DSH_NODE_BIN ??
+    process.env.DSH_NODE ??
+    (process.versions?.electron ? process.execPath : 'node');
   const channels = Array.isArray(config.channels) && config.channels.length > 0 ? config.channels : ['welcome'];
   const rawRetryMs = Number(config.retryMs ?? DEFAULT_RETRY_MS);
   const retryMs = Number.isFinite(rawRetryMs) && rawRetryMs >= 10 ? Math.min(Math.floor(rawRetryMs), 300_000) : DEFAULT_RETRY_MS;
@@ -538,6 +542,30 @@ export function apply(ctx, config = {}) {
   let restartTimer;
   let consecutiveFailures = 0;
 
+  /**
+   * DSH >= 0.2.1-rc.3 removed `AgentRegistry.roots()` in favor of `list()` and
+   * marks delegated child sessions via `session.header.origin === 'subagent'`
+   * or `delegationDepth > 0`.
+   */
+  function isOrdinaryRootAgent(agent) {
+    if (!agent || typeof agent !== 'object') return false;
+    const header = agent.session?.header;
+    if (header && typeof header === 'object') {
+      if (header.origin === 'subagent') return false;
+      if (typeof header.delegationDepth === 'number' && header.delegationDepth > 0) return false;
+    }
+    return true;
+  }
+
+  function isArchivedSession(sessionId) {
+    try {
+      const archived = ctx.get('workspaceRegistry')?.archivedSessionIds;
+      return Array.isArray(archived) && archived.includes(sessionId);
+    } catch {
+      return false;
+    }
+  }
+
   /** Live root agents, oldest first, with the status the gate reads. */
   function rootStatuses() {
     return liveRoots().map((agent) => {
@@ -551,7 +579,7 @@ export function apply(ctx, config = {}) {
     });
   }
 
-  /** Live root agents, oldest first. */
+  /** Live root agents, oldest first (compatible with both DSH 0.1.x `roots()` and 0.2.1-rc.3+ `list()`). */
   function liveRoots() {
     let agents;
     try {
@@ -562,11 +590,49 @@ export function apply(ctx, config = {}) {
     }
     if (agents === undefined || agents === null) return [];
     try {
-      return agents.roots();
+      if (typeof agents.roots === 'function') {
+        return agents.roots();
+      }
+      if (typeof agents.list === 'function') {
+        return agents.list().filter(isOrdinaryRootAgent);
+      }
+      log('cannot list root agents: neither agents.roots() nor agents.list() is available');
+      return [];
     } catch (error) {
       log(`cannot list root agents: ${error?.message ?? error}`);
       return [];
     }
+  }
+
+  /**
+   * Resolve a bound session to its live Agent, activating a cold persisted
+   * session through `sessionController.resolveAgent()` on DSH >= 0.2.1-rc.3
+   * (same activation seam `@deepseek-ai/dsh-schedule` uses).
+   */
+  async function resolveBoundTargetAgent(wanted) {
+    const live = liveRoots().find((agent) => agent.id === wanted);
+    if (live !== undefined) return live;
+    if (isArchivedSession(wanted)) return undefined;
+    let sessionController;
+    try {
+      sessionController = ctx.get('sessionController');
+    } catch {
+      return undefined;
+    }
+    if (sessionController && typeof sessionController.resolveAgent === 'function') {
+      const outcome = await settleWithin(
+        Promise.resolve().then(() => sessionController.resolveAgent(wanted)),
+        10_000,
+      );
+      if (outcome.timedOut === true) {
+        log(`WARNING: session activation for ${wanted} timed out after 10000ms`);
+        return undefined;
+      }
+      if (outcome.ok === true && outcome.value && typeof outcome.value === 'object' && !('error' in outcome.value) && outcome.value.agent) {
+        return isOrdinaryRootAgent(outcome.value.agent) ? outcome.value.agent : undefined;
+      }
+    }
+    return undefined;
   }
 
   /** Wake deliveries waiting for their bound session to go idle, oldest first. */
@@ -597,7 +663,7 @@ export function apply(ctx, config = {}) {
       log(`wake ${id} dropped: identity is unbound (bind a session in the identity chip to receive it here)`);
       return 'dropped';
     }
-    const target = liveRoots().find((agent) => agent.id === wanted);
+    const target = await resolveBoundTargetAgent(wanted);
     if (target === undefined) {
       log(`wake ${id} dropped: bound session ${wanted} is not live (bind the identity to an open session)`);
       return 'dropped';
@@ -1113,15 +1179,22 @@ export function apply(ctx, config = {}) {
       // Delivery is bound-only, so the useful answer is per binding, not "the
       // newest idle root".
       const byId = new Map(liveRoots().map((agent) => [agent.id, agent]));
+      let hasActivator = false;
+      try {
+        hasActivator = typeof ctx.get('sessionController')?.resolveAgent === 'function';
+      } catch {}
       const bound = Object.entries(readBinds()).map(([sessionId, profileName]) => {
         const agent = byId.get(sessionId);
+        const canActivate = agent === undefined && hasActivator && !isArchivedSession(sessionId);
         return {
           sessionId,
           profile: profileName,
-          status: agent === undefined ? 'missing' : agent.status,
+          status: agent === undefined ? (canActivate ? 'cold' : 'missing') : agent.status,
           decision:
             agent === undefined
-              ? 'drop'
+              ? canActivate
+                ? 'activate'
+                : 'drop'
               : agent.status === 'idle'
                 ? 'deliver'
                 : typeof agent.steer === 'function'
@@ -1200,6 +1273,7 @@ export function apply(ctx, config = {}) {
     for (const channel of channels) args.push('--channel', channel);
     const env = {
       ...process.env,
+      ...(process.versions?.electron && nodeBin === process.execPath ? { ELECTRON_RUN_AS_NODE: '1' } : {}),
       DSH_WAKE_URL: `http://127.0.0.1:${boundPort}${WAKE_PATH}`,
       DSH_WAKE_SECRET: secret,
       DSH_WAKE_QUEUE: queuePath,

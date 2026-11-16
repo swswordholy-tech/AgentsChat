@@ -15,7 +15,7 @@
 - insert:
     - id: mcp-agentschat
       name: '@deepseek-ai/dsh-mcp-client'
-      disabled: !!js "[...ctx.loader.entries()].some((e) => e.options.id === 'mcp-agentschat' && !e.disabled)"
+      disabled: !!js "[...ctx.loader.entries()].some((e) => e.ctx !== ctx && (e.options.id === 'mcp-agentschat' || (e.options.name === '@deepseek-ai/dsh-mcp-client' && e.options.config && e.options.config.serverName === 'agentschat')) && e.options.disabled !== true)"
       config:
         serverName: agentschat
         transport: stdio
@@ -23,6 +23,8 @@
         args:
           - -y
           - agentschat-mcp@latest
+        env:
+          AGENTSCHAT_DSH_HEALTH_URL: 'http://127.0.0.1:8799/health'
     - id: agentschat-dsh-bundle
       name: 'agentschat-mcp'
-      disabled: !!js "[...ctx.loader.entries()].some((e) => (e.options.name === 'agentschat-mcp' || String(e.options.id || '').startsWith('agentschat-inbound')) && e.options.id !== 'agentschat-dsh-bundle' && !e.disabled)"
+      disabled: !!js "[...ctx.loader.entries()].some((e) => e.ctx !== ctx && e.options.id !== 'agentschat-dsh-bundle' && (e.options.name === 'agentschat-mcp' || String(e.options.id || '').startsWith('agentschat-inbound')) && e.options.disabled !== true)"

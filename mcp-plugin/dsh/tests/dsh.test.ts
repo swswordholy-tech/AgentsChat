@@ -1103,16 +1103,200 @@ test("wake validates the fallback WebSocket URL when the primary identity config
   }
 });
 
-test("configured default channels reject prototype keys before listen or wake connects", async () => {
-  await withDshIdentity(async () => {
-    const connect = spyOn(MuseAgentChatClient.prototype, "connect").mockRejectedValue(new Error("unexpected connect"));
-    try {
-      for (const channel of ["constructor", "__proto__", "toString", "bad/id", "bad\\id", "bad\x7fid"]) {
-        process.env.AGENTCHAT_CHANNEL_ID = channel;
-        await expect(main(["--listen"])).rejects.toThrow(/channel id/);
-        await expect(main(["--wake"])).rejects.toThrow(/channel id/);
-      }
-      expect(connect).not.toHaveBeenCalled();
-    } finally { connect.mockRestore(); }
+  test("configured default channels reject prototype keys before listen or wake connects", async () => {
+    await withDshIdentity(async () => {
+      const connect = spyOn(MuseAgentChatClient.prototype, "connect").mockRejectedValue(new Error("unexpected connect"));
+      try {
+        for (const channel of ["constructor", "__proto__", "toString", "bad/id", "bad\\id", "bad\x7fid"]) {
+          process.env.AGENTCHAT_CHANNEL_ID = channel;
+          await expect(main(["--listen"])).rejects.toThrow(/channel id/);
+          await expect(main(["--wake"])).rejects.toThrow(/channel id/);
+        }
+        expect(connect).not.toHaveBeenCalled();
+      } finally { connect.mockRestore(); }
+    });
   });
-});
+
+  test("DSH 0.2.2-rc.3 compat: cordis.patch.yml disabled expressions never self-recurse when entry is already in loader.entries()", () => {
+    const patchYaml = readFileSync(join(ROOT, "cordis.patch.yml"), "utf8");
+    const exprMatches = [...patchYaml.matchAll(/disabled:\s*!!js\s+"([^"]+)"/g)].map((m) => m[1]!);
+    expect(exprMatches).toHaveLength(2);
+    const [mcpDisabledExpr, bundleDisabledExpr] = exprMatches;
+
+    const makeEntry = (id: string, name: string, expr?: string, config?: Record<string, unknown>, rawDisabled?: boolean) => {
+      const entryCtx: any = {};
+      const entry: any = {
+        ctx: entryCtx,
+        options: {
+          id,
+          name,
+          ...(config ? { config } : {}),
+          ...(rawDisabled !== undefined ? { disabled: rawDisabled } : expr ? { disabled: { __jsExpr: expr } } : {}),
+        },
+        get disabled(): boolean {
+          if (typeof this.options.disabled === "boolean") return this.options.disabled;
+          if (this.options.disabled?.__jsExpr) {
+            return Boolean(new Function("ctx", `return (${this.options.disabled.__jsExpr});`)(this.ctx));
+          }
+          return false;
+        },
+      };
+      return entry;
+    };
+
+    const entries: any[] = [];
+    const loader = { entries: () => entries[Symbol.iterator]() };
+    const mcpEntry = makeEntry("mcp-agentschat", "@deepseek-ai/dsh-mcp-client", mcpDisabledExpr, { serverName: "agentschat" });
+    const bundleEntry = makeEntry("agentschat-dsh-bundle", "agentschat-mcp", bundleDisabledExpr);
+    mcpEntry.ctx.loader = loader;
+    bundleEntry.ctx.loader = loader;
+    entries.push(mcpEntry, bundleEntry);
+
+    // Must evaluate to false cleanly without RangeError: Maximum call stack size exceeded!
+    expect(mcpEntry.disabled).toBe(false);
+    expect(bundleEntry.disabled).toBe(false);
+
+    // When a manual user-configured entry is also present, bundle entries yield cleanly without recursion
+    const manualMcp = makeEntry("user-mcp-agentschat", "@deepseek-ai/dsh-mcp-client", undefined, { serverName: "agentschat" });
+    const manualInbound = makeEntry("agentschat-inbound-v14", "file:///local/inbound.js");
+    manualMcp.ctx.loader = loader;
+    manualInbound.ctx.loader = loader;
+    entries.push(manualMcp, manualInbound);
+    expect(mcpEntry.disabled).toBe(true);
+    expect(bundleEntry.disabled).toBe(true);
+  });
+
+  test("DSH 0.2.2-rc.3 compat: isAllowedLocalOrigin admits dsh-app:// and tauri/dsh .localhost while blocking untrusted .localhost", () => {
+    expect(isAllowedLocalOrigin("dsh-app://app")).toBe(true);
+    expect(isAllowedLocalOrigin("dsh-app://shell")).toBe(true);
+    expect(isAllowedLocalOrigin("http://tauri.localhost")).toBe(true);
+    expect(isAllowedLocalOrigin("https://tauri.localhost:1420")).toBe(true);
+    expect(isAllowedLocalOrigin("http://dsh.localhost")).toBe(true);
+    expect(isAllowedLocalOrigin("https://dsh-app.localhost")).toBe(true);
+
+    expect(isAllowedLocalOrigin("http://evil.localhost")).toBe(false);
+    expect(isAllowedLocalOrigin("https://attacker.localhost:3000")).toBe(false);
+    expect(isAllowedLocalOrigin("dsh-evil://app")).toBe(false);
+  });
+
+  test("DSH 0.2.2-rc.3 compat: inbound bridge lists ordinary agents via agents.list(), filters subagents, and activates cold sessions via sessionController.resolveAgent()", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dsh-rc3-bridge-"));
+    let stop = () => {};
+    try {
+      mkdirSync(join(dir, "profiles"), { recursive: true });
+      for (const name of ["LiveBot", "ColdBot", "ArchivedBot"]) {
+        writeFileSync(join(dir, "profiles", `${name}.json`), JSON.stringify({ agent_id: name.toLowerCase(), token: "ac_tok" }), "utf8");
+      }
+      writeFileSync(
+        join(dir, "session-binds.json"),
+        JSON.stringify({
+          "session-live": "LiveBot",
+          "session-cold": "ColdBot",
+          "session-archived": "ArchivedBot",
+        }),
+        "utf8",
+      );
+
+      const delivered: Array<{ sessionId: string; message: any }> = [];
+      const liveList: any[] = [
+        {
+          id: "session-live",
+          status: "idle",
+          session: { id: "session-live", header: { delegationDepth: 0 } },
+          followup(msg: any) {
+            delivered.push({ sessionId: "session-live", message: msg });
+          },
+        },
+        {
+          id: "session-subagent",
+          status: "running",
+          session: { id: "session-subagent", header: { origin: "subagent", delegationDepth: 1 } },
+          followup() {
+            throw new Error("must never deliver to subagent");
+          },
+        },
+      ];
+
+      const base = await new Promise<string>((ready) => {
+        applyInboundBridge(
+          {
+            get(service: string) {
+              if (service === "agents") {
+                // DSH >= 0.2.1-rc.3: `roots()` is absent; only `list()` exists!
+                return { list: () => liveList };
+              }
+              if (service === "workspaceRegistry") {
+                return { archivedSessionIds: ["session-archived"] };
+              }
+              if (service === "sessionController") {
+                return {
+                  async resolveAgent(sessionId: string) {
+                    if (sessionId === "session-cold") {
+                      const resumed = {
+                        id: "session-cold",
+                        status: "idle",
+                        session: { id: "session-cold", header: { delegationDepth: 0 } },
+                        followup(msg: any) {
+                          delivered.push({ sessionId: "session-cold", message: msg });
+                        },
+                      };
+                      liveList.push(resumed);
+                      return { agent: resumed };
+                    }
+                    return { error: { code: "session/not-found" } };
+                  },
+                };
+              }
+              return undefined;
+            },
+            effect(fn: () => () => void) {
+              stop = fn();
+            },
+          },
+          {
+            port: 0,
+            mcpBin: "",
+            agentschatDir: dir,
+            logPath: join(dir, "bridge.log"),
+            onListening({ port }: { port: number }) {
+              ready(`http://127.0.0.1:${port}`);
+            },
+          },
+        );
+      });
+
+      const health = (await (await fetch(`${base}/health`)).json()) as any;
+      expect(health.roots).toEqual([{ id: "session-live", status: "idle" }]);
+
+      const selftest = (await (await fetch(`${base}/selftest`)).json()) as any;
+      expect(selftest.bound).toEqual([
+        { sessionId: "session-live", profile: "LiveBot", status: "idle", decision: "deliver" },
+        { sessionId: "session-cold", profile: "ColdBot", status: "cold", decision: "activate" },
+        { sessionId: "session-archived", profile: "ArchivedBot", status: "missing", decision: "drop" },
+      ]);
+
+      const secret = readFileSync(join(dir, "dsh-inbound.secret"), "utf8").trim();
+      const postWake = async (msgId: string, targetSessionId: string) => {
+        const body = JSON.stringify({
+          message_id: msgId,
+          channel_id: "0d8129fd-e282-4687-95bf-0af90acad87d",
+          sender_id: "peer",
+          content: `wake ${msgId}`,
+          target_session_id: targetSessionId,
+        });
+        const sig = createHmac("sha256", secret).update(body, "utf8").digest("hex");
+        return fetch(`${base}/agentschat/wake`, {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-agentschat-signature": sig },
+          body: body,
+        });
+      };
+
+      expect((await postWake("m-cold", "session-cold")).status).toBe(200);
+      expect((await postWake("m-arch", "session-archived")).status).toBe(200);
+      expect(delivered.map((d) => d.sessionId)).toEqual(["session-cold"]);
+    } finally {
+      stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });

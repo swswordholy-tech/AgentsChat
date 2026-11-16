@@ -585,7 +585,7 @@ describe("rest-cli (--join, --send, --wake-once) & unified per-channel cursor", 
     const dir = mkdtempSync(join(tmpdir(), "rest-cli-c92-"));
     try {
       expect(safeAgentCursorSlug("spinning-midnight-tunicate")).toBe("spinning-midnight-tunicate");
-      expect(safeAgentCursorSlug("../../etc/passwd")).toBe(".._.._etc_passwd");
+      expect(safeAgentCursorSlug("../../etc/passwd")).toBe("_");
       expect(safeAgentCursorSlug("user:alice@example.com")).toBe("user_alice_example.com");
       expect(safeAgentCursorSlug("..")).toBe("_");
 

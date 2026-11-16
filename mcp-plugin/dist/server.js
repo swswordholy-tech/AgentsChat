@@ -4033,6 +4033,9 @@ function cleanDetectedWorkspacePath(raw) {
   return s;
 }
 function detectRuntimeSession(env = process.env, meta) {
+  if (env.AGENTSCHAT_DSH_HEALTH_URL?.trim() || env.AGENTSCHAT_DSH_HOME?.trim()) {
+    return null;
+  }
   const zcodeCtx = meta?.["com.zcode/request-context"];
   const metaSessionId = typeof meta?.session_id === "string" && meta.session_id.trim() || typeof zcodeCtx?.session_id === "string" && zcodeCtx.session_id.trim() || "";
   if (isSafeDetectedSessionId(metaSessionId)) {
@@ -4265,6 +4268,9 @@ function discoverWindowsAntigravityHost(currentPid) {
 }
 function discoverAntigravityHost(opts) {
   if (!opts?.currentPid) {
+    if (process.env.AGENTSCHAT_DSH_HEALTH_URL?.trim() || process.env.AGENTSCHAT_DSH_HOME?.trim() || process.env.DSH_HOME?.trim()) {
+      return null;
+    }
     const envAddr = process.env.ANTIGRAVITY_LS_ADDRESS?.trim() || "";
     const envCsrf = process.env.ANTIGRAVITY_CSRF_TOKEN?.trim() || "";
     if (envAddr && envCsrf) {
@@ -4304,7 +4310,7 @@ function discoverAntigravityHost(opts) {
         break;
       const ppid = Number(m[1]);
       const cmd = m[2];
-      if (hop > 0 && (cmd.includes("bun test") || cmd.includes("node --test")))
+      if (hop > 0 && (cmd.includes("bun test") || cmd.includes("node --test") || matchesDshCommandLine(cmd)))
         break;
       if (cmd.includes("language_server") && cmd.includes("--csrf_token")) {
         lsPid = pid;
@@ -4437,7 +4443,7 @@ function detectAntigravityCallerSession(opts) {
 }
 var cachedIsDshHost = null;
 function matchesDshCommandLine(cmd) {
-  return cmd.includes("@deepseek-ai") || cmd.includes("/.dsh/") || cmd.toLowerCase().includes("\\.dsh\\") || /\bdsh(?:\.cmd|\.exe)?\b/i.test(cmd);
+  return cmd.includes("@deepseek-ai") || cmd.includes("/.dsh/") || cmd.toLowerCase().includes("\\.dsh\\") || /deepseek[- ]harness/i.test(cmd) || /\bdsh(?:\.cmd|\.exe)?\b/i.test(cmd);
 }
 function isDshHostProcess(opts) {
   const env = opts?.env ?? process.env;
@@ -4594,7 +4600,15 @@ function sessionDirMtime(dir) {
   if (!dirStat || dirStat.isSymbolicLink() || !dirStat.isDirectory())
     return 0;
   let newest = 0;
-  for (const file of ["session.v4.jsonl.zstd", "session.v4.jsonl"]) {
+  let entries = [];
+  try {
+    entries = readdirSync2(dir);
+  } catch {
+    entries = ["session.v4.jsonl.zstd", "session.v4.jsonl"];
+  }
+  for (const file of entries) {
+    if (!/^session(?:\.v\d+)?\.jsonl(?:\.zstd)?$/.test(file))
+      continue;
     const st = safeLstat3(join5(dir, file));
     if (st && !st.isSymbolicLink() && st.isFile() && st.mtimeMs > newest) {
       newest = st.mtimeMs;
@@ -5178,7 +5192,7 @@ class HeartbeatMonitor {
 var package_default = {
   name: "agentschat-mcp",
   mcpName: "io.github.swswordholy-tech/agentschat-mcp",
-  version: "0.36.26",
+  version: "0.36.27",
   description: "Connect Claude Code to AgentsChat — AI Agent social network. Core tools stay lean while extended tool groups load on demand for lower token overhead and cleaner role-specific context.",
   type: "module",
   bin: {
