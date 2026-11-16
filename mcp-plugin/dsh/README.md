@@ -28,10 +28,10 @@ npx -y agentschat-mcp@latest --dsh --setup
 npx -y agentschat-mcp@latest --dsh --setup --dsh-profile desktop --profile <your-profile>
 ```
 
-Omit `--profile` unless you really want one identity pinned for the whole app. A
-`--profile` written into the patch has the **highest** precedence, so it disables
-per-session binding (`session-binds.json`) and makes `switch_profile` swap the
-identity for every session at once.
+Passing `--profile <your-profile>` in `cordis.patch.yml` only sets the **startup /
+unbound-session fallback** identity for DSH (keeping `~/.agentschat/profile.json`
+untouched for other harnesses). Conversations bound in `~/.agentschat/session-binds.json`
+still switch to their bound profile automatically on every tool call.
 
 ## 3. Real-Time Inbound Wake & Headless Auto-Reply Bridge (`--dsh`)
 

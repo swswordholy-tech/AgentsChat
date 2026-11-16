@@ -147,7 +147,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 // --- Config: CLI args > env vars > profile file > defaults ---
-import { readFileSync, existsSync, writeFileSync, mkdirSync, readdirSync } from "fs";
+import { readFileSync, existsSync, writeFileSync, mkdirSync, readdirSync, lstatSync } from "fs";
 import { homedir } from "os";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
@@ -540,10 +540,19 @@ const identity = decideIdentity({
 });
 
 function readIdentityProfile(file: string): any {
+  let isSymlinkOrNonFile = false;
   try {
-    return JSON.parse(readFileSync(file, "utf-8"));
+    const lst = lstatSync(file);
+    if (lst.isSymbolicLink() || !lst.isFile()) {
+      isSymlinkOrNonFile = true;
+    } else {
+      return JSON.parse(readFileSync(file, "utf-8"));
+    }
   } catch {
     throw new Error(`Cannot read identity profile at ${file}. Repair its JSON/permissions or select --profile <valid-name>.`);
+  }
+  if (isSymlinkOrNonFile) {
+    throw new Error(`Refusing to load symlinked or non-regular identity profile at ${file}. Select --profile <valid-name> directly instead.`);
   }
 }
 
@@ -582,34 +591,46 @@ if (identity.mode === "profile") {
         capabilities: cliArgs.caps?.split(",") ?? profile.capabilities,
       } : profile, profileFile, !hasToken);
     } catch (e) {
-      process.stderr.write(`[agentchat] ERROR: ${(e as Error).message}\n`);
-      process.exit(1);
+      if (profileSource === "default" && !hasToken && explicitAgentId === undefined && !codexIdentity && projectAgentId === undefined) {
+        anonymousMode = true;
+        activeProfileFile = null;
+        profile = {};
+        process.stderr.write(
+          `[agentchat] WARNING: ${(e as Error).message}\n` +
+            `  Starting in ANONYMOUS mode instead of exiting; select an identity via --profile <valid-name> or connect_profile.\n`,
+        );
+      } else {
+        process.stderr.write(`[agentchat] ERROR: ${(e as Error).message}\n`);
+        process.exit(1);
+      }
     }
-    const candidateAgentId = cliArgs.id ?? process.env.AGENTCHAT_AGENT_ID ?? profile?.agent_id ?? "";
-    const activeRuntimeSession: DetectedSession | null = (!isOneShotCli && !toolOnlyMode)
-      ? ensureRuntimeSession()
-      : runtimeSession;
-    const lockCheck = (!isOneShotCli && !toolOnlyMode && !hasToken && candidateAgentId && profile.token !== "dev-token")
-      ? checkAgentLock({
-          lockDir,
-          agentId: candidateAgentId,
-          currentSessionId: activeRuntimeSession?.sessionId ?? null,
-          lockOwnerPid,
-        })
-      : { locked: false };
-    if (lockCheck.locked) {
-      anonymousMode = true;
-      activeProfileFile = null;
-      profile = {};
-      process.stderr.write(
-        `[agentchat] Profile "${declaredName ?? profileNameFromPath(profileFile) ?? "profile"}" (${lockCheck.holder?.agentId}) is already in use by active process pid=${lockCheck.holder?.pid}` +
-          `${lockCheck.holder?.runtime ? ` (${lockCheck.holder.runtime})` : ""}` +
-          `${lockCheck.holder?.sessionId ? ` session=${lockCheck.holder.sessionId}` : ""}.\n` +
-          `  Starting in ANONYMOUS (disconnected) mode so this window does not collide with the active session.\n` +
-          `  Use connect_profile or switch_profile to connect an idle profile or register a new agent for this window.\n`,
-      );
-    } else {
-      process.stderr.write(`[agentchat] Profile loaded: ${profileFile}\n`);
+    if (!anonymousMode) {
+      const candidateAgentId = cliArgs.id ?? process.env.AGENTCHAT_AGENT_ID ?? profile?.agent_id ?? "";
+      const activeRuntimeSession: DetectedSession | null = (!isOneShotCli && !toolOnlyMode)
+        ? ensureRuntimeSession()
+        : runtimeSession;
+      const lockCheck = (!isOneShotCli && !toolOnlyMode && !hasToken && candidateAgentId && profile.token !== "dev-token")
+        ? checkAgentLock({
+            lockDir,
+            agentId: candidateAgentId,
+            currentSessionId: activeRuntimeSession?.sessionId ?? null,
+            lockOwnerPid,
+          })
+        : { locked: false };
+      if (lockCheck.locked) {
+        anonymousMode = true;
+        activeProfileFile = null;
+        profile = {};
+        process.stderr.write(
+          `[agentchat] Profile "${declaredName ?? profileNameFromPath(profileFile) ?? "profile"}" (${lockCheck.holder?.agentId}) is already in use by active process pid=${lockCheck.holder?.pid}` +
+            `${lockCheck.holder?.runtime ? ` (${lockCheck.holder.runtime})` : ""}` +
+            `${lockCheck.holder?.sessionId ? ` session=${lockCheck.holder.sessionId}` : ""}.\n` +
+            `  Starting in ANONYMOUS (disconnected) mode so this window does not collide with the active session.\n` +
+            `  Use connect_profile or switch_profile to connect an idle profile or register a new agent for this window.\n`,
+        );
+      } else {
+        process.stderr.write(`[agentchat] Profile loaded: ${profileFile}\n`);
+      }
     }
   }
 } else if (identity.mode === "env-creds") {
