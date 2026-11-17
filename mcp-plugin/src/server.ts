@@ -6199,8 +6199,33 @@ const handleToolCall = async (request: any): Promise<any> => {
         const r = await apiFetch(`${REST_URL}/api/account/${encodeURIComponent(AGENT_ID)}`, {
           headers: TOKEN ? {Authorization: `Bearer ${TOKEN}`} : {},
         });
-        authLine = r.ok ? "REST auth: ok" : `REST auth: failed (${r.status})`;
+        if (r.ok) {
+          authLine = "REST auth: ok";
+          try {
+            const acct = await r.json() as any;
+            if (typeof acct?.name === "string" && acct.name.trim()) {
+              onboarding.display_name = acct.name.trim();
+            }
+          } catch {}
+        } else {
+          authLine = `REST auth: failed (${r.status})`;
+        }
       } catch { authLine = "REST auth: unknown"; }
+    }
+    if (onboarding.display_name && onboarding.display_name !== profile.display_name) {
+      profile.display_name = onboarding.display_name;
+      if (activeSlot?.profile) activeSlot.profile.display_name = onboarding.display_name;
+      if (activeProfileFile && existsSync(activeProfileFile)) {
+        try { safeWriteProfile(activeProfileFile, profile); } catch {}
+      }
+    } else if (activeProfileFile && existsSync(activeProfileFile)) {
+      try {
+        const diskProf = readIdentityProfile(activeProfileFile);
+        if (typeof diskProf?.display_name === "string" && diskProf.display_name.trim() && diskProf.display_name !== profile.display_name) {
+          profile.display_name = diskProf.display_name.trim();
+          if (activeSlot?.profile) activeSlot.profile.display_name = profile.display_name;
+        }
+      } catch {}
     }
     // Identity guard: a whoami call IS the confirmation. Surface the gate state
     // prominently on this response, then trust the live identity and unblock writes.
@@ -7598,6 +7623,16 @@ function connectWS(slot: ProfileSlot | null = activeSlot) {
       if (activeSlot === slot) sessionId = data.session_id;
       slot!.wsReconnectAttempt = 0;
       slot!.heartbeat.receivedPong();
+      if (typeof data.display_name === "string" && data.display_name.trim() && data.display_name.trim() !== slot!.profile?.display_name) {
+        const cleanName = data.display_name.trim();
+        slot!.profile.display_name = cleanName;
+        if (activeSlot === slot) {
+          profile.display_name = cleanName;
+          if (activeProfileFile && existsSync(activeProfileFile)) {
+            try { safeWriteProfile(activeProfileFile, profile); } catch {}
+          }
+        }
+      }
       process.stderr.write(`[agentchat] Connected as ${slot!.agentId}\n`);
       if (slot!.backfillTimer) clearTimeout(slot!.backfillTimer);
       slot!.backfillTimer = setTimeout(() => {
@@ -7605,6 +7640,16 @@ function connectWS(slot: ProfileSlot | null = activeSlot) {
         if (!shuttingDown) void backfillAllChannels(slot!);
       }, 2000);
       (slot!.backfillTimer as any).unref?.();
+    } else if (data.type === "profile_updated" && data.agent_id === slot!.agentId && typeof data.display_name === "string" && data.display_name.trim()) {
+      const cleanName = data.display_name.trim();
+      slot!.profile.display_name = cleanName;
+      if (activeSlot === slot) {
+        profile.display_name = cleanName;
+        if (activeProfileFile && existsSync(activeProfileFile)) {
+          try { safeWriteProfile(activeProfileFile, profile); } catch {}
+        }
+      }
+      process.stderr.write(`[agentchat] Display name synced from server: ${cleanName}\n`);
     } else if ((data.type === "message" || data.type === "thread_reply") &&
       data.sender_id === slot!.agentId && typeof data.content === "string" && data.content !== "__typing__" &&
       !["loop_tick", "slash_input", "loop_status", "slash_response"].includes(data.meta?.kind)) {

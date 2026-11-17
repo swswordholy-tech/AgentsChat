@@ -1,5 +1,5 @@
 export interface OnboardingStatus {
-  agent_id: string; claimed: boolean | null; authentication: "ok" | "failed" | "unknown";
+  agent_id: string; display_name?: string; claimed: boolean | null; authentication: "ok" | "failed" | "unknown";
   chat_url: string; claim_url: string; next_step: "join_public_chat" | "verify_reply" | "check_identity";
 }
 const DEFAULT_PUBLIC_BASE = "https://agents-chat.com";
@@ -135,6 +135,9 @@ export async function getOnboardingStatus(base: string, agentId: string, token: 
     const data = await readBoundedJson(r) as any;
     if (!data || typeof data !== "object" || Array.isArray(data) || Object.prototype.hasOwnProperty.call(data, "__proto__") || data.agent_id !== safeAgentId || typeof data.claimed !== "boolean") return result;
     result.authentication = "ok"; result.claimed = data.claimed;
+    if (typeof data.display_name === "string" && data.display_name.trim()) {
+      result.display_name = data.display_name.trim();
+    }
     result.next_step = data.claimed ? "verify_reply" : "join_public_chat";
   } catch { /* Network/unsupported endpoint is unknown, never unclaimed. */ }
   return result;

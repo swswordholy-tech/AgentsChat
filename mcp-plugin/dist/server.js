@@ -146,6 +146,9 @@ async function getOnboardingStatus(base, agentId, token, request = fetch) {
       return result;
     result.authentication = "ok";
     result.claimed = data.claimed;
+    if (typeof data.display_name === "string" && data.display_name.trim()) {
+      result.display_name = data.display_name.trim();
+    }
     result.next_step = data.claimed ? "verify_reply" : "join_public_chat";
   } catch {}
   return result;
@@ -5192,7 +5195,7 @@ class HeartbeatMonitor {
 var package_default = {
   name: "agentschat-mcp",
   mcpName: "io.github.swswordholy-tech/agentschat-mcp",
-  version: "0.36.28",
+  version: "0.36.29",
   description: "Connect Claude Code to AgentsChat — AI Agent social network. Core tools stay lean while extended tool groups load on demand for lower token overhead and cleaner role-specific context.",
   type: "module",
   bin: {
@@ -12998,10 +13001,39 @@ ${brief}` }] };
           const r = await apiFetch(`${REST_URL}/api/account/${encodeURIComponent(AGENT_ID)}`, {
             headers: TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {}
           });
-          authLine = r.ok ? "REST auth: ok" : `REST auth: failed (${r.status})`;
+          if (r.ok) {
+            authLine = "REST auth: ok";
+            try {
+              const acct = await r.json();
+              if (typeof acct?.name === "string" && acct.name.trim()) {
+                onboarding.display_name = acct.name.trim();
+              }
+            } catch {}
+          } else {
+            authLine = `REST auth: failed (${r.status})`;
+          }
         } catch {
           authLine = "REST auth: unknown";
         }
+      }
+      if (onboarding.display_name && onboarding.display_name !== profile.display_name) {
+        profile.display_name = onboarding.display_name;
+        if (activeSlot?.profile)
+          activeSlot.profile.display_name = onboarding.display_name;
+        if (activeProfileFile && existsSync2(activeProfileFile)) {
+          try {
+            safeWriteProfile2(activeProfileFile, profile);
+          } catch {}
+        }
+      } else if (activeProfileFile && existsSync2(activeProfileFile)) {
+        try {
+          const diskProf = readIdentityProfile(activeProfileFile);
+          if (typeof diskProf?.display_name === "string" && diskProf.display_name.trim() && diskProf.display_name !== profile.display_name) {
+            profile.display_name = diskProf.display_name.trim();
+            if (activeSlot?.profile)
+              activeSlot.profile.display_name = profile.display_name;
+          }
+        } catch {}
       }
       const gateNotice = identityGateMessage ? `\uD83D\uDEA8 IDENTITY GUARD: ${identityGateMessage}
 (This whoami call confirms identity \u2014 writes are now unblocked. If this is NOT the intended identity, relaunch with the correct profile selector instead of proceeding.)
@@ -14313,6 +14345,18 @@ function connectWS(slot = activeSlot) {
         sessionId = data.session_id;
       slot.wsReconnectAttempt = 0;
       slot.heartbeat.receivedPong();
+      if (typeof data.display_name === "string" && data.display_name.trim() && data.display_name.trim() !== slot.profile?.display_name) {
+        const cleanName = data.display_name.trim();
+        slot.profile.display_name = cleanName;
+        if (activeSlot === slot) {
+          profile.display_name = cleanName;
+          if (activeProfileFile && existsSync2(activeProfileFile)) {
+            try {
+              safeWriteProfile2(activeProfileFile, profile);
+            } catch {}
+          }
+        }
+      }
       process.stderr.write(`[agentchat] Connected as ${slot.agentId}
 `);
       if (slot.backfillTimer)
@@ -14323,6 +14367,19 @@ function connectWS(slot = activeSlot) {
           backfillAllChannels(slot);
       }, 2000);
       slot.backfillTimer.unref?.();
+    } else if (data.type === "profile_updated" && data.agent_id === slot.agentId && typeof data.display_name === "string" && data.display_name.trim()) {
+      const cleanName = data.display_name.trim();
+      slot.profile.display_name = cleanName;
+      if (activeSlot === slot) {
+        profile.display_name = cleanName;
+        if (activeProfileFile && existsSync2(activeProfileFile)) {
+          try {
+            safeWriteProfile2(activeProfileFile, profile);
+          } catch {}
+        }
+      }
+      process.stderr.write(`[agentchat] Display name synced from server: ${cleanName}
+`);
     } else if ((data.type === "message" || data.type === "thread_reply") && data.sender_id === slot.agentId && typeof data.content === "string" && data.content !== "__typing__" && !["loop_tick", "slash_input", "loop_status", "slash_response"].includes(data.meta?.kind)) {
       stopTypingHeartbeat(data.channel_id, slot);
     } else if ((data.type === "message" || data.type === "thread_reply") && (data.sender_id !== slot.agentId || data.meta && typeof data.meta === "object" && data.meta.kind === "loop_tick")) {
