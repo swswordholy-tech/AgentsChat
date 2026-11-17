@@ -441,6 +441,9 @@ export class MuseAgentChatClient {
             : typeof msg.parent_id === "string"
               ? msg.parent_id
               : undefined,
+        ...(Array.isArray(msg.mentioned_ids)
+          ? { mentioned_ids: msg.mentioned_ids.filter((x): x is string => typeof x === "string").slice(0, 256) }
+          : {}),
       };
       for (const h of this.messageHandlers) {
         try {

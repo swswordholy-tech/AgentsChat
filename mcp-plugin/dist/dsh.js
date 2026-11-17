@@ -38,6 +38,9 @@ function shouldDispatch(message, opts) {
     return true;
   if (!opts.channelKind && typeof message.channel_id === "string" && /^dm[-:]/i.test(message.channel_id))
     return true;
+  if (Array.isArray(message.mentioned_ids) && Boolean(opts.agentId) && message.mentioned_ids.includes(opts.agentId)) {
+    return true;
+  }
   return isMentioned(message.content, opts.agentId, opts.displayName);
 }
 function truncateToBytes(text, maxBytes) {
@@ -996,7 +999,8 @@ class MuseAgentChatClient {
         content_type: msg.content_type ?? "text",
         timestamp: String(msg.timestamp ?? new Date().toISOString()),
         channel_type: msg.channel_type,
-        thread_id: typeof msg.thread_id === "string" ? msg.thread_id : typeof msg.parent_id === "string" ? msg.parent_id : undefined
+        thread_id: typeof msg.thread_id === "string" ? msg.thread_id : typeof msg.parent_id === "string" ? msg.parent_id : undefined,
+        ...Array.isArray(msg.mentioned_ids) ? { mentioned_ids: msg.mentioned_ids.filter((x) => typeof x === "string").slice(0, 256) } : {}
       };
       for (const h of this.messageHandlers) {
         try {

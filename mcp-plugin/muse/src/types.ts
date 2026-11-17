@@ -15,6 +15,7 @@ export interface ChatMessage {
   /** Present on inbound group messages the server tags as a DM/thread. */
   channel_type?: ChannelKind;
   thread_id?: string;
+  mentioned_ids?: string[];
 }
 
 export interface MuseAgentChatOptions {

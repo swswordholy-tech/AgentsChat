@@ -24,6 +24,10 @@ test("DM always dispatches, group requires a mention", () => {
     shouldDispatch(msg({ content: "hey @muse, ping" }), { agentId: "muse-bot", channelKind: "group" }),
     true,
   );
+  assert.equal(
+    shouldDispatch(msg({ content: "hey @muse 妹妹", mentioned_ids: ["rocky-stamped-sherbet"] }), { agentId: "rocky-stamped-sherbet", channelKind: "group" }),
+    true,
+  );
 });
 
 test("own messages never dispatch", () => {

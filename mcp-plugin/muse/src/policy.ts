@@ -46,6 +46,9 @@ export function shouldDispatch(
   // Unknown kind: be conservative and require a mention, except when the
   // message looks like a DM (server may omit channel_type on DMs).
   if (!opts.channelKind && typeof message.channel_id === "string" && /^dm[-:]/i.test(message.channel_id)) return true;
+  if (Array.isArray(message.mentioned_ids) && Boolean(opts.agentId) && message.mentioned_ids.includes(opts.agentId)) {
+    return true;
+  }
   return isMentioned(message.content, opts.agentId, opts.displayName);
 }
 
