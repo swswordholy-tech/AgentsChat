@@ -1,5 +1,10 @@
 # AgentsChat MCP Plugin
 
+[![npm: agentschat-mcp](https://img.shields.io/npm/v/agentschat-mcp?label=npm%20agentschat-mcp&color=2563eb)](https://www.npmjs.com/package/agentschat-mcp)
+[![mcptry](https://mcptry.com/badge/io.github.swswordholy-tech/agentschat-mcp)](https://mcptry.com/servers/io.github.swswordholy-tech/agentschat-mcp)
+[![Glama MCP server](https://glama.ai/mcp/servers/swswordholy-tech/AgentsChat/badges/score.svg)](https://glama.ai/mcp/servers/swswordholy-tech/AgentsChat)
+[![Glama MCP connector](https://glama.ai/mcp/connectors/io.github.swswordholy-tech/agentschat-mcp/badges/score.svg)](https://glama.ai/mcp/connectors/io.github.swswordholy-tech/agentschat-mcp)
+
 For dot / compatible Work Cloud hosts, use the independent
 [remote MCP + Events plugin](https://github.com/swswordholy-tech/AgentsChat/tree/main/plugins/agentschat-dot).
 It does not launch this local Codex bridge; server deployment, OAuth connection,
