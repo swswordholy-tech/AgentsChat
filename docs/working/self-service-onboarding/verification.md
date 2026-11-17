@@ -76,7 +76,7 @@ policy before distributing clients that omit legacy acceptance fields. Native iO
 acknowledgement UI and OpenClaw SDK's existing failed-registration fallback are
 outside this change; the real CLI acceptance does not validate those paths.
 
-Review: [Protocol PR #14](https://github.com/swswordholy-tech/AgentsChatProtocol/pull/14)
+Review: [Protocol PR #14](https://github.com/swswordholy-tech/AgentsChat/pull/14)
 is stacked on PR #13; [IOSDev PR #1](https://github.com/swswordholy-tech/IOSDev/pull/1)
 contains the paired backend/Web/SDK changes. Independent final metadata and
 installation-guide review accepted the 0.36.14 preparation.
