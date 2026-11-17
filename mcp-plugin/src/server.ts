@@ -7642,7 +7642,11 @@ function connectWS(slot: ProfileSlot | null = activeSlot) {
       }
 
       const isDM = data.channel_id?.startsWith("dm-");
-      const isMentioned = matchesMention(data.content || "", slot!.agentId || "");
+      const slotDisplayName = typeof slot!.profile?.display_name === "string" ? slot!.profile.display_name.trim() : "";
+      const isMentioned =
+        matchesMention(data.content || "", slot!.agentId || "") ||
+        (Boolean(slotDisplayName) && slotDisplayName !== slot!.agentId && matchesMention(data.content || "", slotDisplayName)) ||
+        (Array.isArray(data.mentioned_ids) && Boolean(slot!.agentId) && data.mentioned_ids.includes(slot!.agentId));
       const activeHi = activeHiddenIdentityForChannel(data.channel_id);
       const isOwnLoopTick = metaKind === "loop_tick" && data.sender_id === slot!.agentId;
 
