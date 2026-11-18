@@ -3984,15 +3984,34 @@ function disconnectCurrentProfile(opts?: { keepBinding?: boolean }): { prevAgent
   return { prevAgentId, prevProfileName };
 }
 
+function findProfileFileByDisplayNameOrAgentId(query: string): { name: string; path: string; displayName?: string; agentId?: string } | null {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return null;
+  for (const entry of listProfileFiles()) {
+    if (entry.name.toLowerCase() === "profile") continue;
+    try {
+      const parsed = JSON.parse(readFileSync(entry.path, "utf-8"));
+      const dName = typeof parsed?.display_name === "string" ? parsed.display_name.trim() : "";
+      const aId = typeof parsed?.agent_id === "string" ? parsed.agent_id.trim() : "";
+      if ((dName && dName.toLowerCase() === needle) || (aId && aId.toLowerCase() === needle)) {
+        return { name: entry.name, path: entry.path, displayName: dName || undefined, agentId: aId || undefined };
+      }
+    } catch {}
+  }
+  return null;
+}
+
 function formatProfileList(): string {
   const profileEntries = listProfileFiles();
   const current = AGENT_ID;
   const currentProfileName = profileNameFromPath(activeProfileFile);
   const lines = profileEntries.map((entry) => {
     let entryAgentId = "";
+    let entryDisplayName = "";
     try {
       const parsed = JSON.parse(readFileSync(entry.path, "utf-8"));
       if (typeof parsed?.agent_id === "string") entryAgentId = parsed.agent_id;
+      if (typeof parsed?.display_name === "string") entryDisplayName = parsed.display_name.trim();
     } catch {}
     const isCurrent = (current && (entry.name === current || entryAgentId === current)) || (currentProfileName && entry.name === currentProfileName);
     const lock = entryAgentId
@@ -4002,6 +4021,12 @@ function formatProfileList(): string {
     const boundSid = findBoundSessionForProfile(configDir, entry.name);
     const dupCollision =
       entry.name.toLowerCase() === "profile" ? findDefaultProfileCollision(configDir, entry.path) : null;
+    const aliasHint =
+      entryDisplayName && entryDisplayName.toLowerCase() !== entry.name.toLowerCase()
+        ? ` (display_name: ${entryDisplayName}${entryAgentId ? `, id: ${entryAgentId}` : ""})`
+        : entryAgentId && entryAgentId.toLowerCase() !== entry.name.toLowerCase()
+          ? ` (id: ${entryAgentId})`
+          : "";
     const statusSuffix = dupCollision
       ? ` [duplicate of ${dupCollision.collidingName} — disallowed; delete profile.json]`
       : lock.locked
@@ -4009,7 +4034,7 @@ function formatProfileList(): string {
         : slot && slot.ws?.readyState === WebSocket.OPEN
           ? ` [online${boundSid ? ` session=${boundSid}` : ""}]`
           : "";
-    return `${isCurrent ? "→ " : "  "}${entry.name}${statusSuffix}`;
+    return `${isCurrent ? "→ " : "  "}${entry.name}${aliasHint}${statusSuffix}`;
   });
   return `Current: ${current || "(anonymous / disconnected)"}\nAvailable profiles:\n${lines.join("\n")}`;
 }
@@ -4058,6 +4083,16 @@ async function registerAndConnectProfile(
       content: [{
         type: "text",
         text: `Error: Profile "${cleanName}" already exists at ${existingTargetFile}. Pass profile_name="${cleanName}" to connect to it, or choose a different register_name.`,
+      }],
+      isError: true,
+    };
+  }
+  const existingMetaMatch = findProfileFileByDisplayNameOrAgentId(cleanName);
+  if (existingMetaMatch) {
+    return {
+      content: [{
+        type: "text",
+        text: `Error: Profile "${existingMetaMatch.name}" (${existingMetaMatch.path}) already uses display_name/agent_id "${cleanName}". Pass profile_name="${existingMetaMatch.name}" (or "${cleanName}") to connect to it, or choose a different register_name.`,
       }],
       isError: true,
     };
@@ -4208,19 +4243,24 @@ async function handleProfileSwitchOrConnect(args: any): Promise<{ content: any[]
     return { content: [{ type: "text", text: switchGate.message }], isError: true };
   }
 
-  const targetFile = nameToPath(profile_name);
+  let targetFile = nameToPath(profile_name);
   if (!existsSync(targetFile)) {
-    if (register) {
-      return await registerAndConnectProfile(profile_name, explicitSessionId);
+    const metaMatch = findProfileFileByDisplayNameOrAgentId(profile_name);
+    if (metaMatch && existsSync(metaMatch.path)) {
+      targetFile = metaMatch.path;
+    } else {
+      if (register) {
+        return await registerAndConnectProfile(profile_name, explicitSessionId);
+      }
+      const available = listProfileFiles().map((entry) => entry.name);
+      return {
+        content: [{
+          type: "text",
+          text: `Profile "${profile_name}" not found. Available: ${available.join(", ")} (or pass register_name="${profile_name}" / register=true to create a new agent)`,
+        }],
+        isError: true,
+      };
     }
-    const available = listProfileFiles().map((entry) => entry.name);
-    return {
-      content: [{
-        type: "text",
-        text: `Profile "${profile_name}" not found. Available: ${available.join(", ")} (or pass register_name="${profile_name}" / register=true to create a new agent)`,
-      }],
-      isError: true,
-    };
   }
 
   if (profileNameFromPath(targetFile)?.toLowerCase() === "profile") {
