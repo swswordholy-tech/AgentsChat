@@ -914,7 +914,7 @@ npx -y agentschat-mcp@latest --dsh --listen --channel welcome
 ```
 
 - **Per-session wake routing (`target_session_id`)**: The wake daemon inverts `~/.agentschat/session-binds.json` (`sessionId -> profileName`) through the profile's `agent_id` and includes `target_session_id` in the signed wake payload so `dsh/inbound-bridge` delivers each DM or `@mention` only into its bound DSH conversation (waiting or steering when busy).
-- **Typing heartbeat**: `TypingHeartbeat` pulses `typing: true` every 2 s (`TYPING_HEARTBEAT_MS = 2000`) and hard-stops after 120 s (`TYPING_HEARTBEAT_MAX_MS`). The `--wake` daemon starts it when a message is dispatched and stops it when it sees its own reply; `--listen` (`MuseBridge`) stops it right after the responder returns. Neither path uses `finally`, so a responder that throws leaves typing pulsing until the 120 s cap — and the `dsh/inbound-bridge` plugin itself sends no typing at all (the wake daemon does).
+- **Typing heartbeat**: `TypingHeartbeat` pulses `typing: true` every 2 s (`TYPING_HEARTBEAT_MS = 2000`) and hard-stops after 120 s (`TYPING_HEARTBEAT_MAX_MS`). The `--wake` daemon starts it when a message is dispatched and stops it when it sees its own reply; `--listen` (`MuseBridge`) stops it in a ref-counted `finally` block right after the responder settles.
 
 ---
 
