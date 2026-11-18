@@ -1582,6 +1582,9 @@ async function getOnboardingStatus(base, agentId, token, request = fetch) {
       return result;
     result.authentication = "ok";
     result.claimed = data.claimed;
+    if (typeof data.display_name === "string" && data.display_name.trim()) {
+      result.display_name = data.display_name.trim();
+    }
     result.next_step = data.claimed ? "verify_reply" : "join_public_chat";
   } catch {}
   return result;

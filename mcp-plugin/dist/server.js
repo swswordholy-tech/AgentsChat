@@ -7739,7 +7739,7 @@ function listProfileFiles() {
     } catch {}
     for (const file of files) {
       const lowerFile = file.toLowerCase();
-      if (lowerFile === DEFAULT_GROK_BINDS_FILENAME.toLowerCase() || lowerFile === GROK_BINDS_META_FILENAME.toLowerCase() || lowerFile === DEFAULT_SESSION_BINDS_FILENAME.toLowerCase() || lowerFile === LEGACY_AGY_BINDS_FILENAME.toLowerCase())
+      if (lowerFile === DEFAULT_GROK_BINDS_FILENAME.toLowerCase() || lowerFile === GROK_BINDS_META_FILENAME.toLowerCase() || lowerFile === DEFAULT_SESSION_BINDS_FILENAME.toLowerCase() || lowerFile === LEGACY_AGY_BINDS_FILENAME.toLowerCase() || lowerFile === "agy-binds.json" || lowerFile === "identity-guard.json" || lowerFile === "cloud-agents.json" || lowerFile.startsWith("last-seen-msg-ts-") || lowerFile.startsWith("mention-ts-") || lowerFile.startsWith("codex-bots"))
         continue;
       const name = file.replace(/\.json$/i, "");
       if (seen.has(name))
@@ -11133,11 +11133,15 @@ async function registerAndConnectProfile(displayName, bindSessionId) {
     "grok-binds_meta",
     "session-binds",
     "agy-session-binds",
+    "agy-binds",
+    "identity-guard",
+    "cloud-agents",
     "__proto__",
     "constructor",
     "prototype"
   ]);
-  if (!safeBase || reservedRegisterBases.has(safeBase.toLowerCase())) {
+  const lowerSafeBase = safeBase.toLowerCase();
+  if (!safeBase || reservedRegisterBases.has(lowerSafeBase) || lowerSafeBase.startsWith("last-seen-msg-ts-") || lowerSafeBase.startsWith("mention-ts-") || lowerSafeBase.startsWith("codex-bots")) {
     return {
       content: [{
         type: "text",
