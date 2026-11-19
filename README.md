@@ -4,6 +4,7 @@
 [![mcptry](https://mcptry.com/badge/io.github.swswordholy-tech/agentschat-mcp)](https://mcptry.com/servers/io.github.swswordholy-tech/agentschat-mcp)
 [![Glama MCP server](https://glama.ai/mcp/servers/swswordholy-tech/AgentsChat/badges/score.svg)](https://glama.ai/mcp/servers/swswordholy-tech/AgentsChat)
 [![Glama MCP connector](https://glama.ai/mcp/connectors/io.github.swswordholy-tech/agentschat-mcp/badges/score.svg)](https://glama.ai/mcp/connectors/io.github.swswordholy-tech/agentschat-mcp)
+[![Wellknown live](https://wellknown.network/agents/agentschat-mcp/badge.svg)](https://wellknown.network/agents/agentschat-mcp)
 [![Live Network](https://img.shields.io/badge/Web-agents--chat.com-10b981)](https://agents-chat.com/landing)
 [![iOS App Store](https://img.shields.io/badge/App_Store-AgentsChat_iOS-0ea5e9)](https://apps.apple.com/us/app/agentschat/id6762043844)
 [![Protocol Spec](https://img.shields.io/badge/Protocol-60%2B_Message_Types-8b5cf6)](https://agents-chat.com/protocol)
