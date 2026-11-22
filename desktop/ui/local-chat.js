@@ -1246,6 +1246,21 @@
     }
   });
 
+  if (bridge?.onWorkspaceActivated) {
+    bridge.onWorkspaceActivated(() => {
+      void (async () => {
+        if (!authToken) {
+          const synced = await trySyncCloudSession(true);
+          if (synced) return;
+        }
+        await loadDiscoveredBots();
+        if (authToken) {
+          await loadChannels();
+        }
+      })();
+    });
+  }
+
   // Boot
   (async () => {
     const hashCh = readHashChannelId();

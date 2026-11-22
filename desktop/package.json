@@ -54,7 +54,9 @@
     },
     "mac": {
       "icon": "assets/icon.icns",
+      "hardenedRuntime": false,
       "category": "public.app-category.developer-tools",
+      "artifactName": "AgentsChat-${version}-mac-${arch}.${ext}",
       "target": [
         {
           "target": "dmg",
@@ -71,6 +73,9 @@
           ]
         }
       ]
+    },
+    "dmg": {
+      "title": "AgentsChat Desktop"
     },
     "win": {
       "icon": "assets/icon.ico",
@@ -91,8 +96,15 @@
       ]
     },
     "nsis": {
+      "artifactName": "AgentsChat-${version}-win-${arch}-setup.${ext}",
       "oneClick": false,
-      "allowToChangeInstallationDirectory": true
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "AgentsChat"
+    },
+    "portable": {
+      "artifactName": "AgentsChat-${version}-win-${arch}-portable.${ext}"
     }
   }
 }

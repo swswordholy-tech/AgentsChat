@@ -212,6 +212,8 @@ async function switchWorkspace(target: "cloud" | "local"): Promise<void> {
       const currentUrl = localView.webContents.getURL();
       if (!currentUrl.startsWith(st.httpUrl)) {
         await localView.webContents.loadURL(st.httpUrl);
+      } else {
+        localView.webContents.send("desktop:workspace-activated");
       }
     }
   }

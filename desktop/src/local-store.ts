@@ -136,6 +136,9 @@ export class LocalStore {
   }
 
   close(): void {
+    try {
+      this.db.exec("PRAGMA wal_checkpoint(TRUNCATE);");
+    } catch {}
     this.db.close();
   }
 

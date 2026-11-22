@@ -12,4 +12,9 @@ contextBridge.exposeInMainWorld("agentschatLocalBridge", {
   activateDiscoveredProfile: (profileName) => ipcRenderer.invoke("desktop:activate-local-profile", profileName),
   switchToCloud: (targetPath) => ipcRenderer.invoke("desktop:open-cloud-path", targetPath || "/"),
   copyText: (text) => ipcRenderer.invoke("desktop:copy-text", text),
+  onWorkspaceActivated: (cb) => {
+    const handler = () => cb();
+    ipcRenderer.on("desktop:workspace-activated", handler);
+    return () => ipcRenderer.removeListener("desktop:workspace-activated", handler);
+  },
 });
