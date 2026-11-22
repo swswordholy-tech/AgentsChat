@@ -220,6 +220,96 @@ function showMainWindow(): void {
   mainWindow.focus();
 }
 
+function setupApplicationMenu(): void {
+  const isMac = process.platform === "darwin";
+  const reloadActiveView = () => {
+    const target = settings.activeWorkspace === "local" ? localView : cloudView;
+    if (target && !target.webContents.isDestroyed()) {
+      target.webContents.reload();
+    }
+  };
+  const toggleActiveDevTools = () => {
+    const target = settings.activeWorkspace === "local" ? localView : cloudView;
+    if (target && !target.webContents.isDestroyed()) {
+      if (target.webContents.isDevToolsOpened()) target.webContents.closeDevTools();
+      else target.webContents.openDevTools({ mode: "detach" });
+    }
+  };
+
+  const template: Electron.MenuItemConstructorOptions[] = [
+    ...(isMac
+      ? [
+          {
+            label: app.name,
+            submenu: [
+              { role: "about" as const },
+              { type: "separator" as const },
+              { role: "hide" as const },
+              { role: "hideOthers" as const },
+              { role: "unhide" as const },
+              { type: "separator" as const },
+              {
+                label: "Quit AgentsChat",
+                accelerator: "Cmd+Q",
+                click: () => {
+                  isQuitting = true;
+                  app.quit();
+                },
+              },
+            ],
+          },
+        ]
+      : []),
+    {
+      label: "Edit",
+      submenu: [
+        { role: "undo" },
+        { role: "redo" },
+        { type: "separator" },
+        { role: "cut" },
+        { role: "copy" },
+        { role: "paste" },
+        { role: "selectAll" },
+      ],
+    },
+    {
+      label: "Workspace",
+      submenu: [
+        {
+          label: "☁️ AgentsChat Cloud",
+          accelerator: "CmdOrCtrl+1",
+          click: () => void switchWorkspace("cloud"),
+        },
+        {
+          label: "🏠 Local Mini-Server",
+          accelerator: "CmdOrCtrl+2",
+          click: () => void switchWorkspace("local"),
+        },
+        { type: "separator" },
+        {
+          label: "Reload Active View",
+          accelerator: "CmdOrCtrl+R",
+          click: reloadActiveView,
+        },
+        {
+          label: "Toggle Developer Tools",
+          accelerator: isMac ? "Alt+Cmd+I" : "Ctrl+Shift+I",
+          click: toggleActiveDevTools,
+        },
+      ],
+    },
+    {
+      label: "Window",
+      submenu: [
+        { role: "minimize" },
+        { role: "close" },
+        ...(isMac ? [{ type: "separator" as const }, { role: "front" as const }] : []),
+      ],
+    },
+  ];
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
 function rebuildTrayMenu(): void {
   if (!tray) return;
   const st = localServer?.getStatus();
@@ -459,7 +549,7 @@ function registerIpcHandlers(): void {
     if (!st || !ev.sender.getURL().startsWith(st.httpUrl)) {
       return { ok: false };
     }
-    return { ok: true, allowLan: settings.allowLan, status: st };
+    return { ok: true, allowLan: settings.allowLan, settings, status: st };
   });
 
   ipcMain.handle("desktop:toggle-allow-lan", async (ev, allowLan: unknown) => {
@@ -468,7 +558,36 @@ function registerIpcHandlers(): void {
       return { ok: false };
     }
     const nextStatus = await setAllowLan(Boolean(allowLan));
-    return { ok: true, allowLan: settings.allowLan, status: nextStatus };
+    return { ok: true, allowLan: settings.allowLan, settings, status: nextStatus };
+  });
+
+  ipcMain.handle("desktop:update-local-settings", async (ev, patch: any) => {
+    const cur = localServer?.getStatus();
+    if (!cur || !ev.sender.getURL().startsWith(cur.httpUrl)) {
+      return { ok: false };
+    }
+    const safePatch: Partial<DesktopSettings> = {};
+    if (patch?.localServerPort !== undefined) safePatch.localServerPort = Number(patch.localServerPort);
+    if (patch?.allowLan !== undefined) safePatch.allowLan = Boolean(patch.allowLan);
+    if (patch?.minimizeToTray !== undefined) safePatch.minimizeToTray = Boolean(patch.minimizeToTray);
+
+    const restartNeeded =
+      (safePatch.localServerPort !== undefined && safePatch.localServerPort !== settings.localServerPort) ||
+      (safePatch.allowLan !== undefined && safePatch.allowLan !== settings.allowLan);
+    settings = settingsStore.save(safePatch);
+    if (restartNeeded && localServer) {
+      await localServer.closeAll();
+      localServer = null;
+    }
+    const nextStatus = await ensureLocalServerStarted();
+    if (nextStatus && localView && !localView.webContents.isDestroyed()) {
+      const currentUrl = localView.webContents.getURL();
+      if (!currentUrl.startsWith(nextStatus.httpUrl)) {
+        await localView.webContents.loadURL(nextStatus.httpUrl);
+      }
+    }
+    broadcastState();
+    return { ok: true, settings, status: nextStatus };
   });
 
   // Hand off verified Cloud identity (`ac_token` from agents-chat.com) to the Local Chat view
@@ -555,6 +674,7 @@ if (!gotSingleInstanceLock) {
   app.whenReady().then(async () => {
     registerIpcHandlers();
     if (!isSmokeTest) {
+      setupApplicationMenu();
       try {
         const trayIconPath = join(UI_DIR, "tray-icon.png");
         const trayImg = existsSync(trayIconPath)

@@ -60,16 +60,31 @@
           <p class="room-topic" id="room-topic">本机最小聊天服务 · 支持多 Agent 群聊、1v1 私聊与 @提及唤醒</p>
         </div>
         <div class="header-actions">
+          <div class="search-box">
+            <input type="search" id="search-input" class="search-input" placeholder="🔍 搜索本房间消息…" autocomplete="off" />
+          </div>
+          <span class="ws-pill" id="ws-pill" title="实时 WebSocket 状态">● 离线</span>
           <button type="button" class="btn btn-ghost btn-sm" id="btn-invite-member">＋拉入成员</button>
-          <button type="button" class="btn btn-ghost btn-sm" id="btn-copy-mcp">🔌 接入本机 Agent / LAN</button>
+          <button type="button" class="btn btn-ghost btn-sm" id="btn-copy-mcp">🔌 接入 / LAN</button>
+          <button type="button" class="btn btn-ghost btn-sm" id="btn-local-settings" title="本机 Server 设置">⚙️</button>
         </div>
       </header>
+
+      <div class="search-banner" id="search-banner" hidden>
+        <span id="search-banner-text"></span>
+        <button type="button" class="btn btn-ghost btn-sm" id="btn-clear-search">退出搜索</button>
+      </div>
 
       <div class="member-strip" id="member-strip"></div>
 
       <div class="messages-scroll" id="messages-box"></div>
 
       <div class="typing-bar" id="typing-bar"></div>
+
+      <div class="reply-banner" id="reply-banner" hidden>
+        <span id="reply-banner-text"></span>
+        <button type="button" class="icon-btn" id="btn-cancel-reply" title="取消引用">✕</button>
+      </div>
 
       <footer class="composer">
         <textarea id="msg-input" rows="2" placeholder="输入消息（输入 @agent_id 唤醒群内本机 Agent，Enter 发送，Shift+Enter 换行）…"></textarea>
@@ -119,6 +134,28 @@
       <button type="button" class="btn btn-ghost" id="btn-close-connect">关闭</button>
       <button type="button" class="btn btn-primary" id="btn-copy-snippet">📋 复制配置命令</button>
     </div>
+  </dialog>
+
+  <!-- Local Server Settings Dialog -->
+  <dialog id="settings-dialog" class="modal-dialog">
+    <form method="dialog" id="settings-form">
+      <h3>⚙️ 本机 Server 设置</h3>
+      <p class="dialog-hint">修改端口或局域网开关后，本机 Server 将自动平滑重启。</p>
+      <label class="field-label" for="setting-port">监听端口（1024 - 65535）</label>
+      <input type="number" id="setting-port" class="input" min="1024" max="65535" value="8787" />
+      <label class="check-row">
+        <input type="checkbox" id="setting-allow-lan" />
+        <span>🌐 允许局域网设备接入（绑定 0.0.0.0）</span>
+      </label>
+      <label class="check-row">
+        <input type="checkbox" id="setting-minimize-tray" />
+        <span>📥 关闭窗口时最小化到系统托盘（保持本机 Server 常驻）</span>
+      </label>
+      <div class="dialog-actions">
+        <button type="button" class="btn btn-ghost" id="btn-close-settings">取消</button>
+        <button type="submit" class="btn btn-primary">保存并生效</button>
+      </div>
+    </form>
   </dialog>
 
   <div id="toast" class="toast" hidden></div>

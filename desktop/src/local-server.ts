@@ -428,6 +428,25 @@ export class LocalMiniServer {
       return;
     }
 
+    // 5b. Full-text Message Search (scoped strictly to channels readable by the authenticated principal)
+    if (pathname === "/api/search" && method === "GET") {
+      const principal = await this.authority.verifyToken(extractBearerToken(req));
+      if (!principal) {
+        sendJson(res, 401, { error: "Unauthorized" });
+        return;
+      }
+      const q = (url.searchParams.get("q") || "").trim();
+      if (!q) {
+        sendJson(res, 400, { error: "Query parameter 'q' is required" });
+        return;
+      }
+      const channelId = url.searchParams.get("channel_id")?.trim() || undefined;
+      const limit = Number(url.searchParams.get("limit") || 20);
+      const messages = this.store.searchMessages(principal.id, q, { channelId, limit });
+      sendJson(res, 200, { query: q, total: messages.length, messages });
+      return;
+    }
+
     // 6. Channels List / Mine / Create
     if ((pathname === "/api/channels" || pathname === "/api/channels/mine") && method === "GET") {
       const token = extractBearerToken(req);

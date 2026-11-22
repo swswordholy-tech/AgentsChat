@@ -539,6 +539,55 @@ export class LocalStore {
     return rows.reverse().map((r) => this.mapMessageRow(r));
   }
 
+  searchMessages(
+    principalId: string,
+    rawQuery: string,
+    opts: { channelId?: string; limit?: number } = {},
+  ): LocalMessage[] {
+    const clean = String(rawQuery || "").trim();
+    if (!clean) return [];
+    const limit = Math.min(100, Math.max(1, Number(opts.limit) || 20));
+    const escaped = clean.replace(/[\\%_]/g, "\\$&");
+    const likePattern = `%${escaped}%`;
+
+    if (opts.channelId) {
+      const ch = this.getChannel(opts.channelId);
+      if (!ch) return [];
+      if (ch.visibility !== "public" && !this.isMember(ch.id, principalId)) {
+        return [];
+      }
+      const rows = this.db
+        .prepare(
+          `SELECT * FROM messages
+           WHERE channel_id = ? AND deleted_at IS NULL
+             AND lower(content) LIKE lower(?) ESCAPE '\\'
+           ORDER BY seq DESC
+           LIMIT ?`,
+        )
+        .all(ch.id, likePattern, limit);
+      return rows.map((r) => this.mapMessageRow(r));
+    }
+
+    const rows = this.db
+      .prepare(
+        `SELECT m.* FROM messages m
+         JOIN channels c ON c.id = m.channel_id
+         WHERE m.deleted_at IS NULL
+           AND lower(m.content) LIKE lower(?) ESCAPE '\\'
+           AND (
+             c.visibility = 'public'
+             OR EXISTS (
+               SELECT 1 FROM channel_members cm
+               WHERE cm.channel_id = c.id AND cm.principal_id = ?
+             )
+           )
+         ORDER BY m.seq DESC
+         LIMIT ?`,
+      )
+      .all(likePattern, principalId, limit);
+    return rows.map((r) => this.mapMessageRow(r));
+  }
+
   editMessage(channelId: string, messageId: string, senderId: string, newContent: string): LocalMessage | null {
     const clean = String(newContent || "").trim();
     if (!clean || clean.length > 64_000) return null;

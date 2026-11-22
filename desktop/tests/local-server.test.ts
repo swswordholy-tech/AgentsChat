@@ -417,4 +417,103 @@ describe("AgentsChat Desktop M1 — Global Identity Authority + Local Group/DM M
       rmSync(tempHome, { recursive: true, force: true });
     }
   }, 20_000);
+
+  test("supports scoped /api/search with SQLite wildcard escaping, private room isolation, and in_reply_to quote replies", async () => {
+    const mockCloud = await startMockCloudUpstream();
+    const local = new LocalMiniServer({
+      port: 0,
+      dbPath: ":memory:",
+      upstreamUrl: mockCloud.url,
+      allowLoopbackHttpUpstream: true,
+    });
+    const status = await local.start();
+    try {
+      // Seed public welcome message + quote reply
+      const pubMsg1 = await fetch(`${status.httpUrl}/api/channels/welcome/messages`, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer ac_cloud_claude_secret",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ content: "Deploy 100% passed on macOS_arm64" }),
+      });
+      expect(pubMsg1.status).toBe(201);
+      const pub1Body = (await pubMsg1.json()) as any;
+      const parentId = pub1Body.message.id;
+
+      const pubMsg2 = await fetch(`${status.httpUrl}/api/channels/welcome/messages`, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer ac_cloud_codex_secret",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ content: "Verified quote reply!", in_reply_to: parentId }),
+      });
+      expect(pubMsg2.status).toBe(201);
+      const pub2Body = (await pubMsg2.json()) as any;
+      expect(pub2Body.message.in_reply_to).toBe(parentId);
+
+      // Boss creates a private room with secret keyword (Codex is NOT a member)
+      const privRes = await fetch(`${status.httpUrl}/api/channels`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${mockCloud.validHumanJwt}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          name: "Secret Strategy Room",
+          type: "group",
+          visibility: "private",
+          members: ["cloud-claude-global"],
+        }),
+      });
+      expect(privRes.status).toBe(201);
+      const privId = ((await privRes.json()) as any).channel.id;
+
+      await fetch(`${status.httpUrl}/api/channels/${privId}/messages`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${mockCloud.validHumanJwt}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ content: "TopSecretLaunchCode42" }),
+      });
+
+      // Wildcard `%` must match literally ("100%"), NOT match every message
+      const pctSearch = (await (
+        await fetch(`${status.httpUrl}/api/search?q=${encodeURIComponent("100%")}`, {
+          headers: { Authorization: "Bearer ac_cloud_codex_secret" },
+        })
+      ).json()) as any;
+      expect(pctSearch.total).toBe(1);
+      expect(pctSearch.messages[0].id).toBe(parentId);
+
+      // Outsider (Codex) searching for private-room secret must get 0 hits (global & targeted)
+      const outsiderGlobal = (await (
+        await fetch(`${status.httpUrl}/api/search?q=TopSecretLaunchCode42`, {
+          headers: { Authorization: "Bearer ac_cloud_codex_secret" },
+        })
+      ).json()) as any;
+      expect(outsiderGlobal.total).toBe(0);
+
+      const outsiderDirect = (await (
+        await fetch(`${status.httpUrl}/api/search?q=TopSecretLaunchCode42&channel_id=${privId}`, {
+          headers: { Authorization: "Bearer ac_cloud_codex_secret" },
+        })
+      ).json()) as any;
+      expect(outsiderDirect.total).toBe(0);
+
+      // Member (Claude) searching for private-room secret finds it
+      const memberSearch = (await (
+        await fetch(`${status.httpUrl}/api/search?q=topsecretlaunchcode42`, {
+          headers: { Authorization: "Bearer ac_cloud_claude_secret" },
+        })
+      ).json()) as any;
+      expect(memberSearch.total).toBe(1);
+      expect(memberSearch.messages[0].channel_id).toBe(privId);
+    } finally {
+      await local.closeAll();
+      await mockCloud.close();
+    }
+  });
 });

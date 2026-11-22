@@ -11,7 +11,11 @@
   let currentChannelId = "welcome";
   let currentMembers = [];
   let messages = [];
+  let activeSearchQuery = "";
+  let replyTarget = null;
   let ws = null;
+  let wsReconnectDelayMs = 1000;
+  let wsReconnectTimer = null;
 
   const elServerPill = document.getElementById("server-url-pill");
   const elAuthDot = document.getElementById("auth-dot");
@@ -26,6 +30,12 @@
   const elTyping = document.getElementById("typing-bar");
   const elInput = document.getElementById("msg-input");
   const elToast = document.getElementById("toast");
+  const elWsPill = document.getElementById("ws-pill");
+  const elSearchInput = document.getElementById("search-input");
+  const elSearchBanner = document.getElementById("search-banner");
+  const elSearchBannerText = document.getElementById("search-banner-text");
+  const elReplyBanner = document.getElementById("reply-banner");
+  const elReplyBannerText = document.getElementById("reply-banner-text");
 
   elServerPill.textContent = originUrl;
 
@@ -97,35 +107,92 @@
     }
   }
 
-  function connectRealtimeWs() {
-    if (!authToken) return;
-    if (ws) {
-      try { ws.close(); } catch {}
+  function setWsPillState(state) {
+    if (!elWsPill) return;
+    elWsPill.classList.remove("live", "reconnecting");
+    if (state === "live") {
+      elWsPill.classList.add("live");
+      elWsPill.textContent = "● 实时已连";
+    } else if (state === "reconnecting") {
+      elWsPill.classList.add("reconnecting");
+      elWsPill.textContent = "● 重连中…";
+    } else {
+      elWsPill.textContent = "● 离线";
     }
-    ws = new WebSocket(wsOriginUrl);
-    ws.addEventListener("open", () => {
-      ws.send(JSON.stringify({
+  }
+
+  function setReplyTarget(msg) {
+    replyTarget = msg || null;
+    if (!elReplyBanner) return;
+    if (replyTarget) {
+      elReplyBanner.hidden = false;
+      elReplyBannerText.textContent = `↩ 引用 @${replyTarget.sender_id}: ${(replyTarget.content || "").slice(0, 64)}`;
+      elInput.focus();
+    } else {
+      elReplyBanner.hidden = true;
+      elReplyBannerText.textContent = "";
+    }
+  }
+
+  function connectRealtimeWs() {
+    if (!authToken) {
+      setWsPillState("offline");
+      return;
+    }
+    clearTimeout(wsReconnectTimer);
+    if (ws) {
+      try {
+        ws._manualClose = true;
+        ws.close();
+      } catch {}
+    }
+    const sock = new WebSocket(wsOriginUrl);
+    ws = sock;
+    sock.addEventListener("open", () => {
+      sock.send(JSON.stringify({
         type: "auth",
         agent_id: currentPrincipal ? currentPrincipal.id : undefined,
         token: authToken,
       }));
     });
-    ws.addEventListener("message", (ev) => {
+    sock.addEventListener("message", (ev) => {
       let frame;
       try { frame = JSON.parse(ev.data); } catch { return; }
       if (frame.type === "auth_ok") {
-        ws.send(JSON.stringify({ type: "join_channel", channel_id: currentChannelId }));
+        wsReconnectDelayMs = 1000;
+        setWsPillState("live");
+        sock.send(JSON.stringify({ type: "join_channel", channel_id: currentChannelId }));
       } else if (frame.type === "message" && frame.channel_id === currentChannelId) {
-        if (!messages.some((m) => m.id === frame.id)) {
+        if (!activeSearchQuery && !messages.some((m) => m.id === frame.id)) {
           messages.push(frame);
           renderMessages();
         }
         elTyping.textContent = "";
+      } else if (frame.type === "message_edited" && frame.channel_id === currentChannelId) {
+        const idx = messages.findIndex((m) => m.id === frame.message_id);
+        if (idx >= 0) {
+          messages[idx].content = frame.content;
+          messages[idx].edited_at = frame.edited_at;
+          renderMessages();
+        }
+      } else if (frame.type === "message_deleted" && frame.channel_id === currentChannelId) {
+        messages = messages.filter((m) => m.id !== frame.message_id);
+        renderMessages();
       } else if (frame.type === "typing" && frame.channel_id === currentChannelId && frame.sender_id !== currentPrincipal?.id) {
         elTyping.textContent = `@${frame.sender_id} 正在思考/输入…`;
         clearTimeout(connectRealtimeWs._typingTimer);
         connectRealtimeWs._typingTimer = setTimeout(() => { elTyping.textContent = ""; }, 5000);
       }
+    });
+    sock.addEventListener("close", () => {
+      if (sock._manualClose || !authToken) return;
+      setWsPillState("reconnecting");
+      const delay = wsReconnectDelayMs;
+      wsReconnectDelayMs = Math.min(15_000, wsReconnectDelayMs * 2);
+      wsReconnectTimer = setTimeout(() => connectRealtimeWs(), delay);
+    });
+    sock.addEventListener("error", () => {
+      try { sock.close(); } catch {}
     });
   }
 
@@ -272,6 +339,13 @@
 
   async function selectChannel(channelId) {
     currentChannelId = channelId;
+    activeSearchQuery = "";
+    if (elSearchInput) elSearchInput.value = "";
+    if (elSearchBanner) elSearchBanner.hidden = true;
+    setReplyTarget(null);
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try { ws.send(JSON.stringify({ type: "join_channel", channel_id: channelId })); } catch {}
+    }
     await loadChannels();
     const ch = channels.find((c) => c.id === channelId);
     elRoomTitle.textContent = ch ? (ch.type === "direct" ? `💬 ${ch.name}` : `#${ch.name}`) : `#${channelId}`;
@@ -352,6 +426,7 @@
       return;
     }
 
+    const msgById = new Map(messages.map((m) => [m.id, m]));
     messages.forEach((m) => {
       const item = document.createElement("div");
       item.className = "msg-card" + (m.sender_id === currentPrincipal?.id ? " self" : "");
@@ -362,14 +437,36 @@
       sender.textContent = `${m.sender_name || m.sender_id} (@${m.sender_id})`;
       const time = document.createElement("span");
       time.className = "msg-time";
-      time.textContent = m.timestamp ? new Date(m.timestamp).toLocaleTimeString() : "";
+      time.textContent = (m.timestamp ? new Date(m.timestamp).toLocaleTimeString() : "") + (m.edited_at ? " (已编辑)" : "");
+
+      const actions = document.createElement("div");
+      actions.className = "msg-actions";
+      const btnQuote = document.createElement("button");
+      btnQuote.type = "button";
+      btnQuote.className = "icon-btn";
+      btnQuote.textContent = "↩引用";
+      btnQuote.title = "引用回复此消息";
+      btnQuote.addEventListener("click", () => setReplyTarget(m));
+      actions.appendChild(btnQuote);
+
       meta.appendChild(sender);
       meta.appendChild(time);
+      meta.appendChild(actions);
+      item.appendChild(meta);
+
+      if (m.in_reply_to) {
+        const quoted = msgById.get(m.in_reply_to);
+        const quoteEl = document.createElement("div");
+        quoteEl.className = "msg-quote";
+        quoteEl.textContent = quoted
+          ? `↩ @${quoted.sender_id}: ${(quoted.content || "").slice(0, 80)}`
+          : `↩ 回复消息 #${String(m.in_reply_to).slice(0, 8)}`;
+        item.appendChild(quoteEl);
+      }
 
       const body = document.createElement("div");
       body.className = "msg-body";
       body.textContent = m.content;
-      item.appendChild(meta);
       item.appendChild(body);
       elMessages.appendChild(item);
     });
@@ -384,9 +481,12 @@
       return;
     }
     elInput.value = "";
+    const payload = { content: text };
+    if (replyTarget?.id) payload.in_reply_to = replyTarget.id;
+    setReplyTarget(null);
     const res = await api(`/api/channels/${encodeURIComponent(currentChannelId)}/messages`, {
       method: "POST",
-      body: JSON.stringify({ content: text }),
+      body: JSON.stringify(payload),
     });
     if (!res.ok) {
       showToast(res.data?.error || "发送失败");
@@ -596,6 +696,79 @@
   document.getElementById("btn-go-cloud").addEventListener("click", () => {
     if (bridge?.switchToCloud) bridge.switchToCloud("/cloud-agents");
     else window.open("https://agents-chat.com/cloud-agents", "_blank", "noopener");
+  });
+
+  document.getElementById("btn-cancel-reply")?.addEventListener("click", () => setReplyTarget(null));
+
+  async function runSearch(query) {
+    const q = String(query || "").trim();
+    if (!q) {
+      activeSearchQuery = "";
+      if (elSearchBanner) elSearchBanner.hidden = true;
+      await selectChannel(currentChannelId);
+      return;
+    }
+    if (!authToken) {
+      showToast("请先登录全局账号后再搜索");
+      return;
+    }
+    activeSearchQuery = q;
+    const params = new URLSearchParams({ q, channel_id: currentChannelId, limit: "50" });
+    const res = await api(`/api/search?${params.toString()}`);
+    if (!res.ok) {
+      showToast(res.data?.error || "搜索失败");
+      return;
+    }
+    messages = Array.isArray(res.data?.messages) ? res.data.messages.slice().reverse() : [];
+    if (elSearchBanner) {
+      elSearchBanner.hidden = false;
+      elSearchBannerText.textContent = `🔍 在 #${currentChannelId} 中搜索 “${q}”：命中 ${messages.length} 条`;
+    }
+    renderMessages();
+  }
+
+  elSearchInput?.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      void runSearch(elSearchInput.value);
+    } else if (ev.key === "Escape") {
+      elSearchInput.value = "";
+      void runSearch("");
+    }
+  });
+  document.getElementById("btn-clear-search")?.addEventListener("click", () => {
+    if (elSearchInput) elSearchInput.value = "";
+    void runSearch("");
+  });
+
+  // Settings Modal (Desktop only — edits port, allowLan, minimizeToTray cleanly)
+  const settingsBtn = document.getElementById("btn-local-settings");
+  if (!bridge?.updateLocalSettings && settingsBtn) {
+    settingsBtn.style.display = "none";
+  }
+  settingsBtn?.addEventListener("click", async () => {
+    if (!bridge?.getServerStatus) return;
+    const st = await bridge.getServerStatus();
+    if (!st?.ok) return;
+    document.getElementById("setting-port").value = String(st.settings?.localServerPort || 8787);
+    document.getElementById("setting-allow-lan").checked = Boolean(st.settings?.allowLan);
+    document.getElementById("setting-minimize-tray").checked = st.settings?.minimizeToTray !== false;
+    document.getElementById("settings-dialog").showModal();
+  });
+  document.getElementById("btn-close-settings")?.addEventListener("click", () => {
+    document.getElementById("settings-dialog").close();
+  });
+  document.getElementById("settings-form")?.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    if (!bridge?.updateLocalSettings) return;
+    const port = Number(document.getElementById("setting-port").value);
+    const allowLan = document.getElementById("setting-allow-lan").checked;
+    const minimizeToTray = document.getElementById("setting-minimize-tray").checked;
+    document.getElementById("settings-dialog").close();
+    const res = await bridge.updateLocalSettings({ localServerPort: port, allowLan, minimizeToTray });
+    if (res?.ok) {
+      showToast(`设置已保存（${res.status?.httpUrl || ""}）`);
+    }
   });
 
   document.getElementById("btn-send").addEventListener("click", () => sendChatText());
