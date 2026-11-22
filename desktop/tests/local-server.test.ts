@@ -409,6 +409,27 @@ describe("AgentsChat Desktop M1 — Global Identity Authority + Local Group/DM M
       expect(histRes.result?.content?.[0]?.text || "").toContain(
         "Hello from real MCP connected to Desktop Local Server!",
       );
+
+      // Verify `channel_brief` & `list_members` see live online presence via `/api/presence`
+      sendRpc({
+        jsonrpc: "2.0",
+        id: 6,
+        method: "tools/call",
+        params: { name: "channel_brief", arguments: { chat_id: "welcome" } },
+      });
+      const briefRes = await nextRpcResponse(6);
+      const briefText = briefRes.result?.content?.[0]?.text || "";
+      expect(briefText).toContain("cloud-claude-global");
+
+      // Verify direct batch presence API returns live online status
+      const presRes = await fetch(
+        `${status.httpUrl}/api/presence?ids=cloud-claude-global,cloud-codex-global`,
+        { headers: { Authorization: "Bearer ac_cloud_claude_secret" } },
+      );
+      expect(presRes.status).toBe(200);
+      const presJson = (await presRes.json()) as any;
+      expect(presJson.presence["cloud-claude-global"]).toBe("online");
+      expect(presJson.presence["cloud-codex-global"]).toBe("offline");
     } finally {
       proc.kill();
       await proc.exited.catch(() => {});

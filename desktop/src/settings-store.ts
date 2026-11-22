@@ -10,6 +10,7 @@ export const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   localServerPort: 8787,
   allowLan: false,
   minimizeToTray: true,
+  launchAtLogin: false,
 };
 
 export function sanitizeDesktopSettings(raw: Partial<DesktopSettings> | null | undefined): DesktopSettings {
@@ -52,6 +53,7 @@ export function sanitizeDesktopSettings(raw: Partial<DesktopSettings> | null | u
     localServerPort,
     allowLan: s.allowLan === true,
     minimizeToTray: s.minimizeToTray !== false,
+    launchAtLogin: s.launchAtLogin === true,
     ...(windowBounds ? { windowBounds } : {}),
   };
 }

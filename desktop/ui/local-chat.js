@@ -11,6 +11,8 @@
   let currentChannelId = "welcome";
   let currentMembers = [];
   let messages = [];
+  let hasMoreOlder = false;
+  let loadingOlder = false;
   let activeSearchQuery = "";
   let replyTarget = null;
   let unreadByChannel = new Map();
@@ -398,12 +400,39 @@
 
     const [memRes, msgRes] = await Promise.all([
       api(`/api/channels/${encodeURIComponent(channelId)}/members`),
-      api(`/api/channels/${encodeURIComponent(channelId)}/messages?limit=80`),
+      api(`/api/channels/${encodeURIComponent(channelId)}/messages?limit=50`),
     ]);
     currentMembers = Array.isArray(memRes.data?.members) ? memRes.data.members : [];
     messages = Array.isArray(msgRes.data?.messages) ? msgRes.data.messages : [];
+    hasMoreOlder = messages.length >= 50;
     renderMembers();
     renderMessages();
+  }
+
+  async function loadOlderMessages() {
+    if (!authToken || loadingOlder || !hasMoreOlder || messages.length === 0 || activeSearchQuery) return;
+    loadingOlder = true;
+    const oldestTs = messages[0]?.timestamp;
+    if (!oldestTs) {
+      loadingOlder = false;
+      return;
+    }
+    const prevHeight = elMessages.scrollHeight;
+    const res = await api(
+      `/api/channels/${encodeURIComponent(currentChannelId)}/messages?limit=50&before=${encodeURIComponent(oldestTs)}`,
+    );
+    loadingOlder = false;
+    if (!res.ok) return;
+    const older = Array.isArray(res.data?.messages) ? res.data.messages : [];
+    hasMoreOlder = older.length >= 50;
+    if (older.length > 0) {
+      const seen = new Set(messages.map((m) => m.id));
+      const uniqueOlder = older.filter((m) => !seen.has(m.id));
+      messages = uniqueOlder.concat(messages);
+      renderMessages({ preserveScrollFromBottom: prevHeight });
+    } else {
+      renderMessages({ preserveScrollFromBottom: prevHeight });
+    }
   }
 
   function renderMembers() {
@@ -501,7 +530,7 @@
     }
   }
 
-  function renderMessages() {
+  function renderMessages(opts = {}) {
     elMessages.replaceChildren();
     if (!authToken) {
       const card = document.createElement("div");
@@ -543,6 +572,19 @@
       card.appendChild(acts);
       elMessages.appendChild(card);
       return;
+    }
+
+    if (hasMoreOlder && !activeSearchQuery) {
+      const loadMoreWrap = document.createElement("div");
+      loadMoreWrap.style.textAlign = "center";
+      loadMoreWrap.style.marginBottom = "8px";
+      const btnMore = document.createElement("button");
+      btnMore.type = "button";
+      btnMore.className = "btn btn-ghost btn-sm";
+      btnMore.textContent = "↑ 加载更早消息";
+      btnMore.addEventListener("click", () => void loadOlderMessages());
+      loadMoreWrap.appendChild(btnMore);
+      elMessages.appendChild(loadMoreWrap);
     }
 
     const msgById = new Map(messages.map((m) => [m.id, m]));
@@ -639,7 +681,11 @@
       item.appendChild(body);
       elMessages.appendChild(item);
     });
-    elMessages.scrollTop = elMessages.scrollHeight;
+    if (opts.preserveScrollFromBottom) {
+      elMessages.scrollTop = Math.max(0, elMessages.scrollHeight - opts.preserveScrollFromBottom);
+    } else {
+      elMessages.scrollTop = elMessages.scrollHeight;
+    }
   }
 
   async function sendChatText(rawText) {
@@ -922,6 +968,7 @@
     document.getElementById("setting-port").value = String(st.settings?.localServerPort || 8787);
     document.getElementById("setting-allow-lan").checked = Boolean(st.settings?.allowLan);
     document.getElementById("setting-minimize-tray").checked = st.settings?.minimizeToTray !== false;
+    document.getElementById("setting-launch-login").checked = Boolean(st.settings?.launchAtLogin);
     document.getElementById("settings-dialog").showModal();
   });
   document.getElementById("btn-close-settings")?.addEventListener("click", () => {
@@ -933,8 +980,9 @@
     const port = Number(document.getElementById("setting-port").value);
     const allowLan = document.getElementById("setting-allow-lan").checked;
     const minimizeToTray = document.getElementById("setting-minimize-tray").checked;
+    const launchAtLogin = document.getElementById("setting-launch-login").checked;
     document.getElementById("settings-dialog").close();
-    const res = await bridge.updateLocalSettings({ localServerPort: port, allowLan, minimizeToTray });
+    const res = await bridge.updateLocalSettings({ localServerPort: port, allowLan, minimizeToTray, launchAtLogin });
     if (res?.ok) {
       showToast(`设置已保存（${res.status?.httpUrl || ""}）`);
     }

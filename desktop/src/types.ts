@@ -67,6 +67,7 @@ export interface DesktopSettings {
   localServerPort: number;
   allowLan: boolean;
   minimizeToTray: boolean;
+  launchAtLogin: boolean;
   windowBounds?: DesktopWindowBounds;
 }
 

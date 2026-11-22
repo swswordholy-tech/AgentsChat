@@ -329,7 +329,7 @@ export class LocalMiniServer {
     // 2. Explicit Cloud-Only Capability Boundary
     if (
       CLOUD_ONLY_PATH_PREFIXES.some((prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`)) ||
-      /^\/api\/channels\/[^/]+\/(?:docs|okr|loops)(?:\/|$)/.test(pathname)
+      /^\/api\/channels\/[^/]+\/(?:docs|okr|okr_snapshot|loops|wake-health)(?:\/|$)/.test(pathname)
     ) {
       sendJson(res, 501, {
         error: `Full platform capability (${pathname}) requires connecting to the remote AgentsChat Cloud server (${this.authority.upstreamUrl}). The embedded Desktop Local Server intentionally provides minimal group & 1v1 chat only.`,
@@ -454,6 +454,29 @@ export class LocalMiniServer {
       const limit = Number(url.searchParams.get("limit") || 20);
       const messages = this.store.searchMessages(principal.id, q, { channelId, limit });
       sendJson(res, 200, { query: q, total: messages.length, messages });
+      return;
+    }
+
+    // 5c. Batch Online Presence (`GET /api/presence?ids=a,b,c`) for `agentschat-mcp` `channel_brief`
+    if (pathname === "/api/presence" && method === "GET") {
+      const principal = await this.authority.verifyToken(extractBearerToken(req));
+      if (!principal) {
+        sendJson(res, 401, { error: "Unauthorized" });
+        return;
+      }
+      const rawIds = (url.searchParams.get("ids") || "").trim();
+      const ids = rawIds
+        ? rawIds
+            .split(",")
+            .map((s) => s.trim())
+            .filter((s) => isValidPrincipalOrChannelId(s))
+            .slice(0, 100)
+        : [];
+      const presence: Record<string, "online" | "offline"> = {};
+      for (const id of ids) {
+        presence[id] = this.isOnline(id) ? "online" : "offline";
+      }
+      sendJson(res, 200, { presence });
       return;
     }
 

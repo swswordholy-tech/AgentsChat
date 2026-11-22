@@ -41,6 +41,7 @@ let pendingDeepLinkUrl: string | null = null;
 let boundsSaveTimer: NodeJS.Timeout | null = null;
 
 const isSmokeTest = process.env.AGENTSCHAT_DESKTOP_SMOKE_TEST === "1";
+const startHidden = !isSmokeTest && process.argv.includes("--hidden");
 const desktopDataDir =
   process.env.AGENTSCHAT_DESKTOP_DATA_DIR?.trim() ||
   join(process.env.HOME || process.env.USERPROFILE || homedir(), ".agentschat", "desktop");
@@ -288,6 +289,17 @@ async function promptCheckForUpdates(): Promise<void> {
   });
 }
 
+function applyLaunchAtLoginSetting(): void {
+  if (isSmokeTest) return;
+  try {
+    app.setLoginItemSettings({
+      openAtLogin: settings.launchAtLogin === true,
+      openAsHidden: true,
+      args: ["--hidden"],
+    });
+  } catch {}
+}
+
 function setupApplicationMenu(): void {
   const isMac = process.platform === "darwin";
   const reloadActiveView = () => {
@@ -376,6 +388,24 @@ function setupApplicationMenu(): void {
         { role: "minimize" },
         { role: "close" },
         ...(isMac ? [{ type: "separator" as const }, { role: "front" as const }] : []),
+      ],
+    },
+    {
+      label: "Help",
+      submenu: [
+        {
+          label: "Check for Updates…",
+          click: () => void promptCheckForUpdates(),
+        },
+        {
+          label: "Open Local Data Folder",
+          click: () => void shell.openPath(desktopDataDir),
+        },
+        { type: "separator" },
+        {
+          label: "AgentsChat Documentation",
+          click: () => void shell.openExternal("https://agents-chat.com/join"),
+        },
       ],
     },
   ];
@@ -499,7 +529,7 @@ async function createDesktopWindow(): Promise<void> {
     ...initialPos,
     minWidth: 880,
     minHeight: 560,
-    show: !isSmokeTest,
+    show: !isSmokeTest && !startHidden,
     title: "AgentsChat",
     ...(existsSync(windowIconPath) ? { icon: windowIconPath } : {}),
     backgroundColor: "#0b0f19",
@@ -711,11 +741,15 @@ function registerIpcHandlers(): void {
     if (patch?.localServerPort !== undefined) safePatch.localServerPort = Number(patch.localServerPort);
     if (patch?.allowLan !== undefined) safePatch.allowLan = Boolean(patch.allowLan);
     if (patch?.minimizeToTray !== undefined) safePatch.minimizeToTray = Boolean(patch.minimizeToTray);
+    if (patch?.launchAtLogin !== undefined) safePatch.launchAtLogin = Boolean(patch.launchAtLogin);
 
     const restartNeeded =
       (safePatch.localServerPort !== undefined && safePatch.localServerPort !== settings.localServerPort) ||
       (safePatch.allowLan !== undefined && safePatch.allowLan !== settings.allowLan);
     settings = settingsStore.save(safePatch);
+    if (safePatch.launchAtLogin !== undefined) {
+      applyLaunchAtLoginSetting();
+    }
     if (restartNeeded && localServer) {
       await localServer.closeAll();
       localServer = null;
@@ -881,6 +915,7 @@ if (!gotSingleInstanceLock) {
       try {
         app.setAsDefaultProtocolClient("agentschat");
       } catch {}
+      applyLaunchAtLoginSetting();
       setupApplicationMenu();
       try {
         const trayIconPath = join(UI_DIR, "tray-icon.png");
