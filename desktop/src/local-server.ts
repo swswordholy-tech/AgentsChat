@@ -1085,7 +1085,10 @@ export class LocalMiniServer {
           return;
         }
 
-        if ((frame.type === "message" || frame.type === "send_message") && typeof frame.channel_id === "string") {
+        if (
+          (frame.type === "message" || frame.type === "send_message" || frame.type === "thread_reply") &&
+          typeof frame.channel_id === "string"
+        ) {
           const ch = this.store.getChannel(frame.channel_id);
           if (!ch) {
             ws.send(JSON.stringify({ type: "error", code: 404, message: "Channel not found" }));
@@ -1100,6 +1103,14 @@ export class LocalMiniServer {
           }
           const content = String(frame.content ?? frame.text ?? "").trim();
           if (!content) return;
+          const replyRef =
+            typeof frame.in_reply_to === "string"
+              ? frame.in_reply_to
+              : typeof frame.parent_id === "string"
+                ? frame.parent_id
+                : typeof frame.reply_to === "string"
+                  ? frame.reply_to
+                  : undefined;
           const saved = this.store.appendMessage({
             id: typeof frame.id === "string" ? frame.id : undefined,
             channelId: ch.id,
@@ -1108,7 +1119,7 @@ export class LocalMiniServer {
             senderType: caller.kind === "user" ? "human" : "agent",
             content,
             contentType: frame.content_type,
-            inReplyTo: typeof frame.in_reply_to === "string" ? frame.in_reply_to : undefined,
+            inReplyTo: replyRef,
           });
           const delivered = this.broadcastToChannel(ch.id, {
             type: "message",
@@ -1187,6 +1198,19 @@ export class LocalMiniServer {
 
         if (frame.type === "read_receipt" && typeof frame.channel_id === "string" && typeof frame.last_read_id === "string") {
           this.store.saveReadCursor(frame.channel_id, caller.id, frame.last_read_id);
+          return;
+        }
+
+        if (frame.type === "proposal" || frame.type === "vote" || frame.type === "archive_channel") {
+          ws.send(
+            JSON.stringify({
+              type: "error",
+              code: 501,
+              error_code: "CLOUD_SERVER_REQUIRED",
+              message: `WS action '${frame.type}' requires connecting to remote AgentsChat Cloud server (${this.authority.upstreamUrl}).`,
+            }),
+          );
+          return;
         }
       })().catch(() => {});
     });

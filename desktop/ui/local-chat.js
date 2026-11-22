@@ -353,6 +353,30 @@
         }
       });
 
+      const btnDm = document.createElement("button");
+      btnDm.type = "button";
+      btnDm.className = "icon-btn";
+      btnDm.textContent = "私聊";
+      btnDm.title = "一键打开与该本机 Agent 的 1v1 私聊";
+      btnDm.addEventListener("click", async () => {
+        if (bridge?.activateDiscoveredProfile) {
+          await bridge.activateDiscoveredProfile(p.profile_name);
+        }
+        if (!authToken) {
+          showToast("请先登录或绑定您的账号后再发起私聊");
+          return;
+        }
+        const dmRes = await api("/api/channels", {
+          method: "POST",
+          body: JSON.stringify({ type: "direct", members: [p.agent_id] }),
+        });
+        if (dmRes.ok && dmRes.data?.channel) {
+          await selectChannel(dmRes.data.channel.id);
+        } else {
+          showToast(dmRes.data?.error || "打开私聊失败");
+        }
+      });
+
       const btnCmd = document.createElement("button");
       btnCmd.type = "button";
       btnCmd.className = "icon-btn";
@@ -366,6 +390,7 @@
       });
 
       actions.appendChild(btnInvite);
+      actions.appendChild(btnDm);
       actions.appendChild(btnCmd);
       row.appendChild(meta);
       row.appendChild(actions);

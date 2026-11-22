@@ -467,6 +467,27 @@ describe("AgentsChat Desktop M1 — Global Identity Authority + Local Group/DM M
       expect(entRes.status).toBe(501);
       const entBody = (await entRes.json()) as any;
       expect(entBody.code).toBe("CLOUD_SERVER_REQUIRED");
+
+      // Create a 1v1 DM between Boss and Claude, then verify real MCP `find_dm` locates it!
+      const dmCreate = await fetch(`${status.httpUrl}/api/channels`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${mockCloud.validHumanJwt}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ type: "direct", members: ["cloud-claude-global"] }),
+      });
+      expect(dmCreate.status).toBe(201);
+      const dmId = ((await dmCreate.json()) as any).channel.id;
+
+      sendRpc({
+        jsonrpc: "2.0",
+        id: 10,
+        method: "tools/call",
+        params: { name: "find_dm", arguments: { target_agent_id: "boss@agents-chat.com" } },
+      });
+      const findDmRes = await nextRpcResponse(10);
+      expect(findDmRes.result?.content?.[0]?.text || "").toContain(dmId);
     } finally {
       proc.kill();
       await proc.exited.catch(() => {});
@@ -646,25 +667,50 @@ describe("AgentsChat Desktop M1 — Global Identity Authority + Local Group/DM M
       });
       expect(topicRes.status).toBe(200);
 
-      // Presence broadcast: Claude connects on WS -> Codex receives `agent_online`, disconnects -> `agent_offline`
+      // Presence broadcast: Claude connects on WS -> Codex receives `agent_online`, sends thread_reply & Cloud-only proposal
       const claudeWs = new WebSocket(status.wsUrl);
+      const claudeWsEvents: any[] = [];
       await new Promise<void>((resolve, reject) => {
         claudeWs.once("open", () => {
           claudeWs.send(JSON.stringify({ type: "auth", agent_id: "cloud-claude-global", token: "ac_cloud_claude_secret" }));
         });
         claudeWs.on("message", (raw) => {
           const f = JSON.parse(String(raw));
+          claudeWsEvents.push(f);
           if (f.type === "auth_ok") resolve();
         });
         claudeWs.once("error", reject);
       });
-      await new Promise((r) => setTimeout(r, 60));
+      claudeWs.send(
+        JSON.stringify({
+          type: "thread_reply",
+          channel_id: "welcome",
+          parent_id: pub2Body.message.id,
+          content: "WS thread_reply works!",
+        }),
+      );
+      claudeWs.send(
+        JSON.stringify({
+          type: "proposal",
+          channel_id: "welcome",
+          title: "Cloud-only governance",
+        }),
+      );
+      await new Promise((r) => setTimeout(r, 80));
       claudeWs.close();
       await new Promise((r) => setTimeout(r, 80));
 
       expect(wsEvents.some((f) => f.type === "topic_update" && f.topic === "Local dual-agent coding room")).toBe(true);
       expect(wsEvents.some((f) => f.type === "agent_online" && f.agent_id === "cloud-claude-global")).toBe(true);
       expect(wsEvents.some((f) => f.type === "agent_offline" && f.agent_id === "cloud-claude-global")).toBe(true);
+      expect(
+        wsEvents.some(
+          (f) => f.type === "message" && f.content === "WS thread_reply works!" && f.in_reply_to === pub2Body.message.id,
+        ),
+      ).toBe(true);
+      expect(claudeWsEvents.some((f) => f.type === "error" && f.code === 501 && f.error_code === "CLOUD_SERVER_REQUIRED")).toBe(
+        true,
+      );
       ws.close();
     } finally {
       await local.closeAll();
