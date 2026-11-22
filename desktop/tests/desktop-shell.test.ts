@@ -2,6 +2,12 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import {
+  checkLatestDesktopRelease,
+  compareSemver,
+  parseDeepLink,
+  parseDesktopReleaseTag,
+} from "../src/desktop-helpers.js";
 import { GlobalIdentityAuthority } from "../src/identity-authority.js";
 import { LocalMiniServer } from "../src/local-server.js";
 import { DEFAULT_DESKTOP_SETTINGS, DesktopSettingsStore, sanitizeDesktopSettings } from "../src/settings-store.js";
@@ -51,6 +57,13 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     expect(
       sanitizeDesktopSettings({ remoteServerUrl: "https://user:pass@agents-chat.com" }).remoteServerUrl,
     ).toBe("https://agents-chat.com");
+
+    // Window bounds persistence & clamping
+    const withBounds = store.save({ windowBounds: { width: 1440, height: 900, x: 120, y: 80 } });
+    expect(withBounds.windowBounds).toEqual({ width: 1440, height: 900, x: 120, y: 80 });
+    expect(store.load().windowBounds).toEqual({ width: 1440, height: 900, x: 120, y: 80 });
+    // Tiny or bogus window dimensions are dropped cleanly
+    expect(sanitizeDesktopSettings({ windowBounds: { width: 100, height: 100 } }).windowBounds).toBeUndefined();
   });
 
   test("discoverLocalAgentProfiles finds valid ~/.agentschat profiles while skipping symlinks, internal files, and dev-token", () => {
@@ -219,5 +232,51 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
         customHomeDir: symHome,
       }),
     ).toThrow(/symlink/i);
+  });
+
+  test("parseDeepLink safely routes agentschat:// links and blocks open redirects or traversal", () => {
+    expect(parseDeepLink("agentschat://local")).toEqual({ workspace: "local" });
+    expect(parseDeepLink("agentschat://local/my-group-1")).toEqual({
+      workspace: "local",
+      channelId: "my-group-1",
+    });
+    expect(parseDeepLink("agentschat://cloud/cloud-agents?tab=hosts")).toEqual({
+      workspace: "cloud",
+      path: "/cloud-agents?tab=hosts",
+    });
+
+    // Rejects non-agentschat schemes, embedded credentials, double slashes, traversal, and unknown hosts
+    expect(parseDeepLink("https://agents-chat.com/welcome")).toBeNull();
+    expect(parseDeepLink("agentschat://cloud//evil.com")).toBeNull();
+    expect(parseDeepLink("agentschat://cloud/../../etc/passwd")).toBeNull();
+    expect(parseDeepLink("agentschat://user:pass@cloud/login")).toBeNull();
+    expect(parseDeepLink("agentschat://evil.com/phish")).toBeNull();
+  });
+
+  test("desktop update checker parses desktop-v* tags, compares semver, and ignores drafts/non-desktop tags", async () => {
+    expect(parseDesktopReleaseTag("desktop-v0.2.1")).toBe("0.2.1");
+    expect(parseDesktopReleaseTag("v0.36.31")).toBeNull();
+    expect(compareSemver("0.2.0", "0.1.9")).toBe(1);
+    expect(compareSemver("0.1.0", "0.1.0")).toBe(0);
+    expect(compareSemver("0.1.0", "1.0.0")).toBe(-1);
+
+    const mockFetch = (async () =>
+      new Response(
+        JSON.stringify([
+          { tag_name: "v0.36.32", html_url: "https://github.com/swswordholy-tech/AgentsChat/releases/tag/v0.36.32" },
+          { tag_name: "desktop-v0.3.0", draft: true, html_url: "https://github.com/swswordholy-tech/AgentsChat/releases/tag/desktop-v0.3.0" },
+          { tag_name: "desktop-v0.2.0", html_url: "https://github.com/swswordholy-tech/AgentsChat/releases/tag/desktop-v0.2.0" },
+        ]),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      )) as unknown as typeof fetch;
+
+    const up = await checkLatestDesktopRelease("0.1.0", mockFetch);
+    expect(up.checked).toBe(true);
+    expect(up.hasUpdate).toBe(true);
+    expect(up.latestVersion).toBe("0.2.0");
+    expect(up.releaseUrl).toBe("https://github.com/swswordholy-tech/AgentsChat/releases/tag/desktop-v0.2.0");
+
+    const same = await checkLatestDesktopRelease("0.2.0", mockFetch);
+    expect(same.hasUpdate).toBe(false);
   });
 });

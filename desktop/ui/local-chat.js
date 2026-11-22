@@ -385,6 +385,10 @@
     const ch = channels.find((c) => c.id === channelId);
     elRoomTitle.textContent = ch ? (ch.type === "direct" ? `💬 ${ch.name}` : `#${ch.name}`) : `#${channelId}`;
     elRoomTopic.textContent = ch?.topic || "本机最小聊天服务 · 全局唯一身份零冲突";
+    const leaveBtn = document.getElementById("btn-leave-channel");
+    if (leaveBtn) {
+      leaveBtn.hidden = !authToken || channelId === "welcome" || ch?.type === "direct";
+    }
 
     if (!authToken) {
       elMemberStrip.replaceChildren();
@@ -1120,8 +1124,59 @@
     }
   });
 
+  document.getElementById("btn-export-md")?.addEventListener("click", () => {
+    if (!messages.length) {
+      showToast("当前房间暂无可导出的消息");
+      return;
+    }
+    const header = `# ${elRoomTitle.textContent || "#" + currentChannelId}\n\n> Exported from AgentsChat Desktop Local Server (${new Date().toISOString()})\n\n---\n\n`;
+    const body = messages
+      .map((m) => {
+        const ts = m.timestamp ? new Date(m.timestamp).toLocaleString() : "";
+        return `### ${m.sender_name || m.sender_id} (\`@${m.sender_id}\`) · ${ts}\n\n${m.content || ""}\n`;
+      })
+      .join("\n---\n\n");
+    const blob = new Blob([header + body], { type: "text/markdown;charset=utf-8" });
+    const dlUrl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const safeName = currentChannelId.replace(/[^a-zA-Z0-9._-]+/g, "-");
+    a.href = dlUrl;
+    a.download = `agentschat-${safeName}-${new Date().toISOString().slice(0, 10)}.md`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(dlUrl), 1000);
+    showToast(`已导出 ${messages.length} 条对话为 Markdown`);
+  });
+
+  document.getElementById("btn-leave-channel")?.addEventListener("click", async () => {
+    if (!authToken || currentChannelId === "welcome") return;
+    const leavingId = currentChannelId;
+    const res = await api(`/api/channels/${encodeURIComponent(leavingId)}/leave`, { method: "POST" });
+    if (res.ok) {
+      showToast(`已退出 #${leavingId}`);
+      await selectChannel("welcome");
+    } else {
+      showToast(res.data?.error || "退出群聊失败");
+    }
+  });
+
+  function readHashChannelId() {
+    const m = window.location.hash.match(/^#channel=([a-zA-Z0-9._-]+)$/);
+    return m ? decodeURIComponent(m[1]) : null;
+  }
+
+  window.addEventListener("hashchange", () => {
+    const target = readHashChannelId();
+    if (target && target !== currentChannelId) {
+      void selectChannel(target);
+    }
+  });
+
   // Boot
   (async () => {
+    const hashCh = readHashChannelId();
+    if (hashCh) currentChannelId = hashCh;
     if (authToken) {
       const ok = await verifyAndSetToken(authToken);
       if (ok) return;

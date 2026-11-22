@@ -34,6 +34,14 @@
   "build": {
     "appId": "com.agentschat.desktop",
     "productName": "AgentsChat",
+    "protocols": [
+      {
+        "name": "AgentsChat",
+        "schemes": [
+          "agentschat"
+        ]
+      }
+    ],
     "files": [
       "out/**/*",
       "ui/**/*",

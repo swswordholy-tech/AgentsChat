@@ -53,6 +53,13 @@ export interface DiscoveredLocalProfile {
   file_path: string;
 }
 
+export interface DesktopWindowBounds {
+  width: number;
+  height: number;
+  x?: number;
+  y?: number;
+}
+
 export interface DesktopSettings {
   activeWorkspace: "cloud" | "local";
   remoteServerUrl: string;
@@ -60,6 +67,7 @@ export interface DesktopSettings {
   localServerPort: number;
   allowLan: boolean;
   minimizeToTray: boolean;
+  windowBounds?: DesktopWindowBounds;
 }
 
 export interface LocalServerStatus {

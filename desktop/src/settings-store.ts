@@ -29,6 +29,22 @@ export function sanitizeDesktopSettings(raw: Partial<DesktopSettings> | null | u
       ? rawPort
       : DEFAULT_DESKTOP_SETTINGS.localServerPort;
 
+  let windowBounds: DesktopSettings["windowBounds"];
+  if (s.windowBounds && typeof s.windowBounds === "object") {
+    const bw = Math.round(Number(s.windowBounds.width));
+    const bh = Math.round(Number(s.windowBounds.height));
+    if (Number.isFinite(bw) && Number.isFinite(bh) && bw >= 880 && bw <= 4096 && bh >= 560 && bh <= 2400) {
+      const bx = s.windowBounds.x !== undefined ? Math.round(Number(s.windowBounds.x)) : undefined;
+      const by = s.windowBounds.y !== undefined ? Math.round(Number(s.windowBounds.y)) : undefined;
+      windowBounds = {
+        width: bw,
+        height: bh,
+        ...(bx !== undefined && Number.isFinite(bx) && bx >= -4096 && bx <= 8192 ? { x: bx } : {}),
+        ...(by !== undefined && Number.isFinite(by) && by >= -4096 && by <= 8192 ? { y: by } : {}),
+      };
+    }
+  }
+
   return {
     activeWorkspace: s.activeWorkspace === "local" ? "local" : "cloud",
     remoteServerUrl,
@@ -36,6 +52,7 @@ export function sanitizeDesktopSettings(raw: Partial<DesktopSettings> | null | u
     localServerPort,
     allowLan: s.allowLan === true,
     minimizeToTray: s.minimizeToTray !== false,
+    ...(windowBounds ? { windowBounds } : {}),
   };
 }
 

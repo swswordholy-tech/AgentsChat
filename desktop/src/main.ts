@@ -2,10 +2,12 @@ import {
   app,
   BrowserWindow,
   clipboard,
+  dialog,
   ipcMain,
   Menu,
   nativeImage,
   Notification,
+  screen,
   shell,
   Tray,
   WebContentsView,
@@ -14,6 +16,7 @@ import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { checkLatestDesktopRelease, parseDeepLink } from "./desktop-helpers.js";
 import { GlobalIdentityAuthority } from "./identity-authority.js";
 import { LocalMiniServer } from "./local-server.js";
 import { DesktopSettingsStore } from "./settings-store.js";
@@ -34,6 +37,8 @@ let localView: WebContentsView | null = null;
 let tray: Tray | null = null;
 let isQuitting = false;
 let localUnreadCount = 0;
+let pendingDeepLinkUrl: string | null = null;
+let boundsSaveTimer: NodeJS.Timeout | null = null;
 
 const isSmokeTest = process.env.AGENTSCHAT_DESKTOP_SMOKE_TEST === "1";
 const desktopDataDir =
@@ -220,6 +225,69 @@ function showMainWindow(): void {
   mainWindow.focus();
 }
 
+async function handleDeepLinkUrl(rawUrl: string): Promise<void> {
+  const parsed = parseDeepLink(rawUrl);
+  if (!parsed) return;
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    pendingDeepLinkUrl = rawUrl;
+    return;
+  }
+  showMainWindow();
+  if (parsed.workspace === "local") {
+    await switchWorkspace("local");
+    const st = localServer?.getStatus();
+    if (st && parsed.channelId && localView && !localView.webContents.isDestroyed()) {
+      await localView.webContents.loadURL(`${st.httpUrl}/#channel=${encodeURIComponent(parsed.channelId)}`);
+    }
+    return;
+  }
+  await switchWorkspace("cloud");
+  if (parsed.path && cloudView && !cloudView.webContents.isDestroyed()) {
+    const targetUrl = new URL(parsed.path, settings.remoteServerUrl).toString();
+    await cloudView.webContents.loadURL(targetUrl);
+  }
+}
+
+async function promptCheckForUpdates(): Promise<void> {
+  const currentVersion = app.getVersion() || "0.1.0";
+  const result = await checkLatestDesktopRelease(currentVersion);
+  if (!result.checked) {
+    await dialog.showMessageBox({
+      type: "info",
+      title: "Check for Updates",
+      message: `Current version: v${currentVersion}`,
+      detail: result.error
+        ? `Could not reach GitHub Releases (${result.error}).`
+        : "Unable to check for updates right now.",
+      buttons: ["Open Releases Page", "Close"],
+      defaultId: 1,
+    }).then(({ response }) => {
+      if (response === 0) void shell.openExternal(result.releaseUrl);
+    });
+    return;
+  }
+  if (result.hasUpdate && result.latestVersion) {
+    const { response } = await dialog.showMessageBox({
+      type: "info",
+      title: "AgentsChat Desktop Update Available",
+      message: `AgentsChat Desktop v${result.latestVersion} is available!`,
+      detail: `You are currently running v${currentVersion}. Download the latest macOS / Windows installer from GitHub Releases.`,
+      buttons: ["Download Update", "Later"],
+      defaultId: 0,
+    });
+    if (response === 0) {
+      void shell.openExternal(result.releaseUrl);
+    }
+    return;
+  }
+  await dialog.showMessageBox({
+    type: "info",
+    title: "Up to Date",
+    message: `AgentsChat Desktop v${currentVersion} is up to date.`,
+    buttons: ["OK"],
+  });
+}
+
 function setupApplicationMenu(): void {
   const isMac = process.platform === "darwin";
   const reloadActiveView = () => {
@@ -243,6 +311,10 @@ function setupApplicationMenu(): void {
             label: app.name,
             submenu: [
               { role: "about" as const },
+              {
+                label: "Check for Updates…",
+                click: () => void promptCheckForUpdates(),
+              },
               { type: "separator" as const },
               { role: "hide" as const },
               { role: "hideOthers" as const },
@@ -358,6 +430,10 @@ function rebuildTrayMenu(): void {
         void setAllowLan(!settings.allowLan);
       },
     },
+    {
+      label: "Check for Updates…",
+      click: () => void promptCheckForUpdates(),
+    },
     { type: "separator" },
     {
       label: "Quit AgentsChat",
@@ -391,9 +467,36 @@ async function setAllowLan(allowLan: boolean): Promise<LocalServerStatus | null>
 async function createDesktopWindow(): Promise<void> {
   const isMac = process.platform === "darwin";
   const windowIconPath = join(ASSETS_DIR, "icon.png");
+
+  // Restore saved bounds only if the saved position is still visible on a connected display
+  let initialWidth = settings.windowBounds?.width || 1320;
+  let initialHeight = settings.windowBounds?.height || 860;
+  let initialPos: { x?: number; y?: number } = {};
+  if (settings.windowBounds?.x !== undefined && settings.windowBounds?.y !== undefined) {
+    try {
+      const targetRect = {
+        x: settings.windowBounds.x,
+        y: settings.windowBounds.y,
+        width: initialWidth,
+        height: initialHeight,
+      };
+      const disp = screen.getDisplayMatching(targetRect);
+      const wa = disp.workArea;
+      const intersects =
+        targetRect.x < wa.x + wa.width - 80 &&
+        targetRect.x + targetRect.width > wa.x + 80 &&
+        targetRect.y < wa.y + wa.height - 60 &&
+        targetRect.y + targetRect.height > wa.y + 40;
+      if (intersects) {
+        initialPos = { x: targetRect.x, y: targetRect.y };
+      }
+    } catch {}
+  }
+
   mainWindow = new BrowserWindow({
-    width: 1320,
-    height: 860,
+    width: initialWidth,
+    height: initialHeight,
+    ...initialPos,
     minWidth: 880,
     minHeight: 560,
     show: !isSmokeTest,
@@ -494,8 +597,23 @@ async function createDesktopWindow(): Promise<void> {
     await localView.webContents.loadURL(st.httpUrl);
   }
 
+  const scheduleBoundsSave = () => {
+    if (isSmokeTest || !mainWindow || mainWindow.isDestroyed() || mainWindow.isMinimized()) return;
+    if (boundsSaveTimer) clearTimeout(boundsSaveTimer);
+    boundsSaveTimer = setTimeout(() => {
+      if (!mainWindow || mainWindow.isDestroyed() || mainWindow.isMinimized()) return;
+      const b = mainWindow.getBounds();
+      settings = settingsStore.save({ windowBounds: { width: b.width, height: b.height, x: b.x, y: b.y } });
+    }, 400);
+    boundsSaveTimer.unref?.();
+  };
+
   layoutViews();
-  mainWindow.on("resize", () => layoutViews());
+  mainWindow.on("resize", () => {
+    layoutViews();
+    scheduleBoundsSave();
+  });
+  mainWindow.on("move", () => scheduleBoundsSave());
   mainWindow.on("focus", () => {
     if (settings.activeWorkspace === "local") {
       clearLocalUnread();
@@ -743,13 +861,26 @@ const gotSingleInstanceLock = isSmokeTest ? true : app.requestSingleInstanceLock
 if (!gotSingleInstanceLock) {
   app.quit();
 } else {
-  app.on("second-instance", () => {
+  const argvDeepLink = process.argv.find((a) => typeof a === "string" && a.startsWith("agentschat://"));
+  if (argvDeepLink) pendingDeepLinkUrl = argvDeepLink;
+
+  app.on("open-url", (ev, url) => {
+    ev.preventDefault();
+    void handleDeepLinkUrl(url);
+  });
+
+  app.on("second-instance", (_ev, commandLine) => {
     showMainWindow();
+    const deep = commandLine.find((a) => typeof a === "string" && a.startsWith("agentschat://"));
+    if (deep) void handleDeepLinkUrl(deep);
   });
 
   app.whenReady().then(async () => {
     registerIpcHandlers();
     if (!isSmokeTest) {
+      try {
+        app.setAsDefaultProtocolClient("agentschat");
+      } catch {}
       setupApplicationMenu();
       try {
         const trayIconPath = join(UI_DIR, "tray-icon.png");
@@ -762,6 +893,11 @@ if (!gotSingleInstanceLock) {
       } catch {}
     }
     await createDesktopWindow();
+    if (!isSmokeTest && pendingDeepLinkUrl) {
+      const toOpen = pendingDeepLinkUrl;
+      pendingDeepLinkUrl = null;
+      void handleDeepLinkUrl(toOpen);
+    }
 
     if (isSmokeTest) {
       const st = localServer?.getStatus();
