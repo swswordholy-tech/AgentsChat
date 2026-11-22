@@ -34,7 +34,13 @@ const CLOUD_ONLY_PATH_PREFIXES = [
   "/api/arenas",
   "/api/stories",
   "/api/file/upload",
+  "/api/upload",
   "/api/stt",
+  "/api/tts",
+  "/api/voices",
+  "/api/hidden-identity",
+  "/api/me/entitlements",
+  "/api/moderation",
 ];
 
 function extractBearerToken(req: IncomingMessage): string | null {
@@ -329,7 +335,7 @@ export class LocalMiniServer {
     // 2. Explicit Cloud-Only Capability Boundary
     if (
       CLOUD_ONLY_PATH_PREFIXES.some((prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`)) ||
-      /^\/api\/channels\/[^/]+\/(?:docs|okr|okr_snapshot|loops|wake-health)(?:\/|$)/.test(pathname)
+      /^\/api\/channels\/[^/]+\/(?:docs|okr|okr_snapshot|loops|wake-health|cloud-wake-health|proposals)(?:\/|$)/.test(pathname)
     ) {
       sendJson(res, 501, {
         error: `Full platform capability (${pathname}) requires connecting to the remote AgentsChat Cloud server (${this.authority.upstreamUrl}). The embedded Desktop Local Server intentionally provides minimal group & 1v1 chat only.`,
@@ -480,7 +486,25 @@ export class LocalMiniServer {
       return;
     }
 
-    // 6. Channels List / Mine / Create
+    // 6. Channels List / Discover / Mine / Create
+    if (pathname === "/api/channels/discover" && method === "GET") {
+      const q = (url.searchParams.get("q") || "").trim().toLowerCase();
+      const publicChannels = this.store
+        .listChannelsForPrincipal(null, false)
+        .filter((ch) => ch.visibility === "public" && ch.type !== "direct")
+        .filter((ch) => !q || ch.id.toLowerCase().includes(q) || ch.name.toLowerCase().includes(q) || ch.topic.toLowerCase().includes(q))
+        .map((ch) => {
+          const members = this.store.listChannelMembers(ch.id);
+          const onlineAgentCount = members.filter((m) => m.kind === "agent" && this.isOnline(m.principal_id)).length;
+          return {
+            ...ch,
+            online_agent_count: onlineAgentCount,
+          };
+        });
+      sendJson(res, 200, { channels: publicChannels });
+      return;
+    }
+
     if ((pathname === "/api/channels" || pathname === "/api/channels/mine") && method === "GET") {
       const token = extractBearerToken(req);
       const principal = token ? await this.authority.verifyToken(token) : null;
@@ -745,9 +769,9 @@ export class LocalMiniServer {
       }
     }
 
-    // 7b. Single-Message Edit & Soft-Delete (`PATCH` / `DELETE /api/channels/:id/messages/:msgId`)
+    // 7b. Single-Message Read, Edit & Soft-Delete (`GET` / `PATCH` / `DELETE /api/channels/:id/messages/:msgId`)
     const msgItemMatch = pathname.match(/^\/api\/channels\/([^/]+)\/messages\/([^/]+)$/);
-    if (msgItemMatch && (method === "PATCH" || method === "DELETE")) {
+    if (msgItemMatch && (method === "GET" || method === "PATCH" || method === "DELETE")) {
       const channelId = decodeURIComponent(msgItemMatch[1]);
       const messageId = decodeURIComponent(msgItemMatch[2]);
       if (!isValidPrincipalOrChannelId(channelId) || !messageId || messageId.length > 128) {
@@ -771,6 +795,11 @@ export class LocalMiniServer {
       const existing = this.store.getMessageById(channelId, messageId);
       if (!existing) {
         sendJson(res, 404, { error: "Message not found" });
+        return;
+      }
+
+      if (method === "GET") {
+        sendJson(res, 200, { ok: true, message: existing });
         return;
       }
 

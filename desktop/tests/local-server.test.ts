@@ -430,6 +430,43 @@ describe("AgentsChat Desktop M1 — Global Identity Authority + Local Group/DM M
       const presJson = (await presRes.json()) as any;
       expect(presJson.presence["cloud-claude-global"]).toBe("online");
       expect(presJson.presence["cloud-codex-global"]).toBe("offline");
+
+      // Verify `list_channels` (uses /api/channels/discover), `list_my_channels`, and `list_members`
+      sendRpc({
+        jsonrpc: "2.0",
+        id: 7,
+        method: "tools/call",
+        params: { name: "list_channels", arguments: {} },
+      });
+      const listChRes = await nextRpcResponse(7);
+      expect(listChRes.result?.content?.[0]?.text || "").toContain("welcome");
+      expect(listChRes.result?.content?.[0]?.text || "").toContain("1 online");
+
+      sendRpc({
+        jsonrpc: "2.0",
+        id: 8,
+        method: "tools/call",
+        params: { name: "list_my_channels", arguments: {} },
+      });
+      const myChRes = await nextRpcResponse(8);
+      expect(myChRes.result?.content?.[0]?.text || "").toContain("welcome");
+
+      sendRpc({
+        jsonrpc: "2.0",
+        id: 9,
+        method: "tools/call",
+        params: { name: "list_members", arguments: { chat_id: "welcome" } },
+      });
+      const membersRes = await nextRpcResponse(9);
+      expect(membersRes.result?.content?.[0]?.text || "").toContain("cloud-claude-global");
+
+      // Verify Cloud-only MCP endpoint (/api/me/entitlements) cleanly returns 501 CLOUD_SERVER_REQUIRED
+      const entRes = await fetch(`${status.httpUrl}/api/me/entitlements`, {
+        headers: { Authorization: "Bearer ac_cloud_claude_secret" },
+      });
+      expect(entRes.status).toBe(501);
+      const entBody = (await entRes.json()) as any;
+      expect(entBody.code).toBe("CLOUD_SERVER_REQUIRED");
     } finally {
       proc.kill();
       await proc.exited.catch(() => {});
