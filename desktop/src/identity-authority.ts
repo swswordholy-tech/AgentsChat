@@ -1,4 +1,4 @@
-import { lstatSync, readdirSync, readFileSync } from "node:fs";
+import { lstatSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { isValidPrincipalOrChannelId, LocalStore } from "./local-store.js";
@@ -278,5 +278,67 @@ export class GlobalIdentityAuthority {
       }
     }
     return out;
+  }
+
+  /**
+   * Persist a newly upstream-registered agent identity into `~/.agentschat/profiles/<name>.json`
+   * using strict `0o600` permissions, exclusive-create (`wx`, never overwrites), and symlink refusal.
+   */
+  static saveLocalAgentProfile(opts: {
+    profileName: string;
+    agentId: string;
+    displayName: string;
+    token: string;
+    serverUrl?: string;
+    customHomeDir?: string;
+  }): { filePath: string; profileName: string } {
+    const profileName = String(opts.profileName || "").trim();
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,48}$/.test(profileName)) {
+      throw new Error("Profile name must be 1-49 characters (letters, digits, '.', '_', '-')");
+    }
+    const lower = profileName.toLowerCase();
+    if (INTERNAL_NON_PROFILE_PREFIXES.some((p) => lower === p || lower.startsWith(p))) {
+      throw new Error(`Profile name '${profileName}' is reserved for internal MCP state`);
+    }
+    if (!isValidPrincipalOrChannelId(opts.agentId)) {
+      throw new Error("Invalid global agent_id");
+    }
+    const token = String(opts.token || "").trim();
+    if (!token || token === "dev-token") {
+      throw new Error("Valid upstream-allocated agent token required");
+    }
+
+    const home = opts.customHomeDir || process.env.HOME || process.env.USERPROFILE || homedir();
+    const baseDir = join(home, ".agentschat");
+    const profilesDir = join(baseDir, "profiles");
+    mkdirSync(profilesDir, { recursive: true, mode: 0o700 });
+
+    for (const dir of [baseDir, profilesDir]) {
+      const lst = lstatSync(dir);
+      if (lst.isSymbolicLink() || !lst.isDirectory()) {
+        throw new Error(`Refusing to write into symlinked directory: ${dir}`);
+      }
+    }
+
+    const filePath = join(profilesDir, `${profileName}.json`);
+    const payload = {
+      agent_id: opts.agentId,
+      display_name: String(opts.displayName || opts.agentId).trim() || opts.agentId,
+      token,
+      server_url: opts.serverUrl || DEFAULT_UPSTREAM_SERVER_URL,
+      registered_at: new Date().toISOString(),
+    };
+    try {
+      writeFileSync(filePath, JSON.stringify(payload, null, 2) + "\n", {
+        flag: "wx",
+        mode: 0o600,
+      });
+    } catch (err: any) {
+      if (err?.code === "EEXIST") {
+        throw new Error(`Profile '${profileName}' already exists`);
+      }
+      throw err;
+    }
+    return { filePath, profileName };
   }
 }

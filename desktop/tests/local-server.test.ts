@@ -511,6 +511,69 @@ describe("AgentsChat Desktop M1 — Global Identity Authority + Local Group/DM M
       ).json()) as any;
       expect(memberSearch.total).toBe(1);
       expect(memberSearch.messages[0].channel_id).toBe(privId);
+
+      // REST PATCH / DELETE message + real-time WS broadcast + strict sender/admin authorization
+      const ws = new WebSocket(status.wsUrl);
+      const wsEvents: any[] = [];
+      await new Promise<void>((resolve, reject) => {
+        ws.once("open", () => {
+          ws.send(JSON.stringify({ type: "auth", agent_id: "cloud-codex-global", token: "ac_cloud_codex_secret" }));
+        });
+        ws.on("message", (raw) => {
+          const f = JSON.parse(String(raw));
+          wsEvents.push(f);
+          if (f.type === "auth_ok") {
+            ws.send(JSON.stringify({ type: "join_channel", channel_id: "welcome" }));
+            resolve();
+          }
+        });
+        ws.once("error", reject);
+      });
+
+      // Outsider (Codex) cannot edit Claude's message
+      const badPatch = await fetch(`${status.httpUrl}/api/channels/welcome/messages/${parentId}`, {
+        method: "PATCH",
+        headers: {
+          Authorization: "Bearer ac_cloud_codex_secret",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ content: "tampered" }),
+      });
+      expect(badPatch.status).toBe(403);
+
+      // Sender (Claude) edits own message -> 200 + WS `message_edited`
+      const okPatch = await fetch(`${status.httpUrl}/api/channels/welcome/messages/${parentId}`, {
+        method: "PATCH",
+        headers: {
+          Authorization: "Bearer ac_cloud_claude_secret",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ content: "Deploy 100% passed on macOS_arm64 (edited)" }),
+      });
+      expect(okPatch.status).toBe(200);
+      const patchedBody = (await okPatch.json()) as any;
+      expect(patchedBody.message.content).toContain("(edited)");
+      expect(patchedBody.message.edited_at).toBeTruthy();
+
+      // Outsider (Codex) cannot delete Claude's message in welcome
+      const badDel = await fetch(`${status.httpUrl}/api/channels/welcome/messages/${parentId}`, {
+        method: "DELETE",
+        headers: { Authorization: "Bearer ac_cloud_codex_secret" },
+      });
+      expect(badDel.status).toBe(403);
+
+      // Sender (Claude) deletes own message -> 200 + WS `message_deleted`
+      const okDel = await fetch(`${status.httpUrl}/api/channels/welcome/messages/${parentId}`, {
+        method: "DELETE",
+        headers: { Authorization: "Bearer ac_cloud_claude_secret" },
+      });
+      expect(okDel.status).toBe(200);
+
+      // Wait briefly for WS frames
+      await new Promise((r) => setTimeout(r, 80));
+      expect(wsEvents.some((f) => f.type === "message_edited" && f.message_id === parentId)).toBe(true);
+      expect(wsEvents.some((f) => f.type === "message_deleted" && f.message_id === parentId)).toBe(true);
+      ws.close();
     } finally {
       await local.closeAll();
       await mockCloud.close();

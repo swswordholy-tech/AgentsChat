@@ -148,4 +148,69 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
       await server.stop();
     }
   });
+
+  test("saveLocalAgentProfile persists valid 0600 profiles, blocks overwrites, traversal, reserved names, and symlinks", () => {
+    const saved = GlobalIdentityAuthority.saveLocalAgentProfile({
+      profileName: "Desktop_Bot-1",
+      agentId: "desktop-bot-global-1",
+      displayName: "Desktop Bot 1",
+      token: "ac_live_global_secret_123",
+      customHomeDir: tempDir,
+    });
+    expect(saved.profileName).toBe("Desktop_Bot-1");
+    expect(saved.filePath.endsWith(join(".agentschat", "profiles", "Desktop_Bot-1.json"))).toBe(true);
+
+    // Discovered cleanly right away
+    const found = GlobalIdentityAuthority.discoverLocalAgentProfiles(tempDir);
+    expect(found.length).toBe(1);
+    expect(found[0]?.agent_id).toBe("desktop-bot-global-1");
+    expect((found[0] as any).token).toBeUndefined();
+
+    // Refuses overwrite of existing profile
+    expect(() =>
+      GlobalIdentityAuthority.saveLocalAgentProfile({
+        profileName: "Desktop_Bot-1",
+        agentId: "other-id",
+        displayName: "Other",
+        token: "ac_other",
+        customHomeDir: tempDir,
+      }),
+    ).toThrow(/already exists/i);
+
+    // Rejects path traversal & reserved internal prefix
+    expect(() =>
+      GlobalIdentityAuthority.saveLocalAgentProfile({
+        profileName: "../evil",
+        agentId: "evil-id",
+        displayName: "Evil",
+        token: "ac_123",
+        customHomeDir: tempDir,
+      }),
+    ).toThrow();
+    expect(() =>
+      GlobalIdentityAuthority.saveLocalAgentProfile({
+        profileName: "session-binds-hack",
+        agentId: "evil-id",
+        displayName: "Evil",
+        token: "ac_123",
+        customHomeDir: tempDir,
+      }),
+    ).toThrow(/reserved/i);
+
+    // Refuses writing into symlinked `.agentschat` directory
+    const symHome = join(tempDir, "sym-home");
+    const decoy = join(tempDir, "decoy-dir");
+    mkdirSync(symHome, { recursive: true });
+    mkdirSync(decoy, { recursive: true });
+    symlinkSync(decoy, join(symHome, ".agentschat"));
+    expect(() =>
+      GlobalIdentityAuthority.saveLocalAgentProfile({
+        profileName: "LegitBot",
+        agentId: "legit-bot",
+        displayName: "Legit",
+        token: "ac_123",
+        customHomeDir: symHome,
+      }),
+    ).toThrow(/symlink/i);
+  });
 });

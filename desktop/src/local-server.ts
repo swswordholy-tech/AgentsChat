@@ -681,6 +681,88 @@ export class LocalMiniServer {
       }
     }
 
+    // 7b. Single-Message Edit & Soft-Delete (`PATCH` / `DELETE /api/channels/:id/messages/:msgId`)
+    const msgItemMatch = pathname.match(/^\/api\/channels\/([^/]+)\/messages\/([^/]+)$/);
+    if (msgItemMatch && (method === "PATCH" || method === "DELETE")) {
+      const channelId = decodeURIComponent(msgItemMatch[1]);
+      const messageId = decodeURIComponent(msgItemMatch[2]);
+      if (!isValidPrincipalOrChannelId(channelId) || !messageId || messageId.length > 128) {
+        sendJson(res, 400, { error: "Invalid channel_id or message_id" });
+        return;
+      }
+      const principal = await this.authority.verifyToken(extractBearerToken(req));
+      if (!principal) {
+        sendJson(res, 401, { error: "Unauthorized" });
+        return;
+      }
+      const channel = this.store.getChannel(channelId);
+      if (!channel) {
+        sendJson(res, 404, { error: "Channel not found" });
+        return;
+      }
+      if (channel.visibility === "private" && !this.store.isMember(channelId, principal.id)) {
+        sendJson(res, 403, { error: "Not a member of this private channel" });
+        return;
+      }
+      const existing = this.store.getMessageById(channelId, messageId);
+      if (!existing) {
+        sendJson(res, 404, { error: "Message not found" });
+        return;
+      }
+
+      if (method === "PATCH") {
+        if (existing.sender_id !== principal.id) {
+          sendJson(res, 403, { error: "Only the original sender can edit this message" });
+          return;
+        }
+        let body: any;
+        try {
+          body = await readJsonBody(req);
+        } catch (e: any) {
+          sendJson(res, 400, { error: String(e?.message || "Invalid JSON") });
+          return;
+        }
+        const newContent = typeof body.content === "string" ? body.content : typeof body.text === "string" ? body.text : "";
+        const updated = this.store.editMessage(channelId, messageId, principal.id, newContent);
+        if (!updated) {
+          sendJson(res, 400, { error: "Non-empty message content required" });
+          return;
+        }
+        this.broadcastToChannel(channelId, {
+          type: "message_edited",
+          channel_id: channelId,
+          message_id: updated.id,
+          content: updated.content,
+          edited_at: updated.edited_at,
+        });
+        sendJson(res, 200, { ok: true, message: updated });
+        return;
+      }
+
+      if (method === "DELETE") {
+        const members = this.store.listChannelMembers(channelId);
+        const me = members.find((m) => m.principal_id === principal.id);
+        const isAdmin = me?.role === "admin" || channel.created_by === principal.id;
+        if (existing.sender_id !== principal.id && !isAdmin) {
+          sendJson(res, 403, { error: "Only the sender or channel admin can delete this message" });
+          return;
+        }
+        const ok = this.store.deleteMessage(channelId, messageId, principal.id, isAdmin);
+        if (!ok) {
+          sendJson(res, 404, { error: "Message not found" });
+          return;
+        }
+        this.broadcastToChannel(channelId, {
+          type: "message_deleted",
+          channel_id: channelId,
+          message_id: messageId,
+          deleted_by: principal.id,
+        });
+        sendJson(res, 200, { ok: true, deleted: messageId });
+        return;
+      }
+    }
+
     // 8. Minimal Streamable HTTP `/mcp` read-only context support (`agentschat_get_channel_context` / `agentschat_read_messages`)
     if (pathname === "/mcp" && method === "POST") {
       const principal = await this.authority.verifyToken(extractBearerToken(req));

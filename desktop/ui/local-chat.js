@@ -13,6 +13,9 @@
   let messages = [];
   let activeSearchQuery = "";
   let replyTarget = null;
+  let unreadByChannel = new Map();
+  let mentionCandidates = [];
+  let mentionActiveIdx = 0;
   let ws = null;
   let wsReconnectDelayMs = 1000;
   let wsReconnectTimer = null;
@@ -36,6 +39,7 @@
   const elSearchBannerText = document.getElementById("search-banner-text");
   const elReplyBanner = document.getElementById("reply-banner");
   const elReplyBannerText = document.getElementById("reply-banner-text");
+  const elMentionMenu = document.getElementById("mention-menu");
 
   elServerPill.textContent = originUrl;
 
@@ -162,12 +166,18 @@
         wsReconnectDelayMs = 1000;
         setWsPillState("live");
         sock.send(JSON.stringify({ type: "join_channel", channel_id: currentChannelId }));
-      } else if (frame.type === "message" && frame.channel_id === currentChannelId) {
-        if (!activeSearchQuery && !messages.some((m) => m.id === frame.id)) {
-          messages.push(frame);
-          renderMessages();
+      } else if (frame.type === "message") {
+        if (frame.channel_id === currentChannelId) {
+          if (!activeSearchQuery && !messages.some((m) => m.id === frame.id)) {
+            messages.push(frame);
+            renderMessages();
+          }
+          elTyping.textContent = "";
+        } else if (frame.channel_id && frame.sender_id !== currentPrincipal?.id) {
+          const prev = unreadByChannel.get(frame.channel_id) || 0;
+          unreadByChannel.set(frame.channel_id, prev + 1);
+          void loadChannels();
         }
-        elTyping.textContent = "";
       } else if (frame.type === "message_edited" && frame.channel_id === currentChannelId) {
         const idx = messages.findIndex((m) => m.id === frame.message_id);
         if (idx >= 0) {
@@ -252,12 +262,22 @@
       const prefix = ch.type === "direct" ? "💬 " : ch.visibility === "private" ? "🔒 #" : "#";
       const label = document.createElement("span");
       label.textContent = prefix + (ch.name || ch.id);
+      const right = document.createElement("span");
+      right.className = "ch-right";
+      const unread = unreadByChannel.get(ch.id) || 0;
+      if (unread > 0 && ch.id !== currentChannelId) {
+        const badge = document.createElement("span");
+        badge.className = "ch-unread";
+        badge.textContent = unread > 99 ? "99+" : String(unread);
+        right.appendChild(badge);
+      }
       const count = document.createElement("span");
       count.style.fontSize = "11px";
       count.style.color = "#64748b";
       count.textContent = String(ch.member_count ?? "");
+      right.appendChild(count);
       btn.appendChild(label);
-      btn.appendChild(count);
+      btn.appendChild(right);
       btn.addEventListener("click", () => selectChannel(ch.id));
       elChannelList.appendChild(btn);
     });
@@ -339,6 +359,7 @@
 
   async function selectChannel(channelId) {
     currentChannelId = channelId;
+    unreadByChannel.delete(channelId);
     activeSearchQuery = "";
     if (elSearchInput) elSearchInput.value = "";
     if (elSearchBanner) elSearchBanner.hidden = true;
@@ -448,6 +469,56 @@
       btnQuote.title = "引用回复此消息";
       btnQuote.addEventListener("click", () => setReplyTarget(m));
       actions.appendChild(btnQuote);
+
+      if (m.sender_id === currentPrincipal?.id) {
+        const btnEdit = document.createElement("button");
+        btnEdit.type = "button";
+        btnEdit.className = "icon-btn";
+        btnEdit.textContent = "✎编辑";
+        btnEdit.title = "编辑这条消息";
+        btnEdit.addEventListener("click", async () => {
+          const r = await openPromptDialog({
+            title: "编辑消息",
+            hint: "修改后将实时同步给房间内所有成员。",
+            placeholder1: "输入新的消息内容",
+          });
+          if (!r?.v1) return;
+          const res = await api(
+            `/api/channels/${encodeURIComponent(currentChannelId)}/messages/${encodeURIComponent(m.id)}`,
+            { method: "PATCH", body: JSON.stringify({ content: r.v1 }) },
+          );
+          if (res.ok && res.data?.message) {
+            m.content = res.data.message.content;
+            m.edited_at = res.data.message.edited_at;
+            renderMessages();
+            showToast("消息已更新");
+          } else {
+            showToast(res.data?.error || "编辑失败");
+          }
+        });
+
+        const btnDel = document.createElement("button");
+        btnDel.type = "button";
+        btnDel.className = "icon-btn";
+        btnDel.textContent = "🗑撤回";
+        btnDel.title = "删除这条消息";
+        btnDel.addEventListener("click", async () => {
+          const res = await api(
+            `/api/channels/${encodeURIComponent(currentChannelId)}/messages/${encodeURIComponent(m.id)}`,
+            { method: "DELETE" },
+          );
+          if (res.ok) {
+            messages = messages.filter((itemMsg) => itemMsg.id !== m.id);
+            renderMessages();
+            showToast("消息已撤回");
+          } else {
+            showToast(res.data?.error || "撤回失败");
+          }
+        });
+
+        actions.appendChild(btnEdit);
+        actions.appendChild(btnDel);
+      }
 
       meta.appendChild(sender);
       meta.appendChild(time);
@@ -771,8 +842,154 @@
     }
   });
 
+  // One-click global agent registration (`https://agents-chat.com/api/account/register` -> `~/.agentschat/profiles/`)
+  const btnRegisterAgent = document.getElementById("btn-register-agent");
+  if (!bridge?.registerLocalAgent && btnRegisterAgent) {
+    btnRegisterAgent.style.display = "none";
+  }
+  let latestRegisteredClaimUrl = null;
+  let latestRegisteredCmd = "";
+  btnRegisterAgent?.addEventListener("click", async () => {
+    if (!bridge?.registerLocalAgent) return;
+    const r = await openPromptDialog({
+      title: "注册全局唯一本机 Agent",
+      hint: "将向 agents-chat.com 申请全局唯一 agent_id 与密钥并保存到 ~/.agentschat/profiles/，本地与远端切换零冲突。",
+      placeholder1: "显示名称（如：My Local Claude）",
+      placeholder2: "可选：Profile 文件名（如：My_Claude）",
+    });
+    if (!r?.v1) return;
+    showToast("正在向 agents-chat.com 申请全局身份…");
+    const res = await bridge.registerLocalAgent({ displayName: r.v1, profileName: r.v2 });
+    if (!res?.ok) {
+      showToast(res?.error || "注册失败");
+      return;
+    }
+    latestRegisteredClaimUrl = res.claim_url || null;
+    latestRegisteredCmd = res.mcp_command || "";
+    document.getElementById("registered-summary").textContent =
+      `已保存 ~/.agentschat/profiles/${res.profile_name}.json（全局 ID：@${res.agent_id}）并自动加入 #welcome。`;
+    document.getElementById("registered-mcp-cmd").textContent = latestRegisteredCmd;
+    const claimBtn = document.getElementById("btn-open-claim");
+    claimBtn.hidden = !latestRegisteredClaimUrl;
+    document.getElementById("registered-dialog").showModal();
+    await loadDiscoveredBots();
+    await selectChannel(currentChannelId);
+  });
+  document.getElementById("btn-close-registered")?.addEventListener("click", () => {
+    document.getElementById("registered-dialog").close();
+  });
+  document.getElementById("btn-copy-registered-cmd")?.addEventListener("click", async () => {
+    if (!latestRegisteredCmd) return;
+    if (bridge?.copyText) await bridge.copyText(latestRegisteredCmd);
+    else await navigator.clipboard?.writeText(latestRegisteredCmd);
+    showToast("已复制新 Agent 本机 MCP 启动命令");
+  });
+  document.getElementById("btn-open-claim")?.addEventListener("click", () => {
+    if (!latestRegisteredClaimUrl) return;
+    document.getElementById("registered-dialog").close();
+    try {
+      const parsed = new URL(latestRegisteredClaimUrl);
+      if (bridge?.switchToCloud) {
+        bridge.switchToCloud(parsed.pathname + parsed.search);
+      } else {
+        window.open(latestRegisteredClaimUrl, "_blank", "noopener");
+      }
+    } catch {}
+  });
+
+  // `@mention` Autocomplete Popover in Composer
+  function closeMentionMenu() {
+    mentionCandidates = [];
+    mentionActiveIdx = 0;
+    if (elMentionMenu) {
+      elMentionMenu.hidden = true;
+      elMentionMenu.replaceChildren();
+    }
+  }
+
+  function applyMentionSelection(agentId) {
+    const pos = elInput.selectionStart ?? elInput.value.length;
+    const before = elInput.value.slice(0, pos);
+    const after = elInput.value.slice(pos);
+    const replaced = before.replace(/(^|\s)@([a-zA-Z0-9._-]*)$/, `$1@${agentId} `);
+    elInput.value = replaced + after;
+    const nextPos = replaced.length;
+    elInput.setSelectionRange(nextPos, nextPos);
+    elInput.focus();
+    closeMentionMenu();
+  }
+
+  function updateMentionMenu() {
+    if (!elMentionMenu) return;
+    const pos = elInput.selectionStart ?? elInput.value.length;
+    const before = elInput.value.slice(0, pos);
+    const match = before.match(/(^|\s)@([a-zA-Z0-9._-]*)$/);
+    if (!match) {
+      closeMentionMenu();
+      return;
+    }
+    const q = (match[2] || "").toLowerCase();
+    mentionCandidates = currentMembers.filter(
+      (m) =>
+        m.agent_id !== currentPrincipal?.id &&
+        (m.agent_id.toLowerCase().includes(q) || (m.display_name || "").toLowerCase().includes(q)),
+    );
+    if (mentionCandidates.length === 0) {
+      closeMentionMenu();
+      return;
+    }
+    mentionActiveIdx = Math.min(mentionActiveIdx, mentionCandidates.length - 1);
+    elMentionMenu.replaceChildren();
+    mentionCandidates.forEach((m, idx) => {
+      const opt = document.createElement("button");
+      opt.type = "button";
+      opt.className = "mention-opt" + (idx === mentionActiveIdx ? " active" : "");
+      const nameSpan = document.createElement("span");
+      nameSpan.textContent = (m.online ? "● " : "") + (m.display_name || m.agent_id);
+      const idSpan = document.createElement("span");
+      idSpan.className = "mention-opt-id";
+      idSpan.textContent = `@${m.agent_id}`;
+      opt.appendChild(nameSpan);
+      opt.appendChild(idSpan);
+      opt.addEventListener("mousedown", (ev) => {
+        ev.preventDefault();
+        applyMentionSelection(m.agent_id);
+      });
+      elMentionMenu.appendChild(opt);
+    });
+    elMentionMenu.hidden = false;
+  }
+
+  elInput.addEventListener("input", () => updateMentionMenu());
+  elInput.addEventListener("blur", () => setTimeout(() => closeMentionMenu(), 120));
+
   document.getElementById("btn-send").addEventListener("click", () => sendChatText());
   elInput.addEventListener("keydown", (ev) => {
+    if (mentionCandidates.length > 0 && elMentionMenu && !elMentionMenu.hidden) {
+      if (ev.key === "ArrowDown") {
+        ev.preventDefault();
+        mentionActiveIdx = (mentionActiveIdx + 1) % mentionCandidates.length;
+        updateMentionMenu();
+        return;
+      }
+      if (ev.key === "ArrowUp") {
+        ev.preventDefault();
+        mentionActiveIdx = (mentionActiveIdx - 1 + mentionCandidates.length) % mentionCandidates.length;
+        updateMentionMenu();
+        return;
+      }
+      if (ev.key === "Enter" || ev.key === "Tab") {
+        ev.preventDefault();
+        const chosen = mentionCandidates[mentionActiveIdx];
+        if (chosen) applyMentionSelection(chosen.agent_id);
+        return;
+      }
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        closeMentionMenu();
+        return;
+      }
+    }
     if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) {
       ev.preventDefault();
       sendChatText();

@@ -463,6 +463,29 @@ async function createDesktopWindow(): Promise<void> {
     return { action: "deny" };
   });
 
+  cloudView.webContents.on("did-fail-load", (_ev, errorCode, errorDescription, validatedURL, isMainFrame) => {
+    if (!isMainFrame || errorCode === -3 || isSmokeTest) return;
+    if (validatedURL && validatedURL.includes("cloud-offline.html")) return;
+    void cloudView?.webContents.loadFile(join(UI_DIR, "cloud-offline.html"), {
+      query: {
+        remote: settings.remoteServerUrl,
+        reason: errorDescription || `ERR_${errorCode}`,
+      },
+    });
+  });
+
+  cloudView.webContents.on("will-navigate", (ev, navUrl) => {
+    const currentUrl = cloudView?.webContents.getURL() || "";
+    if (!currentUrl.startsWith("file://") || !currentUrl.includes("cloud-offline.html")) return;
+    if (navUrl === "agentschat-action://retry-cloud") {
+      ev.preventDefault();
+      void cloudView?.webContents.loadURL(settings.remoteServerUrl);
+    } else if (navUrl === "agentschat-action://switch-local") {
+      ev.preventDefault();
+      void switchWorkspace("local");
+    }
+  });
+
   if (!isSmokeTest) {
     void cloudView.webContents.loadURL(settings.remoteServerUrl);
   }
@@ -628,7 +651,7 @@ function registerIpcHandlers(): void {
     if (!st || !localServer || !ev.sender.getURL().startsWith(st.httpUrl)) {
       return { ok: false, error: "Forbidden" };
     }
-    if (typeof profileName !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(profileName)) {
+    if (typeof profileName !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,48}$/.test(profileName) || profileName.includes("..")) {
       return { ok: false, error: "Invalid profile name" };
     }
     const candidates = GlobalIdentityAuthority.discoverLocalAgentProfiles();
@@ -657,6 +680,59 @@ function registerIpcHandlers(): void {
       };
     } catch (e: any) {
       return { ok: false, error: String(e?.message || "Failed to activate profile") };
+    }
+  });
+
+  // One-click global agent registration: allocates globally unique agent_id + ac_ token via
+  // `https://agents-chat.com/api/account/register`, saves to `~/.agentschat/profiles/<name>.json`
+  // with 0o600 permissions, and joins `#welcome` on the local server.
+  ipcMain.handle("desktop:register-local-agent", async (ev, req: any) => {
+    const st = localServer?.getStatus();
+    if (!st || !localServer || !ev.sender.getURL().startsWith(st.httpUrl)) {
+      return { ok: false, error: "Forbidden" };
+    }
+    const displayName = String(req?.displayName || "").trim();
+    const rawProfileName = String(req?.profileName || "").trim();
+    const safeProfileName =
+      rawProfileName ||
+      displayName
+        .replace(/[^a-zA-Z0-9._-]+/g, "-")
+        .replace(/^-+|-+$/g, "")
+        .slice(0, 40) ||
+      `Agent-${Date.now().toString(36)}`;
+    if (!displayName || displayName.length > 64) {
+      return { ok: false, error: "Display name (1-64 chars) is required" };
+    }
+    try {
+      const upstream = await localServer.authority.registerAgentViaUpstream({
+        name: displayName,
+        capabilities: ["chat", "code"],
+      });
+      if (upstream.status < 200 || upstream.status >= 300 || !upstream.data?.id || !upstream.data?.key) {
+        return {
+          ok: false,
+          error: String(upstream.data?.error || `Upstream registration failed (${upstream.status})`),
+        };
+      }
+      const saved = GlobalIdentityAuthority.saveLocalAgentProfile({
+        profileName: safeProfileName,
+        agentId: String(upstream.data.id),
+        displayName: String(upstream.data.name || displayName),
+        token: String(upstream.data.key),
+        serverUrl: st.upstreamUrl,
+      });
+      localServer.store.addMember("welcome", String(upstream.data.id), "member");
+      broadcastState();
+      return {
+        ok: true,
+        profile_name: saved.profileName,
+        agent_id: String(upstream.data.id),
+        display_name: String(upstream.data.name || displayName),
+        claim_url: typeof upstream.data.claim_url === "string" ? upstream.data.claim_url : null,
+        mcp_command: `npx -y agentschat-mcp@latest --profile ${saved.profileName} --url ${st.httpUrl}`,
+      };
+    } catch (e: any) {
+      return { ok: false, error: String(e?.message || "Failed to register local agent") };
     }
   });
 }

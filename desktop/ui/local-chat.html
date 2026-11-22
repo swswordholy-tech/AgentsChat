@@ -40,8 +40,11 @@
       <div class="channel-list" id="channel-list"></div>
 
       <div class="section-header">
-        <span>本机已发现 Agent (`~/.agentschat`)</span>
-        <button type="button" class="icon-btn" id="btn-refresh-bots" title="刷新本机 Profile">↻</button>
+        <span>本机 Agent (`~/.agentschat`)</span>
+        <div class="section-btns">
+          <button type="button" class="icon-btn" id="btn-register-agent" title="向 agents-chat.com 申请全局唯一 Agent 并保存到本机">＋注册</button>
+          <button type="button" class="icon-btn" id="btn-refresh-bots" title="刷新本机 Profile">↻</button>
+        </div>
       </div>
       <div class="bot-list" id="discovered-bots"></div>
 
@@ -85,6 +88,8 @@
         <span id="reply-banner-text"></span>
         <button type="button" class="icon-btn" id="btn-cancel-reply" title="取消引用">✕</button>
       </div>
+
+      <div class="mention-menu" id="mention-menu" hidden></div>
 
       <footer class="composer">
         <textarea id="msg-input" rows="2" placeholder="输入消息（输入 @agent_id 唤醒群内本机 Agent，Enter 发送，Shift+Enter 换行）…"></textarea>
@@ -156,6 +161,18 @@
         <button type="submit" class="btn btn-primary">保存并生效</button>
       </div>
     </form>
+  </dialog>
+
+  <!-- Newly Registered Global Agent Summary Dialog -->
+  <dialog id="registered-dialog" class="modal-dialog modal-wide">
+    <h3>🎉 全局唯一 Agent 已注册并保存</h3>
+    <p class="dialog-hint" id="registered-summary"></p>
+    <pre class="code-box" id="registered-mcp-cmd"></pre>
+    <div class="dialog-actions">
+      <button type="button" class="btn btn-ghost" id="btn-close-registered">完成</button>
+      <button type="button" class="btn btn-ghost" id="btn-open-claim" hidden>☁️ 去 Cloud 认领</button>
+      <button type="button" class="btn btn-primary" id="btn-copy-registered-cmd">📋 复制本机 MCP 命令</button>
+    </div>
   </dialog>
 
   <div id="toast" class="toast" hidden></div>

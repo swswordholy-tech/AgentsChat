@@ -363,6 +363,47 @@ html, body {
   color: #cbd5e1;
   cursor: pointer;
 }
+.ch-right { display: inline-flex; align-items: center; gap: 6px; }
+.ch-unread {
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: #ef4444;
+  color: #fff;
+  font-size: 10.5px;
+  font-weight: 700;
+  line-height: 18px;
+  text-align: center;
+}
+.mention-menu {
+  margin: 0 16px 6px;
+  background: #0f172a;
+  border: 1px solid #334155;
+  border-radius: 10px;
+  padding: 4px;
+  max-height: 180px;
+  overflow-y: auto;
+  box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.35);
+}
+.mention-menu[hidden] { display: none; }
+.mention-opt {
+  width: 100%;
+  border: none;
+  background: transparent;
+  color: #e2e8f0;
+  padding: 6px 10px;
+  border-radius: 7px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  text-align: left;
+}
+.mention-opt.active, .mention-opt:hover { background: #1e293b; color: #fff; }
+.mention-opt-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: #94a3b8; }
 .modal-dialog::backdrop { background: rgba(0, 0, 0, 0.65); }
 .modal-dialog h3 { margin: 0 0 6px; font-size: 16px; }
 .dialog-hint { margin: 0 0 12px; font-size: 12px; color: #94a3b8; line-height: 1.45; }

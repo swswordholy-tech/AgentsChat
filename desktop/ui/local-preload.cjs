@@ -8,6 +8,7 @@ contextBridge.exposeInMainWorld("agentschatLocalBridge", {
   getServerStatus: () => ipcRenderer.invoke("desktop:get-local-server-status"),
   toggleAllowLan: (allowLan) => ipcRenderer.invoke("desktop:toggle-allow-lan", Boolean(allowLan)),
   updateLocalSettings: (patch) => ipcRenderer.invoke("desktop:update-local-settings", patch),
+  registerLocalAgent: (req) => ipcRenderer.invoke("desktop:register-local-agent", req),
   activateDiscoveredProfile: (profileName) => ipcRenderer.invoke("desktop:activate-local-profile", profileName),
   switchToCloud: (targetPath) => ipcRenderer.invoke("desktop:open-cloud-path", targetPath || "/"),
   copyText: (text) => ipcRenderer.invoke("desktop:copy-text", text),
