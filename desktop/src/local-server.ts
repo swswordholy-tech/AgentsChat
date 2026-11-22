@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
+import { networkInterfaces } from "node:os";
 import { extname, join, normalize } from "node:path";
 import { WebSocketServer, WebSocket } from "ws";
 import { GlobalIdentityAuthority } from "./identity-authority.js";
@@ -206,12 +207,24 @@ export class LocalMiniServer {
     const connectHost = this.host === "0.0.0.0" ? "127.0.0.1" : this.host;
     const port = this.boundPort || this.requestedPort;
     const channels = this.store.listChannelsForPrincipal(null, false);
+    const lanUrls: string[] = [];
+    if (this.host === "0.0.0.0" && this.httpServer) {
+      const ifaces = networkInterfaces();
+      for (const addrs of Object.values(ifaces)) {
+        for (const addr of addrs || []) {
+          if (addr.family === "IPv4" && !addr.internal && addr.address) {
+            lanUrls.push(`http://${addr.address}:${port}`);
+          }
+        }
+      }
+    }
     return {
       running: Boolean(this.httpServer),
       host: this.host,
       port,
       httpUrl: `http://${connectHost}:${port}`,
       wsUrl: `ws://${connectHost}:${port}/ws`,
+      lanUrls: Array.from(new Set(lanUrls)),
       upstreamUrl: this.authority.upstreamUrl,
       connectedAgents: Array.from(this.socketsByPrincipal.keys()),
       channelCount: channels.length,
@@ -285,6 +298,7 @@ export class LocalMiniServer {
         build: "desktop-local",
         agents: st.connectedAgents.length,
         channels: st.channelCount,
+        lan_urls: st.lanUrls,
         upstream_identity_authority: this.authority.upstreamUrl,
         capabilities: {
           group_chat: true,

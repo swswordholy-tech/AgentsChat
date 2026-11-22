@@ -21,9 +21,10 @@ import type { DesktopSettings, LocalServerStatus } from "./types.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const UI_DIR = join(__dirname, "..", "ui");
+const ASSETS_DIR = join(__dirname, "..", "assets");
 const RAIL_WIDTH = 68;
 
-// Programmatic 16x16 crisp monochrome/cyan PNG icon so Tray works out-of-the-box on macOS & Windows
+// Fallback 16x16 PNG data URL if tray-icon.png is unavailable
 const TRAY_ICON_DATA_URL =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAWklEQVQ4T2NkoBAwUqifYdQABgZGBv8MDAz/yWLD////GXG5DF0DsiF4XYYugM9l2AxgxOcybAbgcxk2Awi5DFcAIZfhCiDkMlwBhFyGK2B0GDAyMDAwAABnTRkR6z51AAAAAElFTkSuQmCC";
 
@@ -32,6 +33,7 @@ let cloudView: WebContentsView | null = null;
 let localView: WebContentsView | null = null;
 let tray: Tray | null = null;
 let isQuitting = false;
+let localUnreadCount = 0;
 
 const isSmokeTest = process.env.AGENTSCHAT_DESKTOP_SMOKE_TEST === "1";
 const desktopDataDir =
@@ -66,6 +68,25 @@ function isOAuthPopupUrl(rawUrl: string, remoteOrigin: string): boolean {
   }
 }
 
+function syncUnreadBadge(): void {
+  try {
+    if (typeof app.setBadgeCount === "function") {
+      app.setBadgeCount(localUnreadCount);
+    }
+  } catch {}
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.setTitle(localUnreadCount > 0 ? `(${localUnreadCount}) AgentsChat` : "AgentsChat");
+  }
+}
+
+function clearLocalUnread(): void {
+  if (localUnreadCount !== 0) {
+    localUnreadCount = 0;
+    syncUnreadBadge();
+    broadcastState();
+  }
+}
+
 async function ensureLocalServerStarted(): Promise<LocalServerStatus | null> {
   if (!settings.localServerEnabled) {
     if (localServer) {
@@ -86,21 +107,26 @@ async function ensureLocalServerStarted(): Promise<LocalServerStatus | null> {
       upstreamUrl: settings.remoteServerUrl,
       staticUiDir: UI_DIR,
       onMessageReceived: (msg, channelName) => {
-        if (!Notification.isSupported()) return;
-        const winFocusedOnLocal =
+        const winFocusedOnLocal = Boolean(
           mainWindow &&
+          !mainWindow.isDestroyed() &&
           mainWindow.isFocused() &&
-          settings.activeWorkspace === "local";
+          settings.activeWorkspace === "local",
+        );
         if (!winFocusedOnLocal && msg.sender_type === "agent") {
-          const notif = new Notification({
-            title: `${msg.sender_name || msg.sender_id} · #${channelName} (Local)`,
-            body: msg.content.slice(0, 140),
-          });
-          notif.on("click", () => {
-            showMainWindow();
-            void switchWorkspace("local");
-          });
-          notif.show();
+          localUnreadCount += 1;
+          syncUnreadBadge();
+          if (Notification.isSupported()) {
+            const notif = new Notification({
+              title: `${msg.sender_name || msg.sender_id} · #${channelName} (Local)`,
+              body: msg.content.slice(0, 140),
+            });
+            notif.on("click", () => {
+              showMainWindow();
+              void switchWorkspace("local");
+            });
+            notif.show();
+          }
         }
         broadcastState();
       },
@@ -121,6 +147,7 @@ function getCombinedState() {
     platform: process.platform,
     settings,
     localServer: localServer ? localServer.getStatus() : null,
+    localUnreadCount,
     discoveredProfiles: GlobalIdentityAuthority.discoverLocalAgentProfiles(),
   };
 }
@@ -172,6 +199,8 @@ async function readCloudTokenIfSameOrigin(): Promise<string | null> {
 async function switchWorkspace(target: "cloud" | "local"): Promise<void> {
   settings = settingsStore.save({ activeWorkspace: target });
   if (target === "local") {
+    localUnreadCount = 0;
+    syncUnreadBadge();
     const st = await ensureLocalServerStarted();
     if (st && localView && !localView.webContents.isDestroyed()) {
       const currentUrl = localView.webContents.getURL();
@@ -231,6 +260,14 @@ function rebuildTrayMenu(): void {
         })();
       },
     },
+    {
+      label: "🌐 Allow LAN Access (0.0.0.0)",
+      type: "checkbox",
+      checked: settings.allowLan,
+      click: () => {
+        void setAllowLan(!settings.allowLan);
+      },
+    },
     { type: "separator" },
     {
       label: "Quit AgentsChat",
@@ -243,8 +280,27 @@ function rebuildTrayMenu(): void {
   tray.setContextMenu(menu);
 }
 
+async function setAllowLan(allowLan: boolean): Promise<LocalServerStatus | null> {
+  const changed = Boolean(allowLan) !== settings.allowLan;
+  settings = settingsStore.save({ allowLan: Boolean(allowLan) });
+  if (changed && localServer) {
+    await localServer.closeAll();
+    localServer = null;
+  }
+  const st = await ensureLocalServerStarted();
+  if (st && localView && !localView.webContents.isDestroyed()) {
+    const cur = localView.webContents.getURL();
+    if (!cur.startsWith(st.httpUrl)) {
+      await localView.webContents.loadURL(st.httpUrl);
+    }
+  }
+  broadcastState();
+  return st;
+}
+
 async function createDesktopWindow(): Promise<void> {
   const isMac = process.platform === "darwin";
+  const windowIconPath = join(ASSETS_DIR, "icon.png");
   mainWindow = new BrowserWindow({
     width: 1320,
     height: 860,
@@ -252,6 +308,7 @@ async function createDesktopWindow(): Promise<void> {
     minHeight: 560,
     show: !isSmokeTest,
     title: "AgentsChat",
+    ...(existsSync(windowIconPath) ? { icon: windowIconPath } : {}),
     backgroundColor: "#0b0f19",
     ...(isMac ? { titleBarStyle: "hiddenInset", trafficLightPosition: { x: 14, y: 14 } } : { autoHideMenuBar: true }),
     webPreferences: {
@@ -326,6 +383,11 @@ async function createDesktopWindow(): Promise<void> {
 
   layoutViews();
   mainWindow.on("resize", () => layoutViews());
+  mainWindow.on("focus", () => {
+    if (settings.activeWorkspace === "local") {
+      clearLocalUnread();
+    }
+  });
 
   mainWindow.on("close", (ev) => {
     if (!isQuitting && settings.minimizeToTray && settings.localServerEnabled) {
@@ -390,6 +452,23 @@ function registerIpcHandlers(): void {
       await cloudView.webContents.loadURL(targetUrl);
     }
     return true;
+  });
+
+  ipcMain.handle("desktop:get-local-server-status", (ev) => {
+    const st = localServer?.getStatus();
+    if (!st || !ev.sender.getURL().startsWith(st.httpUrl)) {
+      return { ok: false };
+    }
+    return { ok: true, allowLan: settings.allowLan, status: st };
+  });
+
+  ipcMain.handle("desktop:toggle-allow-lan", async (ev, allowLan: unknown) => {
+    const cur = localServer?.getStatus();
+    if (!cur || !ev.sender.getURL().startsWith(cur.httpUrl)) {
+      return { ok: false };
+    }
+    const nextStatus = await setAllowLan(Boolean(allowLan));
+    return { ok: true, allowLan: settings.allowLan, status: nextStatus };
   });
 
   // Hand off verified Cloud identity (`ac_token` from agents-chat.com) to the Local Chat view
@@ -477,7 +556,11 @@ if (!gotSingleInstanceLock) {
     registerIpcHandlers();
     if (!isSmokeTest) {
       try {
-        tray = new Tray(nativeImage.createFromDataURL(TRAY_ICON_DATA_URL));
+        const trayIconPath = join(UI_DIR, "tray-icon.png");
+        const trayImg = existsSync(trayIconPath)
+          ? nativeImage.createFromPath(trayIconPath)
+          : nativeImage.createFromDataURL(TRAY_ICON_DATA_URL);
+        tray = new Tray(trayImg);
         tray.setToolTip("AgentsChat Desktop");
         tray.on("click", () => showMainWindow());
       } catch {}

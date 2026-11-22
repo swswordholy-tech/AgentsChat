@@ -475,11 +475,121 @@
     }
   });
 
+  let activeHarness = "claude";
+  let activeConnectBaseUrl = originUrl;
+
+  function buildHarnessSnippet(harness, baseUrl) {
+    if (harness === "claude") {
+      return `claude mcp add agentschat-local -- npx -y agentschat-mcp@latest --profile My-Agent --url ${baseUrl}`;
+    }
+    if (harness === "codex") {
+      return `codex mcp add agentschat-local -- npx -y agentschat-mcp@latest --profile My-Codex --url ${baseUrl}`;
+    }
+    if (harness === "dsh") {
+      return `npx -y agentschat-mcp@latest --dsh --wake --profile My-DSH --url ${baseUrl}`;
+    }
+    return JSON.stringify(
+      {
+        mcpServers: {
+          "agentschat-local": {
+            command: "npx",
+            args: ["-y", "agentschat-mcp@latest", "--profile", "My-Agent", "--url", baseUrl],
+          },
+        },
+      },
+      null,
+      2,
+    );
+  }
+
+  async function refreshConnectModal() {
+    const lanText = document.getElementById("lan-status-text");
+    const lanList = document.getElementById("lan-urls-list");
+    const toggleBtn = document.getElementById("btn-toggle-lan");
+    const snippetBox = document.getElementById("mcp-snippet-box");
+
+    let allowLan = false;
+    let lanUrls = [];
+    if (bridge?.getServerStatus) {
+      const st = await bridge.getServerStatus();
+      if (st?.ok) {
+        allowLan = Boolean(st.allowLan);
+        lanUrls = Array.isArray(st.status?.lanUrls) ? st.status.lanUrls : [];
+      }
+      toggleBtn.style.display = "inline-flex";
+    } else {
+      const h = await api("/health");
+      lanUrls = Array.isArray(h.data?.lan_urls) ? h.data.lan_urls : [];
+      allowLan = lanUrls.length > 0;
+      toggleBtn.style.display = "none";
+    }
+
+    toggleBtn.textContent = allowLan ? "关闭局域网" : "开启局域网";
+    lanText.textContent = allowLan
+      ? `局域网已开放 (0.0.0.0) — 点击下方地址即可复制`
+      : "当前仅本机回环可连（127.0.0.1），开启后同 Wi-Fi 设备也可接入";
+
+    lanList.innerHTML = "";
+    activeConnectBaseUrl = originUrl;
+    if (allowLan && lanUrls.length > 0) {
+      for (const u of lanUrls) {
+        const pill = document.createElement("button");
+        pill.type = "button";
+        pill.className = "lan-url-pill";
+        pill.textContent = u;
+        pill.title = "点击复制并切换下方命令地址";
+        pill.addEventListener("click", async () => {
+          activeConnectBaseUrl = u;
+          snippetBox.textContent = buildHarnessSnippet(activeHarness, activeConnectBaseUrl);
+          if (bridge?.copyText) await bridge.copyText(u);
+          else await navigator.clipboard?.writeText(u);
+          showToast("已复制局域网地址：" + u);
+        });
+        lanList.appendChild(pill);
+      }
+    }
+    snippetBox.textContent = buildHarnessSnippet(activeHarness, activeConnectBaseUrl);
+  }
+
   document.getElementById("btn-copy-mcp").addEventListener("click", async () => {
-    const cmd = `npx -y agentschat-mcp@latest --profile <YourProfile> --url ${originUrl}`;
-    if (bridge?.copyText) await bridge.copyText(cmd);
-    else await navigator.clipboard?.writeText(cmd);
-    showToast("已复制本机 MCP 接入命令");
+    const dlg = document.getElementById("connect-dialog");
+    await refreshConnectModal();
+    dlg.showModal();
+  });
+
+  document.getElementById("btn-close-connect").addEventListener("click", () => {
+    document.getElementById("connect-dialog").close();
+  });
+
+  document.getElementById("btn-toggle-lan").addEventListener("click", async () => {
+    if (!bridge?.toggleAllowLan || !bridge?.getServerStatus) return;
+    const cur = await bridge.getServerStatus();
+    const next = !Boolean(cur?.allowLan);
+    const res = await bridge.toggleAllowLan(next);
+    if (res?.ok) {
+      showToast(next ? "已开放局域网接入 (0.0.0.0)" : "已切回仅本机回环 (127.0.0.1)");
+      await refreshConnectModal();
+    }
+  });
+
+  document.getElementById("snippet-tabs").addEventListener("click", (ev) => {
+    const btn = ev.target.closest(".tab-btn");
+    if (!btn) return;
+    activeHarness = btn.dataset.harness || "claude";
+    for (const el of document.querySelectorAll("#snippet-tabs .tab-btn")) {
+      el.classList.toggle("active", el === btn);
+    }
+    document.getElementById("mcp-snippet-box").textContent = buildHarnessSnippet(
+      activeHarness,
+      activeConnectBaseUrl,
+    );
+  });
+
+  document.getElementById("btn-copy-snippet").addEventListener("click", async () => {
+    const txt = document.getElementById("mcp-snippet-box").textContent || "";
+    if (bridge?.copyText) await bridge.copyText(txt);
+    else await navigator.clipboard?.writeText(txt);
+    showToast("已复制 MCP 接入配置");
   });
 
   document.getElementById("btn-refresh-bots").addEventListener("click", () => loadDiscoveredBots());

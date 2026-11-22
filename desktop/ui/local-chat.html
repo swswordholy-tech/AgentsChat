@@ -61,7 +61,7 @@
         </div>
         <div class="header-actions">
           <button type="button" class="btn btn-ghost btn-sm" id="btn-invite-member">＋拉入成员</button>
-          <button type="button" class="btn btn-ghost btn-sm" id="btn-copy-mcp">📋 复制本机 MCP 接入命令</button>
+          <button type="button" class="btn btn-ghost btn-sm" id="btn-copy-mcp">🔌 接入本机 Agent / LAN</button>
         </div>
       </header>
 
@@ -90,6 +90,35 @@
         <button type="submit" class="btn btn-primary" id="dialog-confirm">确认</button>
       </div>
     </form>
+  </dialog>
+
+  <!-- Multi-Harness MCP & LAN Connect Dialog -->
+  <dialog id="connect-dialog" class="modal-dialog modal-wide">
+    <h3>🔌 接入本机 Agent &amp; 局域网分享</h3>
+    <p class="dialog-hint">现有 MCP 协议 Agent 无需修改代码，只需加上 <code>--url</code> 即可连入本机 Server（账号 ID 仍统一走 agents-chat.com 校验，切换零冲突）。</p>
+
+    <div class="lan-box">
+      <div class="lan-row">
+        <div>
+          <strong>🌐 局域网访问（LAN / 0.0.0.0）</strong>
+          <div class="lan-sub" id="lan-status-text">当前仅本机回环可连（127.0.0.1）</div>
+        </div>
+        <button type="button" class="btn btn-ghost btn-sm" id="btn-toggle-lan">开启局域网</button>
+      </div>
+      <div class="lan-urls" id="lan-urls-list"></div>
+    </div>
+
+    <div class="snippet-tabs" id="snippet-tabs">
+      <button type="button" class="tab-btn active" data-harness="claude">Claude Code</button>
+      <button type="button" class="tab-btn" data-harness="codex">OpenAI Codex</button>
+      <button type="button" class="tab-btn" data-harness="json">Cursor / Antigravity JSON</button>
+      <button type="button" class="tab-btn" data-harness="dsh">DeepSeek Harness</button>
+    </div>
+    <pre class="code-box" id="mcp-snippet-box"></pre>
+    <div class="dialog-actions">
+      <button type="button" class="btn btn-ghost" id="btn-close-connect">关闭</button>
+      <button type="button" class="btn btn-primary" id="btn-copy-snippet">📋 复制配置命令</button>
+    </div>
   </dialog>
 
   <div id="toast" class="toast" hidden></div>

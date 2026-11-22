@@ -118,6 +118,32 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
       // Path traversal attempt must never escape staticUiDir
       const traversalRes = await fetch(`${status.httpUrl}/..%2Fpackage.json`);
       expect(traversalRes.status).toBe(404);
+      // Loopback mode never advertises LAN URLs
+      expect(status.lanUrls).toEqual([]);
+      const health = (await (await fetch(`${status.httpUrl}/health`)).json()) as any;
+      expect(health.lan_urls).toEqual([]);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test("LocalMiniServer exposes LAN IPv4 addresses when host=0.0.0.0", async () => {
+    const server = new LocalMiniServer({
+      port: 0,
+      host: "0.0.0.0",
+      dbPath: join(tempDir, "lan-test.db"),
+    });
+    const status = await server.start();
+    try {
+      expect(status.host).toBe("0.0.0.0");
+      expect(status.httpUrl).toBe(`http://127.0.0.1:${status.port}`);
+      expect(Array.isArray(status.lanUrls)).toBe(true);
+      for (const u of status.lanUrls) {
+        expect(u).toMatch(/^http:\/\/\d+\.\d+\.\d+\.\d+:\d+$/);
+        expect(u).not.toContain("127.0.0.1");
+      }
+      const health = (await (await fetch(`${status.httpUrl}/health`)).json()) as any;
+      expect(health.lan_urls).toEqual(status.lanUrls);
     } finally {
       await server.stop();
     }

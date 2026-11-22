@@ -68,6 +68,7 @@ export interface LocalServerStatus {
   port: number;
   httpUrl: string;
   wsUrl: string;
+  lanUrls: string[];
   upstreamUrl: string;
   connectedAgents: string[];
   channelCount: number;
