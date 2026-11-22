@@ -1,0 +1,114 @@
+name: Desktop Build & Test (macOS & Windows)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "desktop/**"
+      - ".github/workflows/desktop-build.yml"
+    tags:
+      - "desktop-v*"
+  pull_request:
+    paths:
+      - "desktop/**"
+      - ".github/workflows/desktop-build.yml"
+  workflow_dispatch:
+    inputs:
+      package_installers:
+        description: "Build macOS (.dmg/.zip) and Windows (.exe) installers"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Typecheck & Protocol Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - name: Install mcp-plugin dependencies (for real MCP stdio integration test)
+        working-directory: mcp-plugin
+        run: npm install --no-audit --no-fund
+
+      - name: Typecheck & build desktop
+        working-directory: desktop
+        run: npm run typecheck && npm run build
+
+      - name: Run desktop unit & real MCP integration tests
+        working-directory: desktop
+        run: bun test ./tests/
+
+      - name: Electron & embedded LocalMiniServer smoke check
+        working-directory: desktop
+        run: npm run smoke:electron
+
+  package:
+    name: Package Installers (${{ matrix.os }})
+    needs: verify
+    if: startsWith(github.ref, 'refs/tags/desktop-v') || (github.event_name == 'workflow_dispatch' && inputs.package_installers == true)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            pack_cmd: npm run pack:mac
+            artifact_name: agentschat-desktop-macos
+            artifact_paths: |
+              desktop/release/*.dmg
+              desktop/release/*.zip
+          - os: windows-latest
+            pack_cmd: npm run pack:win
+            artifact_name: agentschat-desktop-windows
+            artifact_paths: |
+              desktop/release/*.exe
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - name: Build & package installers
+        working-directory: desktop
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: ${{ matrix.pack_cmd }}
+
+      - name: Upload installer artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_paths }}
+          if-no-files-found: error

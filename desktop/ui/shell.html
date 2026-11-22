@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline';" />
+  <title>AgentsChat</title>
+  <style>
+    * { box-sizing: border-box; user-select: none; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background: #0b0f19;
+      color: #f1f5f9;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+      overflow: hidden;
+    }
+    .rail {
+      width: 68px;
+      height: 100vh;
+      background: #070a12;
+      border-right: 1px solid #1e293b;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 14px 0 14px;
+      gap: 12px;
+      -webkit-app-region: drag;
+    }
+    .rail.mac { padding-top: 44px; }
+    .node-btn {
+      -webkit-app-region: no-drag;
+      position: relative;
+      width: 44px;
+      height: 44px;
+      border-radius: 13px;
+      border: 1px solid #1e293b;
+      background: #111827;
+      color: #94a3b8;
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 2px;
+      transition: all 0.16s ease;
+      padding: 0;
+    }
+    .node-btn:hover {
+      border-color: #4f46e5;
+      color: #f8fafc;
+      transform: translateY(-1px);
+    }
+    .node-btn.active {
+      background: linear-gradient(145deg, #4f46e5, #2563eb);
+      border-color: #818cf8;
+      color: #ffffff;
+      box-shadow: 0 4px 14px rgba(79, 70, 229, 0.35);
+    }
+    .node-icon { font-size: 18px; line-height: 1; }
+    .node-lbl { font-size: 9px; font-weight: 700; letter-spacing: 0.02em; }
+    .dot {
+      position: absolute;
+      right: -2px;
+      bottom: -2px;
+      width: 11px;
+      height: 11px;
+      border-radius: 50%;
+      border: 2px solid #070a12;
+      background: #475569;
+    }
+    .dot.live { background: #10b981; }
+    .spacer { flex: 1; }
+    .mini-btn {
+      -webkit-app-region: no-drag;
+      width: 38px;
+      height: 38px;
+      border-radius: 10px;
+      border: 1px solid #1e293b;
+      background: #0f172a;
+      color: #94a3b8;
+      font-size: 15px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .mini-btn:hover { border-color: #38bdf8; color: #f8fafc; }
+    .badge {
+      font-size: 10px;
+      color: #64748b;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+  </style>
+</head>
+<body>
+  <aside class="rail" id="rail">
+    <button class="node-btn active" id="btn-cloud" title="AgentsChat Cloud — Full Platform (Cloud Agents, /loop, OKR, Cross-Machine)">
+      <span class="node-icon">☁️</span>
+      <span class="node-lbl">Cloud</span>
+    </button>
+
+    <button class="node-btn" id="btn-local" title="Embedded Local Server — Group & 1v1 Chat on 127.0.0.1">
+      <span class="node-icon">🏠</span>
+      <span class="node-lbl">Local</span>
+      <span class="dot" id="local-dot"></span>
+    </button>
+
+    <div class="spacer"></div>
+
+    <span class="badge" id="local-port-badge" title="Local Server Port">:8787</span>
+    <button class="mini-btn" id="btn-copy-url" title="Copy Local MCP Server URL">📋</button>
+    <button class="mini-btn" id="btn-power" title="Start / Stop Embedded Local Server">⚡</button>
+  </aside>
+
+  <script>
+    const api = window.agentschatShell;
+    const rail = document.getElementById("rail");
+    const btnCloud = document.getElementById("btn-cloud");
+    const btnLocal = document.getElementById("btn-local");
+    const localDot = document.getElementById("local-dot");
+    const portBadge = document.getElementById("local-port-badge");
+    const btnCopyUrl = document.getElementById("btn-copy-url");
+    const btnPower = document.getElementById("btn-power");
+
+    let latestState = null;
+
+    function render(state) {
+      if (!state) return;
+      latestState = state;
+      if (state.platform === "darwin") rail.classList.add("mac");
+      const active = state.settings?.activeWorkspace || "cloud";
+      btnCloud.classList.toggle("active", active === "cloud");
+      btnLocal.classList.toggle("active", active === "local");
+
+      const running = Boolean(state.localServer?.running);
+      localDot.classList.toggle("live", running);
+      portBadge.textContent = running ? ":" + state.localServer.port : "OFF";
+      btnPower.style.color = running ? "#34d399" : "#64748b";
+      btnPower.title = running
+        ? `Local Server running (${state.localServer.httpUrl}) — click to stop`
+        : "Local Server stopped — click to start";
+    }
+
+    btnCloud.addEventListener("click", () => api?.switchWorkspace("cloud"));
+    btnLocal.addEventListener("click", () => api?.switchWorkspace("local"));
+    btnPower.addEventListener("click", () => {
+      const next = !(latestState?.settings?.localServerEnabled !== false);
+      api?.toggleLocalServer(next);
+    });
+    btnCopyUrl.addEventListener("click", async () => {
+      const url = latestState?.localServer?.httpUrl || "http://127.0.0.1:8787";
+      await api?.copyText(`npx -y agentschat-mcp@latest --url ${url}`);
+      btnCopyUrl.textContent = "✅";
+      setTimeout(() => { btnCopyUrl.textContent = "📋"; }, 1200);
+    });
+
+    if (api) {
+      api.getState().then(render);
+      api.onStateChanged(render);
+    }
+  </script>
+</body>
+</html>

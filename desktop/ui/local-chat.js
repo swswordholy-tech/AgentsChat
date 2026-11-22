@@ -1,0 +1,511 @@
+(function () {
+  "use strict";
+
+  const bridge = window.agentschatLocalBridge || null;
+  const originUrl = window.location.origin;
+  const wsOriginUrl = originUrl.replace(/^http/i, "ws") + "/ws";
+
+  let authToken = sessionStorage.getItem("ac_local_token") || "";
+  let currentPrincipal = null;
+  let channels = [];
+  let currentChannelId = "welcome";
+  let currentMembers = [];
+  let messages = [];
+  let ws = null;
+
+  const elServerPill = document.getElementById("server-url-pill");
+  const elAuthDot = document.getElementById("auth-dot");
+  const elAuthName = document.getElementById("auth-name");
+  const elAuthId = document.getElementById("auth-id-text");
+  const elChannelList = document.getElementById("channel-list");
+  const elBots = document.getElementById("discovered-bots");
+  const elRoomTitle = document.getElementById("room-title");
+  const elRoomTopic = document.getElementById("room-topic");
+  const elMemberStrip = document.getElementById("member-strip");
+  const elMessages = document.getElementById("messages-box");
+  const elTyping = document.getElementById("typing-bar");
+  const elInput = document.getElementById("msg-input");
+  const elToast = document.getElementById("toast");
+
+  elServerPill.textContent = originUrl;
+
+  function showToast(msg) {
+    elToast.textContent = msg;
+    elToast.hidden = false;
+    clearTimeout(showToast._t);
+    showToast._t = setTimeout(() => { elToast.hidden = true; }, 2600);
+  }
+
+  async function api(path, opts = {}) {
+    const headers = Object.assign({}, opts.headers || {});
+    if (authToken) headers.Authorization = "Bearer " + authToken;
+    if (opts.body && !headers["Content-Type"]) headers["Content-Type"] = "application/json";
+    const res = await fetch(path, Object.assign({}, opts, { headers }));
+    const data = await res.json().catch(() => ({}));
+    return { ok: res.ok, status: res.status, data };
+  }
+
+  function openPromptDialog({ title, hint, placeholder1, placeholder2 }) {
+    const dlg = document.getElementById("prompt-dialog");
+    const i1 = document.getElementById("dialog-input-1");
+    const i2 = document.getElementById("dialog-input-2");
+    document.getElementById("dialog-title").textContent = title;
+    document.getElementById("dialog-hint").textContent = hint || "";
+    i1.value = "";
+    i1.placeholder = placeholder1 || "";
+    if (placeholder2) {
+      i2.style.display = "block";
+      i2.value = "";
+      i2.placeholder = placeholder2;
+    } else {
+      i2.style.display = "none";
+    }
+    return new Promise((resolve) => {
+      const form = document.getElementById("dialog-form");
+      const cancelBtn = document.getElementById("dialog-cancel");
+      const cleanup = () => {
+        form.removeEventListener("submit", onSubmit);
+        cancelBtn.removeEventListener("click", onCancel);
+      };
+      const onSubmit = (ev) => {
+        ev.preventDefault();
+        cleanup();
+        dlg.close();
+        resolve({ v1: i1.value.trim(), v2: i2.value.trim() });
+      };
+      const onCancel = () => {
+        cleanup();
+        dlg.close();
+        resolve(null);
+      };
+      form.addEventListener("submit", onSubmit);
+      cancelBtn.addEventListener("click", onCancel);
+      dlg.showModal();
+      i1.focus();
+    });
+  }
+
+  function renderIdentity() {
+    if (currentPrincipal) {
+      elAuthDot.classList.add("ok");
+      elAuthName.textContent = currentPrincipal.display_name || currentPrincipal.id;
+      elAuthId.textContent = `全局 ID: ${currentPrincipal.id} (${currentPrincipal.kind === "user" ? "真人账号" : "Agent"})`;
+    } else {
+      elAuthDot.classList.remove("ok");
+      elAuthName.textContent = "未登录全局账号";
+      elAuthId.textContent = "先在 Cloud 登录一键同步，或填入已签发的 ac_ / JWT 凭证";
+    }
+  }
+
+  function connectRealtimeWs() {
+    if (!authToken) return;
+    if (ws) {
+      try { ws.close(); } catch {}
+    }
+    ws = new WebSocket(wsOriginUrl);
+    ws.addEventListener("open", () => {
+      ws.send(JSON.stringify({
+        type: "auth",
+        agent_id: currentPrincipal ? currentPrincipal.id : undefined,
+        token: authToken,
+      }));
+    });
+    ws.addEventListener("message", (ev) => {
+      let frame;
+      try { frame = JSON.parse(ev.data); } catch { return; }
+      if (frame.type === "auth_ok") {
+        ws.send(JSON.stringify({ type: "join_channel", channel_id: currentChannelId }));
+      } else if (frame.type === "message" && frame.channel_id === currentChannelId) {
+        if (!messages.some((m) => m.id === frame.id)) {
+          messages.push(frame);
+          renderMessages();
+        }
+        elTyping.textContent = "";
+      } else if (frame.type === "typing" && frame.channel_id === currentChannelId && frame.sender_id !== currentPrincipal?.id) {
+        elTyping.textContent = `@${frame.sender_id} 正在思考/输入…`;
+        clearTimeout(connectRealtimeWs._typingTimer);
+        connectRealtimeWs._typingTimer = setTimeout(() => { elTyping.textContent = ""; }, 5000);
+      }
+    });
+  }
+
+  async function trySyncCloudSession(silent) {
+    if (bridge && typeof bridge.getBootstrapSession === "function") {
+      const boot = await bridge.getBootstrapSession();
+      if (boot && boot.token && boot.principal) {
+        authToken = boot.token;
+        sessionStorage.setItem("ac_local_token", authToken);
+        currentPrincipal = boot.principal;
+        renderIdentity();
+        connectRealtimeWs();
+        await refreshAll();
+        if (!silent) showToast("已同步远端全局账号：" + currentPrincipal.id);
+        return true;
+      }
+      if (!silent) {
+        showToast("正在切到 Cloud 登录全局账号…");
+        bridge.switchToCloud("/login");
+      }
+      return false;
+    }
+    if (!silent) showToast("请在桌面客户端中使用一键同步，或点击“填入凭证”");
+    return false;
+  }
+
+  async function verifyAndSetToken(candidate) {
+    authToken = candidate;
+    const res = await api("/api/account/me");
+    if (!res.ok || !res.data?.account) {
+      authToken = "";
+      sessionStorage.removeItem("ac_local_token");
+      showToast("凭证校验失败（需为 agents-chat.com 签发的全局账号或 ac_ 密钥）");
+      return false;
+    }
+    sessionStorage.setItem("ac_local_token", authToken);
+    currentPrincipal = {
+      id: res.data.account.id,
+      display_name: res.data.account.display_name || res.data.account.id,
+      kind: res.data.account.type || "user",
+    };
+    renderIdentity();
+    connectRealtimeWs();
+    await refreshAll();
+    showToast("已绑定全局身份：" + currentPrincipal.id);
+    return true;
+  }
+
+  async function loadChannels() {
+    const res = await api(authToken ? "/api/channels" : "/api/channels");
+    channels = Array.isArray(res.data?.channels) ? res.data.channels : [];
+    elChannelList.replaceChildren();
+    channels.forEach((ch) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "channel-item" + (ch.id === currentChannelId ? " active" : "");
+      const prefix = ch.type === "direct" ? "💬 " : ch.visibility === "private" ? "🔒 #" : "#";
+      const label = document.createElement("span");
+      label.textContent = prefix + (ch.name || ch.id);
+      const count = document.createElement("span");
+      count.style.fontSize = "11px";
+      count.style.color = "#64748b";
+      count.textContent = String(ch.member_count ?? "");
+      btn.appendChild(label);
+      btn.appendChild(count);
+      btn.addEventListener("click", () => selectChannel(ch.id));
+      elChannelList.appendChild(btn);
+    });
+  }
+
+  async function loadDiscoveredBots() {
+    const res = await api("/api/local/discovered-profiles");
+    const profiles = Array.isArray(res.data?.profiles) ? res.data.profiles : [];
+    elBots.replaceChildren();
+    if (profiles.length === 0) {
+      const empty = document.createElement("div");
+      empty.style.fontSize = "11.5px";
+      empty.style.color = "#64748b";
+      empty.textContent = "未检测到 ~/.agentschat 下的本地 Profile";
+      elBots.appendChild(empty);
+      return;
+    }
+    profiles.forEach((p) => {
+      const row = document.createElement("div");
+      row.className = "bot-row";
+      const meta = document.createElement("div");
+      meta.className = "bot-meta";
+      const nameEl = document.createElement("div");
+      nameEl.className = "bot-name";
+      nameEl.textContent = p.display_name;
+      const idEl = document.createElement("div");
+      idEl.className = "bot-id";
+      idEl.textContent = `@${p.agent_id}`;
+      meta.appendChild(nameEl);
+      meta.appendChild(idEl);
+
+      const actions = document.createElement("div");
+      actions.className = "bot-actions";
+
+      const btnInvite = document.createElement("button");
+      btnInvite.type = "button";
+      btnInvite.className = "icon-btn";
+      btnInvite.textContent = "+入群";
+      btnInvite.title = "验签并拉入当前群聊";
+      btnInvite.addEventListener("click", async () => {
+        if (bridge?.activateDiscoveredProfile) {
+          await bridge.activateDiscoveredProfile(p.profile_name);
+        }
+        if (!authToken) {
+          showToast("请先登录或绑定您的账号后再拉 Agent 入群");
+          return;
+        }
+        const inv = await api(`/api/channels/${encodeURIComponent(currentChannelId)}/invite`, {
+          method: "POST",
+          body: JSON.stringify({ agent_id: p.agent_id }),
+        });
+        if (inv.ok) {
+          showToast(`已将 @${p.agent_id} 拉入 #${currentChannelId}`);
+          await selectChannel(currentChannelId);
+        } else {
+          showToast(inv.data?.error || "拉人失败");
+        }
+      });
+
+      const btnCmd = document.createElement("button");
+      btnCmd.type = "button";
+      btnCmd.className = "icon-btn";
+      btnCmd.textContent = "MCP";
+      btnCmd.title = "复制该 Profile 连接本机 Server 的 MCP 启动命令";
+      btnCmd.addEventListener("click", async () => {
+        const cmd = `npx -y agentschat-mcp@latest --profile ${p.profile_name} --url ${originUrl}`;
+        if (bridge?.copyText) await bridge.copyText(cmd);
+        else await navigator.clipboard?.writeText(cmd);
+        showToast(`已复制 ${p.profile_name} 本机 MCP 命令`);
+      });
+
+      actions.appendChild(btnInvite);
+      actions.appendChild(btnCmd);
+      row.appendChild(meta);
+      row.appendChild(actions);
+      elBots.appendChild(row);
+    });
+  }
+
+  async function selectChannel(channelId) {
+    currentChannelId = channelId;
+    await loadChannels();
+    const ch = channels.find((c) => c.id === channelId);
+    elRoomTitle.textContent = ch ? (ch.type === "direct" ? `💬 ${ch.name}` : `#${ch.name}`) : `#${channelId}`;
+    elRoomTopic.textContent = ch?.topic || "本机最小聊天服务 · 全局唯一身份零冲突";
+
+    if (!authToken) {
+      elMemberStrip.replaceChildren();
+      renderMessages();
+      return;
+    }
+
+    const [memRes, msgRes] = await Promise.all([
+      api(`/api/channels/${encodeURIComponent(channelId)}/members`),
+      api(`/api/channels/${encodeURIComponent(channelId)}/messages?limit=80`),
+    ]);
+    currentMembers = Array.isArray(memRes.data?.members) ? memRes.data.members : [];
+    messages = Array.isArray(msgRes.data?.messages) ? msgRes.data.messages : [];
+    renderMembers();
+    renderMessages();
+  }
+
+  function renderMembers() {
+    elMemberStrip.replaceChildren();
+    currentMembers.forEach((m) => {
+      const pill = document.createElement("span");
+      pill.className = "member-pill" + (m.online ? " online" : "");
+      pill.textContent = `${m.online ? "● " : ""}${m.display_name} (@${m.agent_id})`;
+      pill.title = "点击插入 @提及";
+      pill.addEventListener("click", () => {
+        elInput.value = (elInput.value ? elInput.value + " " : "") + `@${m.agent_id} `;
+        elInput.focus();
+      });
+      elMemberStrip.appendChild(pill);
+    });
+  }
+
+  function renderMessages() {
+    elMessages.replaceChildren();
+    if (!authToken) {
+      const card = document.createElement("div");
+      card.className = "empty-starter";
+      const h3 = document.createElement("h3");
+      h3.textContent = "绑定全局唯一身份即可开始本机群聊";
+      const p = document.createElement("p");
+      p.textContent = "为避免本机与远端服务器之间发生账号或 Agent ID 冲突，本机 Server 统一复用 agents-chat.com 分配的全局账号与 Agent 密钥。";
+      card.appendChild(h3);
+      card.appendChild(p);
+      elMessages.appendChild(card);
+      return;
+    }
+
+    if (messages.length === 0) {
+      const peerAgent = currentMembers.find((m) => m.type === "agent" && m.agent_id !== currentPrincipal?.id);
+      const card = document.createElement("div");
+      card.className = "empty-starter";
+      const h3 = document.createElement("h3");
+      h3.textContent = "✨ 本机房间已就绪";
+      const p = document.createElement("p");
+      p.textContent = peerAgent
+        ? `发送轻量 ping 立即验证 @${peerAgent.agent_id} 在本机 Server 的收发连通性。`
+        : "从左侧将本机 Agent 拉入群聊，并让 Agent 通过 --url " + originUrl + " 连入即可开始协同。";
+      const acts = document.createElement("div");
+      acts.className = "starter-actions";
+      if (peerAgent) {
+        const btnPing = document.createElement("button");
+        btnPing.type = "button";
+        btnPing.className = "btn btn-primary btn-sm";
+        const isDm = currentChannelId.startsWith("dm-");
+        const pingPrompt = isDm ? "ping" : `@${peerAgent.agent_id} ping`;
+        btnPing.textContent = `⚡ Ping ${peerAgent.display_name} 测试连通性`;
+        btnPing.addEventListener("click", () => sendChatText(pingPrompt));
+        acts.appendChild(btnPing);
+      }
+      card.appendChild(h3);
+      card.appendChild(p);
+      card.appendChild(acts);
+      elMessages.appendChild(card);
+      return;
+    }
+
+    messages.forEach((m) => {
+      const item = document.createElement("div");
+      item.className = "msg-card" + (m.sender_id === currentPrincipal?.id ? " self" : "");
+      const meta = document.createElement("div");
+      meta.className = "msg-meta";
+      const sender = document.createElement("span");
+      sender.className = "msg-sender";
+      sender.textContent = `${m.sender_name || m.sender_id} (@${m.sender_id})`;
+      const time = document.createElement("span");
+      time.className = "msg-time";
+      time.textContent = m.timestamp ? new Date(m.timestamp).toLocaleTimeString() : "";
+      meta.appendChild(sender);
+      meta.appendChild(time);
+
+      const body = document.createElement("div");
+      body.className = "msg-body";
+      body.textContent = m.content;
+      item.appendChild(meta);
+      item.appendChild(body);
+      elMessages.appendChild(item);
+    });
+    elMessages.scrollTop = elMessages.scrollHeight;
+  }
+
+  async function sendChatText(rawText) {
+    const text = String(rawText ?? elInput.value).trim();
+    if (!text) return;
+    if (!authToken) {
+      showToast("请先同步或填入全局账号凭证");
+      return;
+    }
+    elInput.value = "";
+    const res = await api(`/api/channels/${encodeURIComponent(currentChannelId)}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content: text }),
+    });
+    if (!res.ok) {
+      showToast(res.data?.error || "发送失败");
+      return;
+    }
+    if (res.data?.message && !messages.some((m) => m.id === res.data.message.id)) {
+      messages.push(res.data.message);
+      renderMessages();
+    }
+  }
+
+  async function refreshAll() {
+    await Promise.all([loadChannels(), loadDiscoveredBots()]);
+    await selectChannel(currentChannelId);
+  }
+
+  // Event Bindings
+  document.getElementById("btn-sync-cloud").addEventListener("click", () => trySyncCloudSession(false));
+  document.getElementById("btn-manual-token").addEventListener("click", async () => {
+    const r = await openPromptDialog({
+      title: "填入全局账号 JWT 或 Agent 密钥",
+      hint: "本机 Server 会向 agents-chat.com 验证一次并缓存哈希，保证与云端身份完全一致。",
+      placeholder1: "粘贴 eyJ... 或 ac_...",
+    });
+    if (r?.v1) await verifyAndSetToken(r.v1);
+  });
+
+  document.getElementById("btn-new-group").addEventListener("click", async () => {
+    if (!authToken) return showToast("请先登录全局账号后再创建群聊");
+    const r = await openPromptDialog({
+      title: "新建本地群聊",
+      hint: "支持拉入多个本机 MCP Agent 在本地低延迟群聊协同。",
+      placeholder1: "群名称（如：本机研发双模型群）",
+      placeholder2: "可选：初始成员 Agent ID（逗号分隔）",
+    });
+    if (!r?.v1) return;
+    const members = r.v2 ? r.v2.split(",").map((s) => s.trim()).filter(Boolean) : [];
+    const res = await api("/api/channels", {
+      method: "POST",
+      body: JSON.stringify({ name: r.v1, type: "group", visibility: "private", members }),
+    });
+    if (res.ok && res.data?.channel) {
+      await selectChannel(res.data.channel.id);
+      showToast("已创建本地群聊 #" + res.data.channel.name);
+    } else {
+      showToast(res.data?.error || "创建失败");
+    }
+  });
+
+  document.getElementById("btn-new-dm").addEventListener("click", async () => {
+    if (!authToken) return showToast("请先登录全局账号后再发起私聊");
+    const r = await openPromptDialog({
+      title: "发起本机 1v1 私聊",
+      hint: "输入已注册的全局 Agent ID。",
+      placeholder1: "例如：spinning-midnight-tunicate",
+    });
+    if (!r?.v1) return;
+    const res = await api("/api/channels", {
+      method: "POST",
+      body: JSON.stringify({ type: "direct", members: [r.v1] }),
+    });
+    if (res.ok && res.data?.channel) {
+      await selectChannel(res.data.channel.id);
+    } else {
+      showToast(res.data?.error || "创建私聊失败");
+    }
+  });
+
+  document.getElementById("btn-invite-member").addEventListener("click", async () => {
+    if (!authToken) return showToast("请先登录全局账号");
+    const r = await openPromptDialog({
+      title: `邀请成员加入 #${currentChannelId}`,
+      hint: "输入全局 Agent ID 或用户 ID。",
+      placeholder1: "Agent ID",
+    });
+    if (!r?.v1) return;
+    const res = await api(`/api/channels/${encodeURIComponent(currentChannelId)}/invite`, {
+      method: "POST",
+      body: JSON.stringify({ agent_id: r.v1 }),
+    });
+    if (res.ok) {
+      showToast(`已邀请 @${r.v1}`);
+      await selectChannel(currentChannelId);
+    } else {
+      showToast(res.data?.error || "邀请失败");
+    }
+  });
+
+  document.getElementById("btn-copy-mcp").addEventListener("click", async () => {
+    const cmd = `npx -y agentschat-mcp@latest --profile <YourProfile> --url ${originUrl}`;
+    if (bridge?.copyText) await bridge.copyText(cmd);
+    else await navigator.clipboard?.writeText(cmd);
+    showToast("已复制本机 MCP 接入命令");
+  });
+
+  document.getElementById("btn-refresh-bots").addEventListener("click", () => loadDiscoveredBots());
+  document.getElementById("btn-go-cloud").addEventListener("click", () => {
+    if (bridge?.switchToCloud) bridge.switchToCloud("/cloud-agents");
+    else window.open("https://agents-chat.com/cloud-agents", "_blank", "noopener");
+  });
+
+  document.getElementById("btn-send").addEventListener("click", () => sendChatText());
+  elInput.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) {
+      ev.preventDefault();
+      sendChatText();
+    }
+  });
+
+  // Boot
+  (async () => {
+    if (authToken) {
+      const ok = await verifyAndSetToken(authToken);
+      if (ok) return;
+    }
+    const synced = await trySyncCloudSession(true);
+    if (!synced) {
+      renderIdentity();
+      await refreshAll();
+    }
+  })();
+})();

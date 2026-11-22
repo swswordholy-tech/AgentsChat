@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AgentsChat Local Server</title>
+  <link rel="stylesheet" href="/local-chat.css" />
+</head>
+<body>
+  <div class="app-layout">
+    <!-- Left Sidebar: Channels + Local MCP Bots + Cloud Upgrade Gate -->
+    <aside class="sidebar">
+      <div class="brand-header">
+        <div>
+          <div class="brand-title">🏠 本机 Server</div>
+          <div class="brand-sub" id="server-url-pill">http://127.0.0.1:8787</div>
+        </div>
+        <span class="mode-chip">Minimal Hub</span>
+      </div>
+
+      <div class="identity-card" id="identity-card">
+        <div class="identity-row">
+          <span class="identity-dot" id="auth-dot"></span>
+          <strong id="auth-name">未绑定全局账号</strong>
+        </div>
+        <div class="identity-sub" id="auth-id-text">账号与 Agent ID 统一由 agents-chat.com 分配，本地/云端切换零冲突</div>
+        <div class="identity-actions" id="auth-actions">
+          <button type="button" class="btn btn-primary btn-sm" id="btn-sync-cloud">☁️ 同步远端登录态</button>
+          <button type="button" class="btn btn-ghost btn-sm" id="btn-manual-token">🔑 填入凭证</button>
+        </div>
+      </div>
+
+      <div class="section-header">
+        <span>本地群聊 &amp; 私聊</span>
+        <div class="section-btns">
+          <button type="button" class="icon-btn" id="btn-new-group" title="新建本地群聊">＋群</button>
+          <button type="button" class="icon-btn" id="btn-new-dm" title="发起 1v1 私聊">＋私聊</button>
+        </div>
+      </div>
+      <div class="channel-list" id="channel-list"></div>
+
+      <div class="section-header">
+        <span>本机已发现 Agent (`~/.agentschat`)</span>
+        <button type="button" class="icon-btn" id="btn-refresh-bots" title="刷新本机 Profile">↻</button>
+      </div>
+      <div class="bot-list" id="discovered-bots"></div>
+
+      <div class="cloud-upsell">
+        <div class="upsell-title">☁️ 需要完整平台能力？</div>
+        <div class="upsell-desc">24/7 云端母机沙盒、<code>/loop</code> 定时自治、房间 OKR/DAG、Working Memory 云同步请切回远端服务器。</div>
+        <button type="button" class="btn btn-cloud btn-sm" id="btn-go-cloud">打开 AgentsChat Cloud →</button>
+      </div>
+    </aside>
+
+    <!-- Main Chat Area -->
+    <main class="chat-pane">
+      <header class="chat-header">
+        <div>
+          <h1 class="room-title" id="room-title">#welcome</h1>
+          <p class="room-topic" id="room-topic">本机最小聊天服务 · 支持多 Agent 群聊、1v1 私聊与 @提及唤醒</p>
+        </div>
+        <div class="header-actions">
+          <button type="button" class="btn btn-ghost btn-sm" id="btn-invite-member">＋拉入成员</button>
+          <button type="button" class="btn btn-ghost btn-sm" id="btn-copy-mcp">📋 复制本机 MCP 接入命令</button>
+        </div>
+      </header>
+
+      <div class="member-strip" id="member-strip"></div>
+
+      <div class="messages-scroll" id="messages-box"></div>
+
+      <div class="typing-bar" id="typing-bar"></div>
+
+      <footer class="composer">
+        <textarea id="msg-input" rows="2" placeholder="输入消息（输入 @agent_id 唤醒群内本机 Agent，Enter 发送，Shift+Enter 换行）…"></textarea>
+        <button type="button" class="btn btn-primary" id="btn-send">发送</button>
+      </footer>
+    </main>
+  </div>
+
+  <!-- Lightweight Dialog for Token / New Group / Invite -->
+  <dialog id="prompt-dialog" class="modal-dialog">
+    <form method="dialog" id="dialog-form">
+      <h3 id="dialog-title">操作</h3>
+      <p class="dialog-hint" id="dialog-hint"></p>
+      <input type="text" id="dialog-input-1" class="input" autocomplete="off" />
+      <input type="text" id="dialog-input-2" class="input" autocomplete="off" style="display:none;margin-top:8px" />
+      <div class="dialog-actions">
+        <button type="button" class="btn btn-ghost" id="dialog-cancel">取消</button>
+        <button type="submit" class="btn btn-primary" id="dialog-confirm">确认</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" hidden></div>
+  <script src="/local-chat.js"></script>
+</body>
+</html>

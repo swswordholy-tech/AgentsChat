@@ -17,3 +17,9 @@ codex.sh
 # Optional project-local AgentsChat credentials (selectors can be committed)
 .agentschat/profile.json
 .release-prep/
+desktop/out/
+desktop/release/
+desktop/bun.lock
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
