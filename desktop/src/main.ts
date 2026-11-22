@@ -39,6 +39,7 @@ let isQuitting = false;
 let localUnreadCount = 0;
 let pendingDeepLinkUrl: string | null = null;
 let boundsSaveTimer: NodeJS.Timeout | null = null;
+const smokeRendererErrors: string[] = [];
 
 const isSmokeTest = process.env.AGENTSCHAT_DESKTOP_SMOKE_TEST === "1";
 const startHidden = !isSmokeTest && process.argv.includes("--hidden");
@@ -568,6 +569,17 @@ async function createDesktopWindow(): Promise<void> {
   mainWindow.contentView.addChildView(cloudView);
   mainWindow.contentView.addChildView(localView);
 
+  if (isSmokeTest) {
+    const captureErrors = (label: string, wc: Electron.WebContents) => {
+      wc.on("console-message", (_ev, level, message) => {
+        // level 3 = error (includes uncaught JS exceptions & CSP violations)
+        if (level >= 3) smokeRendererErrors.push(`[${label}] ${message}`);
+      });
+    };
+    captureErrors("shell", mainWindow.webContents);
+    captureErrors("local", localView.webContents);
+  }
+
   const remoteOrigin = new URL(settings.remoteServerUrl).origin;
   cloudView.webContents.setWindowOpenHandler(({ url }) => {
     if (isOAuthPopupUrl(url, remoteOrigin)) {
@@ -946,11 +958,65 @@ if (!gotSingleInstanceLock) {
       try {
         const healthRes = await fetch(`${st.httpUrl}/health`);
         const health = (await healthRes.json()) as any;
-        const uiTitle = await localView?.webContents.executeJavaScript("document.title", true);
-        if (healthRes.status !== 200 || health?.mode !== "desktop_local_minimal" || uiTitle !== "AgentsChat Local Server") {
-          throw new Error(`Unexpected smoke check output: status=${healthRes.status}, title=${uiTitle}`);
+        const shellProbe = await mainWindow?.webContents.executeJavaScript(
+          `(async () => {
+            const st = await window.agentschatShell?.getState?.();
+            return {
+              hasShellBridge: Boolean(window.agentschatShell),
+              running: Boolean(st?.localServer?.running),
+              hasLocalBtn: Boolean(document.getElementById("btn-local")),
+              hasUnreadBadge: Boolean(document.getElementById("local-unread-badge")),
+            };
+          })()`,
+          true,
+        );
+        const localProbe = await localView?.webContents.executeJavaScript(
+          `(async () => {
+            const st = await window.agentschatLocalBridge?.getServerStatus?.();
+            const requiredIds = [
+              "btn-copy-mcp", "btn-local-settings", "btn-register-agent",
+              "search-input", "btn-export-md", "msg-input",
+              "connect-dialog", "settings-dialog", "registered-dialog"
+            ];
+            const missingIds = requiredIds.filter((id) => !document.getElementById(id));
+            document.getElementById("btn-copy-mcp")?.click();
+            await new Promise((r) => setTimeout(r, 80));
+            const connectOpen = Boolean(document.getElementById("connect-dialog")?.open);
+            const snippetText = document.getElementById("mcp-snippet-box")?.textContent || "";
+            document.getElementById("btn-close-connect")?.click();
+            return {
+              title: document.title,
+              hasLocalBridge: Boolean(window.agentschatLocalBridge),
+              ipcOk: Boolean(st?.ok && st?.status?.running),
+              missingIds,
+              connectOpen,
+              hasClaudeSnippet: snippetText.includes("claude mcp add agentschat-local"),
+            };
+          })()`,
+          true,
+        );
+        if (
+          healthRes.status !== 200 ||
+          health?.mode !== "desktop_local_minimal" ||
+          !shellProbe?.hasShellBridge ||
+          !shellProbe?.running ||
+          !shellProbe?.hasLocalBtn ||
+          !shellProbe?.hasUnreadBadge ||
+          localProbe?.title !== "AgentsChat Local Server" ||
+          !localProbe?.hasLocalBridge ||
+          !localProbe?.ipcOk ||
+          (localProbe?.missingIds?.length ?? 1) > 0 ||
+          !localProbe?.connectOpen ||
+          !localProbe?.hasClaudeSnippet ||
+          smokeRendererErrors.length > 0
+        ) {
+          throw new Error(
+            `Smoke audit failed: shell=${JSON.stringify(shellProbe)} local=${JSON.stringify(localProbe)} errors=${JSON.stringify(smokeRendererErrors)}`,
+          );
         }
-        console.log(`[desktop-smoke] OK: Electron ${process.versions.electron}, LocalMiniServer=${st.httpUrl}, UI="${uiTitle}"`);
+        console.log(
+          `[desktop-smoke] OK: Electron ${process.versions.electron}, LocalMiniServer=${st.httpUrl}, shell+local bridges & DOM modal verified (0 console/CSP errors)`,
+        );
         isQuitting = true;
         await localServer?.closeAll();
         localServer = null;
