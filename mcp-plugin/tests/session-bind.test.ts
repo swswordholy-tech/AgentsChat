@@ -6,10 +6,13 @@ import { join, resolve } from "node:path";
 import {
   acquireAgentLock,
   checkAgentLock,
+  discoverAntigravityHost,
   detectAntigravityCallerSession,
   detectDshCallerSession,
   detectRuntimeSession,
   findBoundSessionForProfile,
+  isAntigravityLanguageServerCommand,
+  isLocalAntigravityConversation,
   loadSessionBinds,
   lockFilePath,
   parseAntigravityLsofOutput,
@@ -1423,5 +1426,181 @@ describe("multi-window lock & connect_profile / disconnect_profile integration t
         )) as unknown as typeof fetch,
     });
     expect(traversalSid).toBe("session-legit-42");
+  });
+
+  test("Antigravity 2.34.0 host probe accepts --override_ide_name/--app_data_dir without --csrf_token and rejects unrelated language servers", () => {
+    expect(
+      isAntigravityLanguageServerCommand(
+        `/Applications/Antigravity.app/Contents/Resources/bin/language_server --standalone --override_ide_name antigravity --subclient_type hub --override_ide_version 2.34.0 --app_data_dir antigravity --read_host_bridge_token_from_stdin`,
+      ),
+    ).toBe(true);
+    expect(
+      isAntigravityLanguageServerCommand(`language_server --csrf_token legacy-tok --app_data_dir antigravity`),
+    ).toBe(true);
+    expect(isAntigravityLanguageServerCommand(`typescript-language-server --stdio`)).toBe(false);
+    expect(isAntigravityLanguageServerCommand(`gopls serve`)).toBe(false);
+    expect(isAntigravityLanguageServerCommand(`language_server.exe --stdio`)).toBe(false);
+
+    const win234 = parseWindowsAntigravityProbeJson(
+      JSON.stringify({
+        lsPid: 19001,
+        lsCmd: `"C:\\Users\\Boss\\AppData\\Local\\Programs\\Antigravity\\resources\\app\\extensions\\antigravity\\bin\\language_server_windows_x64.exe" --override_ide_name antigravity --app_data_dir antigravity`,
+        ports: [52100, 52101],
+        lockedPresence: [],
+        lockedDbs: [],
+      }),
+    );
+    expect(win234).toEqual({
+      lsPid: 19001,
+      csrfToken: "",
+      ports: [52101, 52100],
+      openConversations: [],
+    });
+
+    expect(
+      parseWindowsAntigravityProbeJson(
+        JSON.stringify({
+          lsPid: 19002,
+          lsCmd: `language_server.exe --stdio`,
+          ports: [52102],
+          lockedPresence: [],
+          lockedDbs: [],
+        }),
+      ),
+    ).toBeNull();
+  });
+
+  test("isLocalAntigravityConversation distinguishes local Antigravity UUIDs from Claude UUIDs and non-UUIDs", () => {
+    const root = mkdtempSync(join(tmpdir(), "ac-local-agy-"));
+    const agyBrainCid = "aaaaaaaa-1111-4111-8111-111111111111";
+    const agyDbCid = "bbbbbbbb-2222-4222-8222-222222222222";
+    const claudeCid = "cccccccc-3333-4333-8333-333333333333";
+
+    const brainDir = join(root, "explicit-brain");
+    mkdirSync(join(brainDir, agyBrainCid), { recursive: true });
+    expect(isLocalAntigravityConversation(agyBrainCid, { brainDir })).toBe(true);
+    expect(isLocalAntigravityConversation(claudeCid, { brainDir })).toBe(false);
+    expect(isLocalAntigravityConversation("session-dsh-123", { brainDir })).toBe(false);
+
+    const home = join(root, "home");
+    mkdirSync(join(home, ".gemini", "antigravity", "conversations"), { recursive: true });
+    writeFileSync(join(home, ".gemini", "antigravity", "conversations", `${agyDbCid}.db`), "");
+    expect(isLocalAntigravityConversation(agyDbCid, { homeDir: home })).toBe(true);
+    expect(isLocalAntigravityConversation(claudeCid, { homeDir: home })).toBe(false);
+  });
+
+  test("Antigravity 2.34.0 restart auto-connects all bound Antigravity profiles (even with 0 open tabs and no csrf_token) while excluding Claude UUIDs and respecting disconnect_profile(keep_binding=true)", async () => {
+    const home = mkdtempSync(join(tmpdir(), "ac-agy-234-autoconn-"));
+    const cfgDir = join(home, ".agentschat");
+    const brainDir = mkdtempSync(join(tmpdir(), "ac-agy-234-brain-"));
+    mkdirSync(cfgDir, { recursive: true });
+
+    const cidA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1";
+    const cidB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2";
+    const cidClaude = "cccccccc-cccc-4ccc-8ccc-ccccccccccc3";
+    mkdirSync(join(brainDir, cidA, ".system_generated", "logs"), { recursive: true });
+    mkdirSync(join(brainDir, cidB, ".system_generated", "logs"), { recursive: true });
+
+    writeFileSync(
+      join(cfgDir, "AgyBotA.json"),
+      JSON.stringify({ agent_id: "bot-a", display_name: "AgyBotA", token: "ac_bot_a", capabilities: ["coding"] }),
+    );
+    writeFileSync(
+      join(cfgDir, "AgyBotB.json"),
+      JSON.stringify({ agent_id: "bot-b", display_name: "AgyBotB", token: "ac_bot_b", capabilities: ["coding"] }),
+    );
+    writeFileSync(
+      join(cfgDir, "ClaudeOnlyBot.json"),
+      JSON.stringify({ agent_id: "claude-only-bot", display_name: "ClaudeOnlyBot", token: "ac_claude_only", capabilities: ["coding"] }),
+    );
+    writeFileSync(
+      join(cfgDir, "session-binds.json"),
+      JSON.stringify({
+        [cidA]: "AgyBotA",
+        [cidB]: "AgyBotB",
+        [cidClaude]: "ClaudeOnlyBot",
+      }),
+    );
+
+    const onlineAgents = new Set<string>();
+    const liveSocketsByAgent = new Map<string, any>();
+    const wsHub = Bun.serve<{ agentId?: string }>({
+      port: 0,
+      fetch(req, server) {
+        const u = new URL(req.url);
+        if (u.pathname === "/ws" && server.upgrade(req, { data: {} })) {
+          return undefined;
+        }
+        return Response.json({ ok: true, build: "test" });
+      },
+      websocket: {
+        message(ws, message) {
+          try {
+            const data = JSON.parse(String(message));
+            if (data.type === "auth" && typeof data.agent_id === "string") {
+              ws.data.agentId = data.agent_id;
+              onlineAgents.add(data.agent_id);
+              liveSocketsByAgent.set(data.agent_id, ws);
+              ws.send(JSON.stringify({ type: "auth_ok", session_id: `ws-${data.agent_id}` }));
+            } else if (data.type === "ping") {
+              ws.send(JSON.stringify({ type: "pong" }));
+            }
+          } catch {}
+        },
+        close(ws) {
+          if (ws.data?.agentId) {
+            onlineAgents.delete(ws.data.agentId);
+            liveSocketsByAgent.delete(ws.data.agentId);
+          }
+        },
+      },
+    });
+
+    const mcp = spawnMcpSession(home, [], {
+      AGENTCHAT_REST_URL: `http://127.0.0.1:${wsHub.port}`,
+      AGENTCHAT_URL: `ws://127.0.0.1:${wsHub.port}/ws`,
+      AGENTSCHAT_AGY_BRAIN_DIR: brainDir,
+      ANTIGRAVITY_LS_ADDRESS: "127.0.0.1:57518",
+      ANTIGRAVITY_OPEN_CONVERSATIONS: "",
+    });
+
+    try {
+      await mcp.send(INIT);
+      await mcp.send(INITED);
+
+      // Zero tool calls yet: both bound Antigravity profiles auto-connect, while ClaudeOnlyBot stays offline.
+      for (let i = 0; i < 40 && !(onlineAgents.has("bot-a") && onlineAgents.has("bot-b")); i++) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      await new Promise((r) => setTimeout(r, 120));
+      expect(onlineAgents.has("bot-a")).toBe(true);
+      expect(onlineAgents.has("bot-b")).toBe(true);
+      expect(onlineAgents.has("claude-only-bot")).toBe(false);
+
+      // Disconnect cidA with keep_binding=true -> bot-a drops offline and stays offline after pong triggers syncOpenBoundSessions().
+      writeFileSync(
+        join(brainDir, cidA, ".system_generated", "logs", "transcript.jsonl"),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          tool_calls: [{ name: "call_mcp_tool", args: { ToolName: '"disconnect_profile"', Arguments: '{"keep_binding":true}' } }],
+        }) + "\n",
+      );
+      const disc = await mcp.send(callTool(51, "disconnect_profile", { keep_binding: true }));
+      expect(disc.result.isError).toBeUndefined();
+      expect(disc.result.content[0].text).toContain("Disconnected from profile");
+
+      for (let i = 0; i < 30 && onlineAgents.has("bot-a"); i++) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      liveSocketsByAgent.get("bot-b")?.send(JSON.stringify({ type: "pong" }));
+      await new Promise((r) => setTimeout(r, 120));
+
+      expect(onlineAgents.has("bot-a")).toBe(false);
+      expect(onlineAgents.has("bot-b")).toBe(true);
+      expect(loadSessionBinds(cfgDir)[cidA]).toBe("AgyBotA");
+    } finally {
+      await mcp.close();
+      wsHub.stop(true);
+    }
   });
 });

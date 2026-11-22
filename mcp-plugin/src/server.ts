@@ -133,6 +133,7 @@ import {
   findBoundSessionForProfile,
   detectRuntimeSession,
   discoverAntigravityHost,
+  isLocalAntigravityConversation,
   detectAntigravityCallerSession,
   detectDshCallerSession,
   isDshHostProcess,
@@ -1085,6 +1086,7 @@ interface ProfileSlot {
 }
 
 const profileSlots = new Map<string, ProfileSlot>();
+const manuallyDisconnectedSessions = new Set<string>();
 let activeSlot: ProfileSlot | null = null;
 
 const debugLogsEnabled = /^(1|true|yes|debug)$/i.test(
@@ -3744,6 +3746,9 @@ function createProfileSlot(opts: {
 }
 
 function activateSlot(slot: ProfileSlot, callerSession?: DetectedSession | null): void {
+  if (callerSession?.sessionId) {
+    manuallyDisconnectedSessions.delete(callerSession.sessionId);
+  }
   if (callerSession) {
     slot.runtimeSession = {
       ...callerSession,
@@ -3853,6 +3858,9 @@ if (!anonymousMode && AGENT_ID) {
  */
 function applyIdentityFromProfile(newProfile: any, targetFile: string, bindSessionId?: string | null): void {
   validateIdentityProfile(newProfile, targetFile);
+  if (bindSessionId && bindSessionId.trim()) {
+    manuallyDisconnectedSessions.delete(bindSessionId.trim());
+  }
   const targetProfName = profileNameFromPath(targetFile) || newProfile.display_name || newProfile.agent_id;
 
   let targetSession: DetectedSession | null = runtimeSession ? { ...runtimeSession } : null;
@@ -3896,6 +3904,9 @@ function applyIdentityFromProfile(newProfile: any, targetFile: string, bindSessi
         targetSession = { sessionId: agyHost.openConversations[0]!, runtime: "antigravity" };
       }
     }
+  }
+  if (targetSession?.sessionId) {
+    manuallyDisconnectedSessions.delete(targetSession.sessionId);
   }
 
   // Only tear down existing slot(s) that belong to THIS session (or the same profile),
@@ -3977,7 +3988,10 @@ function disconnectCurrentProfile(opts?: { keepBinding?: boolean }): { prevAgent
       releaseAgentLock({ lockDir, agentId: prevAgentId, currentSessionId: sidToRemove });
     }
   }
-  if (!opts?.keepBinding && sidToRemove) {
+  if (opts?.keepBinding && sidToRemove) {
+    manuallyDisconnectedSessions.add(sidToRemove);
+  } else if (!opts?.keepBinding && sidToRemove) {
+    manuallyDisconnectedSessions.delete(sidToRemove);
     removeSessionBind(configDir, sidToRemove);
   }
   setAnonymousCallerState(runtimeSession);
@@ -7558,18 +7572,54 @@ async function backfillAllChannels(slot: ProfileSlot | null = activeSlot): Promi
 
 /**
  * Automatically connect any additional unlocked profiles in `session-binds.json`
- * that are bound to currently open Antigravity conversations.
+ * that belong to Antigravity conversations (both currently open tabs/locks and
+ * previously bound local Antigravity conversations across IDE restarts).
  */
 function syncOpenBoundSessions(): void {
-  if (toolOnlyMode || shuttingDown) return;
+  if (toolOnlyMode || shuttingDown || codexIdentity || isDshHostProcess()) return;
+  if (
+    cliArgs.profile ||
+    process.env.AGENTSCHAT_PROFILE ||
+    process.env.AGENTCHAT_PROFILE ||
+    cliArgs.token ||
+    process.env.AGENTCHAT_TOKEN ||
+    process.env.CLAUDE_CODE_SESSION_ID ||
+    process.env.CLAUDE_SESSION_ID ||
+    process.env.ZCODE_SESSION_ID ||
+    process.env.ANTIGRAVITY_CONVERSATION_ID
+  ) {
+    return;
+  }
   const agyHost = discoverAntigravityHost();
-  if (!agyHost || agyHost.openConversations.length === 0) return;
+  const isAgyHost =
+    Boolean(agyHost) ||
+    process.env.__CFBundleIdentifier === "com.google.antigravity" ||
+    Boolean(process.env.AGY_BROWSER_WS_URL) ||
+    Boolean(process.env.AGENTSCHAT_AGY_BRAIN_DIR?.trim());
+  if (!isAgyHost) return;
+
   const binds = loadSessionBinds(configDir);
-  for (const cid of agyHost.openConversations) {
+  const isAgyUuid = (sid: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sid);
+  const candidateCids: string[] = [];
+  for (const cid of agyHost?.openConversations ?? []) {
+    if (!candidateCids.includes(cid)) candidateCids.push(cid);
+  }
+  for (const cid of Object.keys(binds)) {
+    if (isAgyUuid(cid) && isLocalAntigravityConversation(cid) && !candidateCids.includes(cid)) {
+      candidateCids.push(cid);
+    }
+  }
+  if (candidateCids.length === 0) return;
+
+  for (const cid of candidateCids) {
+    if (manuallyDisconnectedSessions.has(cid)) continue;
     const boundProf = binds[cid];
     if (!boundProf || profileSlots.has(boundProf)) continue;
     const boundPath = nameToPath(boundProf);
     if (!existsSync(boundPath)) continue;
+    if (boundProf.toLowerCase() === "profile" && Boolean(findDefaultProfileCollision(configDir, boundPath))) {
+      continue;
+    }
     try {
       const candidate = readIdentityProfile(boundPath);
       validateIdentityProfile(candidate, boundPath);
@@ -7620,6 +7670,9 @@ function syncOpenBoundSessions(): void {
       slot.heartbeat.start();
       connectWS(slot);
       if (!activeSlot) activateSlot(slot, sess);
+      process.stderr.write(
+        `[agentchat] Auto-connected bound Antigravity profile "${boundProf}" (${candidate.agent_id}) for session ${cid.slice(0, 8)}...\n`,
+      );
     } catch {}
   }
 }
@@ -7966,6 +8019,11 @@ function connectWS(slot: ProfileSlot | null = activeSlot) {
                   contextPrefix,
                   logger: (m) => process.stderr.write(`${m}\n`),
                 });
+              } else if (targetCid && !csrfToken) {
+                rateLimitedLog(
+                  `agy-wake-no-csrf:${slot!.agentId}`,
+                  `[agentchat] Skipping Antigravity wake for ${slot!.agentId}: parent language_server did not expose --csrf_token and ANTIGRAVITY_CSRF_TOKEN is unset.\n`,
+                );
               }
             } catch (e) {
               process.stderr.write(`[agentchat] antigravity wake error: ${e}\n`);
@@ -8151,6 +8209,7 @@ async function main() {
       process.env.__CFBundleIdentifier === "com.google.antigravity" ||
       Boolean(process.env.AGY_BROWSER_WS_URL) ||
       Boolean(process.env.ANTIGRAVITY_LS_ADDRESS) ||
+      Boolean(process.env.AGENTSCHAT_AGY_BRAIN_DIR?.trim()) ||
       Boolean(discoverAntigravityHost())
     ) {
       const agySyncTimer = setInterval(() => {

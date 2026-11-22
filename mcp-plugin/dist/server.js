@@ -4133,6 +4133,14 @@ function parseWindowsNetstatOutput(stdout, targetPid) {
   ports.sort((a, b) => b - a);
   return ports;
 }
+function isAntigravityLanguageServerCommand(cmd, processName) {
+  const cmdLower = (cmd || "").toLowerCase();
+  const nameLower = (processName || "").toLowerCase();
+  if (!cmdLower.includes("language_server") && !nameLower.includes("language_server")) {
+    return false;
+  }
+  return cmdLower.includes("--csrf_token") || /--override_ide_name(?:=|\s+)["']?antigravity(?=["'\s]|$)/i.test(cmd) || /--app_data_dir(?:=|\s+)["']?antigravity(?:-cli)?(?=["'\s]|$)/i.test(cmd) || /--override_user_agent_name(?:=|\s+)["']?antigravity(?=["'\s]|$)/i.test(cmd) || /antigravity(?:\.app)?[\\/].*language_server/i.test(cmd);
+}
 function parseWindowsAntigravityProbeJson(stdout, netstatStdout = "") {
   const trimmed = (stdout || "").trim();
   if (!trimmed || trimmed === "{}")
@@ -4151,7 +4159,7 @@ function parseWindowsAntigravityProbeJson(stdout, netstatStdout = "") {
   if (!Number.isSafeInteger(lsPid) || lsPid <= 0 || !lsCmd)
     return null;
   const csrfToken = extractCliFlagValue(lsCmd, "--csrf_token");
-  if (!csrfToken)
+  if (!isAntigravityLanguageServerCommand(lsCmd))
     return null;
   const portSet = new Set;
   const rawPorts = Array.isArray(parsed?.ports) ? parsed.ports : typeof parsed?.ports === "number" ? [parsed.ports] : [];
@@ -4205,7 +4213,7 @@ function discoverWindowsAntigravityHost(currentPid) {
     "  $cmd = [string]$proc.CommandLine",
     "  $name = [string]$proc.Name",
     "  if ($h -gt 0 -and ($cmd -match 'bun(?:\\.exe)?\\s+test' -or $cmd -match 'node(?:\\.exe)?\\s+--test')) { break }",
-    "  if (($cmd -match 'language_server' -or $name -match 'language_server') -and $cmd -match '--csrf_token') {",
+    "  if (($cmd -match 'language_server' -or $name -match 'language_server') -and ($cmd -match '--csrf_token' -or $cmd -match '--override_ide_name(?:=|\\s+)[\\x22\\x27]?antigravity' -or $cmd -match '--app_data_dir(?:=|\\s+)[\\x22\\x27]?antigravity' -or $cmd -match '--override_user_agent_name(?:=|\\s+)[\\x22\\x27]?antigravity' -or $cmd -match 'antigravity[\\\\/]')) {",
     "    $lsPid = [int]$proc.ProcessId",
     "    $lsCmd = $cmd",
     "    break",
@@ -4276,7 +4284,7 @@ function discoverAntigravityHost(opts) {
     }
     const envAddr = process.env.ANTIGRAVITY_LS_ADDRESS?.trim() || "";
     const envCsrf = process.env.ANTIGRAVITY_CSRF_TOKEN?.trim() || "";
-    if (envAddr && envCsrf) {
+    if (envAddr) {
       const portMatch = envAddr.match(/:(\d+)$/);
       const ports = portMatch ? [Number(portMatch[1])] : [];
       const openConversations = (process.env.ANTIGRAVITY_OPEN_CONVERSATIONS || "").split(",").map((s) => s.trim()).filter((s) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s));
@@ -4315,7 +4323,7 @@ function discoverAntigravityHost(opts) {
       const cmd = m[2];
       if (hop > 0 && (cmd.includes("bun test") || cmd.includes("node --test") || matchesDshCommandLine(cmd)))
         break;
-      if (cmd.includes("language_server") && cmd.includes("--csrf_token")) {
+      if (isAntigravityLanguageServerCommand(cmd)) {
         lsPid = pid;
         lsCmd = cmd;
         break;
@@ -4327,10 +4335,6 @@ function discoverAntigravityHost(opts) {
       return null;
     }
     const csrfToken = extractCliFlagValue(lsCmd, "--csrf_token");
-    if (!csrfToken) {
-      cachedAgyHost = { at: now, info: null };
-      return null;
-    }
     const appDataDir = extractCliFlagValue(lsCmd, "--app_data_dir") || "antigravity";
     const lsof = spawnSync("lsof", ["-Pan", "-p", String(lsPid)], { encoding: "utf8", timeout: 1500 });
     const { ports, openConversations } = lsof.status === 0 && lsof.stdout ? parseAntigravityLsofOutput(lsof.stdout, appDataDir) : { ports: [], openConversations: [] };
@@ -4341,6 +4345,42 @@ function discoverAntigravityHost(opts) {
     cachedAgyHost = { at: now, info: null };
     return null;
   }
+}
+function isLocalAntigravityConversation(cid, opts) {
+  if (typeof cid !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(cid)) {
+    return false;
+  }
+  const explicitBrain = opts?.brainDir?.trim() || process.env.AGENTSCHAT_AGY_BRAIN_DIR?.trim() || "";
+  if (explicitBrain) {
+    if (!isSafeDirOrMissing(explicitBrain))
+      return false;
+    const st = safeLstat3(join5(explicitBrain, cid));
+    return Boolean(st && !st.isSymbolicLink() && st.isDirectory());
+  }
+  const home = opts?.homeDir?.trim() || process.env.HOME || process.env.USERPROFILE || homedir3();
+  const cleanAppDir = (opts?.appDataDir || "antigravity").trim().replace(/^\/+|\/+$/g, "") || "antigravity";
+  const baseDir = join5(home, ".gemini", cleanAppDir);
+  if (!isSafeDirOrMissing(baseDir))
+    return false;
+  const brainParent = join5(baseDir, "brain");
+  if (isSafeDirOrMissing(brainParent)) {
+    const brainSt = safeLstat3(join5(brainParent, cid));
+    if (brainSt && !brainSt.isSymbolicLink() && brainSt.isDirectory())
+      return true;
+  }
+  const convParent = join5(baseDir, "conversations");
+  if (isSafeDirOrMissing(convParent)) {
+    const dbSt = safeLstat3(join5(convParent, `${cid}.db`));
+    if (dbSt && !dbSt.isSymbolicLink() && dbSt.isFile())
+      return true;
+  }
+  const presParent = join5(baseDir, "presence");
+  if (isSafeDirOrMissing(presParent)) {
+    const presSt = safeLstat3(join5(presParent, `${cid}.lock`));
+    if (presSt && !presSt.isSymbolicLink() && presSt.isFile())
+      return true;
+  }
+  return false;
 }
 function detectAntigravityCallerSession(opts) {
   const home = process.env.HOME || process.env.USERPROFILE || homedir3();
@@ -8331,6 +8371,7 @@ var sessionId = null;
 var shuttingDown = false;
 var transport = null;
 var profileSlots = new Map;
+var manuallyDisconnectedSessions = new Set;
 var activeSlot = null;
 var debugLogsEnabled = /^(1|true|yes|debug)$/i.test(process.env.AGENTSCHAT_MCP_DEBUG || process.env.AGENTCHAT_DEBUG || "");
 var defaultLogRateMs = Math.max(1000, Number(process.env.AGENTSCHAT_MCP_LOG_RATE_MS || 60000));
@@ -10906,6 +10947,9 @@ function createProfileSlot(opts) {
   return slot;
 }
 function activateSlot(slot, callerSession) {
+  if (callerSession?.sessionId) {
+    manuallyDisconnectedSessions.delete(callerSession.sessionId);
+  }
   if (callerSession) {
     slot.runtimeSession = {
       ...callerSession,
@@ -11008,6 +11052,9 @@ if (!anonymousMode && AGENT_ID) {
 }
 function applyIdentityFromProfile(newProfile, targetFile, bindSessionId) {
   validateIdentityProfile(newProfile, targetFile);
+  if (bindSessionId && bindSessionId.trim()) {
+    manuallyDisconnectedSessions.delete(bindSessionId.trim());
+  }
   const targetProfName = profileNameFromPath(targetFile) || newProfile.display_name || newProfile.agent_id;
   let targetSession = runtimeSession ? { ...runtimeSession } : null;
   if (bindSessionId && bindSessionId.trim()) {
@@ -11031,6 +11078,9 @@ function applyIdentityFromProfile(newProfile, targetFile, bindSessionId) {
         targetSession = { sessionId: agyHost.openConversations[0], runtime: "antigravity" };
       }
     }
+  }
+  if (targetSession?.sessionId) {
+    manuallyDisconnectedSessions.delete(targetSession.sessionId);
   }
   for (const existingSlot of [...profileSlots.values()]) {
     if (existingSlot.profileName === targetProfName || existingSlot.agentId === newProfile.agent_id) {
@@ -11091,7 +11141,10 @@ function disconnectCurrentProfile(opts) {
       releaseAgentLock({ lockDir, agentId: prevAgentId, currentSessionId: sidToRemove });
     }
   }
-  if (!opts?.keepBinding && sidToRemove) {
+  if (opts?.keepBinding && sidToRemove) {
+    manuallyDisconnectedSessions.add(sidToRemove);
+  } else if (!opts?.keepBinding && sidToRemove) {
+    manuallyDisconnectedSessions.delete(sidToRemove);
     removeSessionBind(configDir, sidToRemove);
   }
   setAnonymousCallerState(runtimeSession);
@@ -14257,19 +14310,41 @@ async function backfillAllChannels(slot = activeSlot) {
   }
 }
 function syncOpenBoundSessions() {
-  if (toolOnlyMode || shuttingDown)
+  if (toolOnlyMode || shuttingDown || codexIdentity || isDshHostProcess())
     return;
+  if (cliArgs.profile || process.env.AGENTSCHAT_PROFILE || process.env.AGENTCHAT_PROFILE || cliArgs.token || process.env.AGENTCHAT_TOKEN || process.env.CLAUDE_CODE_SESSION_ID || process.env.CLAUDE_SESSION_ID || process.env.ZCODE_SESSION_ID || process.env.ANTIGRAVITY_CONVERSATION_ID) {
+    return;
+  }
   const agyHost = discoverAntigravityHost();
-  if (!agyHost || agyHost.openConversations.length === 0)
+  const isAgyHost = Boolean(agyHost) || process.env.__CFBundleIdentifier === "com.google.antigravity" || Boolean(process.env.AGY_BROWSER_WS_URL) || Boolean(process.env.AGENTSCHAT_AGY_BRAIN_DIR?.trim());
+  if (!isAgyHost)
     return;
   const binds = loadSessionBinds(configDir);
-  for (const cid of agyHost.openConversations) {
+  const isAgyUuid = (sid) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sid);
+  const candidateCids = [];
+  for (const cid of agyHost?.openConversations ?? []) {
+    if (!candidateCids.includes(cid))
+      candidateCids.push(cid);
+  }
+  for (const cid of Object.keys(binds)) {
+    if (isAgyUuid(cid) && isLocalAntigravityConversation(cid) && !candidateCids.includes(cid)) {
+      candidateCids.push(cid);
+    }
+  }
+  if (candidateCids.length === 0)
+    return;
+  for (const cid of candidateCids) {
+    if (manuallyDisconnectedSessions.has(cid))
+      continue;
     const boundProf = binds[cid];
     if (!boundProf || profileSlots.has(boundProf))
       continue;
     const boundPath = nameToPath(boundProf);
     if (!existsSync2(boundPath))
       continue;
+    if (boundProf.toLowerCase() === "profile" && Boolean(findDefaultProfileCollision(configDir, boundPath))) {
+      continue;
+    }
     try {
       const candidate = readIdentityProfile(boundPath);
       validateIdentityProfile(candidate, boundPath);
@@ -14318,6 +14393,8 @@ function syncOpenBoundSessions() {
       connectWS(slot);
       if (!activeSlot)
         activateSlot(slot, sess);
+      process.stderr.write(`[agentchat] Auto-connected bound Antigravity profile "${boundProf}" (${candidate.agent_id}) for session ${cid.slice(0, 8)}...
+`);
     } catch {}
   }
 }
@@ -14630,6 +14707,9 @@ ${context}
                   logger: (m) => process.stderr.write(`${m}
 `)
                 });
+              } else if (targetCid && !csrfToken) {
+                rateLimitedLog(`agy-wake-no-csrf:${slot.agentId}`, `[agentchat] Skipping Antigravity wake for ${slot.agentId}: parent language_server did not expose --csrf_token and ANTIGRAVITY_CSRF_TOKEN is unset.
+`);
               }
             } catch (e) {
               process.stderr.write(`[agentchat] antigravity wake error: ${e}
@@ -14846,7 +14926,7 @@ async function main() {
   installStdioLifecycleGuards();
   if (!toolOnlyMode) {
     syncOpenBoundSessions();
-    if (process.env.__CFBundleIdentifier === "com.google.antigravity" || Boolean(process.env.AGY_BROWSER_WS_URL) || Boolean(process.env.ANTIGRAVITY_LS_ADDRESS) || Boolean(discoverAntigravityHost())) {
+    if (process.env.__CFBundleIdentifier === "com.google.antigravity" || Boolean(process.env.AGY_BROWSER_WS_URL) || Boolean(process.env.ANTIGRAVITY_LS_ADDRESS) || Boolean(process.env.AGENTSCHAT_AGY_BRAIN_DIR?.trim()) || Boolean(discoverAntigravityHost())) {
       const agySyncTimer = setInterval(() => {
         if (!shuttingDown)
           syncOpenBoundSessions();

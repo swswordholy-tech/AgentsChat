@@ -725,6 +725,26 @@ export function parseWindowsNetstatOutput(stdout: string, targetPid: number): nu
 }
 
 /**
+ * Return true iff a process command line / name belongs to Antigravity's
+ * `language_server` (`<= 2.33.0` with `--csrf_token` or `>= 2.34.0` identified by
+ * Antigravity IDE flags / bundle path).
+ */
+export function isAntigravityLanguageServerCommand(cmd: string, processName?: string): boolean {
+  const cmdLower = (cmd || "").toLowerCase();
+  const nameLower = (processName || "").toLowerCase();
+  if (!cmdLower.includes("language_server") && !nameLower.includes("language_server")) {
+    return false;
+  }
+  return (
+    cmdLower.includes("--csrf_token") ||
+    /--override_ide_name(?:=|\s+)["']?antigravity(?=["'\s]|$)/i.test(cmd) ||
+    /--app_data_dir(?:=|\s+)["']?antigravity(?:-cli)?(?=["'\s]|$)/i.test(cmd) ||
+    /--override_user_agent_name(?:=|\s+)["']?antigravity(?=["'\s]|$)/i.test(cmd) ||
+    /antigravity(?:\.app)?[\\/].*language_server/i.test(cmd)
+  );
+}
+
+/**
  * Pure parser for the JSON emitted by `discoverWindowsAntigravityHost`'s PowerShell probe
  * (`{ lsPid, lsCmd, ports, lockedPresence, lockedDbs }`), with optional `netstat -ano`
  * fallback output when `Get-NetTCPConnection` is unavailable.
@@ -749,7 +769,7 @@ export function parseWindowsAntigravityProbeJson(
   if (!Number.isSafeInteger(lsPid) || lsPid <= 0 || !lsCmd) return null;
 
   const csrfToken = extractCliFlagValue(lsCmd, "--csrf_token");
-  if (!csrfToken) return null;
+  if (!isAntigravityLanguageServerCommand(lsCmd)) return null;
 
   const portSet = new Set<number>();
   const rawPorts = Array.isArray(parsed?.ports)
@@ -819,7 +839,7 @@ function discoverWindowsAntigravityHost(currentPid: number): AntigravityHostInfo
     "  $cmd = [string]$proc.CommandLine",
     "  $name = [string]$proc.Name",
     "  if ($h -gt 0 -and ($cmd -match 'bun(?:\\.exe)?\\s+test' -or $cmd -match 'node(?:\\.exe)?\\s+--test')) { break }",
-    "  if (($cmd -match 'language_server' -or $name -match 'language_server') -and $cmd -match '--csrf_token') {",
+    "  if (($cmd -match 'language_server' -or $name -match 'language_server') -and ($cmd -match '--csrf_token' -or $cmd -match '--override_ide_name(?:=|\\s+)[\\x22\\x27]?antigravity' -or $cmd -match '--app_data_dir(?:=|\\s+)[\\x22\\x27]?antigravity' -or $cmd -match '--override_user_agent_name(?:=|\\s+)[\\x22\\x27]?antigravity' -or $cmd -match 'antigravity[\\\\/]')) {",
     "    $lsPid = [int]$proc.ProcessId",
     "    $lsCmd = $cmd",
     "    break",
@@ -899,7 +919,7 @@ export function discoverAntigravityHost(opts?: {
     }
     const envAddr = process.env.ANTIGRAVITY_LS_ADDRESS?.trim() || "";
     const envCsrf = process.env.ANTIGRAVITY_CSRF_TOKEN?.trim() || "";
-    if (envAddr && envCsrf) {
+    if (envAddr) {
       const portMatch = envAddr.match(/:(\d+)$/);
       const ports = portMatch ? [Number(portMatch[1])] : [];
       const openConversations = (process.env.ANTIGRAVITY_OPEN_CONVERSATIONS || "")
@@ -951,7 +971,7 @@ export function discoverAntigravityHost(opts?: {
       const ppid = Number(m[1]);
       const cmd = m[2]!;
       if (hop > 0 && (cmd.includes("bun test") || cmd.includes("node --test") || matchesDshCommandLine(cmd))) break;
-      if (cmd.includes("language_server") && cmd.includes("--csrf_token")) {
+      if (isAntigravityLanguageServerCommand(cmd)) {
         lsPid = pid;
         lsCmd = cmd;
         break;
@@ -965,11 +985,6 @@ export function discoverAntigravityHost(opts?: {
     }
 
     const csrfToken = extractCliFlagValue(lsCmd, "--csrf_token");
-    if (!csrfToken) {
-      cachedAgyHost = { at: now, info: null };
-      return null;
-    }
-
     const appDataDir = extractCliFlagValue(lsCmd, "--app_data_dir") || "antigravity";
 
     const lsof = spawnSync("lsof", ["-Pan", "-p", String(lsPid)], { encoding: "utf8", timeout: 1500 });
@@ -985,6 +1000,47 @@ export function discoverAntigravityHost(opts?: {
     cachedAgyHost = { at: now, info: null };
     return null;
   }
+}
+
+/**
+ * Return true iff `cid` is a valid UUID backed by local Antigravity conversation
+ * state (brain directory, SQLite DB, or presence lock), preventing non-Antigravity
+ * UUIDs (such as Claude Code session IDs) from being auto-connected under Antigravity.
+ */
+export function isLocalAntigravityConversation(
+  cid: string,
+  opts?: { brainDir?: string; appDataDir?: string; homeDir?: string },
+): boolean {
+  if (typeof cid !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(cid)) {
+    return false;
+  }
+  const explicitBrain = opts?.brainDir?.trim() || process.env.AGENTSCHAT_AGY_BRAIN_DIR?.trim() || "";
+  if (explicitBrain) {
+    if (!isSafeDirOrMissing(explicitBrain)) return false;
+    const st = safeLstat(join(explicitBrain, cid));
+    return Boolean(st && !st.isSymbolicLink() && st.isDirectory());
+  }
+  const home = opts?.homeDir?.trim() || process.env.HOME || process.env.USERPROFILE || homedir();
+  const cleanAppDir = (opts?.appDataDir || "antigravity").trim().replace(/^\/+|\/+$/g, "") || "antigravity";
+  const baseDir = join(home, ".gemini", cleanAppDir);
+  if (!isSafeDirOrMissing(baseDir)) return false;
+
+  const brainParent = join(baseDir, "brain");
+  if (isSafeDirOrMissing(brainParent)) {
+    const brainSt = safeLstat(join(brainParent, cid));
+    if (brainSt && !brainSt.isSymbolicLink() && brainSt.isDirectory()) return true;
+  }
+  const convParent = join(baseDir, "conversations");
+  if (isSafeDirOrMissing(convParent)) {
+    const dbSt = safeLstat(join(convParent, `${cid}.db`));
+    if (dbSt && !dbSt.isSymbolicLink() && dbSt.isFile()) return true;
+  }
+  const presParent = join(baseDir, "presence");
+  if (isSafeDirOrMissing(presParent)) {
+    const presSt = safeLstat(join(presParent, `${cid}.lock`));
+    if (presSt && !presSt.isSymbolicLink() && presSt.isFile()) return true;
+  }
+  return false;
 }
 
 /**
