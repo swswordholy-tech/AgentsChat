@@ -21,15 +21,21 @@ const child = spawn(String(electronBinary), [desktopDir], {
   },
 });
 
+function cleanupTempDir() {
+  try {
+    rmSync(tempDataDir, { recursive: true, force: true, maxRetries: 6, retryDelay: 100 });
+  } catch {}
+}
+
 const timer = setTimeout(() => {
-  console.error("[desktop-smoke] Timed out after 20s");
+  console.error("[desktop-smoke] Timed out after 25s");
   child.kill();
-  rmSync(tempDataDir, { recursive: true, force: true });
+  cleanupTempDir();
   process.exit(1);
-}, 20_000);
+}, 25_000);
 
 child.on("exit", (code) => {
   clearTimeout(timer);
-  rmSync(tempDataDir, { recursive: true, force: true });
+  cleanupTempDir();
   process.exit(code ?? 1);
 });

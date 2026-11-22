@@ -17,7 +17,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { checkLatestDesktopRelease, parseDeepLink } from "./desktop-helpers.js";
-import { GlobalIdentityAuthority } from "./identity-authority.js";
+import { GlobalIdentityAuthority, resolveHomeDir } from "./identity-authority.js";
 import { LocalMiniServer } from "./local-server.js";
 import { DesktopSettingsStore } from "./settings-store.js";
 import type { DesktopSettings, LocalServerStatus } from "./types.js";
@@ -45,7 +45,7 @@ const isSmokeTest = process.env.AGENTSCHAT_DESKTOP_SMOKE_TEST === "1";
 const startHidden = !isSmokeTest && process.argv.includes("--hidden");
 const desktopDataDir =
   process.env.AGENTSCHAT_DESKTOP_DATA_DIR?.trim() ||
-  join(process.env.HOME || process.env.USERPROFILE || homedir(), ".agentschat", "desktop");
+  join(resolveHomeDir(), ".agentschat", "desktop");
 const settingsStore = new DesktopSettingsStore(join(desktopDataDir, "settings.json"));
 let settings: DesktopSettings = settingsStore.load();
 let localServer: LocalMiniServer | null = null;

@@ -311,13 +311,19 @@ describe("AgentsChat Desktop M1 — Global Identity Authority + Local Group/DM M
     const status = await local.start();
 
     const mcpServerEntry = resolve(import.meta.dir, "../../mcp-plugin/src/server.ts");
+    const cleanEnv: Record<string, string> = {};
+    for (const [k, v] of Object.entries(process.env)) {
+      if (typeof v === "string" && !k.startsWith("AGENTCHAT_") && !k.startsWith("AGENTSCHAT_")) {
+        cleanEnv[k] = v;
+      }
+    }
+    cleanEnv.HOME = tempHome;
+    cleanEnv.USERPROFILE = tempHome;
+
     const proc = Bun.spawn(
       [process.execPath, mcpServerEntry, "--profile", "ClaudeLocalTest", "--url", status.httpUrl],
       {
-        env: {
-          PATH: process.env.PATH!,
-          HOME: tempHome,
-        },
+        env: cleanEnv,
         stdin: "pipe",
         stdout: "pipe",
         stderr: "pipe",
@@ -363,8 +369,11 @@ describe("AgentsChat Desktop M1 — Global Identity Authority + Local Group/DM M
       const initRes = await nextRpcResponse(1);
       expect(initRes.result?.serverInfo).toBeDefined();
 
-      // Wait briefly for WS auth_ok handshake
-      await new Promise((r) => setTimeout(r, 250));
+      // Wait for WS auth_ok handshake (poll up to 3s for slower CI runners like windows-latest)
+      const wsDeadline = Date.now() + 3_000;
+      while (Date.now() < wsDeadline && !local.getStatus().connectedAgents.includes("cloud-claude-global")) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
 
       sendRpc({
         jsonrpc: "2.0",
@@ -493,7 +502,9 @@ describe("AgentsChat Desktop M1 — Global Identity Authority + Local Group/DM M
       await proc.exited.catch(() => {});
       await local.closeAll();
       await mockCloud.close();
-      rmSync(tempHome, { recursive: true, force: true });
+      try {
+        rmSync(tempHome, { recursive: true, force: true, maxRetries: 6, retryDelay: 50 });
+      } catch {}
     }
   }, 20_000);
 

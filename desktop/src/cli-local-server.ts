@@ -1,6 +1,6 @@
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveHomeDir } from "./identity-authority.js";
 import { LocalMiniServer } from "./local-server.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -8,7 +8,7 @@ const port = Number(process.env.AGENTSCHAT_LOCAL_PORT || 8787);
 const host = process.env.AGENTSCHAT_ALLOW_LAN === "1" ? "0.0.0.0" : "127.0.0.1";
 const dbPath =
   process.env.AGENTSCHAT_LOCAL_DB ||
-  join(process.env.HOME || process.env.USERPROFILE || homedir(), ".agentschat", "desktop", "local-hub.sqlite");
+  join(resolveHomeDir(), ".agentschat", "desktop", "local-hub.sqlite");
 
 const server = new LocalMiniServer({
   port,

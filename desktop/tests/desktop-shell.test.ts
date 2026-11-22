@@ -20,7 +20,9 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
   });
 
   afterEach(() => {
-    rmSync(tempDir, { recursive: true, force: true });
+    try {
+      rmSync(tempDir, { recursive: true, force: true, maxRetries: 6, retryDelay: 50 });
+    } catch {}
   });
 
   test("DesktopSettingsStore persists atomically and rejects insecure remote URLs or out-of-range ports", () => {
@@ -90,13 +92,17 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
       JSON.stringify({ agent_id: "dev-bot", token: "dev-token" }),
     );
 
-    // Symlinked profile must be ignored (mirrors agentschat-mcp symlink guard)
+    // Symlinked profile must be ignored (mirrors agentschat-mcp symlink guard; Windows may lack SeCreateSymbolicLinkPrivilege)
     const outsideTarget = join(tempDir, "outside.json");
     writeFileSync(
       outsideTarget,
       JSON.stringify({ agent_id: "symlink-bot", display_name: "Symlink Bot", token: "ac_symlink_secret" }),
     );
-    symlinkSync(outsideTarget, join(profilesDir, "Symlinked.json"));
+    try {
+      symlinkSync(outsideTarget, join(profilesDir, "Symlinked.json"), "file");
+    } catch (err: any) {
+      if (process.platform !== "win32" || err?.code !== "EPERM") throw err;
+    }
 
     const discovered = GlobalIdentityAuthority.discoverLocalAgentProfiles(tempDir);
     expect(discovered.length).toBe(1);
@@ -143,7 +149,7 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
       const health = (await (await fetch(`${status.httpUrl}/health`)).json()) as any;
       expect(health.lan_urls).toEqual([]);
     } finally {
-      await server.stop();
+      await server.closeAll();
     }
   });
 
@@ -165,7 +171,7 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
       const health = (await (await fetch(`${status.httpUrl}/health`)).json()) as any;
       expect(health.lan_urls).toEqual(status.lanUrls);
     } finally {
-      await server.stop();
+      await server.closeAll();
     }
   });
 
@@ -217,12 +223,12 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
       }),
     ).toThrow(/reserved/i);
 
-    // Refuses writing into symlinked `.agentschat` directory
+    // Refuses writing into symlinked / junctioned `.agentschat` directory
     const symHome = join(tempDir, "sym-home");
     const decoy = join(tempDir, "decoy-dir");
     mkdirSync(symHome, { recursive: true });
     mkdirSync(decoy, { recursive: true });
-    symlinkSync(decoy, join(symHome, ".agentschat"));
+    symlinkSync(decoy, join(symHome, ".agentschat"), process.platform === "win32" ? "junction" : "dir");
     expect(() =>
       GlobalIdentityAuthority.saveLocalAgentProfile({
         profileName: "LegitBot",

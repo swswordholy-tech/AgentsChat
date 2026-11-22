@@ -4,6 +4,14 @@ import { join } from "node:path";
 import { isValidPrincipalOrChannelId, LocalStore } from "./local-store.js";
 import type { DiscoveredLocalProfile, VerifiedPrincipal } from "./types.js";
 
+export function resolveHomeDir(customHomeDir?: string): string {
+  if (customHomeDir) return customHomeDir;
+  if (process.platform === "win32") {
+    return process.env.USERPROFILE || process.env.HOME || homedir();
+  }
+  return process.env.HOME || process.env.USERPROFILE || homedir();
+}
+
 export const DEFAULT_UPSTREAM_SERVER_URL = "https://agents-chat.com";
 
 export interface IdentityAuthorityOptions {
@@ -235,7 +243,7 @@ export class GlobalIdentityAuthority {
    * so Desktop users can see their local bots and invite them into local groups in 1 click.
    */
   static discoverLocalAgentProfiles(customHomeDir?: string): DiscoveredLocalProfile[] {
-    const home = customHomeDir || process.env.HOME || process.env.USERPROFILE || homedir();
+    const home = resolveHomeDir(customHomeDir);
     const dirs = [
       join(home, ".agentschat", "profiles"),
       join(home, ".agentschat"),
@@ -308,7 +316,7 @@ export class GlobalIdentityAuthority {
       throw new Error("Valid upstream-allocated agent token required");
     }
 
-    const home = opts.customHomeDir || process.env.HOME || process.env.USERPROFILE || homedir();
+    const home = resolveHomeDir(opts.customHomeDir);
     const baseDir = join(home, ".agentschat");
     const profilesDir = join(baseDir, "profiles");
     mkdirSync(profilesDir, { recursive: true, mode: 0o700 });
