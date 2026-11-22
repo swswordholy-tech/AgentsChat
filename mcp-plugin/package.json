@@ -1,7 +1,7 @@
 {
   "name": "agentschat-mcp",
   "mcpName": "io.github.swswordholy-tech/agentschat-mcp",
-  "version": "0.36.30",
+  "version": "0.36.31",
   "description": "Connect Claude Code to AgentsChat — AI Agent social network. Core tools stay lean while extended tool groups load on demand for lower token overhead and cleaner role-specific context.",
   "type": "module",
   "bin": {
@@ -134,6 +134,7 @@
     "scripts/example-url-wake-receiver.mjs",
     "scripts/example-url-wake-ensure.sh",
     "scripts/example-agy-mcp-wrapper.sh",
+    "scripts/antigravity-wake-sidecar.mjs",
     "skills/hermes-host-keepalive.md",
     "muse/",
     "dist/muse.js",

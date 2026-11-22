@@ -27,7 +27,14 @@ import {
 } from "../src/session-bind.ts";
 import { decideIdentity } from "../src/identity.ts";
 import { findDefaultProfileCollision } from "../src/profile-store.ts";
-import { buildWakePrompt, fireAntigravityWake, fireZcodeWake } from "../src/wake.ts";
+import {
+  ANTIGRAVITY_SIDECAR_STATE_FILENAME,
+  buildWakePrompt,
+  fireAntigravityWake,
+  fireZcodeWake,
+  verifyWakeSignature,
+  WAKE_SIG_HEADER,
+} from "../src/wake.ts";
 
 const ENTRY = resolve(import.meta.dir, "../src/server.ts");
 
@@ -1601,6 +1608,115 @@ describe("multi-window lock & connect_profile / disconnect_profile integration t
     } finally {
       await mcp.close();
       wsHub.stop(true);
+    }
+  });
+
+  test("Antigravity 2.34.0 inbound WS DM delivers HMAC-signed wake through live agentschat-wake sidecar without --csrf_token", async () => {
+    const home = mkdtempSync(join(tmpdir(), "ac-agy-sidecar-ws-"));
+    const cfgDir = join(home, ".agentschat");
+    const brainDir = mkdtempSync(join(tmpdir(), "ac-agy-sidecar-brain-"));
+    mkdirSync(cfgDir, { recursive: true });
+
+    const cid = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    mkdirSync(join(brainDir, cid, ".system_generated", "logs"), { recursive: true });
+    writeFileSync(
+      join(cfgDir, "AgySidecarBot.json"),
+      JSON.stringify({ agent_id: "sidecar-bot", display_name: "AgySidecarBot", token: "ac_sidecar_bot", capabilities: ["coding"] }),
+    );
+    writeFileSync(join(cfgDir, "session-binds.json"), JSON.stringify({ [cid]: "AgySidecarBot" }));
+
+    const secret = "sidecar-test-secret-0123456789abcdef";
+    const deliveredWakes: Array<{ recipient?: string; prompt?: string; sigValid: boolean }> = [];
+    const mockSidecar = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      async fetch(req) {
+        const u = new URL(req.url);
+        if (u.pathname === "/wake" && req.method === "POST") {
+          const rawBody = await req.text();
+          const sig = req.headers.get(WAKE_SIG_HEADER) || "";
+          const parsed = JSON.parse(rawBody) as { recipient?: string; prompt?: string };
+          deliveredWakes.push({
+            recipient: parsed.recipient,
+            prompt: parsed.prompt,
+            sigValid: verifyWakeSignature(rawBody, sig, [secret]),
+          });
+          return Response.json({ ok: true });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    writeFileSync(
+      join(cfgDir, ANTIGRAVITY_SIDECAR_STATE_FILENAME),
+      JSON.stringify({ url: `http://127.0.0.1:${mockSidecar.port}/wake`, secret, pid: process.pid }),
+    );
+
+    const liveSockets = new Set<any>();
+    const wsHub = Bun.serve<{ agentId?: string }>({
+      port: 0,
+      fetch(req, server) {
+        const u = new URL(req.url);
+        if (u.pathname === "/ws" && server.upgrade(req, { data: {} })) return undefined;
+        return Response.json({ ok: true, build: "test", messages: [] });
+      },
+      websocket: {
+        message(ws, message) {
+          const data = JSON.parse(String(message));
+          if (data.type === "auth" && typeof data.agent_id === "string") {
+            ws.data.agentId = data.agent_id;
+            liveSockets.add(ws);
+            ws.send(JSON.stringify({ type: "auth_ok", session_id: `ws-${data.agent_id}` }));
+          } else if (data.type === "ping") {
+            ws.send(JSON.stringify({ type: "pong" }));
+          }
+        },
+        close(ws) {
+          liveSockets.delete(ws);
+        },
+      },
+    });
+
+    const mcp = spawnMcpSession(home, [], {
+      AGENTCHAT_REST_URL: `http://127.0.0.1:${wsHub.port}`,
+      AGENTCHAT_URL: `ws://127.0.0.1:${wsHub.port}/ws`,
+      AGENTSCHAT_AGY_BRAIN_DIR: brainDir,
+      ANTIGRAVITY_LS_ADDRESS: "127.0.0.1:57518",
+      ANTIGRAVITY_OPEN_CONVERSATIONS: "",
+    });
+
+    try {
+      await mcp.send(INIT);
+      await mcp.send(INITED);
+
+      for (let i = 0; i < 40 && liveSockets.size === 0; i++) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      expect(liveSockets.size).toBe(1);
+
+      for (const sock of liveSockets) {
+        sock.send(
+          JSON.stringify({
+            type: "message",
+            id: "msg-sidecar-dm-1",
+            channel_id: "dm-nkdfuq",
+            sender_id: "swswordholy@gmail.com",
+            content: "ping",
+            timestamp: new Date().toISOString(),
+          }),
+        );
+      }
+
+      for (let i = 0; i < 40 && deliveredWakes.length === 0; i++) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      expect(deliveredWakes).toHaveLength(1);
+      expect(deliveredWakes[0]!.sigValid).toBe(true);
+      expect(deliveredWakes[0]!.recipient).toBe(cid);
+      expect(deliveredWakes[0]!.prompt).toContain("ping");
+    } finally {
+      await mcp.close();
+      wsHub.stop(true);
+      mockSidecar.stop(true);
     }
   });
 });

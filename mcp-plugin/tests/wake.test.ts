@@ -16,11 +16,17 @@
  * a real wake from a forged POST. The channel-owning agent's ac_ key stays local.
  */
 import { describe, expect, test } from "bun:test";
+import { spawn } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import {
+  ANTIGRAVITY_SIDECAR_STATE_FILENAME,
   buildGrokPrompt,
   buildWakePayload,
   buildWakePrompt,
   clampWakeTimerMs,
+  fireAntigravitySidecarWake,
   fireAntigravityWake,
   fireGrokWake,
   fireWake,
@@ -28,6 +34,7 @@ import {
   formatWakeAttachments,
   grokPortFromGatewayConfig,
   normalizeLoopbackLsAddress,
+  readAntigravitySidecarConfig,
   resolveEnvWakeId,
   resolveWindowsCliSpawn,
   sanitizeWakeLogUrl,
@@ -488,5 +495,199 @@ describe("Campaign #108 KR3 — wake SSRF, symlink, 32-bit timer, CLI flag & DM 
     });
     expect(capturedArgs).not.toContain("--cwd");
     expect(capturedArgs).not.toContain("--evil-flag");
+  });
+
+  test("readAntigravitySidecarConfig & fireAntigravitySidecarWake enforce loopback, symlink, live PID, UUID, and HMAC signing", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ac-sidecar-cfg-"));
+    try {
+      const cfgDir = join(root, ".agentschat");
+      mkdirSync(cfgDir, { recursive: true });
+      const stateFile = join(cfgDir, ANTIGRAVITY_SIDECAR_STATE_FILENAME);
+
+      // Valid live config
+      writeFileSync(
+        stateFile,
+        JSON.stringify({ url: "http://127.0.0.1:54321/wake", secret: "sidecar-sec-123", pid: process.pid }),
+      );
+      expect(readAntigravitySidecarConfig(cfgDir)).toEqual({
+        url: "http://127.0.0.1:54321/wake",
+        secret: "sidecar-sec-123",
+        pid: process.pid,
+      });
+
+      // Dead PID rejected
+      expect(readAntigravitySidecarConfig(cfgDir, { isPidAliveFn: () => false })).toBeNull();
+
+      // Non-loopback URL rejected (SSRF guard)
+      writeFileSync(
+        stateFile,
+        JSON.stringify({ url: "http://169.254.169.254:80/wake", secret: "sidecar-sec-123", pid: process.pid }),
+      );
+      expect(readAntigravitySidecarConfig(cfgDir)).toBeNull();
+
+      // __proto__ pollution rejected
+      writeFileSync(
+        stateFile,
+        `{"url":"http://127.0.0.1:54321/wake","secret":"sec","pid":${process.pid},"__proto__":{}}`,
+      );
+      expect(readAntigravitySidecarConfig(cfgDir)).toBeNull();
+
+      // Symlinked state file rejected
+      const outside = join(root, "outside.json");
+      writeFileSync(
+        outside,
+        JSON.stringify({ url: "http://127.0.0.1:54321/wake", secret: "sidecar-sec-123", pid: process.pid }),
+      );
+      const symDir = join(root, "symcfg");
+      mkdirSync(symDir, { recursive: true });
+      symlinkSync(outside, join(symDir, ANTIGRAVITY_SIDECAR_STATE_FILENAME));
+      expect(readAntigravitySidecarConfig(symDir)).toBeNull();
+
+      // fireAntigravitySidecarWake rejects invalid UUID or off-loopback URL before any fetch
+      let fetched = 0;
+      const stubFetch = (async () => {
+        fetched++;
+        return new Response("ok", { status: 200 });
+      }) as unknown as typeof fetch;
+      expect(
+        await fireAntigravitySidecarWake(MSG, {
+          conversationId: "not-a-uuid",
+          sidecarUrl: "http://127.0.0.1:54321/wake",
+          secret: "sec",
+          fetchImpl: stubFetch,
+        }),
+      ).toBe(false);
+      expect(
+        await fireAntigravitySidecarWake(MSG, {
+          conversationId: "ba32c38a-052c-4291-86dd-373a68ea85a3",
+          sidecarUrl: "http://example.com:54321/wake",
+          secret: "sec",
+          fetchImpl: stubFetch,
+        }),
+      ).toBe(false);
+      expect(fetched).toBe(0);
+
+      // Valid sidecar POST signs raw body with WAKE_SIG_HEADER
+      let sentSig = "";
+      let sentBody = "";
+      const ok = await fireAntigravitySidecarWake(
+        { id: "m-sidecar-1", channel_id: "dm-boss", sender_id: "boss", content: "ping" },
+        {
+          conversationId: "ba32c38a-052c-4291-86dd-373a68ea85a3",
+          sidecarUrl: "http://127.0.0.1:54321/wake",
+          secret: "sec-abc",
+          fetchImpl: (async (_u: any, init: any) => {
+            sentSig = init?.headers?.[WAKE_SIG_HEADER] || "";
+            sentBody = String(init?.body || "");
+            return new Response(JSON.stringify({ ok: true }), { status: 200 });
+          }) as unknown as typeof fetch,
+        },
+      );
+      expect(ok).toBe(true);
+      expect(verifyWakeSignature(sentBody, sentSig, ["sec-abc"])).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("antigravity-wake-sidecar.mjs verifies HMAC signatures, invokes agentapi send-message cleanly, and cleans up state on SIGTERM", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ac-sidecar-e2e-"));
+    const stateFile = join(root, "state", "antigravity-sidecar.json");
+    const mockLogFile = join(root, "agentapi-calls.jsonl");
+    const mockAgentApi = join(root, "mock-agentapi.js");
+    writeFileSync(
+      mockAgentApi,
+      `#!${process.execPath}
+const fs = require("node:fs");
+fs.appendFileSync(${JSON.stringify(mockLogFile)}, JSON.stringify(process.argv.slice(2)) + "\\n");
+`,
+      { mode: 0o755 },
+    );
+    chmodSync(mockAgentApi, 0o755);
+
+    const sidecarScript = resolve(import.meta.dir, "../scripts/antigravity-wake-sidecar.mjs");
+    const child = spawn("node", [sidecarScript], {
+      env: {
+        ...process.env,
+        AGENTSCHAT_AGY_SIDECAR_STATE: stateFile,
+        AGENTSCHAT_AGENTAPI_BIN: mockAgentApi,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    try {
+      for (let i = 0; i < 60 && !existsSync(stateFile); i++) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      expect(existsSync(stateFile)).toBe(true);
+      if (process.platform !== "win32") {
+        expect(statSync(stateFile).mode & 0o777).toBe(0o600);
+      }
+
+      const state = JSON.parse(readFileSync(stateFile, "utf8")) as { url: string; secret: string; pid: number };
+      expect(state.pid).toBe(child.pid!);
+      expect(state.url.startsWith("http://127.0.0.1:")).toBe(true);
+
+      const healthUrl = state.url.replace(/\/wake$/, "/health");
+      const healthRes = await fetch(healthUrl);
+      expect(healthRes.status).toBe(200);
+      expect(await healthRes.json()).toEqual({ ok: true, pid: child.pid! });
+
+      // Unsigned request -> 401
+      const cid = "567abecb-afce-4fb8-8e1f-de6c231f6d61";
+      const unsignedRes = await fetch(state.url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ recipient: cid, display_title: "AgentsChat #dm-boss", prompt: "ping" }),
+      });
+      expect(unsignedRes.status).toBe(401);
+
+      // Wrong signature -> 401
+      const badSigBody = JSON.stringify({ recipient: cid, display_title: "AgentsChat #dm-boss", prompt: "ping" });
+      const badSigRes = await fetch(state.url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", [WAKE_SIG_HEADER]: signWakeBody(badSigBody, "wrong-secret") },
+        body: badSigBody,
+      });
+      expect(badSigRes.status).toBe(401);
+
+      // Signed non-UUID recipient -> 400
+      const badUuidBody = JSON.stringify({ recipient: "not-a-uuid", display_title: "AgentsChat", prompt: "ping" });
+      const badUuidRes = await fetch(state.url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", [WAKE_SIG_HEADER]: signWakeBody(badUuidBody, state.secret) },
+        body: badUuidBody,
+      });
+      expect(badUuidRes.status).toBe(400);
+
+      // Valid wake via fireAntigravitySidecarWake -> 200 and mock agentapi receives exact send-message args
+      const sent = await fireAntigravitySidecarWake(
+        { id: "msg-e2e-1", channel_id: "dm-nkdfuq", sender_id: "swswordholy", content: "ping" },
+        { conversationId: cid, sidecarUrl: state.url, secret: state.secret },
+      );
+      expect(sent).toBe(true);
+
+      const lines = readFileSync(mockLogFile, "utf8").trim().split("\n");
+      expect(lines).toHaveLength(1);
+      const invokedArgs = JSON.parse(lines[0]!) as string[];
+      expect(invokedArgs[0]).toBe("send-message");
+      expect(invokedArgs[1]).toBe("--title=AgentsChat #dm-nkdfuq");
+      expect(invokedArgs[2]).toBe(cid);
+      expect(invokedArgs[3]).toContain("[AgentsChat] swswordholy 在私聊 (dm-nkdfuq)给你发了消息");
+      expect(invokedArgs[3]).toContain("ping");
+
+      // SIGTERM cleanly removes state file
+      child.kill("SIGTERM");
+      await new Promise<void>((resolveExit) => {
+        child.once("exit", () => resolveExit());
+        setTimeout(() => resolveExit(), 3000);
+      });
+      expect(existsSync(stateFile)).toBe(false);
+    } finally {
+      try {
+        child.kill("SIGKILL");
+      } catch {}
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

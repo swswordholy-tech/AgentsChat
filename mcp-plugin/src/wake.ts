@@ -835,6 +835,194 @@ export async function fireAntigravityWake(msg: WakeMessage, cfg: AntigravityWake
   return false;
 }
 
+export const ANTIGRAVITY_SIDECAR_STATE_FILENAME = "antigravity-sidecar.json";
+const AGY_SIDECAR_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export interface AntigravitySidecarConfig {
+  url: string;
+  secret: string;
+  pid: number;
+}
+
+export interface AntigravitySidecarWakeConfig {
+  /** Target Antigravity conversation UUID. */
+  conversationId: string;
+  /** Local loopback URL of the running Antigravity sidecar `/wake` endpoint. */
+  sidecarUrl: string;
+  /** Shared HMAC-SHA256 secret written by the sidecar. */
+  secret: string;
+  /** Optional missed channel messages prefix fetched since last @mention. */
+  contextPrefix?: string;
+  /** Optional prompt override. */
+  promptOverride?: string;
+  timeoutMs?: number;
+  fetchImpl?: typeof fetch;
+  logger?: (msg: string) => void;
+}
+
+function defaultIsPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err: any) {
+    return Boolean(err && typeof err === "object" && err.code === "EPERM");
+  }
+}
+
+function parseLoopbackSidecarWakeUrl(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 4096 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(trimmed)) {
+    return null;
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "http:" || parsed.username || parsed.password) return null;
+  const host = parsed.hostname.toLowerCase();
+  if (host !== "127.0.0.1" && host !== "[::1]" && host !== "::1" && host !== "localhost") {
+    return null;
+  }
+  const port = Number(parsed.port);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+  if (parsed.pathname !== "/wake") return null;
+  return parsed.toString();
+}
+
+/**
+ * Read and validate the local Antigravity wake sidecar state file (`~/.agentschat/antigravity-sidecar.json`).
+ * Returns `null` if missing, malformed, symlinked, pointing off-loopback, or owned by a dead PID.
+ */
+export function readAntigravitySidecarConfig(
+  configDir: string,
+  opts?: { isPidAliveFn?: (pid: number) => boolean },
+): AntigravitySidecarConfig | null {
+  const overridePath = process.env.AGENTSCHAT_AGY_SIDECAR_STATE?.trim();
+  const statePath = overridePath || (configDir ? join(configDir, ANTIGRAVITY_SIDECAR_STATE_FILENAME) : "");
+  if (!statePath) return null;
+  if (!hasSafeWakeDirChain(dirname(statePath))) return null;
+  let st: Stats;
+  try {
+    st = lstatSync(statePath);
+  } catch {
+    return null;
+  }
+  if (st.isSymbolicLink() || !st.isFile() || st.size <= 0 || st.size > 65_536) return null;
+
+  let parsed: any;
+  try {
+    parsed = JSON.parse(readFileSync(statePath, "utf8"));
+  } catch {
+    return null;
+  }
+  if (
+    !parsed ||
+    typeof parsed !== "object" ||
+    Array.isArray(parsed) ||
+    Object.prototype.hasOwnProperty.call(parsed, "__proto__")
+  ) {
+    return null;
+  }
+
+  const url = parseLoopbackSidecarWakeUrl(parsed.url);
+  if (!url) return null;
+
+  const secret = parsed.secret;
+  if (
+    typeof secret !== "string" ||
+    secret.length === 0 ||
+    secret.length > 8192 ||
+    /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(secret)
+  ) {
+    return null;
+  }
+
+  const pid = Number(parsed.pid);
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+  const aliveCheck = opts?.isPidAliveFn ?? defaultIsPidAlive;
+  if (!aliveCheck(pid)) return null;
+
+  return { url, secret, pid };
+}
+
+/**
+ * Deliver an Antigravity session wake through the official `agentschat-wake` sidecar
+ * (`agentapi send-message`), authenticated with an HMAC-SHA256 signature over the body.
+ */
+export async function fireAntigravitySidecarWake(
+  msg: WakeMessage,
+  cfg: AntigravitySidecarWakeConfig,
+): Promise<boolean> {
+  const log = cfg.logger ?? (() => {});
+  const conversationId = (cfg.conversationId ?? "").trim();
+  if (!AGY_SIDECAR_UUID_RE.test(conversationId)) {
+    log(`[agentchat] antigravity sidecar wake: invalid recipient UUID, skipping`);
+    return false;
+  }
+  const sidecarUrl = parseLoopbackSidecarWakeUrl(cfg.sidecarUrl);
+  if (!sidecarUrl) {
+    log(`[agentchat] antigravity sidecar wake: rejected non-loopback or invalid sidecarUrl`);
+    return false;
+  }
+  const secret = cfg.secret;
+  if (
+    typeof secret !== "string" ||
+    secret.length === 0 ||
+    secret.length > 8192 ||
+    /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(secret)
+  ) {
+    log(`[agentchat] antigravity sidecar wake: missing or invalid sidecar secret, skipping`);
+    return false;
+  }
+
+  const prompt = cfg.promptOverride ?? buildWakePrompt(msg, cfg.contextPrefix);
+  const channel = sanitizeWakeHeaderToken(redactSecrets(String(msg.channel_id ?? "")), 128) ?? "chat";
+  const displayTitle = `AgentsChat #${channel}`;
+  const body = JSON.stringify({
+    recipient: conversationId,
+    target_session_id: conversationId,
+    display_title: displayTitle,
+    prompt,
+    channel_id: sanitizeWakeHeaderToken(msg.channel_id, 128),
+    message_id: sanitizeWakeHeaderToken(msg.id ?? (msg as any).message_id, 128),
+    sender_id: sanitizeWakeHeaderToken(msg.sender_id, 128),
+    timestamp: sanitizeWakeHeaderToken(msg.timestamp, 64) || new Date().toISOString(),
+  });
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    [WAKE_SIG_HEADER]: signWakeBody(body, secret),
+  };
+
+  const f = cfg.fetchImpl ?? fetch;
+  const timeoutMs = clampWakeTimerMs(cfg.timeoutMs, 10_000);
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  t.unref?.();
+  try {
+    const res = await f(sidecarUrl, {
+      method: "POST",
+      headers,
+      body,
+      signal: ctrl.signal,
+      redirect: "error",
+    });
+    await res.body?.cancel().catch(() => {});
+    if (res.ok) return true;
+    log(`[agentchat] antigravity sidecar wake POST ${sanitizeWakeLogUrl(sidecarUrl)} → HTTP ${res.status}`);
+    return false;
+  } catch (err) {
+    log(
+      `[agentchat] antigravity sidecar wake POST ${sanitizeWakeLogUrl(sidecarUrl)} failed: ${redactSecrets(String(err)).slice(0, 200)}`,
+    );
+    return false;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 export interface ZcodeWakeConfig {
   /** ZCode session ID (`sess_...`) captured from `_meta.session_id` or `ZCODE_SESSION_ID`. */
   sessionId: string;

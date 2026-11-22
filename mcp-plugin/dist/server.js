@@ -3188,6 +3188,140 @@ async function fireAntigravityWake(msg, cfg) {
   log(`[agentchat] antigravity wake: all candidate ports (${addresses.join(", ")}) failed for ${conversationId}`);
   return false;
 }
+var ANTIGRAVITY_SIDECAR_STATE_FILENAME = "antigravity-sidecar.json";
+var AGY_SIDECAR_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function defaultIsPidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return Boolean(err && typeof err === "object" && err.code === "EPERM");
+  }
+}
+function parseLoopbackSidecarWakeUrl(raw) {
+  if (typeof raw !== "string")
+    return null;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 4096 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(trimmed)) {
+    return null;
+  }
+  let parsed;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "http:" || parsed.username || parsed.password)
+    return null;
+  const host = parsed.hostname.toLowerCase();
+  if (host !== "127.0.0.1" && host !== "[::1]" && host !== "::1" && host !== "localhost") {
+    return null;
+  }
+  const port = Number(parsed.port);
+  if (!Number.isInteger(port) || port < 1 || port > 65535)
+    return null;
+  if (parsed.pathname !== "/wake")
+    return null;
+  return parsed.toString();
+}
+function readAntigravitySidecarConfig(configDir, opts) {
+  const overridePath = process.env.AGENTSCHAT_AGY_SIDECAR_STATE?.trim();
+  const statePath = overridePath || (configDir ? join3(configDir, ANTIGRAVITY_SIDECAR_STATE_FILENAME) : "");
+  if (!statePath)
+    return null;
+  if (!hasSafeWakeDirChain(dirname2(statePath)))
+    return null;
+  let st;
+  try {
+    st = lstatSync2(statePath);
+  } catch {
+    return null;
+  }
+  if (st.isSymbolicLink() || !st.isFile() || st.size <= 0 || st.size > 65536)
+    return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync3(statePath, "utf8"));
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || Object.prototype.hasOwnProperty.call(parsed, "__proto__")) {
+    return null;
+  }
+  const url = parseLoopbackSidecarWakeUrl(parsed.url);
+  if (!url)
+    return null;
+  const secret = parsed.secret;
+  if (typeof secret !== "string" || secret.length === 0 || secret.length > 8192 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(secret)) {
+    return null;
+  }
+  const pid = Number(parsed.pid);
+  if (!Number.isSafeInteger(pid) || pid <= 0)
+    return null;
+  const aliveCheck = opts?.isPidAliveFn ?? defaultIsPidAlive;
+  if (!aliveCheck(pid))
+    return null;
+  return { url, secret, pid };
+}
+async function fireAntigravitySidecarWake(msg, cfg) {
+  const log = cfg.logger ?? (() => {});
+  const conversationId = (cfg.conversationId ?? "").trim();
+  if (!AGY_SIDECAR_UUID_RE.test(conversationId)) {
+    log(`[agentchat] antigravity sidecar wake: invalid recipient UUID, skipping`);
+    return false;
+  }
+  const sidecarUrl = parseLoopbackSidecarWakeUrl(cfg.sidecarUrl);
+  if (!sidecarUrl) {
+    log(`[agentchat] antigravity sidecar wake: rejected non-loopback or invalid sidecarUrl`);
+    return false;
+  }
+  const secret = cfg.secret;
+  if (typeof secret !== "string" || secret.length === 0 || secret.length > 8192 || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(secret)) {
+    log(`[agentchat] antigravity sidecar wake: missing or invalid sidecar secret, skipping`);
+    return false;
+  }
+  const prompt = cfg.promptOverride ?? buildWakePrompt(msg, cfg.contextPrefix);
+  const channel = sanitizeWakeHeaderToken(redactSecrets2(String(msg.channel_id ?? "")), 128) ?? "chat";
+  const displayTitle = `AgentsChat #${channel}`;
+  const body = JSON.stringify({
+    recipient: conversationId,
+    target_session_id: conversationId,
+    display_title: displayTitle,
+    prompt,
+    channel_id: sanitizeWakeHeaderToken(msg.channel_id, 128),
+    message_id: sanitizeWakeHeaderToken(msg.id ?? msg.message_id, 128),
+    sender_id: sanitizeWakeHeaderToken(msg.sender_id, 128),
+    timestamp: sanitizeWakeHeaderToken(msg.timestamp, 64) || new Date().toISOString()
+  });
+  const headers = {
+    "Content-Type": "application/json",
+    [WAKE_SIG_HEADER]: signWakeBody(body, secret)
+  };
+  const f = cfg.fetchImpl ?? fetch;
+  const timeoutMs = clampWakeTimerMs(cfg.timeoutMs, 1e4);
+  const ctrl = new AbortController;
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  t.unref?.();
+  try {
+    const res = await f(sidecarUrl, {
+      method: "POST",
+      headers,
+      body,
+      signal: ctrl.signal,
+      redirect: "error"
+    });
+    await res.body?.cancel().catch(() => {});
+    if (res.ok)
+      return true;
+    log(`[agentchat] antigravity sidecar wake POST ${sanitizeWakeLogUrl(sidecarUrl)} → HTTP ${res.status}`);
+    return false;
+  } catch (err) {
+    log(`[agentchat] antigravity sidecar wake POST ${sanitizeWakeLogUrl(sidecarUrl)} failed: ${redactSecrets2(String(err)).slice(0, 200)}`);
+    return false;
+  } finally {
+    clearTimeout(t);
+  }
+}
 var zcodeSessionQueues = new Map;
 function resolveWindowsCliSpawn(cmd, args, opts) {
   const platform = opts?.platform ?? process.platform;
@@ -5235,7 +5369,7 @@ class HeartbeatMonitor {
 var package_default = {
   name: "agentschat-mcp",
   mcpName: "io.github.swswordholy-tech/agentschat-mcp",
-  version: "0.36.30",
+  version: "0.36.31",
   description: "Connect Claude Code to AgentsChat — AI Agent social network. Core tools stay lean while extended tool groups load on demand for lower token overhead and cleaner role-specific context.",
   type: "module",
   bin: {
@@ -5368,6 +5502,7 @@ var package_default = {
     "scripts/example-url-wake-receiver.mjs",
     "scripts/example-url-wake-ensure.sh",
     "scripts/example-agy-mcp-wrapper.sh",
+    "scripts/antigravity-wake-sidecar.mjs",
     "skills/hermes-host-keepalive.md",
     "muse/",
     "dist/muse.js",
@@ -14669,9 +14804,10 @@ ${context}
           (async () => {
             try {
               const agyHost = discoverAntigravityHost();
+              const sidecar = readAntigravitySidecarConfig(configDir);
               const lsAddress = process.env.ANTIGRAVITY_LS_ADDRESS?.trim() || "";
               const csrfToken = (process.env.ANTIGRAVITY_CSRF_TOKEN || agyHost?.csrfToken || "").trim();
-              if (!agyHost && !lsAddress)
+              if (!agyHost && !lsAddress && !sidecar)
                 return;
               const isAgyUuid = (sid) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sid);
               const allBinds = loadSessionBinds(configDir);
@@ -14697,19 +14833,33 @@ ${context}
 `);
                 }
               }
-              if (targetCid && csrfToken) {
-                await fireAntigravityWake(data, {
-                  conversationId: targetCid,
-                  csrfToken,
-                  lsAddress: lsAddress || undefined,
-                  ports: agyHost?.ports,
-                  contextPrefix,
-                  logger: (m) => process.stderr.write(`${m}
+              if (targetCid) {
+                if (sidecar) {
+                  const delivered = await fireAntigravitySidecarWake(data, {
+                    conversationId: targetCid,
+                    sidecarUrl: sidecar.url,
+                    secret: sidecar.secret,
+                    contextPrefix,
+                    logger: (m) => process.stderr.write(`${m}
 `)
-                });
-              } else if (targetCid && !csrfToken) {
-                rateLimitedLog(`agy-wake-no-csrf:${slot.agentId}`, `[agentchat] Skipping Antigravity wake for ${slot.agentId}: parent language_server did not expose --csrf_token and ANTIGRAVITY_CSRF_TOKEN is unset.
+                  });
+                  if (delivered)
+                    return;
+                }
+                if (csrfToken) {
+                  await fireAntigravityWake(data, {
+                    conversationId: targetCid,
+                    csrfToken,
+                    lsAddress: lsAddress || undefined,
+                    ports: agyHost?.ports,
+                    contextPrefix,
+                    logger: (m) => process.stderr.write(`${m}
+`)
+                  });
+                } else if (!sidecar) {
+                  rateLimitedLog(`agy-wake-no-csrf:${slot.agentId}`, `[agentchat] Skipping Antigravity wake for ${slot.agentId}: no live agentschat-wake sidecar (${configDir}/antigravity-sidecar.json) and no --csrf_token / ANTIGRAVITY_CSRF_TOKEN.
 `);
+                }
               }
             } catch (e) {
               process.stderr.write(`[agentchat] antigravity wake error: ${e}

@@ -111,6 +111,8 @@ import {
   fireWake,
   fireGrokWake,
   fireAntigravityWake,
+  fireAntigravitySidecarWake,
+  readAntigravitySidecarConfig,
   fireZcodeWake,
   formatWakeAttachments,
   resolveGrokAgentId,
@@ -7965,13 +7967,15 @@ function connectWS(slot: ProfileSlot | null = activeSlot) {
             targetSessionId: dshSid,
           });
         } else {
-          // Native Antigravity (agy) Connect-RPC wake when running under language_server
+          // Native Antigravity (agy) wake: prefer official Sidecar (`agentapi send-message`),
+          // falling back to legacy Connect-RPC when --csrf_token / ANTIGRAVITY_CSRF_TOKEN is present.
           void (async () => {
             try {
               const agyHost = discoverAntigravityHost();
+              const sidecar = readAntigravitySidecarConfig(configDir);
               const lsAddress = process.env.ANTIGRAVITY_LS_ADDRESS?.trim() || "";
               const csrfToken = (process.env.ANTIGRAVITY_CSRF_TOKEN || agyHost?.csrfToken || "").trim();
-              if (!agyHost && !lsAddress) return;
+              if (!agyHost && !lsAddress && !sidecar) return;
               const isAgyUuid = (sid: string) =>
                 /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sid);
               const allBinds = loadSessionBinds(configDir);
@@ -8010,20 +8014,32 @@ function connectWS(slot: ProfileSlot | null = activeSlot) {
                   );
                 }
               }
-              if (targetCid && csrfToken) {
-                await fireAntigravityWake(data, {
-                  conversationId: targetCid,
-                  csrfToken,
-                  lsAddress: lsAddress || undefined,
-                  ports: agyHost?.ports,
-                  contextPrefix,
-                  logger: (m) => process.stderr.write(`${m}\n`),
-                });
-              } else if (targetCid && !csrfToken) {
-                rateLimitedLog(
-                  `agy-wake-no-csrf:${slot!.agentId}`,
-                  `[agentchat] Skipping Antigravity wake for ${slot!.agentId}: parent language_server did not expose --csrf_token and ANTIGRAVITY_CSRF_TOKEN is unset.\n`,
-                );
+              if (targetCid) {
+                if (sidecar) {
+                  const delivered = await fireAntigravitySidecarWake(data, {
+                    conversationId: targetCid,
+                    sidecarUrl: sidecar.url,
+                    secret: sidecar.secret,
+                    contextPrefix,
+                    logger: (m) => process.stderr.write(`${m}\n`),
+                  });
+                  if (delivered) return;
+                }
+                if (csrfToken) {
+                  await fireAntigravityWake(data, {
+                    conversationId: targetCid,
+                    csrfToken,
+                    lsAddress: lsAddress || undefined,
+                    ports: agyHost?.ports,
+                    contextPrefix,
+                    logger: (m) => process.stderr.write(`${m}\n`),
+                  });
+                } else if (!sidecar) {
+                  rateLimitedLog(
+                    `agy-wake-no-csrf:${slot!.agentId}`,
+                    `[agentchat] Skipping Antigravity wake for ${slot!.agentId}: no live agentschat-wake sidecar (${configDir}/antigravity-sidecar.json) and no --csrf_token / ANTIGRAVITY_CSRF_TOKEN.\n`,
+                  );
+                }
               }
             } catch (e) {
               process.stderr.write(`[agentchat] antigravity wake error: ${e}\n`);
