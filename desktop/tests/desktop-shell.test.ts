@@ -107,6 +107,7 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
       const indexRes = await fetch(`${status.httpUrl}/`);
       expect(indexRes.status).toBe(200);
       expect(indexRes.headers.get("content-type")).toContain("text/html");
+      expect(indexRes.headers.get("content-security-policy")).toContain("default-src 'self'");
       const html = await indexRes.text();
       expect(html).toContain("AgentsChat Local Server");
       expect(html).toContain("local-chat.js");
@@ -114,6 +115,12 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
       const jsRes = await fetch(`${status.httpUrl}/local-chat.js`);
       expect(jsRes.status).toBe(200);
       expect(jsRes.headers.get("content-type")).toContain("javascript");
+
+      // Internal Electron preloads & shell files must NEVER be exposed over HTTP
+      for (const secretPath of ["/preload.cjs", "/local-preload.cjs", "/shell.html", "/cloud-offline.html"]) {
+        const res = await fetch(`${status.httpUrl}${secretPath}`);
+        expect(res.status).toBe(404);
+      }
 
       // Path traversal attempt must never escape staticUiDir
       const traversalRes = await fetch(`${status.httpUrl}/..%2Fpackage.json`);

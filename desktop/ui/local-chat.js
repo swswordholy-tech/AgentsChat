@@ -180,14 +180,28 @@
         }
       } else if (frame.type === "message_edited" && frame.channel_id === currentChannelId) {
         const idx = messages.findIndex((m) => m.id === frame.message_id);
-        if (idx >= 0) {
-          messages[idx].content = frame.content;
+        const updatedText = frame.content ?? frame.new_content;
+        if (idx >= 0 && typeof updatedText === "string") {
+          messages[idx].content = updatedText;
           messages[idx].edited_at = frame.edited_at;
           renderMessages();
         }
       } else if (frame.type === "message_deleted" && frame.channel_id === currentChannelId) {
         messages = messages.filter((m) => m.id !== frame.message_id);
         renderMessages();
+      } else if (frame.type === "agent_online" || frame.type === "agent_offline") {
+        const online = frame.type === "agent_online";
+        const found = currentMembers.find((m) => m.agent_id === frame.agent_id);
+        if (found) {
+          found.online = online;
+          renderMembers();
+        } else if (frame.channel_id === currentChannelId) {
+          void selectChannel(currentChannelId);
+        }
+      } else if (frame.type === "topic_update" && frame.channel_id === currentChannelId) {
+        elRoomTopic.textContent = frame.topic || "本机最小聊天服务 · 全局唯一身份零冲突";
+        const ch = channels.find((c) => c.id === currentChannelId);
+        if (ch) ch.topic = frame.topic || "";
       } else if (frame.type === "typing" && frame.channel_id === currentChannelId && frame.sender_id !== currentPrincipal?.id) {
         elTyping.textContent = `@${frame.sender_id} 正在思考/输入…`;
         clearTimeout(connectRealtimeWs._typingTimer);
@@ -403,6 +417,86 @@
     });
   }
 
+  function appendInlineRichText(parent, text) {
+    // Pure DOM tokenization (zero innerHTML): inline `code`, @mentions, and safe https/http URLs
+    const tokenRe = /(`[^`\n]+`)|(https?:\/\/[^\s<>"'`]+)|((?:^|(?<=[\s(\[]))@[a-zA-Z0-9][a-zA-Z0-9._-]{1,62})/g;
+    let last = 0;
+    let m;
+    while ((m = tokenRe.exec(text)) !== null) {
+      if (m.index > last) {
+        parent.appendChild(document.createTextNode(text.slice(last, m.index)));
+      }
+      if (m[1]) {
+        const code = document.createElement("code");
+        code.className = "inline-code";
+        code.textContent = m[1].slice(1, -1);
+        parent.appendChild(code);
+      } else if (m[2]) {
+        const a = document.createElement("a");
+        a.className = "msg-link";
+        a.href = m[2];
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        a.textContent = m[2];
+        parent.appendChild(a);
+      } else if (m[3]) {
+        const chip = document.createElement("span");
+        chip.className = "mention-chip";
+        chip.textContent = m[3];
+        parent.appendChild(chip);
+      }
+      last = m.index + m[0].length;
+    }
+    if (last < text.length) {
+      parent.appendChild(document.createTextNode(text.slice(last)));
+    }
+  }
+
+  function renderFormattedBody(container, rawText) {
+    const text = String(rawText || "");
+    const fenceRe = /```([a-zA-Z0-9_+-]*)\n?([\s\S]*?)```/g;
+    let last = 0;
+    let match;
+    while ((match = fenceRe.exec(text)) !== null) {
+      if (match.index > last) {
+        const seg = document.createElement("span");
+        appendInlineRichText(seg, text.slice(last, match.index));
+        container.appendChild(seg);
+      }
+      const lang = match[1] || "code";
+      const codeText = match[2].replace(/\n$/, "");
+      const wrap = document.createElement("div");
+      wrap.className = "code-block-wrap";
+      const head = document.createElement("div");
+      head.className = "code-block-head";
+      const langEl = document.createElement("span");
+      langEl.textContent = lang;
+      const copyBtn = document.createElement("button");
+      copyBtn.type = "button";
+      copyBtn.className = "icon-btn";
+      copyBtn.textContent = "📋 复制";
+      copyBtn.addEventListener("click", async () => {
+        if (bridge?.copyText) await bridge.copyText(codeText);
+        else await navigator.clipboard?.writeText(codeText);
+        showToast("已复制代码块");
+      });
+      head.appendChild(langEl);
+      head.appendChild(copyBtn);
+      const pre = document.createElement("pre");
+      pre.className = "code-block-pre";
+      const codeEl = document.createElement("code");
+      codeEl.textContent = codeText;
+      pre.appendChild(codeEl);
+      wrap.appendChild(head);
+      wrap.appendChild(pre);
+      container.appendChild(wrap);
+      last = match.index + match[0].length;
+    }
+    if (last < text.length) {
+      appendInlineRichText(container, text.slice(last));
+    }
+  }
+
   function renderMessages() {
     elMessages.replaceChildren();
     if (!authToken) {
@@ -537,7 +631,7 @@
 
       const body = document.createElement("div");
       body.className = "msg-body";
-      body.textContent = m.content;
+      renderFormattedBody(body, m.content);
       item.appendChild(body);
       elMessages.appendChild(item);
     });
@@ -960,7 +1054,37 @@
     elMentionMenu.hidden = false;
   }
 
-  elInput.addEventListener("input", () => updateMentionMenu());
+  document.getElementById("btn-edit-topic")?.addEventListener("click", async () => {
+    if (!authToken) return showToast("请先登录全局账号后再编辑主题");
+    const r = await openPromptDialog({
+      title: `编辑 #${currentChannelId} 主题`,
+      hint: "主题将实时同步给房间内所有连接的本机 Agent。",
+      placeholder1: "输入新的房间主题 / 协作目标",
+    });
+    if (r === null) return;
+    const res = await api(`/api/channels/${encodeURIComponent(currentChannelId)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ topic: r.v1 }),
+    });
+    if (res.ok && res.data?.channel) {
+      elRoomTopic.textContent = res.data.channel.topic || "本机最小聊天服务 · 全局唯一身份零冲突";
+      showToast("主题已更新");
+    } else {
+      showToast(res.data?.error || "主题更新失败");
+    }
+  });
+
+  let lastTypingSentAt = 0;
+  elInput.addEventListener("input", () => {
+    updateMentionMenu();
+    const now = Date.now();
+    if (ws && ws.readyState === WebSocket.OPEN && elInput.value.trim() && now - lastTypingSentAt > 2500) {
+      lastTypingSentAt = now;
+      try {
+        ws.send(JSON.stringify({ type: "typing", channel_id: currentChannelId }));
+      } catch {}
+    }
+  });
   elInput.addEventListener("blur", () => setTimeout(() => closeMentionMenu(), 120));
 
   document.getElementById("btn-send").addEventListener("click", () => sendChatText());

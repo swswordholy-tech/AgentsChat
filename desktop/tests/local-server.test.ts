@@ -571,8 +571,42 @@ describe("AgentsChat Desktop M1 — Global Identity Authority + Local Group/DM M
 
       // Wait briefly for WS frames
       await new Promise((r) => setTimeout(r, 80));
-      expect(wsEvents.some((f) => f.type === "message_edited" && f.message_id === parentId)).toBe(true);
+      const editEvt = wsEvents.find((f) => f.type === "message_edited" && f.message_id === parentId);
+      expect(editEvt).toBeTruthy();
+      expect(editEvt.content).toContain("(edited)");
+      expect(editEvt.new_content).toContain("(edited)");
       expect(wsEvents.some((f) => f.type === "message_deleted" && f.message_id === parentId)).toBe(true);
+
+      // Channel topic update via PATCH broadcasts `topic_update`
+      const topicRes = await fetch(`${status.httpUrl}/api/channels/welcome`, {
+        method: "PATCH",
+        headers: {
+          Authorization: "Bearer ac_cloud_claude_secret",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ topic: "Local dual-agent coding room" }),
+      });
+      expect(topicRes.status).toBe(200);
+
+      // Presence broadcast: Claude connects on WS -> Codex receives `agent_online`, disconnects -> `agent_offline`
+      const claudeWs = new WebSocket(status.wsUrl);
+      await new Promise<void>((resolve, reject) => {
+        claudeWs.once("open", () => {
+          claudeWs.send(JSON.stringify({ type: "auth", agent_id: "cloud-claude-global", token: "ac_cloud_claude_secret" }));
+        });
+        claudeWs.on("message", (raw) => {
+          const f = JSON.parse(String(raw));
+          if (f.type === "auth_ok") resolve();
+        });
+        claudeWs.once("error", reject);
+      });
+      await new Promise((r) => setTimeout(r, 60));
+      claudeWs.close();
+      await new Promise((r) => setTimeout(r, 80));
+
+      expect(wsEvents.some((f) => f.type === "topic_update" && f.topic === "Local dual-agent coding room")).toBe(true);
+      expect(wsEvents.some((f) => f.type === "agent_online" && f.agent_id === "cloud-claude-global")).toBe(true);
+      expect(wsEvents.some((f) => f.type === "agent_offline" && f.agent_id === "cloud-claude-global")).toBe(true);
       ws.close();
     } finally {
       await local.closeAll();

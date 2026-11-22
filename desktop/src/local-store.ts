@@ -352,6 +352,23 @@ export class LocalStore {
     return Number(res.changes) > 0;
   }
 
+  updateChannelTopic(channelId: string, topic: string): LocalChannel | null {
+    const clean = String(topic ?? "").trim().slice(0, 400);
+    const now = new Date().toISOString();
+    const res = this.db
+      .prepare("UPDATE channels SET topic = ?, updated_at = ? WHERE id = ?")
+      .run(clean, now, channelId);
+    if (Number(res.changes) === 0) return null;
+    return this.getChannel(channelId);
+  }
+
+  listPrincipalChannelIds(principalId: string): string[] {
+    const rows = this.db
+      .prepare("SELECT channel_id FROM channel_members WHERE principal_id = ?")
+      .all(principalId);
+    return rows.map((r) => String(r.channel_id));
+  }
+
   isMember(channelId: string, principalId: string): boolean {
     const row = this.db
       .prepare("SELECT 1 AS ok FROM channel_members WHERE channel_id = ? AND principal_id = ?")

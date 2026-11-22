@@ -1,8 +1,8 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { networkInterfaces } from "node:os";
-import { extname, join, normalize } from "node:path";
+import { extname, join, resolve, sep } from "node:path";
 import { WebSocketServer, WebSocket } from "ws";
 import { GlobalIdentityAuthority } from "./identity-authority.js";
 import { isValidPrincipalOrChannelId, LocalStore } from "./local-store.js";
@@ -79,6 +79,16 @@ const MIME_BY_EXT: Record<string, string> = {
   ".svg": "image/svg+xml",
   ".png": "image/png",
 };
+
+// Strict allowlist of public UI assets servable over HTTP — internal Electron preload/shell files
+// (preload.cjs, local-preload.cjs, shell.html, cloud-offline.html) must NEVER be exposed over HTTP.
+const ALLOWED_PUBLIC_UI_FILES = new Set([
+  "local-chat.html",
+  "local-chat.css",
+  "local-chat.js",
+  "tray-icon.png",
+  "tray-icon@2x.png",
+]);
 
 /**
  * Embedded Local Mini-Server for AgentsChat Desktop (macOS & Windows).
@@ -593,6 +603,37 @@ export class LocalMiniServer {
         return;
       }
 
+      if (action === "" && method === "PATCH") {
+        if (!this.store.isMember(channelId, principal.id)) {
+          sendJson(res, 403, { error: "Only channel members can update topic" });
+          return;
+        }
+        let body: any;
+        try {
+          body = await readJsonBody(req);
+        } catch (e: any) {
+          sendJson(res, 400, { error: String(e?.message || "Invalid JSON") });
+          return;
+        }
+        if (typeof body?.topic !== "string") {
+          sendJson(res, 400, { error: "String 'topic' field required" });
+          return;
+        }
+        const updated = this.store.updateChannelTopic(channelId, body.topic);
+        if (!updated) {
+          sendJson(res, 404, { error: "Channel not found" });
+          return;
+        }
+        this.broadcastToChannel(channelId, {
+          type: "topic_update",
+          channel_id: channelId,
+          topic: updated.topic,
+          updated_by: principal.id,
+        });
+        sendJson(res, 200, { ok: true, channel: updated });
+        return;
+      }
+
       if (action === "members" && method === "GET") {
         const members = this.store.listChannelMembers(channelId).map((m) => ({
           agent_id: m.principal_id,
@@ -733,6 +774,7 @@ export class LocalMiniServer {
           channel_id: channelId,
           message_id: updated.id,
           content: updated.content,
+          new_content: updated.content,
           edited_at: updated.edited_at,
         });
         sendJson(res, 200, { ok: true, message: updated });
@@ -845,22 +887,34 @@ export class LocalMiniServer {
       return;
     }
 
-    // 9. Optional Static Desktop Local Chat UI
+    // 9. Optional Static Desktop Local Chat UI (strict allowlist + symlink/traversal guard + CSP)
     if (this.staticUiDir && (method === "GET" || method === "HEAD")) {
-      const rel = pathname === "/" ? "local-chat.html" : pathname.replace(/^\/+/, "");
-      const safeRel = normalize(rel).replace(/^(\.\.(\/|\\|$))+/, "");
-      const candidate = join(this.staticUiDir, safeRel);
-      if (candidate.startsWith(normalize(this.staticUiDir)) && existsSync(candidate)) {
-        const ext = extname(candidate).toLowerCase();
-        const mime = MIME_BY_EXT[ext] || "application/octet-stream";
-        const content = readFileSync(candidate);
-        res.writeHead(200, {
-          "Content-Type": mime,
-          "Cache-Control": "no-store",
-          "X-Content-Type-Options": "nosniff",
-        });
-        res.end(method === "HEAD" ? undefined : content);
-        return;
+      const requestedName = pathname === "/" ? "local-chat.html" : pathname.replace(/^\/+/, "");
+      if (ALLOWED_PUBLIC_UI_FILES.has(requestedName)) {
+        const baseDir = resolve(this.staticUiDir);
+        const candidate = resolve(baseDir, requestedName);
+        if (candidate.startsWith(baseDir + sep) && existsSync(candidate)) {
+          try {
+            const lst = lstatSync(candidate);
+            if (!lst.isSymbolicLink() && lst.isFile()) {
+              const ext = extname(candidate).toLowerCase();
+              const mime = MIME_BY_EXT[ext] || "application/octet-stream";
+              const content = readFileSync(candidate);
+              const headers: Record<string, string> = {
+                "Content-Type": mime,
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+              };
+              if (ext === ".html") {
+                headers["Content-Security-Policy"] =
+                  "default-src 'self'; connect-src 'self' ws: wss:; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:;";
+              }
+              res.writeHead(200, headers);
+              res.end(method === "HEAD" ? undefined : content);
+              return;
+            }
+          } catch {}
+        }
       }
     }
 
@@ -919,6 +973,7 @@ export class LocalMiniServer {
           const sessionId = `local_${randomUUID()}`;
           authed = { ws, sessionId, principal };
           let set = this.socketsByPrincipal.get(principal.id);
+          const wasOffline = !set || set.size === 0;
           if (!set) {
             set = new Set();
             this.socketsByPrincipal.set(principal.id, set);
@@ -936,6 +991,17 @@ export class LocalMiniServer {
               session_id: sessionId,
             }),
           );
+
+          if (wasOffline) {
+            for (const cid of this.store.listPrincipalChannelIds(principal.id)) {
+              this.broadcastToChannel(cid, {
+                type: "agent_online",
+                channel_id: cid,
+                agent_id: principal.id,
+                display_name: principal.display_name,
+              });
+            }
+          }
           return;
         }
 
@@ -1021,15 +1087,36 @@ export class LocalMiniServer {
         }
 
         if (frame.type === "edit_message" && typeof frame.channel_id === "string" && typeof frame.message_id === "string") {
-          const updated = this.store.editMessage(frame.channel_id, frame.message_id, caller.id, String(frame.new_content || ""));
+          const updated = this.store.editMessage(
+            frame.channel_id,
+            frame.message_id,
+            caller.id,
+            String(frame.new_content ?? frame.content ?? ""),
+          );
           if (updated) {
             this.broadcastToChannel(frame.channel_id, {
               type: "message_edited",
               channel_id: frame.channel_id,
               message_id: updated.id,
+              content: updated.content,
               new_content: updated.content,
               edited_at: updated.edited_at,
             });
+          }
+          return;
+        }
+
+        if (frame.type === "set_topic" && typeof frame.channel_id === "string" && typeof frame.topic === "string") {
+          if (this.store.isMember(frame.channel_id, caller.id)) {
+            const updated = this.store.updateChannelTopic(frame.channel_id, frame.topic);
+            if (updated) {
+              this.broadcastToChannel(frame.channel_id, {
+                type: "topic_update",
+                channel_id: frame.channel_id,
+                topic: updated.topic,
+                updated_by: caller.id,
+              });
+            }
           }
           return;
         }
@@ -1055,12 +1142,26 @@ export class LocalMiniServer {
     ws.on("close", () => {
       clearTimeout(authTimeout);
       if (authed) {
-        const set = this.socketsByPrincipal.get(authed.principal.id);
+        const closedPrincipalId = authed.principal.id;
+        const set = this.socketsByPrincipal.get(closedPrincipalId);
+        let wentOffline = false;
         if (set) {
           set.delete(authed);
-          if (set.size === 0) this.socketsByPrincipal.delete(authed.principal.id);
+          if (set.size === 0) {
+            this.socketsByPrincipal.delete(closedPrincipalId);
+            wentOffline = true;
+          }
         }
         authed = null;
+        if (wentOffline) {
+          for (const cid of this.store.listPrincipalChannelIds(closedPrincipalId)) {
+            this.broadcastToChannel(cid, {
+              type: "agent_offline",
+              channel_id: cid,
+              agent_id: closedPrincipalId,
+            });
+          }
+        }
       }
     });
   }
