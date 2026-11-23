@@ -25,7 +25,7 @@ import type { DesktopSettings, LocalServerStatus } from "./types.js";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const UI_DIR = join(__dirname, "..", "ui");
 const ASSETS_DIR = join(__dirname, "..", "assets");
-const RAIL_WIDTH = 68;
+const RAIL_WIDTH = 72;
 
 // Fallback 16x16 PNG data URL if tray-icon.png is unavailable
 const TRAY_ICON_DATA_URL =
@@ -363,12 +363,12 @@ function setupApplicationMenu(): void {
       label: "Workspace",
       submenu: [
         {
-          label: "☁️ AgentsChat Cloud",
+          label: "AgentsChat Cloud",
           accelerator: "CmdOrCtrl+1",
           click: () => void switchWorkspace("cloud"),
         },
         {
-          label: "🏠 Local Mini-Server",
+          label: "Local Mini-Server",
           accelerator: "CmdOrCtrl+2",
           click: () => void switchWorkspace("local"),
         },
@@ -406,7 +406,7 @@ function setupApplicationMenu(): void {
         },
         { type: "separator" },
         {
-          label: "🏪 Bot Market (Rent / Monetize Bots)",
+          label: "Bot Market (Rent / Monetize Bots)",
           click: () => {
             showMainWindow();
             void switchWorkspace("cloud").then(() => {
@@ -437,7 +437,7 @@ function rebuildTrayMenu(): void {
     },
     { type: "separator" },
     {
-      label: "☁️ Cloud Workspace (agents-chat.com)",
+      label: "Cloud Workspace (agents-chat.com)",
       type: "radio",
       checked: settings.activeWorkspace === "cloud",
       click: () => {
@@ -447,8 +447,8 @@ function rebuildTrayMenu(): void {
     },
     {
       label: st
-        ? `🏠 Local Server (${st.httpUrl} · ${st.connectedAgents.length} online)`
-        : "🏠 Local Server (Stopped)",
+        ? `Local Server (${st.httpUrl} · ${st.connectedAgents.length} online)`
+        : "Local Server (Stopped)",
       type: "radio",
       checked: settings.activeWorkspace === "local",
       click: () => {
@@ -468,7 +468,7 @@ function rebuildTrayMenu(): void {
       },
     },
     {
-      label: "🌐 Allow LAN Access (0.0.0.0)",
+      label: "Allow LAN Access (0.0.0.0)",
       type: "checkbox",
       checked: settings.allowLan,
       click: () => {
@@ -547,8 +547,8 @@ async function createDesktopWindow(): Promise<void> {
     show: !isSmokeTest && !startHidden,
     title: "AgentsChat",
     ...(existsSync(windowIconPath) ? { icon: windowIconPath } : {}),
-    backgroundColor: "#0b0f19",
-    ...(isMac ? { titleBarStyle: "hiddenInset", trafficLightPosition: { x: 14, y: 14 } } : { autoHideMenuBar: true }),
+    backgroundColor: "#09090b",
+    ...(isMac ? { titleBarStyle: "hiddenInset", trafficLightPosition: { x: 10, y: 15 } } : { autoHideMenuBar: true }),
     webPreferences: {
       preload: join(UI_DIR, "preload.cjs"),
       contextIsolation: true,

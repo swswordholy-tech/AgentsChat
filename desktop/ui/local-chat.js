@@ -4,6 +4,7 @@
   const bridge = window.agentschatLocalBridge || null;
   const originUrl = window.location.origin;
   const wsOriginUrl = originUrl.replace(/^http/i, "ws") + "/ws";
+  const SVG_NS = "http://www.w3.org/2000/svg";
 
   let authToken = sessionStorage.getItem("ac_local_token") || "";
   let currentPrincipal = null;
@@ -23,6 +24,7 @@
   let wsReconnectTimer = null;
 
   const elServerPill = document.getElementById("server-url-pill");
+  const elIdentityCard = document.getElementById("identity-card");
   const elAuthDot = document.getElementById("auth-dot");
   const elAuthName = document.getElementById("auth-name");
   const elAuthId = document.getElementById("auth-id-text");
@@ -43,7 +45,98 @@
   const elReplyBannerText = document.getElementById("reply-banner-text");
   const elMentionMenu = document.getElementById("mention-menu");
 
-  elServerPill.textContent = originUrl;
+  elServerPill.textContent = originUrl.replace(/^https?:\/\//, "");
+
+  // Pure-DOM SVG Icon Factory (zero innerHTML, uniform 1.65px round-cap craft)
+  const ICON_PATHS = {
+    hash: [
+      ["path", { d: "M4 9h16" }],
+      ["path", { d: "M4 15h16" }],
+      ["path", { d: "M10 3 8 21" }],
+      ["path", { d: "M16 3l-2 18" }],
+    ],
+    lock: [
+      ["rect", { x: "5", y: "11", width: "14", height: "10", rx: "2" }],
+      ["path", { d: "M8 11V7a4 4 0 0 1 8 0v4" }],
+    ],
+    dm: [
+      ["path", { d: "M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" }],
+    ],
+    reply: [
+      ["path", { d: "M9 17 4 12l5-5" }],
+      ["path", { d: "M20 18v-2a4 4 0 0 0-4-4H4" }],
+    ],
+    edit: [
+      ["path", { d: "M12 20h9" }],
+      ["path", { d: "M16.5 3.5a2.12 2.12 0 1 1 3 3L7 19l-4 1 1-4Z" }],
+    ],
+    trash: [
+      ["path", { d: "M3 6h18" }],
+      ["path", { d: "M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2" }],
+      ["path", { d: "M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" }],
+    ],
+    copy: [
+      ["rect", { x: "9", y: "9", width: "11", height: "11", rx: "2.2" }],
+      ["path", { d: "M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" }],
+    ],
+    terminal: [
+      ["rect", { x: "3.5", y: "4.5", width: "17", height: "15", rx: "3" }],
+      ["path", { d: "m8.5 10 2.5 2.25-2.5 2.25" }],
+      ["path", { d: "M13 14.5h3" }],
+    ],
+    bolt: [
+      ["path", { d: "M13 2 3 14h9l-1 8 10-12h-9l1-8Z" }],
+    ],
+    shield: [
+      ["path", { d: "M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z" }],
+    ],
+  };
+
+  function createSvgIcon(name) {
+    const svg = document.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("aria-hidden", "true");
+    const defs = ICON_PATHS[name] || [];
+    for (const [tag, attrs] of defs) {
+      const el = document.createElementNS(SVG_NS, tag);
+      for (const [k, v] of Object.entries(attrs)) {
+        el.setAttribute(k, v);
+      }
+      svg.appendChild(el);
+    }
+    return svg;
+  }
+
+  // Deterministic subtle dark-mode avatar palette (low-chroma OKLCH tint, never harsh neon)
+  function avatarColors(seed) {
+    const str = String(seed || "agent");
+    let h = 2166136261;
+    for (let i = 0; i < str.length; i++) {
+      h ^= str.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    const hue = Math.abs(h) % 360;
+    return {
+      bg: `hsla(${hue}, 38%, 42%, 0.22)`,
+      fg: `hsl(${hue}, 62%, 78%)`,
+    };
+  }
+
+  function avatarInitials(name, id) {
+    const src = String(name || id || "?").trim();
+    if (!src) return "?";
+    const parts = src.split(/[\s_-]+/).filter(Boolean);
+    if (parts.length >= 2 && /^[A-Za-z0-9]/.test(parts[0]) && /^[A-Za-z0-9]/.test(parts[1])) {
+      return (parts[0][0] + parts[1][0]).toUpperCase();
+    }
+    return src.slice(0, 2).toUpperCase();
+  }
+
+  function autoResizeComposer() {
+    if (!elInput) return;
+    elInput.style.height = "auto";
+    elInput.style.height = Math.min(160, Math.max(24, elInput.scrollHeight)) + "px";
+  }
 
   function showToast(msg) {
     elToast.textContent = msg;
@@ -61,13 +154,13 @@
     return { ok: res.ok, status: res.status, data };
   }
 
-  function openPromptDialog({ title, hint, placeholder1, placeholder2 }) {
+  function openPromptDialog({ title, hint, placeholder1, placeholder2, value1 }) {
     const dlg = document.getElementById("prompt-dialog");
     const i1 = document.getElementById("dialog-input-1");
     const i2 = document.getElementById("dialog-input-2");
     document.getElementById("dialog-title").textContent = title;
     document.getElementById("dialog-hint").textContent = hint || "";
-    i1.value = "";
+    i1.value = value1 || "";
     i1.placeholder = placeholder1 || "";
     if (placeholder2) {
       i2.style.display = "block";
@@ -98,18 +191,21 @@
       cancelBtn.addEventListener("click", onCancel);
       dlg.showModal();
       i1.focus();
+      if (value1) i1.select();
     });
   }
 
   function renderIdentity() {
     if (currentPrincipal) {
+      elIdentityCard?.classList.add("bound");
       elAuthDot.classList.add("ok");
       elAuthName.textContent = currentPrincipal.display_name || currentPrincipal.id;
-      elAuthId.textContent = `全局 ID: ${currentPrincipal.id} (${currentPrincipal.kind === "user" ? "真人账号" : "Agent"})`;
+      elAuthId.textContent = `@${currentPrincipal.id} · ${currentPrincipal.kind === "user" ? "真人账号" : "Agent"}`;
     } else {
+      elIdentityCard?.classList.remove("bound");
       elAuthDot.classList.remove("ok");
       elAuthName.textContent = "未登录全局账号";
-      elAuthId.textContent = "先在 Cloud 登录一键同步，或填入已签发的 ac_ / JWT 凭证";
+      elAuthId.textContent = "从 Cloud 一键同步登录态，或填入已签发的 ac_ / JWT 凭证";
     }
   }
 
@@ -118,12 +214,12 @@
     elWsPill.classList.remove("live", "reconnecting");
     if (state === "live") {
       elWsPill.classList.add("live");
-      elWsPill.textContent = "● 实时已连";
+      elWsPill.textContent = "实时已连";
     } else if (state === "reconnecting") {
       elWsPill.classList.add("reconnecting");
-      elWsPill.textContent = "● 重连中…";
+      elWsPill.textContent = "重连中…";
     } else {
-      elWsPill.textContent = "● 离线";
+      elWsPill.textContent = "离线";
     }
   }
 
@@ -132,7 +228,7 @@
     if (!elReplyBanner) return;
     if (replyTarget) {
       elReplyBanner.hidden = false;
-      elReplyBannerText.textContent = `↩ 引用 @${replyTarget.sender_id}: ${(replyTarget.content || "").slice(0, 64)}`;
+      elReplyBannerText.textContent = `回复 @${replyTarget.sender_id}: ${(replyTarget.content || "").slice(0, 72)}`;
       elInput.focus();
     } else {
       elReplyBanner.hidden = true;
@@ -205,7 +301,7 @@
         const ch = channels.find((c) => c.id === currentChannelId);
         if (ch) ch.topic = frame.topic || "";
       } else if (frame.type === "typing" && frame.channel_id === currentChannelId && frame.sender_id !== currentPrincipal?.id) {
-        elTyping.textContent = `@${frame.sender_id} 正在思考/输入…`;
+        elTyping.textContent = `@${frame.sender_id} 正在输入…`;
         clearTimeout(connectRealtimeWs._typingTimer);
         connectRealtimeWs._typingTimer = setTimeout(() => { elTyping.textContent = ""; }, 5000);
       }
@@ -268,16 +364,27 @@
   }
 
   async function loadChannels() {
-    const res = await api(authToken ? "/api/channels" : "/api/channels");
+    const res = await api("/api/channels");
     channels = Array.isArray(res.data?.channels) ? res.data.channels : [];
     elChannelList.replaceChildren();
     channels.forEach((ch) => {
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = "channel-item" + (ch.id === currentChannelId ? " active" : "");
-      const prefix = ch.type === "direct" ? "💬 " : ch.visibility === "private" ? "🔒 #" : "#";
+
+      const left = document.createElement("span");
+      left.className = "ch-left";
+      const glyph = document.createElement("span");
+      glyph.className = "ch-glyph";
+      glyph.appendChild(
+        createSvgIcon(ch.type === "direct" ? "dm" : ch.visibility === "private" ? "lock" : "hash"),
+      );
       const label = document.createElement("span");
-      label.textContent = prefix + (ch.name || ch.id);
+      label.className = "ch-name";
+      label.textContent = ch.name || ch.id;
+      left.appendChild(glyph);
+      left.appendChild(label);
+
       const right = document.createElement("span");
       right.className = "ch-right";
       const unread = unreadByChannel.get(ch.id) || 0;
@@ -287,12 +394,13 @@
         badge.textContent = unread > 99 ? "99+" : String(unread);
         right.appendChild(badge);
       }
-      const count = document.createElement("span");
-      count.style.fontSize = "11px";
-      count.style.color = "#64748b";
-      count.textContent = String(ch.member_count ?? "");
-      right.appendChild(count);
-      btn.appendChild(label);
+      if (ch.member_count !== undefined && ch.member_count !== null) {
+        const count = document.createElement("span");
+        count.className = "ch-count";
+        count.textContent = String(ch.member_count);
+        right.appendChild(count);
+      }
+      btn.appendChild(left);
       btn.appendChild(right);
       btn.addEventListener("click", () => selectChannel(ch.id));
       elChannelList.appendChild(btn);
@@ -305,25 +413,36 @@
     elBots.replaceChildren();
     if (profiles.length === 0) {
       const empty = document.createElement("div");
-      empty.style.fontSize = "11.5px";
-      empty.style.color = "#64748b";
-      empty.textContent = "未检测到 ~/.agentschat 下的本地 Profile";
+      empty.className = "bot-empty";
+      empty.textContent = "未检测到 ~/.agentschat 下的本地 Profile，可点击上方“注册”快速创建。";
       elBots.appendChild(empty);
       return;
     }
     profiles.forEach((p) => {
       const row = document.createElement("div");
       row.className = "bot-row";
+
       const meta = document.createElement("div");
       meta.className = "bot-meta";
+      const colors = avatarColors(p.agent_id);
+      const dot = document.createElement("span");
+      dot.className = "bot-dot";
+      dot.style.background = colors.bg;
+      dot.style.color = colors.fg;
+      dot.textContent = avatarInitials(p.display_name, p.agent_id);
+
+      const copy = document.createElement("div");
+      copy.className = "bot-copy";
       const nameEl = document.createElement("div");
       nameEl.className = "bot-name";
       nameEl.textContent = p.display_name;
       const idEl = document.createElement("div");
       idEl.className = "bot-id";
       idEl.textContent = `@${p.agent_id}`;
-      meta.appendChild(nameEl);
-      meta.appendChild(idEl);
+      copy.appendChild(nameEl);
+      copy.appendChild(idEl);
+      meta.appendChild(dot);
+      meta.appendChild(copy);
 
       const actions = document.createElement("div");
       actions.className = "bot-actions";
@@ -331,7 +450,7 @@
       const btnInvite = document.createElement("button");
       btnInvite.type = "button";
       btnInvite.className = "icon-btn";
-      btnInvite.textContent = "+入群";
+      btnInvite.textContent = "入群";
       btnInvite.title = "验签并拉入当前群聊";
       btnInvite.addEventListener("click", async () => {
         if (bridge?.activateDiscoveredProfile) {
@@ -357,7 +476,7 @@
       btnDm.type = "button";
       btnDm.className = "icon-btn";
       btnDm.textContent = "私聊";
-      btnDm.title = "一键打开与该本机 Agent 的 1v1 私聊";
+      btnDm.title = "打开与该本机 Agent 的 1v1 私聊";
       btnDm.addEventListener("click", async () => {
         if (bridge?.activateDiscoveredProfile) {
           await bridge.activateDiscoveredProfile(p.profile_name);
@@ -410,7 +529,7 @@
     }
     await loadChannels();
     const ch = channels.find((c) => c.id === channelId);
-    elRoomTitle.textContent = ch ? (ch.type === "direct" ? `💬 ${ch.name}` : `#${ch.name}`) : `#${channelId}`;
+    elRoomTitle.textContent = ch ? (ch.type === "direct" ? ch.name : `#${ch.name}`) : `#${channelId}`;
     elRoomTopic.textContent = ch?.topic || "本机最小聊天服务 · 全局唯一身份零冲突";
     const leaveBtn = document.getElementById("btn-leave-channel");
     if (leaveBtn) {
@@ -463,12 +582,20 @@
   function renderMembers() {
     elMemberStrip.replaceChildren();
     currentMembers.forEach((m) => {
-      const pill = document.createElement("span");
+      const pill = document.createElement("button");
+      pill.type = "button";
       pill.className = "member-pill" + (m.online ? " online" : "");
-      pill.textContent = `${m.online ? "● " : ""}${m.display_name} (@${m.agent_id})`;
+      const nameSpan = document.createElement("span");
+      nameSpan.textContent = m.display_name || m.agent_id;
+      const idSpan = document.createElement("span");
+      idSpan.className = "member-pill-id";
+      idSpan.textContent = `@${m.agent_id}`;
+      pill.appendChild(nameSpan);
+      pill.appendChild(idSpan);
       pill.title = "点击插入 @提及";
       pill.addEventListener("click", () => {
         elInput.value = (elInput.value ? elInput.value + " " : "") + `@${m.agent_id} `;
+        autoResizeComposer();
         elInput.focus();
       });
       elMemberStrip.appendChild(pill);
@@ -521,7 +648,7 @@
         appendInlineRichText(seg, text.slice(last, match.index));
         container.appendChild(seg);
       }
-      const lang = match[1] || "code";
+      const lang = match[1] || "text";
       const codeText = match[2].replace(/\n$/, "");
       const wrap = document.createElement("div");
       wrap.className = "code-block-wrap";
@@ -532,7 +659,10 @@
       const copyBtn = document.createElement("button");
       copyBtn.type = "button";
       copyBtn.className = "icon-btn";
-      copyBtn.textContent = "📋 复制";
+      copyBtn.appendChild(createSvgIcon("copy"));
+      const copyLbl = document.createElement("span");
+      copyLbl.textContent = "复制";
+      copyBtn.appendChild(copyLbl);
       copyBtn.addEventListener("click", async () => {
         if (bridge?.copyText) await bridge.copyText(codeText);
         else await navigator.clipboard?.writeText(codeText);
@@ -555,17 +685,47 @@
     }
   }
 
+  function formatShortTime(iso) {
+    if (!iso) return "";
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return "";
+    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }
+
+  function canGroupWithPrev(prev, curr) {
+    if (!prev || !curr) return false;
+    if (prev.sender_id !== curr.sender_id) return false;
+    if (curr.in_reply_to) return false;
+    const t1 = prev.timestamp ? Date.parse(prev.timestamp) : NaN;
+    const t2 = curr.timestamp ? Date.parse(curr.timestamp) : NaN;
+    if (Number.isNaN(t1) || Number.isNaN(t2)) return false;
+    return Math.abs(t2 - t1) < 5 * 60 * 1000;
+  }
+
   function renderMessages(opts = {}) {
     elMessages.replaceChildren();
     if (!authToken) {
       const card = document.createElement("div");
       card.className = "empty-starter";
+      const iconWrap = document.createElement("div");
+      iconWrap.className = "empty-icon";
+      iconWrap.appendChild(createSvgIcon("shield"));
       const h3 = document.createElement("h3");
       h3.textContent = "绑定全局唯一身份即可开始本机群聊";
       const p = document.createElement("p");
-      p.textContent = "为避免本机与远端服务器之间发生账号或 Agent ID 冲突，本机 Server 统一复用 agents-chat.com 分配的全局账号与 Agent 密钥。";
+      p.textContent = "为避免本机与远端发生账号或 Agent ID 冲突，本机 Server 统一复用 agents-chat.com 分配的全局账号与 Agent 密钥。";
+      const acts = document.createElement("div");
+      acts.className = "starter-actions";
+      const btnSync = document.createElement("button");
+      btnSync.type = "button";
+      btnSync.className = "btn btn-primary";
+      btnSync.textContent = "从 Cloud 一键同步身份";
+      btnSync.addEventListener("click", () => trySyncCloudSession(false));
+      acts.appendChild(btnSync);
+      card.appendChild(iconWrap);
       card.appendChild(h3);
       card.appendChild(p);
+      card.appendChild(acts);
       elMessages.appendChild(card);
       return;
     }
@@ -574,78 +734,165 @@
       const peerAgent = currentMembers.find((m) => m.type === "agent" && m.agent_id !== currentPrincipal?.id);
       const card = document.createElement("div");
       card.className = "empty-starter";
+      const iconWrap = document.createElement("div");
+      iconWrap.className = "empty-icon";
+      iconWrap.appendChild(createSvgIcon("terminal"));
       const h3 = document.createElement("h3");
-      h3.textContent = "✨ 本机房间已就绪";
+      h3.textContent = activeSearchQuery ? "没有匹配的历史消息" : "本机房间已就绪";
       const p = document.createElement("p");
-      p.textContent = peerAgent
-        ? `发送轻量 ping 立即验证 @${peerAgent.agent_id} 在本机 Server 的收发连通性。`
-        : "从左侧将本机 Agent 拉入群聊，并让 Agent 通过 --url " + originUrl + " 连入即可开始协同。";
+      p.textContent = activeSearchQuery
+        ? `在当前房间内未找到包含 “${activeSearchQuery}” 的消息。`
+        : peerAgent
+          ? `发送轻量 ping 立即验证 @${peerAgent.agent_id} 在本机 Server 的收发连通性。`
+          : `从左侧将本机 Agent 拉入房间，或让 Agent 通过 --url ${originUrl} 连入即可开始本地低延迟协同。`;
       const acts = document.createElement("div");
       acts.className = "starter-actions";
-      if (peerAgent) {
+      if (!activeSearchQuery && peerAgent) {
         const btnPing = document.createElement("button");
         btnPing.type = "button";
-        btnPing.className = "btn btn-primary btn-sm";
+        btnPing.className = "btn btn-primary";
+        btnPing.appendChild(createSvgIcon("bolt"));
+        const lbl = document.createElement("span");
         const isDm = currentChannelId.startsWith("dm-");
         const pingPrompt = isDm ? "ping" : `@${peerAgent.agent_id} ping`;
-        btnPing.textContent = `⚡ Ping ${peerAgent.display_name} 测试连通性`;
+        lbl.textContent = `Ping ${peerAgent.display_name} 测试连通性`;
+        btnPing.appendChild(lbl);
         btnPing.addEventListener("click", () => sendChatText(pingPrompt));
         acts.appendChild(btnPing);
+      } else if (!activeSearchQuery) {
+        const btnConnect = document.createElement("button");
+        btnConnect.type = "button";
+        btnConnect.className = "btn btn-primary";
+        btnConnect.textContent = "查看本机 MCP 接入配置";
+        btnConnect.addEventListener("click", () => document.getElementById("btn-copy-mcp")?.click());
+        acts.appendChild(btnConnect);
       }
+      card.appendChild(iconWrap);
       card.appendChild(h3);
       card.appendChild(p);
-      card.appendChild(acts);
+      if (acts.childElementCount > 0) card.appendChild(acts);
       elMessages.appendChild(card);
       return;
     }
 
+    const stream = document.createElement("div");
+    stream.className = "msg-stream-inner";
+
     if (hasMoreOlder && !activeSearchQuery) {
       const loadMoreWrap = document.createElement("div");
-      loadMoreWrap.style.textAlign = "center";
-      loadMoreWrap.style.marginBottom = "8px";
+      loadMoreWrap.className = "load-more-wrap";
       const btnMore = document.createElement("button");
       btnMore.type = "button";
       btnMore.className = "btn btn-ghost btn-sm";
-      btnMore.textContent = "↑ 加载更早消息";
+      btnMore.textContent = "加载更早消息";
       btnMore.addEventListener("click", () => void loadOlderMessages());
       loadMoreWrap.appendChild(btnMore);
-      elMessages.appendChild(loadMoreWrap);
+      stream.appendChild(loadMoreWrap);
     }
 
     const msgById = new Map(messages.map((m) => [m.id, m]));
-    messages.forEach((m) => {
-      const item = document.createElement("div");
-      item.className = "msg-card" + (m.sender_id === currentPrincipal?.id ? " self" : "");
-      const meta = document.createElement("div");
-      meta.className = "msg-meta";
-      const sender = document.createElement("span");
-      sender.className = "msg-sender";
-      sender.textContent = `${m.sender_name || m.sender_id} (@${m.sender_id})`;
-      const time = document.createElement("span");
-      time.className = "msg-time";
-      time.textContent = (m.timestamp ? new Date(m.timestamp).toLocaleTimeString() : "") + (m.edited_at ? " (已编辑)" : "");
+    messages.forEach((m, idx) => {
+      const isSelf = m.sender_id === currentPrincipal?.id;
+      const grouped = canGroupWithPrev(messages[idx - 1], m);
 
+      const row = document.createElement("article");
+      row.className = "msg-row" + (isSelf ? " self" : "") + (grouped ? " grouped" : "");
+
+      if (grouped) {
+        const gutter = document.createElement("span");
+        gutter.className = "msg-gutter-time";
+        gutter.textContent = formatShortTime(m.timestamp);
+        row.appendChild(gutter);
+      } else {
+        const av = document.createElement("div");
+        av.className = "msg-avatar";
+        const colors = isSelf
+          ? { bg: "rgba(59, 130, 246, 0.22)", fg: "#93c5fd" }
+          : avatarColors(m.sender_id);
+        av.style.background = colors.bg;
+        av.style.color = colors.fg;
+        av.textContent = avatarInitials(m.sender_name, m.sender_id);
+        row.appendChild(av);
+      }
+
+      const col = document.createElement("div");
+      col.className = "msg-content-col";
+
+      if (!grouped) {
+        const meta = document.createElement("div");
+        meta.className = "msg-meta";
+        const sender = document.createElement("span");
+        sender.className = "msg-sender";
+        sender.textContent = m.sender_name || m.sender_id;
+        meta.appendChild(sender);
+
+        const handle = document.createElement("span");
+        handle.className = "msg-handle";
+        handle.textContent = `@${m.sender_id}`;
+        meta.appendChild(handle);
+
+        if (isSelf) {
+          const tag = document.createElement("span");
+          tag.className = "msg-self-tag";
+          tag.textContent = "你";
+          meta.appendChild(tag);
+        }
+
+        const time = document.createElement("span");
+        time.className = "msg-time";
+        time.textContent = formatShortTime(m.timestamp) + (m.edited_at ? " · 已编辑" : "");
+        meta.appendChild(time);
+        col.appendChild(meta);
+      }
+
+      if (m.in_reply_to) {
+        const quoted = msgById.get(m.in_reply_to);
+        const quoteEl = document.createElement("div");
+        quoteEl.className = "msg-quote";
+        quoteEl.appendChild(createSvgIcon("reply"));
+        const qt = document.createElement("span");
+        qt.textContent = quoted
+          ? `@${quoted.sender_id}: ${(quoted.content || "").slice(0, 80)}`
+          : `回复消息 #${String(m.in_reply_to).slice(0, 8)}`;
+        quoteEl.appendChild(qt);
+        col.appendChild(quoteEl);
+      }
+
+      const body = document.createElement("div");
+      body.className = "msg-body";
+      renderFormattedBody(body, m.content);
+      col.appendChild(body);
+      row.appendChild(col);
+
+      // Floating Hover Action Bar
       const actions = document.createElement("div");
       actions.className = "msg-actions";
       const btnQuote = document.createElement("button");
       btnQuote.type = "button";
-      btnQuote.className = "icon-btn";
-      btnQuote.textContent = "↩引用";
+      btnQuote.className = "msg-action-btn";
+      btnQuote.appendChild(createSvgIcon("reply"));
+      const qSpan = document.createElement("span");
+      qSpan.textContent = "引用";
+      btnQuote.appendChild(qSpan);
       btnQuote.title = "引用回复此消息";
       btnQuote.addEventListener("click", () => setReplyTarget(m));
       actions.appendChild(btnQuote);
 
-      if (m.sender_id === currentPrincipal?.id) {
+      if (isSelf) {
         const btnEdit = document.createElement("button");
         btnEdit.type = "button";
-        btnEdit.className = "icon-btn";
-        btnEdit.textContent = "✎编辑";
+        btnEdit.className = "msg-action-btn";
+        btnEdit.appendChild(createSvgIcon("edit"));
+        const eSpan = document.createElement("span");
+        eSpan.textContent = "编辑";
+        btnEdit.appendChild(eSpan);
         btnEdit.title = "编辑这条消息";
         btnEdit.addEventListener("click", async () => {
           const r = await openPromptDialog({
             title: "编辑消息",
             hint: "修改后将实时同步给房间内所有成员。",
             placeholder1: "输入新的消息内容",
+            value1: m.content || "",
           });
           if (!r?.v1) return;
           const res = await api(
@@ -664,8 +911,11 @@
 
         const btnDel = document.createElement("button");
         btnDel.type = "button";
-        btnDel.className = "icon-btn";
-        btnDel.textContent = "🗑撤回";
+        btnDel.className = "msg-action-btn danger";
+        btnDel.appendChild(createSvgIcon("trash"));
+        const dSpan = document.createElement("span");
+        dSpan.textContent = "撤回";
+        btnDel.appendChild(dSpan);
         btnDel.title = "删除这条消息";
         btnDel.addEventListener("click", async () => {
           const res = await api(
@@ -685,27 +935,11 @@
         actions.appendChild(btnDel);
       }
 
-      meta.appendChild(sender);
-      meta.appendChild(time);
-      meta.appendChild(actions);
-      item.appendChild(meta);
-
-      if (m.in_reply_to) {
-        const quoted = msgById.get(m.in_reply_to);
-        const quoteEl = document.createElement("div");
-        quoteEl.className = "msg-quote";
-        quoteEl.textContent = quoted
-          ? `↩ @${quoted.sender_id}: ${(quoted.content || "").slice(0, 80)}`
-          : `↩ 回复消息 #${String(m.in_reply_to).slice(0, 8)}`;
-        item.appendChild(quoteEl);
-      }
-
-      const body = document.createElement("div");
-      body.className = "msg-body";
-      renderFormattedBody(body, m.content);
-      item.appendChild(body);
-      elMessages.appendChild(item);
+      row.appendChild(actions);
+      stream.appendChild(row);
     });
+
+    elMessages.appendChild(stream);
     if (opts.preserveScrollFromBottom) {
       elMessages.scrollTop = Math.max(0, elMessages.scrollHeight - opts.preserveScrollFromBottom);
     } else {
@@ -721,6 +955,7 @@
       return;
     }
     elInput.value = "";
+    autoResizeComposer();
     const payload = { content: text };
     if (replyTarget?.id) payload.in_reply_to = replyTarget.id;
     setReplyTarget(null);
@@ -742,6 +977,22 @@
     await Promise.all([loadChannels(), loadDiscoveredBots()]);
     await selectChannel(currentChannelId);
   }
+
+  // Click local URL pill to copy
+  elServerPill?.addEventListener("click", async () => {
+    if (bridge?.copyText) await bridge.copyText(originUrl);
+    else await navigator.clipboard?.writeText(originUrl);
+    showToast("已复制本机地址：" + originUrl);
+  });
+
+  // Global Cmd/Ctrl+K search shortcut
+  window.addEventListener("keydown", (ev) => {
+    if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "k") {
+      ev.preventDefault();
+      elSearchInput?.focus();
+      elSearchInput?.select();
+    }
+  });
 
   // Event Bindings
   document.getElementById("btn-sync-cloud").addEventListener("click", () => trySyncCloudSession(false));
@@ -866,10 +1117,10 @@
 
     toggleBtn.textContent = allowLan ? "关闭局域网" : "开启局域网";
     lanText.textContent = allowLan
-      ? `局域网已开放 (0.0.0.0) — 点击下方地址即可复制`
+      ? "局域网已开放 (0.0.0.0) — 点击下方地址即可复制并切换配置"
       : "当前仅本机回环可连（127.0.0.1），开启后同 Wi-Fi 设备也可接入";
 
-    lanList.innerHTML = "";
+    lanList.replaceChildren();
     activeConnectBaseUrl = originUrl;
     if (allowLan && lanUrls.length > 0) {
       for (const u of lanUrls) {
@@ -966,7 +1217,7 @@
     messages = Array.isArray(res.data?.messages) ? res.data.messages.slice().reverse() : [];
     if (elSearchBanner) {
       elSearchBanner.hidden = false;
-      elSearchBannerText.textContent = `🔍 在 #${currentChannelId} 中搜索 “${q}”：命中 ${messages.length} 条`;
+      elSearchBannerText.textContent = `在 #${currentChannelId} 中搜索 “${q}”：命中 ${messages.length} 条`;
     }
     renderMessages();
   }
@@ -977,6 +1228,7 @@
       void runSearch(elSearchInput.value);
     } else if (ev.key === "Escape") {
       elSearchInput.value = "";
+      elSearchInput.blur();
       void runSearch("");
     }
   });
@@ -985,7 +1237,7 @@
     void runSearch("");
   });
 
-  // Settings Modal (Desktop only — edits port, allowLan, minimizeToTray cleanly)
+  // Settings Modal (Desktop only)
   const settingsBtn = document.getElementById("btn-local-settings");
   if (!bridge?.updateLocalSettings && settingsBtn) {
     settingsBtn.style.display = "none";
@@ -1017,7 +1269,7 @@
     }
   });
 
-  // One-click global agent registration (`https://agents-chat.com/api/account/register` -> `~/.agentschat/profiles/`)
+  // One-click global agent registration
   const btnRegisterAgent = document.getElementById("btn-register-agent");
   if (!bridge?.registerLocalAgent && btnRegisterAgent) {
     btnRegisterAgent.style.display = "none";
@@ -1072,7 +1324,7 @@
     } catch {}
   });
 
-  // `@mention` Autocomplete Popover in Composer
+  // `@mention` Autocomplete Popover
   function closeMentionMenu() {
     mentionCandidates = [];
     mentionActiveIdx = 0;
@@ -1090,6 +1342,7 @@
     elInput.value = replaced + after;
     const nextPos = replaced.length;
     elInput.setSelectionRange(nextPos, nextPos);
+    autoResizeComposer();
     elInput.focus();
     closeMentionMenu();
   }
@@ -1119,12 +1372,20 @@
       const opt = document.createElement("button");
       opt.type = "button";
       opt.className = "mention-opt" + (idx === mentionActiveIdx ? " active" : "");
+
+      const left = document.createElement("span");
+      left.className = "mention-opt-left";
+      const dot = document.createElement("span");
+      dot.className = "mention-opt-dot" + (m.online ? " live" : "");
       const nameSpan = document.createElement("span");
-      nameSpan.textContent = (m.online ? "● " : "") + (m.display_name || m.agent_id);
+      nameSpan.textContent = m.display_name || m.agent_id;
+      left.appendChild(dot);
+      left.appendChild(nameSpan);
+
       const idSpan = document.createElement("span");
       idSpan.className = "mention-opt-id";
       idSpan.textContent = `@${m.agent_id}`;
-      opt.appendChild(nameSpan);
+      opt.appendChild(left);
       opt.appendChild(idSpan);
       opt.addEventListener("mousedown", (ev) => {
         ev.preventDefault();
@@ -1141,6 +1402,7 @@
       title: `编辑 #${currentChannelId} 主题`,
       hint: "主题将实时同步给房间内所有连接的本机 Agent。",
       placeholder1: "输入新的房间主题 / 协作目标",
+      value1: elRoomTopic.textContent || "",
     });
     if (r === null) return;
     const res = await api(`/api/channels/${encodeURIComponent(currentChannelId)}`, {
@@ -1157,6 +1419,7 @@
 
   let lastTypingSentAt = 0;
   elInput.addEventListener("input", () => {
+    autoResizeComposer();
     updateMentionMenu();
     const now = Date.now();
     if (ws && ws.readyState === WebSocket.OPEN && elInput.value.trim() && now - lastTypingSentAt > 2500) {
