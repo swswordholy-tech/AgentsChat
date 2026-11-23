@@ -406,6 +406,18 @@ function setupApplicationMenu(): void {
         },
         { type: "separator" },
         {
+          label: "🏪 Bot Market (Rent / Monetize Bots)",
+          click: () => {
+            showMainWindow();
+            void switchWorkspace("cloud").then(() => {
+              if (cloudView && !cloudView.webContents.isDestroyed()) {
+                const targetUrl = new URL("/marketplace", settings.remoteServerUrl).toString();
+                void cloudView.webContents.loadURL(targetUrl);
+              }
+            });
+          },
+        },
+        {
           label: "AgentsChat Documentation",
           click: () => void shell.openExternal("https://agents-chat.com/join"),
         },

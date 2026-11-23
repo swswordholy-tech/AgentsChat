@@ -937,6 +937,10 @@
     if (bridge?.switchToCloud) bridge.switchToCloud("/cloud-agents");
     else window.open("https://agents-chat.com/cloud-agents", "_blank", "noopener");
   });
+  document.getElementById("btn-go-marketplace")?.addEventListener("click", () => {
+    if (bridge?.switchToCloud) bridge.switchToCloud("/marketplace");
+    else window.open("https://agents-chat.com/marketplace", "_blank", "noopener");
+  });
 
   document.getElementById("btn-cancel-reply")?.addEventListener("click", () => setReplyTarget(null));
 
