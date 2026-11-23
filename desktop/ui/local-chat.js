@@ -6,6 +6,13 @@
   const wsOriginUrl = originUrl.replace(/^http/i, "ws") + "/ws";
   const SVG_NS = "http://www.w3.org/2000/svg";
 
+  // Restore saved theme (default = WeChat crisp Light mode)
+  try {
+    if (localStorage.getItem("ac_desktop_theme") === "dark") {
+      document.body.classList.add("dark");
+    }
+  } catch {}
+
   let authToken = sessionStorage.getItem("ac_local_token") || "";
   let currentPrincipal = null;
   let channels = [];
@@ -47,7 +54,7 @@
 
   elServerPill.textContent = originUrl.replace(/^https?:\/\//, "");
 
-  // Pure-DOM SVG Icon Factory (zero innerHTML, uniform 1.65px round-cap craft)
+  // Pure-DOM SVG Icon Factory (zero markup string sinks)
   const ICON_PATHS = {
     hash: [
       ["path", { d: "M4 9h16" }],
@@ -79,13 +86,8 @@
       ["rect", { x: "9", y: "9", width: "11", height: "11", rx: "2.2" }],
       ["path", { d: "M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" }],
     ],
-    terminal: [
-      ["rect", { x: "3.5", y: "4.5", width: "17", height: "15", rx: "3" }],
-      ["path", { d: "m8.5 10 2.5 2.25-2.5 2.25" }],
-      ["path", { d: "M13 14.5h3" }],
-    ],
-    bolt: [
-      ["path", { d: "M13 2 3 14h9l-1 8 10-12h-9l1-8Z" }],
+    chat: [
+      ["path", { d: "M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5Z" }],
     ],
     shield: [
       ["path", { d: "M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z" }],
@@ -107,19 +109,25 @@
     return svg;
   }
 
-  // Deterministic subtle dark-mode avatar palette (low-chroma OKLCH tint, never harsh neon)
-  function avatarColors(seed) {
+  // Friendly, vibrant WeChat-like avatar palette (clean readable white initials)
+  const AVATAR_SWATCHES = [
+    "#07c160",
+    "#2b7fff",
+    "#ff8c2e",
+    "#6366f1",
+    "#0ea5a4",
+    "#e85d75",
+    "#8b5cf6",
+    "#3b82f6",
+  ];
+  function avatarBg(seed) {
     const str = String(seed || "agent");
     let h = 2166136261;
     for (let i = 0; i < str.length; i++) {
       h ^= str.charCodeAt(i);
       h = Math.imul(h, 16777619);
     }
-    const hue = Math.abs(h) % 360;
-    return {
-      bg: `hsla(${hue}, 38%, 42%, 0.22)`,
-      fg: `hsl(${hue}, 62%, 78%)`,
-    };
+    return AVATAR_SWATCHES[Math.abs(h) % AVATAR_SWATCHES.length];
   }
 
   function avatarInitials(name, id) {
@@ -130,12 +138,6 @@
       return (parts[0][0] + parts[1][0]).toUpperCase();
     }
     return src.slice(0, 2).toUpperCase();
-  }
-
-  function autoResizeComposer() {
-    if (!elInput) return;
-    elInput.style.height = "auto";
-    elInput.style.height = Math.min(160, Math.max(24, elInput.scrollHeight)) + "px";
   }
 
   function showToast(msg) {
@@ -205,7 +207,7 @@
       elIdentityCard?.classList.remove("bound");
       elAuthDot.classList.remove("ok");
       elAuthName.textContent = "未登录全局账号";
-      elAuthId.textContent = "从 Cloud 一键同步登录态，或填入已签发的 ac_ / JWT 凭证";
+      elAuthId.textContent = "先在 Cloud 一键同步，或填入 ac_ / JWT 凭证";
     }
   }
 
@@ -228,7 +230,7 @@
     if (!elReplyBanner) return;
     if (replyTarget) {
       elReplyBanner.hidden = false;
-      elReplyBannerText.textContent = `回复 @${replyTarget.sender_id}: ${(replyTarget.content || "").slice(0, 72)}`;
+      elReplyBannerText.textContent = `引用 @${replyTarget.sender_id}: ${(replyTarget.content || "").slice(0, 72)}`;
       elInput.focus();
     } else {
       elReplyBanner.hidden = true;
@@ -301,7 +303,7 @@
         const ch = channels.find((c) => c.id === currentChannelId);
         if (ch) ch.topic = frame.topic || "";
       } else if (frame.type === "typing" && frame.channel_id === currentChannelId && frame.sender_id !== currentPrincipal?.id) {
-        elTyping.textContent = `@${frame.sender_id} 正在输入…`;
+        elTyping.textContent = `@${frame.sender_id} 对方正在输入…`;
         clearTimeout(connectRealtimeWs._typingTimer);
         connectRealtimeWs._typingTimer = setTimeout(() => { elTyping.textContent = ""; }, 5000);
       }
@@ -372,36 +374,44 @@
       btn.type = "button";
       btn.className = "channel-item" + (ch.id === currentChannelId ? " active" : "");
 
-      const left = document.createElement("span");
-      left.className = "ch-left";
-      const glyph = document.createElement("span");
-      glyph.className = "ch-glyph";
-      glyph.appendChild(
-        createSvgIcon(ch.type === "direct" ? "dm" : ch.visibility === "private" ? "lock" : "hash"),
-      );
-      const label = document.createElement("span");
-      label.className = "ch-name";
-      label.textContent = ch.name || ch.id;
-      left.appendChild(glyph);
-      left.appendChild(label);
-
-      const right = document.createElement("span");
-      right.className = "ch-right";
+      const av = document.createElement("div");
+      av.className = "ch-avatar";
+      av.style.background = avatarBg(ch.id);
+      if (ch.type === "direct") {
+        av.textContent = avatarInitials(ch.name, ch.id);
+      } else {
+        av.appendChild(createSvgIcon(ch.visibility === "private" ? "lock" : "hash"));
+      }
       const unread = unreadByChannel.get(ch.id) || 0;
       if (unread > 0 && ch.id !== currentChannelId) {
         const badge = document.createElement("span");
         badge.className = "ch-unread";
         badge.textContent = unread > 99 ? "99+" : String(unread);
-        right.appendChild(badge);
+        av.appendChild(badge);
       }
+
+      const body = document.createElement("div");
+      body.className = "ch-body";
+      const top = document.createElement("div");
+      top.className = "ch-top";
+      const name = document.createElement("span");
+      name.className = "ch-name";
+      name.textContent = ch.type === "direct" ? (ch.name || ch.id) : `#${ch.name || ch.id}`;
+      top.appendChild(name);
       if (ch.member_count !== undefined && ch.member_count !== null) {
         const count = document.createElement("span");
         count.className = "ch-count";
-        count.textContent = String(ch.member_count);
-        right.appendChild(count);
+        count.textContent = `${ch.member_count}人`;
+        top.appendChild(count);
       }
-      btn.appendChild(left);
-      btn.appendChild(right);
+      const sub = document.createElement("div");
+      sub.className = "ch-sub";
+      sub.textContent = ch.topic || (ch.type === "direct" ? "1v1 本机私聊" : "本机多 Agent 群聊");
+      body.appendChild(top);
+      body.appendChild(sub);
+
+      btn.appendChild(av);
+      btn.appendChild(body);
       btn.addEventListener("click", () => selectChannel(ch.id));
       elChannelList.appendChild(btn);
     });
@@ -414,7 +424,7 @@
     if (profiles.length === 0) {
       const empty = document.createElement("div");
       empty.className = "bot-empty";
-      empty.textContent = "未检测到 ~/.agentschat 下的本地 Profile，可点击上方“注册”快速创建。";
+      empty.textContent = "未检测到 ~/.agentschat 下的本地 Profile，可点击上方「＋注册」快速创建。";
       elBots.appendChild(empty);
       return;
     }
@@ -424,11 +434,9 @@
 
       const meta = document.createElement("div");
       meta.className = "bot-meta";
-      const colors = avatarColors(p.agent_id);
       const dot = document.createElement("span");
       dot.className = "bot-dot";
-      dot.style.background = colors.bg;
-      dot.style.color = colors.fg;
+      dot.style.background = avatarBg(p.agent_id);
       dot.textContent = avatarInitials(p.display_name, p.agent_id);
 
       const copy = document.createElement("div");
@@ -529,7 +537,9 @@
     }
     await loadChannels();
     const ch = channels.find((c) => c.id === channelId);
-    elRoomTitle.textContent = ch ? (ch.type === "direct" ? ch.name : `#${ch.name}`) : `#${channelId}`;
+    const baseTitle = ch ? (ch.type === "direct" ? ch.name : `#${ch.name}`) : `#${channelId}`;
+    const countSuffix = ch && ch.type !== "direct" && ch.member_count ? ` (${ch.member_count})` : "";
+    elRoomTitle.textContent = baseTitle + countSuffix;
     elRoomTopic.textContent = ch?.topic || "本机最小聊天服务 · 全局唯一身份零冲突";
     const leaveBtn = document.getElementById("btn-leave-channel");
     if (leaveBtn) {
@@ -595,7 +605,6 @@
       pill.title = "点击插入 @提及";
       pill.addEventListener("click", () => {
         elInput.value = (elInput.value ? elInput.value + " " : "") + `@${m.agent_id} `;
-        autoResizeComposer();
         elInput.focus();
       });
       elMemberStrip.appendChild(pill);
@@ -603,7 +612,6 @@
   }
 
   function appendInlineRichText(parent, text) {
-    // Pure DOM tokenization (zero innerHTML): inline `code`, @mentions, and safe https/http URLs
     const tokenRe = /(`[^`\n]+`)|(https?:\/\/[^\s<>"'`]+)|((?:^|(?<=[\s(\[]))@[a-zA-Z0-9][a-zA-Z0-9._-]{1,62})/g;
     let last = 0;
     let m;
@@ -685,21 +693,20 @@
     }
   }
 
-  function formatShortTime(iso) {
+  function formatWeChatTime(iso) {
     if (!iso) return "";
     const d = new Date(iso);
     if (Number.isNaN(d.getTime())) return "";
     return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   }
 
-  function canGroupWithPrev(prev, curr) {
-    if (!prev || !curr) return false;
-    if (prev.sender_id !== curr.sender_id) return false;
-    if (curr.in_reply_to) return false;
-    const t1 = prev.timestamp ? Date.parse(prev.timestamp) : NaN;
-    const t2 = curr.timestamp ? Date.parse(curr.timestamp) : NaN;
+  function shouldShowTimeDivider(prev, curr) {
+    if (!curr?.timestamp) return false;
+    if (!prev?.timestamp) return true;
+    const t1 = Date.parse(prev.timestamp);
+    const t2 = Date.parse(curr.timestamp);
     if (Number.isNaN(t1) || Number.isNaN(t2)) return false;
-    return Math.abs(t2 - t1) < 5 * 60 * 1000;
+    return Math.abs(t2 - t1) >= 5 * 60 * 1000;
   }
 
   function renderMessages(opts = {}) {
@@ -713,7 +720,7 @@
       const h3 = document.createElement("h3");
       h3.textContent = "绑定全局唯一身份即可开始本机群聊";
       const p = document.createElement("p");
-      p.textContent = "为避免本机与远端发生账号或 Agent ID 冲突，本机 Server 统一复用 agents-chat.com 分配的全局账号与 Agent 密钥。";
+      p.textContent = "为避免本机与远端发生账号或 Agent ID 冲突，本机 Server 统一复用 agents-chat.com 分配的全局账号与密钥。";
       const acts = document.createElement("div");
       acts.className = "starter-actions";
       const btnSync = document.createElement("button");
@@ -736,27 +743,24 @@
       card.className = "empty-starter";
       const iconWrap = document.createElement("div");
       iconWrap.className = "empty-icon";
-      iconWrap.appendChild(createSvgIcon("terminal"));
+      iconWrap.appendChild(createSvgIcon("chat"));
       const h3 = document.createElement("h3");
-      h3.textContent = activeSearchQuery ? "没有匹配的历史消息" : "本机房间已就绪";
+      h3.textContent = activeSearchQuery ? "没有匹配的历史消息" : "房间已就绪，发条消息聊聊吧";
       const p = document.createElement("p");
       p.textContent = activeSearchQuery
         ? `在当前房间内未找到包含 “${activeSearchQuery}” 的消息。`
         : peerAgent
-          ? `发送轻量 ping 立即验证 @${peerAgent.agent_id} 在本机 Server 的收发连通性。`
-          : `从左侧将本机 Agent 拉入房间，或让 Agent 通过 --url ${originUrl} 连入即可开始本地低延迟协同。`;
+          ? `发送轻量 ping 即可验证 @${peerAgent.agent_id} 的本机实时连通性。`
+          : `从左侧将本机 Agent 拉入房间，或让 Agent 通过 --url ${originUrl} 连入即可开始本地群聊。`;
       const acts = document.createElement("div");
       acts.className = "starter-actions";
       if (!activeSearchQuery && peerAgent) {
         const btnPing = document.createElement("button");
         btnPing.type = "button";
         btnPing.className = "btn btn-primary";
-        btnPing.appendChild(createSvgIcon("bolt"));
-        const lbl = document.createElement("span");
         const isDm = currentChannelId.startsWith("dm-");
         const pingPrompt = isDm ? "ping" : `@${peerAgent.agent_id} ping`;
-        lbl.textContent = `Ping ${peerAgent.display_name} 测试连通性`;
-        btnPing.appendChild(lbl);
+        btnPing.textContent = `Ping ${peerAgent.display_name} 测试连通性`;
         btnPing.addEventListener("click", () => sendChatText(pingPrompt));
         acts.appendChild(btnPing);
       } else if (!activeSearchQuery) {
@@ -775,118 +779,78 @@
       return;
     }
 
-    const stream = document.createElement("div");
-    stream.className = "msg-stream-inner";
-
     if (hasMoreOlder && !activeSearchQuery) {
       const loadMoreWrap = document.createElement("div");
       loadMoreWrap.className = "load-more-wrap";
       const btnMore = document.createElement("button");
       btnMore.type = "button";
-      btnMore.className = "btn btn-ghost btn-sm";
-      btnMore.textContent = "加载更早消息";
+      btnMore.className = "btn btn-ghost btn-xs";
+      btnMore.textContent = "查看更多消息";
       btnMore.addEventListener("click", () => void loadOlderMessages());
       loadMoreWrap.appendChild(btnMore);
-      stream.appendChild(loadMoreWrap);
+      elMessages.appendChild(loadMoreWrap);
     }
 
     const msgById = new Map(messages.map((m) => [m.id, m]));
     messages.forEach((m, idx) => {
-      const isSelf = m.sender_id === currentPrincipal?.id;
-      const grouped = canGroupWithPrev(messages[idx - 1], m);
-
-      const row = document.createElement("article");
-      row.className = "msg-row" + (isSelf ? " self" : "") + (grouped ? " grouped" : "");
-
-      if (grouped) {
-        const gutter = document.createElement("span");
-        gutter.className = "msg-gutter-time";
-        gutter.textContent = formatShortTime(m.timestamp);
-        row.appendChild(gutter);
-      } else {
-        const av = document.createElement("div");
-        av.className = "msg-avatar";
-        const colors = isSelf
-          ? { bg: "rgba(59, 130, 246, 0.22)", fg: "#93c5fd" }
-          : avatarColors(m.sender_id);
-        av.style.background = colors.bg;
-        av.style.color = colors.fg;
-        av.textContent = avatarInitials(m.sender_name, m.sender_id);
-        row.appendChild(av);
+      if (shouldShowTimeDivider(messages[idx - 1], m)) {
+        const divider = document.createElement("div");
+        divider.className = "time-divider";
+        divider.textContent = formatWeChatTime(m.timestamp);
+        elMessages.appendChild(divider);
       }
+
+      const isSelf = m.sender_id === currentPrincipal?.id;
+      const row = document.createElement("div");
+      row.className = "wx-msg" + (isSelf ? " self" : "");
+
+      const av = document.createElement("div");
+      av.className = "wx-avatar";
+      av.style.background = isSelf ? "#07c160" : avatarBg(m.sender_id);
+      av.textContent = avatarInitials(m.sender_name, m.sender_id);
+      row.appendChild(av);
 
       const col = document.createElement("div");
-      col.className = "msg-content-col";
+      col.className = "wx-col";
 
-      if (!grouped) {
-        const meta = document.createElement("div");
-        meta.className = "msg-meta";
-        const sender = document.createElement("span");
-        sender.className = "msg-sender";
-        sender.textContent = m.sender_name || m.sender_id;
-        meta.appendChild(sender);
-
-        const handle = document.createElement("span");
-        handle.className = "msg-handle";
-        handle.textContent = `@${m.sender_id}`;
-        meta.appendChild(handle);
-
-        if (isSelf) {
-          const tag = document.createElement("span");
-          tag.className = "msg-self-tag";
-          tag.textContent = "你";
-          meta.appendChild(tag);
-        }
-
-        const time = document.createElement("span");
-        time.className = "msg-time";
-        time.textContent = formatShortTime(m.timestamp) + (m.edited_at ? " · 已编辑" : "");
-        meta.appendChild(time);
-        col.appendChild(meta);
+      if (!isSelf) {
+        const sender = document.createElement("div");
+        sender.className = "wx-sender";
+        const nameSpan = document.createElement("span");
+        nameSpan.textContent = m.sender_name || m.sender_id;
+        const idSpan = document.createElement("span");
+        idSpan.className = "wx-sender-id";
+        idSpan.textContent = `@${m.sender_id}`;
+        sender.appendChild(nameSpan);
+        sender.appendChild(idSpan);
+        col.appendChild(sender);
       }
 
-      if (m.in_reply_to) {
-        const quoted = msgById.get(m.in_reply_to);
-        const quoteEl = document.createElement("div");
-        quoteEl.className = "msg-quote";
-        quoteEl.appendChild(createSvgIcon("reply"));
-        const qt = document.createElement("span");
-        qt.textContent = quoted
-          ? `@${quoted.sender_id}: ${(quoted.content || "").slice(0, 80)}`
-          : `回复消息 #${String(m.in_reply_to).slice(0, 8)}`;
-        quoteEl.appendChild(qt);
-        col.appendChild(quoteEl);
-      }
+      const bubbleRow = document.createElement("div");
+      bubbleRow.className = "wx-bubble-row";
 
-      const body = document.createElement("div");
-      body.className = "msg-body";
-      renderFormattedBody(body, m.content);
-      col.appendChild(body);
-      row.appendChild(col);
+      const bubble = document.createElement("div");
+      bubble.className = "wx-bubble";
+      renderFormattedBody(bubble, m.content);
+      bubbleRow.appendChild(bubble);
 
-      // Floating Hover Action Bar
       const actions = document.createElement("div");
-      actions.className = "msg-actions";
+      actions.className = "wx-actions";
+
       const btnQuote = document.createElement("button");
       btnQuote.type = "button";
-      btnQuote.className = "msg-action-btn";
+      btnQuote.className = "wx-act-btn";
+      btnQuote.title = "引用回复";
       btnQuote.appendChild(createSvgIcon("reply"));
-      const qSpan = document.createElement("span");
-      qSpan.textContent = "引用";
-      btnQuote.appendChild(qSpan);
-      btnQuote.title = "引用回复此消息";
       btnQuote.addEventListener("click", () => setReplyTarget(m));
       actions.appendChild(btnQuote);
 
       if (isSelf) {
         const btnEdit = document.createElement("button");
         btnEdit.type = "button";
-        btnEdit.className = "msg-action-btn";
+        btnEdit.className = "wx-act-btn";
+        btnEdit.title = "编辑消息";
         btnEdit.appendChild(createSvgIcon("edit"));
-        const eSpan = document.createElement("span");
-        eSpan.textContent = "编辑";
-        btnEdit.appendChild(eSpan);
-        btnEdit.title = "编辑这条消息";
         btnEdit.addEventListener("click", async () => {
           const r = await openPromptDialog({
             title: "编辑消息",
@@ -911,12 +875,9 @@
 
         const btnDel = document.createElement("button");
         btnDel.type = "button";
-        btnDel.className = "msg-action-btn danger";
+        btnDel.className = "wx-act-btn danger";
+        btnDel.title = "撤回消息";
         btnDel.appendChild(createSvgIcon("trash"));
-        const dSpan = document.createElement("span");
-        dSpan.textContent = "撤回";
-        btnDel.appendChild(dSpan);
-        btnDel.title = "删除这条消息";
         btnDel.addEventListener("click", async () => {
           const res = await api(
             `/api/channels/${encodeURIComponent(currentChannelId)}/messages/${encodeURIComponent(m.id)}`,
@@ -935,11 +896,30 @@
         actions.appendChild(btnDel);
       }
 
-      row.appendChild(actions);
-      stream.appendChild(row);
+      bubbleRow.appendChild(actions);
+      col.appendChild(bubbleRow);
+
+      if (m.in_reply_to) {
+        const quoted = msgById.get(m.in_reply_to);
+        const quoteEl = document.createElement("div");
+        quoteEl.className = "wx-quote-pill";
+        quoteEl.textContent = quoted
+          ? `${quoted.sender_name || quoted.sender_id}: ${(quoted.content || "").slice(0, 80)}`
+          : `引用消息 #${String(m.in_reply_to).slice(0, 8)}`;
+        col.appendChild(quoteEl);
+      }
+
+      if (m.edited_at) {
+        const ed = document.createElement("span");
+        ed.className = "wx-edited-tag";
+        ed.textContent = "已编辑";
+        col.appendChild(ed);
+      }
+
+      row.appendChild(col);
+      elMessages.appendChild(row);
     });
 
-    elMessages.appendChild(stream);
     if (opts.preserveScrollFromBottom) {
       elMessages.scrollTop = Math.max(0, elMessages.scrollHeight - opts.preserveScrollFromBottom);
     } else {
@@ -955,7 +935,6 @@
       return;
     }
     elInput.value = "";
-    autoResizeComposer();
     const payload = { content: text };
     if (replyTarget?.id) payload.in_reply_to = replyTarget.id;
     setReplyTarget(null);
@@ -983,6 +962,27 @@
     if (bridge?.copyText) await bridge.copyText(originUrl);
     else await navigator.clipboard?.writeText(originUrl);
     showToast("已复制本机地址：" + originUrl);
+  });
+
+  // Light / Dark theme toggle
+  document.getElementById("btn-toggle-theme")?.addEventListener("click", () => {
+    const isDark = document.body.classList.toggle("dark");
+    try { localStorage.setItem("ac_desktop_theme", isDark ? "dark" : "light"); } catch {}
+    showToast(isDark ? "已切换至深色模式" : "已切换至浅色模式");
+  });
+
+  // Composer toolbar quick shortcuts
+  document.getElementById("btn-quick-mention")?.addEventListener("click", () => {
+    const val = elInput.value;
+    elInput.value = val + (val && !val.endsWith(" ") ? " @" : "@");
+    elInput.focus();
+    updateMentionMenu();
+  });
+  document.getElementById("btn-quick-connect")?.addEventListener("click", () => {
+    document.getElementById("btn-copy-mcp")?.click();
+  });
+  document.getElementById("btn-quick-export")?.addEventListener("click", () => {
+    document.getElementById("btn-export-md")?.click();
   });
 
   // Global Cmd/Ctrl+K search shortcut
@@ -1342,7 +1342,6 @@
     elInput.value = replaced + after;
     const nextPos = replaced.length;
     elInput.setSelectionRange(nextPos, nextPos);
-    autoResizeComposer();
     elInput.focus();
     closeMentionMenu();
   }
@@ -1419,7 +1418,6 @@
 
   let lastTypingSentAt = 0;
   elInput.addEventListener("input", () => {
-    autoResizeComposer();
     updateMentionMenu();
     const now = Date.now();
     if (ws && ws.readyState === WebSocket.OPEN && elInput.value.trim() && now - lastTypingSentAt > 2500) {

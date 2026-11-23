@@ -547,7 +547,7 @@ async function createDesktopWindow(): Promise<void> {
     show: !isSmokeTest && !startHidden,
     title: "AgentsChat",
     ...(existsSync(windowIconPath) ? { icon: windowIconPath } : {}),
-    backgroundColor: "#09090b",
+    backgroundColor: "#eaeaea",
     ...(isMac ? { titleBarStyle: "hiddenInset", trafficLightPosition: { x: 10, y: 15 } } : { autoHideMenuBar: true }),
     webPreferences: {
       preload: join(UI_DIR, "preload.cjs"),

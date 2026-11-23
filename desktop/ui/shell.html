@@ -6,24 +6,20 @@
   <title>AgentsChat</title>
   <style>
     :root {
-      --bg-rail: #09090b;
-      --bg-rail: oklch(13% 0.004 255);
-      --bg-hover: #16181e;
-      --bg-hover: oklch(20% 0.006 255);
-      --bg-active: #1d222c;
-      --bg-active: oklch(24% 0.012 255);
-      --border-hairline: rgba(255, 255, 255, 0.075);
-      --border-subtle: rgba(255, 255, 255, 0.11);
-      --ink-primary: #f1f3f6;
-      --ink-secondary: #98a0b0;
-      --ink-muted: #666e7e;
-      --accent: #3b82f6;
-      --accent-ink: #60a5fa;
-      --accent-soft: rgba(59, 130, 246, 0.16);
-      --live: #34d399;
-      --live-soft: rgba(52, 211, 153, 0.14);
-      --danger: #ef4444;
-      --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+      --rail-bg: #e9eaec;
+      --rail-border: #d8dadd;
+      --btn-hover: rgba(0, 0, 0, 0.06);
+      --btn-active: #ffffff;
+      --btn-active-shadow: 0 1px 3px rgba(0, 0, 0, 0.09), 0 0 0 1px rgba(0, 0, 0, 0.05);
+      --ink-primary: #191919;
+      --ink-secondary: #60646c;
+      --ink-muted: #8b9099;
+      --wechat-green: #07c160;
+      --wechat-green-hover: #06ad56;
+      --wechat-green-soft: rgba(7, 193, 96, 0.14);
+      --danger: #fa5151;
+      --sep: rgba(0, 0, 0, 0.08);
+      --ease: cubic-bezier(0.16, 1, 0.3, 1);
     }
 
     * { box-sizing: border-box; user-select: none; }
@@ -33,33 +29,41 @@
       padding: 0;
       width: 100%;
       height: 100%;
-      background: var(--bg-rail);
+      background: var(--rail-bg);
       color: var(--ink-primary);
-      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "SF Pro Text", "Segoe UI", system-ui, sans-serif;
       -webkit-font-smoothing: antialiased;
-      text-rendering: optimizeLegibility;
       overflow: hidden;
     }
 
     .rail {
       width: 72px;
       height: 100vh;
-      background: var(--bg-rail);
-      border-right: 1px solid var(--border-hairline);
+      background: var(--rail-bg);
+      border-right: 1px solid var(--rail-border);
       display: flex;
       flex-direction: column;
       align-items: center;
-      padding: 14px 0 14px;
-      gap: 6px;
+      padding: 16px 0 16px;
+      gap: 8px;
       -webkit-app-region: drag;
     }
-    .rail.mac { padding-top: 46px; }
+    .rail.mac { padding-top: 48px; }
 
-    .rail-sep {
-      width: 28px;
-      height: 1px;
-      background: var(--border-hairline);
-      margin: 4px 0 6px;
+    .brand-avatar {
+      width: 36px;
+      height: 36px;
+      border-radius: 9px;
+      background: linear-gradient(145deg, #07c160, #05a852);
+      color: #ffffff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      box-shadow: 0 2px 6px rgba(7, 193, 96, 0.28);
+      margin-bottom: 6px;
       flex-shrink: 0;
     }
 
@@ -74,10 +78,10 @@
     .node-btn {
       -webkit-app-region: no-drag;
       position: relative;
-      width: 52px;
+      width: 50px;
       height: 50px;
-      border-radius: 12px;
-      border: 1px solid transparent;
+      border-radius: 10px;
+      border: none;
       background: transparent;
       color: var(--ink-secondary);
       cursor: pointer;
@@ -87,90 +91,61 @@
       justify-content: center;
       gap: 4px;
       padding: 0;
-      transition: background-color 140ms var(--ease-out), color 140ms var(--ease-out), border-color 140ms var(--ease-out), transform 120ms var(--ease-out);
-    }
-    .node-btn::before {
-      content: "";
-      position: absolute;
-      left: -10px;
-      top: 50%;
-      width: 3px;
-      height: 18px;
-      border-radius: 0 3px 3px 0;
-      background: var(--accent);
-      transform: translateY(-50%) scaleY(0.35);
-      opacity: 0;
-      transition: opacity 160ms var(--ease-out), transform 180ms var(--ease-out);
+      transition: background-color 140ms var(--ease), color 140ms var(--ease), box-shadow 140ms var(--ease), transform 110ms var(--ease);
     }
     .node-btn:hover {
-      background: var(--bg-hover);
+      background: var(--btn-hover);
       color: var(--ink-primary);
     }
-    .node-btn:active {
-      transform: scale(0.96);
-    }
-    .node-btn:focus-visible {
-      outline: 2px solid var(--accent);
-      outline-offset: 2px;
-    }
+    .node-btn:active { transform: scale(0.96); }
+    .node-btn:focus-visible { outline: 2px solid var(--wechat-green); outline-offset: 2px; }
+
     .node-btn.active {
-      background: var(--bg-active);
-      border-color: var(--border-subtle);
-      color: var(--ink-primary);
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 2px 6px rgba(0, 0, 0, 0.28);
-    }
-    .node-btn.active::before {
-      opacity: 1;
-      transform: translateY(-50%) scaleY(1);
+      background: var(--btn-active);
+      color: var(--wechat-green);
+      box-shadow: var(--btn-active-shadow);
     }
     .node-btn.active .node-svg {
-      color: var(--accent-ink);
+      stroke: var(--wechat-green);
     }
 
     .node-svg {
-      width: 19px;
-      height: 19px;
+      width: 21px;
+      height: 21px;
       stroke: currentColor;
       fill: none;
-      stroke-width: 1.65;
+      stroke-width: 1.75;
       stroke-linecap: round;
       stroke-linejoin: round;
       flex-shrink: 0;
-      transition: color 140ms var(--ease-out);
     }
     .node-lbl {
       font-size: 10px;
       font-weight: 500;
-      letter-spacing: 0.01em;
       line-height: 1;
     }
     .node-btn.active .node-lbl {
       font-weight: 600;
-      color: var(--ink-primary);
+      color: #191919;
     }
 
     .dot {
       position: absolute;
       right: 7px;
       top: 7px;
-      width: 7px;
-      height: 7px;
+      width: 8px;
+      height: 8px;
       border-radius: 50%;
-      background: var(--ink-muted);
-      box-shadow: 0 0 0 2px var(--bg-rail);
-      transition: background-color 180ms var(--ease-out);
+      background: #c0c4cc;
+      box-shadow: 0 0 0 2px var(--rail-bg);
     }
-    .node-btn.active .dot {
-      box-shadow: 0 0 0 2px var(--bg-active);
-    }
-    .dot.live {
-      background: var(--live);
-    }
+    .node-btn.active .dot { box-shadow: 0 0 0 2px #ffffff; }
+    .dot.live { background: var(--wechat-green); }
 
     .unread-badge {
       position: absolute;
-      top: 3px;
-      right: 3px;
+      top: 2px;
+      right: 2px;
       min-width: 17px;
       height: 17px;
       padding: 0 4.5px;
@@ -182,11 +157,17 @@
       font-variant-numeric: tabular-nums;
       line-height: 17px;
       text-align: center;
-      box-shadow: 0 0 0 2px var(--bg-rail), 0 2px 6px rgba(0, 0, 0, 0.4);
+      box-shadow: 0 1px 4px rgba(250, 81, 81, 0.4);
     }
-    .unread-badge[hidden] { display: none; }
 
     .spacer { flex: 1; }
+
+    .rail-sep {
+      width: 28px;
+      height: 1px;
+      background: var(--sep);
+      margin: 2px 0;
+    }
 
     .footer-stack {
       display: flex;
@@ -199,108 +180,88 @@
     .lan-chip {
       -webkit-app-region: no-drag;
       font-size: 9px;
-      font-weight: 600;
-      letter-spacing: 0.06em;
+      font-weight: 700;
+      letter-spacing: 0.04em;
       padding: 2px 6px;
       border-radius: 5px;
-      background: var(--live-soft);
-      color: var(--live);
-      border: 1px solid rgba(52, 211, 153, 0.28);
+      background: var(--wechat-green-soft);
+      color: #059e4e;
     }
-    .lan-chip[hidden] { display: none; }
 
     .badge {
       -webkit-app-region: no-drag;
       font-size: 10px;
-      font-weight: 500;
+      font-weight: 600;
       color: var(--ink-muted);
       font-family: "SF Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
       font-variant-numeric: tabular-nums;
-      letter-spacing: -0.02em;
-      padding: 2px 5px;
-      border-radius: 5px;
-      transition: color 140ms var(--ease-out);
     }
-    .badge.live {
-      color: var(--ink-secondary);
-    }
+    .badge.live { color: #059e4e; }
 
     .mini-btn {
       -webkit-app-region: no-drag;
       width: 36px;
       height: 36px;
       border-radius: 9px;
-      border: 1px solid transparent;
+      border: none;
       background: transparent;
-      color: var(--ink-muted);
+      color: var(--ink-secondary);
       cursor: pointer;
       display: flex;
       align-items: center;
       justify-content: center;
       padding: 0;
-      transition: background-color 140ms var(--ease-out), color 140ms var(--ease-out), border-color 140ms var(--ease-out), transform 120ms var(--ease-out);
+      transition: background-color 140ms var(--ease), color 140ms var(--ease), transform 110ms var(--ease);
     }
     .mini-btn:hover {
-      background: var(--bg-hover);
-      border-color: var(--border-hairline);
+      background: var(--btn-hover);
       color: var(--ink-primary);
     }
-    .mini-btn:active {
-      transform: scale(0.95);
-    }
-    .mini-btn:focus-visible {
-      outline: 2px solid var(--accent);
-      outline-offset: 2px;
-    }
+    .mini-btn:active { transform: scale(0.95); }
+    .mini-btn:focus-visible { outline: 2px solid var(--wechat-green); outline-offset: 2px; }
     .mini-btn svg {
-      width: 16px;
-      height: 16px;
+      width: 17px;
+      height: 17px;
       stroke: currentColor;
       fill: none;
-      stroke-width: 1.65;
+      stroke-width: 1.7;
       stroke-linecap: round;
       stroke-linejoin: round;
     }
     .mini-btn.copied {
-      color: var(--live);
-      background: var(--live-soft);
-      border-color: rgba(52, 211, 153, 0.28);
+      color: #059e4e;
+      background: var(--wechat-green-soft);
     }
     .mini-btn.power-on {
-      color: var(--live);
+      color: var(--wechat-green);
     }
     .mini-btn.power-on:hover {
-      color: #6ee7b7;
-      background: var(--live-soft);
-      border-color: rgba(52, 211, 153, 0.24);
+      color: var(--wechat-green-hover);
+      background: var(--wechat-green-soft);
     }
 
     @media (prefers-reduced-motion: reduce) {
-      *, *::before, *::after {
-        transition-duration: 0.01ms !important;
-      }
+      *, *::before, *::after { transition-duration: 0.01ms !important; }
     }
   </style>
 </head>
 <body>
-  <aside class="rail" id="rail" aria-label="Workspace Switcher">
-    <div class="rail-sep" aria-hidden="true"></div>
+  <aside class="rail" id="rail" aria-label="工作区切换">
+    <div class="brand-avatar" title="AgentsChat Desktop">AC</div>
 
     <nav class="nav-group">
-      <button class="node-btn active" id="btn-cloud" type="button" title="AgentsChat Cloud (⌘1) — Cloud Agents, /loop, OKR & Bot Market" aria-label="AgentsChat Cloud">
+      <button class="node-btn active" id="btn-cloud" type="button" title="AgentsChat Cloud (⌘1) — 云端多 Agent 协同、/loop 与 Bot 市场" aria-label="云端工作区">
         <svg class="node-svg" viewBox="0 0 24 24" aria-hidden="true">
           <path d="M17.5 19H7a4.5 4.5 0 0 1-.4-8.98A5.5 5.5 0 0 1 17.3 8.5 3.75 3.75 0 0 1 17.5 19Z" />
         </svg>
-        <span class="node-lbl">Cloud</span>
+        <span class="node-lbl">云端</span>
       </button>
 
-      <button class="node-btn" id="btn-local" type="button" title="Local Mini-Server (⌘2) — Local MCP Hub on 127.0.0.1" aria-label="Local Mini-Server">
+      <button class="node-btn" id="btn-local" type="button" title="本机 Server (⌘2) — 本机低延迟多 Agent 群聊与私聊" aria-label="本机聊天">
         <svg class="node-svg" viewBox="0 0 24 24" aria-hidden="true">
-          <rect x="3.5" y="4.5" width="17" height="15" rx="3" />
-          <path d="m8.5 10 2.5 2.25-2.5 2.25" />
-          <path d="M13 14.5h3" />
+          <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5Z" />
         </svg>
-        <span class="node-lbl">Local</span>
+        <span class="node-lbl">本机</span>
         <span class="dot" id="local-dot" aria-hidden="true"></span>
         <span class="unread-badge" id="local-unread-badge" hidden>0</span>
       </button>
@@ -310,9 +271,9 @@
 
     <div class="footer-stack">
       <div class="rail-sep" aria-hidden="true"></div>
-      <span class="lan-chip" id="lan-chip" title="LAN Access Enabled (0.0.0.0)" hidden>LAN</span>
-      <span class="badge" id="local-port-badge" title="Local Server Port">:8787</span>
-      <button class="mini-btn" id="btn-copy-url" type="button" title="Copy Local MCP Server Command" aria-label="Copy Local MCP Server Command">
+      <span class="lan-chip" id="lan-chip" title="局域网接入已开启 (0.0.0.0)" hidden>LAN</span>
+      <span class="badge" id="local-port-badge" title="本机 Server 监听端口">:8787</span>
+      <button class="mini-btn" id="btn-copy-url" type="button" title="复制本机 MCP 接入命令" aria-label="复制本机 MCP 命令">
         <svg id="icon-copy" viewBox="0 0 24 24" aria-hidden="true">
           <rect x="9" y="9" width="11" height="11" rx="2.2" />
           <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
@@ -321,7 +282,7 @@
           <path d="M20 6 9 17l-5-5" />
         </svg>
       </button>
-      <button class="mini-btn" id="btn-power" type="button" title="Start / Stop Embedded Local Server" aria-label="Toggle Local Server">
+      <button class="mini-btn" id="btn-power" type="button" title="启动 / 停止内置本机 Server" aria-label="开关本机 Server">
         <svg viewBox="0 0 24 24" aria-hidden="true">
           <path d="M12 3v8" />
           <path d="M17.66 6.34a8 8 0 1 1-11.32 0" />
@@ -367,8 +328,8 @@
       portBadge.classList.toggle("live", running);
       btnPower.classList.toggle("power-on", running);
       btnPower.title = running
-        ? `Local Server running (${state.localServer.httpUrl}) — click to stop`
-        : "Local Server stopped — click to start";
+        ? `本机 Server 运行中 (${state.localServer.httpUrl}) — 点击停止`
+        : "本机 Server 已停止 — 点击启动";
     }
 
     btnCloud.addEventListener("click", () => api?.switchWorkspace("cloud"));

@@ -8,57 +8,42 @@
 </head>
 <body>
   <div class="app-layout">
-    <!-- Left Sidebar -->
+    <!-- Middle Column: WeChat-Style Search + Session List + Local Agents -->
     <aside class="sidebar">
-      <div class="brand-header">
-        <div class="brand-ident">
-          <span class="brand-mark" aria-hidden="true">
-            <svg viewBox="0 0 24 24">
-              <rect x="3.5" y="4.5" width="17" height="15" rx="3" />
-              <path d="m8.5 10 2.5 2.25-2.5 2.25" />
-              <path d="M13 14.5h3" />
-            </svg>
-          </span>
-          <div class="brand-copy">
-            <div class="brand-title">本机 Server</div>
-            <button type="button" class="brand-sub" id="server-url-pill" title="点击复制本机服务地址">http://127.0.0.1:8787</button>
+      <div class="sidebar-top">
+        <div class="search-row">
+          <div class="search-box">
+            <svg class="search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></svg>
+            <input type="search" id="search-input" class="search-input" placeholder="搜索本房间消息 (⌘K)" autocomplete="off" aria-label="搜索本房间消息" />
           </div>
+          <button type="button" class="plus-btn" id="btn-new-group" title="新建本地群聊" aria-label="新建本地群聊">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14" /><path d="M5 12h14" /></svg>
+          </button>
+          <button type="button" class="plus-btn" id="btn-new-dm" title="发起 1v1 私聊" aria-label="发起私聊">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" /></svg>
+          </button>
         </div>
-        <span class="mode-chip">Local</span>
       </div>
 
       <section class="identity-card" id="identity-card" aria-label="全局账号身份">
-        <div class="identity-row">
-          <span class="identity-dot" id="auth-dot" aria-hidden="true"></span>
-          <strong class="identity-name" id="auth-name">未绑定全局账号</strong>
+        <div class="identity-head">
+          <div class="identity-row">
+            <span class="identity-dot" id="auth-dot" aria-hidden="true"></span>
+            <strong class="identity-name" id="auth-name">未绑定全局账号</strong>
+          </div>
+          <button type="button" class="server-pill" id="server-url-pill" title="点击复制本机服务地址">127.0.0.1:8787</button>
         </div>
         <div class="identity-sub" id="auth-id-text">账号与 Agent ID 统一由 agents-chat.com 分配，本地与云端零冲突</div>
         <div class="identity-actions" id="auth-actions">
-          <button type="button" class="btn btn-primary btn-sm" id="btn-sync-cloud">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17.5 19H7a4.5 4.5 0 0 1-.4-8.98A5.5 5.5 0 0 1 17.3 8.5 3.75 3.75 0 0 1 17.5 19Z" /></svg>
-            同步远端登录
-          </button>
-          <button type="button" class="btn btn-ghost btn-sm" id="btn-manual-token">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="15" r="4" /><path d="m10.85 12.15 8.65-8.65" /><path d="m17 6 2.5 2.5" /><path d="m14.5 8.5 2 2" /></svg>
-            填入凭证
-          </button>
+          <button type="button" class="btn btn-primary btn-xs" id="btn-sync-cloud">同步远端登录</button>
+          <button type="button" class="btn btn-ghost btn-xs" id="btn-manual-token">填入凭证</button>
         </div>
       </section>
 
       <div class="sidebar-scroll">
         <div class="sidebar-group">
           <div class="section-header">
-            <span>群聊与私聊</span>
-            <div class="section-btns">
-              <button type="button" class="micro-btn" id="btn-new-group" title="新建本地群聊" aria-label="新建本地群聊">
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14" /><path d="M5 12h14" /></svg>
-                <span>群聊</span>
-              </button>
-              <button type="button" class="micro-btn" id="btn-new-dm" title="发起 1v1 私聊" aria-label="发起 1v1 私聊">
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" /></svg>
-                <span>私聊</span>
-              </button>
-            </div>
+            <span>会话列表</span>
           </div>
           <div class="channel-list" id="channel-list"></div>
         </div>
@@ -67,10 +52,7 @@
           <div class="section-header">
             <span>本机 Agent</span>
             <div class="section-btns">
-              <button type="button" class="micro-btn" id="btn-register-agent" title="向 agents-chat.com 申请全局唯一 Agent 并保存到 ~/.agentschat">
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14" /><path d="M5 12h14" /></svg>
-                <span>注册</span>
-              </button>
+              <button type="button" class="micro-btn" id="btn-register-agent" title="向 agents-chat.com 申请全局唯一 Agent 并保存到 ~/.agentschat">＋注册</button>
               <button type="button" class="micro-btn icon-only" id="btn-refresh-bots" title="刷新 ~/.agentschat Profile" aria-label="刷新本机 Agent">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36" /><path d="M21 3v6h-6" /></svg>
               </button>
@@ -82,7 +64,7 @@
 
       <footer class="cloud-bridge">
         <button type="button" class="bridge-row" id="btn-go-cloud">
-          <span class="bridge-icon" aria-hidden="true">
+          <span class="bridge-icon green" aria-hidden="true">
             <svg viewBox="0 0 24 24"><path d="M17.5 19H7a4.5 4.5 0 0 1-.4-8.98A5.5 5.5 0 0 1 17.3 8.5 3.75 3.75 0 0 1 17.5 19Z" /></svg>
           </span>
           <span class="bridge-text">
@@ -92,7 +74,7 @@
           <svg class="bridge-arrow" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6" /></svg>
         </button>
         <button type="button" class="bridge-row" id="btn-go-marketplace">
-          <span class="bridge-icon accent" aria-hidden="true">
+          <span class="bridge-icon blue" aria-hidden="true">
             <svg viewBox="0 0 24 24"><path d="M3 9h18l-1.5 10.5A2 2 0 0 1 17.52 21H6.48a2 2 0 0 1-1.98-1.5L3 9Z" /><path d="M8 9V6a4 4 0 0 1 8 0v3" /></svg>
           </span>
           <span class="bridge-text">
@@ -104,46 +86,41 @@
       </footer>
     </aside>
 
-    <!-- Main Chat Area -->
+    <!-- Right Column: WeChat-Style Clean Chat Workspace -->
     <main class="chat-pane">
       <header class="chat-header">
         <div class="room-meta">
-          <h1 class="room-title" id="room-title">#welcome</h1>
+          <div class="room-title-row">
+            <h1 class="room-title" id="room-title">#welcome</h1>
+            <span class="ws-pill" id="ws-pill" title="实时 WebSocket 连接状态">离线</span>
+          </div>
           <div class="topic-row">
             <p class="room-topic" id="room-topic">本机最小聊天服务 · 支持多 Agent 群聊、1v1 私聊与 @提及唤醒</p>
-            <button type="button" class="ghost-icon-btn subtle" id="btn-edit-topic" title="编辑房间主题" aria-label="编辑房间主题">
+            <button type="button" class="header-icon-btn subtle" id="btn-edit-topic" title="编辑房间主题" aria-label="编辑房间主题">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20h9" /><path d="M16.5 3.5a2.12 2.12 0 1 1 3 3L7 19l-4 1 1-4Z" /></svg>
             </button>
           </div>
         </div>
 
         <div class="header-actions">
-          <div class="search-box">
-            <svg class="search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></svg>
-            <input type="search" id="search-input" class="search-input" placeholder="搜索消息…" autocomplete="off" aria-label="搜索本房间消息" />
-            <kbd class="search-kbd" aria-hidden="true">⌘K</kbd>
-          </div>
-
-          <span class="ws-pill" id="ws-pill" title="实时 WebSocket 连接状态">离线</span>
-
-          <div class="header-divider" aria-hidden="true"></div>
-
-          <button type="button" class="btn btn-ghost btn-sm" id="btn-invite-member" title="邀请成员加入当前房间">
+          <button type="button" class="header-pill-btn" id="btn-invite-member" title="拉入成员">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" /><circle cx="9" cy="7" r="4" /><path d="M19 8v6" /><path d="M16 11h6" /></svg>
             <span>拉入成员</span>
           </button>
-          <button type="button" class="btn btn-ghost btn-sm" id="btn-copy-mcp" title="查看本机 MCP 接入配置与局域网设置">
+          <button type="button" class="header-pill-btn" id="btn-copy-mcp" title="查看本机 MCP 接入配置与局域网设置">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22v-5" /><path d="M9 8V2" /><path d="M15 8V2" /><path d="M18 8v4a6 6 0 0 1-12 0V8Z" /></svg>
             <span>接入 / LAN</span>
           </button>
-
-          <button type="button" class="ghost-icon-btn" id="btn-export-md" title="导出本房间对话为 Markdown" aria-label="导出对话">
+          <button type="button" class="header-icon-btn" id="btn-export-md" title="导出对话为 Markdown" aria-label="导出对话">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><path d="m7 10 5 5 5-5" /><path d="M12 15V3" /></svg>
           </button>
-          <button type="button" class="ghost-icon-btn danger" id="btn-leave-channel" title="退出当前群聊" aria-label="退出群聊" hidden>
+          <button type="button" class="header-icon-btn" id="btn-toggle-theme" title="切换浅色 / 深色模式" aria-label="切换浅色深色主题">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z" /></svg>
+          </button>
+          <button type="button" class="header-icon-btn danger" id="btn-leave-channel" title="退出当前群聊" aria-label="退出群聊" hidden>
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" /><path d="m16 17 5-5-5-5" /><path d="M21 12H9" /></svg>
           </button>
-          <button type="button" class="ghost-icon-btn" id="btn-local-settings" title="本机 Server 设置" aria-label="本机 Server 设置">
+          <button type="button" class="header-icon-btn" id="btn-local-settings" title="本机 Server 设置" aria-label="本机 Server 设置">
             <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.6.85 1 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z" /></svg>
           </button>
         </div>
@@ -151,38 +128,47 @@
 
       <div class="search-banner" id="search-banner" hidden>
         <span id="search-banner-text"></span>
-        <button type="button" class="btn btn-ghost btn-sm" id="btn-clear-search">退出搜索</button>
+        <button type="button" class="btn btn-ghost btn-xs" id="btn-clear-search">退出搜索</button>
       </div>
 
       <div class="member-strip" id="member-strip"></div>
 
       <div class="messages-scroll" id="messages-box"></div>
 
-      <div class="composer-dock">
-        <div class="typing-bar" id="typing-bar" aria-live="polite"></div>
-
+      <!-- WeChat-Style Bottom Composer Panel -->
+      <section class="composer-area">
         <div class="mention-menu" id="mention-menu" hidden></div>
 
-        <div class="composer-shell">
-          <div class="reply-banner" id="reply-banner" hidden>
-            <span id="reply-banner-text"></span>
-            <button type="button" class="ghost-icon-btn compact" id="btn-cancel-reply" title="取消引用" aria-label="取消引用">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg>
+        <div class="reply-banner" id="reply-banner" hidden>
+          <span id="reply-banner-text"></span>
+          <button type="button" class="header-icon-btn compact" id="btn-cancel-reply" title="取消引用" aria-label="取消引用">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg>
+          </button>
+        </div>
+
+        <div class="composer-toolbar">
+          <div class="toolbar-left">
+            <button type="button" class="tool-icon-btn" id="btn-quick-mention" title="插入 @ 提及本机 Agent">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4" /><path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-3.92 7.94" /></svg>
+            </button>
+            <button type="button" class="tool-icon-btn" id="btn-quick-connect" title="查看 MCP 接入命令与局域网地址">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22v-5" /><path d="M9 8V2" /><path d="M15 8V2" /><path d="M18 8v4a6 6 0 0 1-12 0V8Z" /></svg>
+            </button>
+            <button type="button" class="tool-icon-btn" id="btn-quick-export" title="导出对话为 Markdown">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><path d="M14 2v6h6" /><path d="M12 18v-6" /><path d="m9 15 3 3 3-3" /></svg>
             </button>
           </div>
-
-          <footer class="composer">
-            <textarea id="msg-input" rows="1" placeholder="输入消息，键入 @ 提及群内本机 Agent…"></textarea>
-            <div class="composer-footer">
-              <span class="composer-hint"><code>@</code> 提及 Agent · <code>Enter</code> 发送 · <code>Shift+Enter</code> 换行</span>
-              <button type="button" class="btn btn-primary btn-send" id="btn-send" title="发送消息 (Enter)">
-                <span>发送</span>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5" /><path d="m5 12 7-7 7 7" /></svg>
-              </button>
-            </div>
-          </footer>
+          <div class="typing-bar" id="typing-bar" aria-live="polite"></div>
         </div>
-      </div>
+
+        <footer class="composer">
+          <textarea id="msg-input" rows="3" placeholder="输入消息，键入 @ 提及群内 Agent…"></textarea>
+          <div class="composer-footer">
+            <span class="composer-hint">Enter 发送 · Shift+Enter 换行</span>
+            <button type="button" class="btn btn-primary btn-send" id="btn-send">发送</button>
+          </div>
+        </footer>
+      </section>
     </main>
   </div>
 
@@ -225,10 +211,7 @@
     <pre class="code-box" id="mcp-snippet-box"></pre>
     <div class="dialog-actions">
       <button type="button" class="btn btn-ghost" id="btn-close-connect">关闭</button>
-      <button type="button" class="btn btn-primary" id="btn-copy-snippet">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2.2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
-        复制配置命令
-      </button>
+      <button type="button" class="btn btn-primary" id="btn-copy-snippet">复制配置命令</button>
     </div>
   </dialog>
 
@@ -277,10 +260,7 @@
     <div class="dialog-actions">
       <button type="button" class="btn btn-ghost" id="btn-close-registered">完成</button>
       <button type="button" class="btn btn-ghost" id="btn-open-claim" hidden>去 Cloud 认领</button>
-      <button type="button" class="btn btn-primary" id="btn-copy-registered-cmd">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2.2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
-        复制本机 MCP 命令
-      </button>
+      <button type="button" class="btn btn-primary" id="btn-copy-registered-cmd">复制本机 MCP 命令</button>
     </div>
   </dialog>
 
