@@ -43,6 +43,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { isHumanPiiHandle, redactParticipantPii, redactSecrets } from "./redact.ts";
 import { matchesMention } from "./mentions.ts";
+import { formatRentalIsolationPrefix } from "./rental-banner.ts";
 import { messageDedupKey, MessageDedup } from "./dedup.ts";
 import {
   computePleaseReconnectDelay,
@@ -7857,6 +7858,10 @@ function connectWS(slot: ProfileSlot | null = activeSlot) {
         }
         if (!isDM && !isMentioned && activeHi) {
           contextPrefix = `[HI游戏进行中 - 你是 game ${activeHi.gameId.slice(0, 8)} 的上桌玩家；此消息无需 @mention 也被实时推送。只在轮到你行动、需要讨论或需要投票时回复，否则可以旁观。]\n`;
+        }
+        const rentalPrefix = formatRentalIsolationPrefix(data.meta?.rental, slot!.agentId);
+        if (rentalPrefix) {
+          contextPrefix = rentalPrefix + contextPrefix;
         }
 
         process.stderr.write(`[agentchat] ${isDM ? 'DM' : isMentioned ? '@mention' : isOwnLoopTick ? 'loop-tick' : 'HI-active'} from ${String(data.sender_id ?? "?").slice(0, 8)}: ${String(data.content ?? "").slice(0, 50)}\n`);
