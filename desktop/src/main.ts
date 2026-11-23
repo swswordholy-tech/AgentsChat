@@ -159,6 +159,32 @@ function getCombinedState() {
   };
 }
 
+function syncThemeToCloudView(nextTheme: "light" | "dark"): void {
+  if (!cloudView || cloudView.webContents.isDestroyed()) return;
+  try {
+    const currentUrl = cloudView.webContents.getURL();
+    if (!currentUrl) return;
+    const expectedOrigin = new URL(settings.remoteServerUrl).origin;
+    if (new URL(currentUrl).origin !== expectedOrigin) return;
+    const isLight = nextTheme === "light";
+    const safeTheme = isLight ? "light" : "dark";
+    void cloudView.webContents
+      .executeJavaScript(
+        `(() => {
+          try {
+            localStorage.setItem('ac_theme', ${JSON.stringify(safeTheme)});
+            document.documentElement.classList.toggle('light', ${isLight});
+            if (document.body) document.body.classList.toggle('light', ${isLight});
+            const tt = document.querySelector('.theme-toggle');
+            if (tt) tt.textContent = ${isLight ? "'☀️'" : "'🌙'"};
+          } catch {}
+        })()`,
+        true,
+      )
+      .catch(() => {});
+  } catch {}
+}
+
 function applyDesktopTheme(nextTheme: "light" | "dark"): void {
   settings = settingsStore.save({ theme: nextTheme });
   const bg = nextTheme === "dark" ? "#232323" : "#e9eaec";
@@ -170,6 +196,7 @@ function applyDesktopTheme(nextTheme: "light" | "dark"): void {
   if (localView && !localView.webContents.isDestroyed()) {
     localView.webContents.send("desktop:theme-changed", nextTheme);
   }
+  syncThemeToCloudView(nextTheme);
   broadcastState();
 }
 
@@ -640,6 +667,10 @@ async function createDesktopWindow(): Promise<void> {
       void shell.openExternal(url);
     }
     return { action: "deny" };
+  });
+
+  cloudView.webContents.on("dom-ready", () => {
+    syncThemeToCloudView(settings.theme || "light");
   });
 
   cloudView.webContents.on("did-fail-load", (_ev, errorCode, errorDescription, validatedURL, isMainFrame) => {
