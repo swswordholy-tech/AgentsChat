@@ -24,6 +24,44 @@
   let activeSearchQuery = "";
   let replyTarget = null;
   let unreadByChannel = new Map();
+  const draftsByChannel = (() => {
+    const map = new Map();
+    try {
+      const parsed = JSON.parse(sessionStorage.getItem("ac_local_drafts_v1") || "{}");
+      if (parsed && typeof parsed === "object") {
+        Object.entries(parsed).slice(0, 50).forEach(([k, v]) => {
+          if (typeof v === "string" && v.trim()) map.set(k, v.slice(0, 4000));
+        });
+      }
+    } catch {}
+    return map;
+  })();
+  function persistLocalDrafts() {
+    try {
+      const obj = {};
+      let count = 0;
+      for (const [k, v] of draftsByChannel.entries()) {
+        if (count++ >= 50) break;
+        obj[k] = v;
+      }
+      sessionStorage.setItem("ac_local_drafts_v1", JSON.stringify(obj));
+    } catch {}
+  }
+  function saveLocalDraft(channelId, text) {
+    if (!channelId) return;
+    const val = typeof text === "string" ? text.slice(0, 4000) : "";
+    if (val.trim()) draftsByChannel.set(channelId, val);
+    else draftsByChannel.delete(channelId);
+    persistLocalDrafts();
+  }
+  function getLocalDraft(channelId) {
+    return (channelId && draftsByChannel.get(channelId)) || "";
+  }
+  function clearLocalDraft(channelId) {
+    if (!channelId || !draftsByChannel.has(channelId)) return;
+    draftsByChannel.delete(channelId);
+    persistLocalDrafts();
+  }
   let mentionCandidates = [];
   let mentionActiveIdx = 0;
   let ws = null;
@@ -178,6 +216,28 @@
     elToast.hidden = false;
     clearTimeout(showToast._t);
     showToast._t = setTimeout(() => { elToast.hidden = true; }, 2600);
+  }
+
+  async function copyTextToClipboard(text) {
+    const val = String(text ?? "");
+    try {
+      if (bridge?.copyText) {
+        await bridge.copyText(val);
+        return;
+      }
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(val);
+        return;
+      }
+    } catch {}
+    const ta = document.createElement("textarea");
+    ta.value = val;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand("copy"); } catch {}
+    ta.remove();
   }
 
   async function api(path, opts = {}) {
@@ -445,7 +505,16 @@
       }
       const sub = document.createElement("div");
       sub.className = "ch-sub";
-      sub.textContent = ch.topic || (ch.type === "direct" ? "1v1 本机私聊" : "本机多 Agent 群聊");
+      const draftText = ch.id !== currentChannelId ? getLocalDraft(ch.id) : "";
+      if (draftText) {
+        const tag = document.createElement("span");
+        tag.className = "ch-draft-prefix";
+        tag.textContent = "[草稿]";
+        sub.appendChild(tag);
+        sub.appendChild(document.createTextNode(draftText.replace(/\s+/g, " ").slice(0, 48)));
+      } else {
+        sub.textContent = ch.topic || (ch.type === "direct" ? "1v1 本机私聊" : "本机多 Agent 群聊");
+      }
       body.appendChild(top);
       body.appendChild(sub);
 
@@ -565,7 +634,14 @@
   }
 
   async function selectChannel(channelId) {
+    const prevChannelId = currentChannelId;
+    if (prevChannelId && prevChannelId !== channelId && elInput) {
+      saveLocalDraft(prevChannelId, elInput.value);
+    }
     currentChannelId = channelId;
+    if (elInput && prevChannelId !== channelId) {
+      elInput.value = getLocalDraft(channelId);
+    }
     unreadByChannel.delete(channelId);
     activeSearchQuery = "";
     if (elSearchInput) elSearchInput.value = "";
@@ -711,8 +787,14 @@
       copyLbl.textContent = "复制";
       copyBtn.appendChild(copyLbl);
       copyBtn.addEventListener("click", async () => {
-        if (bridge?.copyText) await bridge.copyText(codeText);
-        else await navigator.clipboard?.writeText(codeText);
+        await copyTextToClipboard(codeText);
+        copyLbl.textContent = "✓ 已复制";
+        copyBtn.classList.add("copied");
+        clearTimeout(copyBtn._copyTimer);
+        copyBtn._copyTimer = setTimeout(() => {
+          copyLbl.textContent = "复制";
+          copyBtn.classList.remove("copied");
+        }, 1500);
         showToast("已复制代码块");
       });
       head.appendChild(langEl);
@@ -729,6 +811,43 @@
     }
     if (last < text.length) {
       appendInlineRichText(container, text.slice(last));
+    }
+  }
+
+  function highlightSearchHits(container, rawQuery) {
+    const query = String(rawQuery || "").trim();
+    if (!query || !container) return;
+    const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp(escaped, "gi");
+    const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+    const nodes = [];
+    let current;
+    while ((current = walker.nextNode())) {
+      if (current.parentElement && current.parentElement.closest(".code-block-head")) continue;
+      if (re.test(current.nodeValue || "")) nodes.push(current);
+      re.lastIndex = 0;
+    }
+    for (const node of nodes) {
+      const value = node.nodeValue || "";
+      re.lastIndex = 0;
+      const frag = document.createDocumentFragment();
+      let last = 0;
+      let match;
+      while ((match = re.exec(value)) !== null) {
+        if (match.index > last) {
+          frag.appendChild(document.createTextNode(value.slice(last, match.index)));
+        }
+        const mark = document.createElement("mark");
+        mark.className = "search-hit";
+        mark.textContent = match[0];
+        frag.appendChild(mark);
+        last = match.index + match[0].length;
+        if (match[0].length === 0) break;
+      }
+      if (last < value.length) {
+        frag.appendChild(document.createTextNode(value.slice(last)));
+      }
+      node.parentNode?.replaceChild(frag, node);
     }
   }
 
@@ -842,6 +961,7 @@
       const isSelf = m.sender_id === currentPrincipal?.id;
       const row = document.createElement("div");
       row.className = "wx-msg" + (isSelf ? " self" : "");
+      if (m.id) row.dataset.msgId = m.id;
 
       const av = document.createElement("div");
       av.className = "wx-avatar" + (isSelf ? "" : " clickable");
@@ -878,6 +998,7 @@
       const bubble = document.createElement("div");
       bubble.className = "wx-bubble";
       renderFormattedBody(bubble, m.content);
+      if (activeSearchQuery) highlightSearchHits(bubble, activeSearchQuery);
       bubbleRow.appendChild(bubble);
 
       const actions = document.createElement("div");
@@ -897,9 +1018,7 @@
       btnCopyMsg.title = "复制消息内容";
       btnCopyMsg.appendChild(createSvgIcon("copy"));
       btnCopyMsg.addEventListener("click", async () => {
-        const txt = String(m.content || "");
-        if (bridge?.copyText) await bridge.copyText(txt);
-        else await navigator.clipboard?.writeText(txt);
+        await copyTextToClipboard(String(m.content || ""));
         showToast("已复制消息");
       });
       actions.appendChild(btnCopyMsg);
@@ -961,10 +1080,24 @@
       if (m.in_reply_to) {
         const quoted = msgById.get(m.in_reply_to);
         const quoteEl = document.createElement("div");
-        quoteEl.className = "wx-quote-pill";
+        quoteEl.className = "wx-quote-pill" + (quoted ? " jumpable" : "");
         quoteEl.textContent = quoted
           ? `${quoted.sender_name || quoted.sender_id}: ${(quoted.content || "").slice(0, 80)}`
           : `引用消息 #${String(m.in_reply_to).slice(0, 8)}`;
+        if (quoted) {
+          quoteEl.title = "点击定位到原消息";
+          quoteEl.addEventListener("click", () => {
+            const targetRow = Array.from(elMessages.querySelectorAll(".wx-msg")).find(
+              (el) => el.dataset.msgId === quoted.id,
+            );
+            if (!targetRow) return;
+            targetRow.scrollIntoView({ behavior: "smooth", block: "center" });
+            targetRow.classList.remove("wx-jump-flash");
+            void targetRow.offsetWidth;
+            targetRow.classList.add("wx-jump-flash");
+            setTimeout(() => targetRow.classList.remove("wx-jump-flash"), 1200);
+          });
+        }
         col.appendChild(quoteEl);
       }
 
@@ -998,6 +1131,7 @@
       return;
     }
     elInput.value = "";
+    clearLocalDraft(currentChannelId);
     const payload = { content: text };
     if (replyTarget?.id) payload.in_reply_to = replyTarget.id;
     setReplyTarget(null);
@@ -1060,12 +1194,30 @@
     document.getElementById("btn-export-md")?.click();
   });
 
-  // Global Cmd/Ctrl+K search shortcut
+  // Global shortcuts: Cmd/Ctrl+K search, Alt+Up/Down switch channel, Esc clear search
   window.addEventListener("keydown", (ev) => {
     if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "k") {
       ev.preventDefault();
       elSearchInput?.focus();
       elSearchInput?.select();
+      return;
+    }
+    if (ev.altKey && !ev.metaKey && !ev.ctrlKey && (ev.key === "ArrowUp" || ev.key === "ArrowDown")) {
+      if (channels.length > 1) {
+        ev.preventDefault();
+        const curIdx = channels.findIndex((c) => c.id === currentChannelId);
+        const base = curIdx >= 0 ? curIdx : 0;
+        const delta = ev.key === "ArrowDown" ? 1 : -1;
+        const nextCh = channels[(base + delta + channels.length) % channels.length];
+        if (nextCh && nextCh.id !== currentChannelId) {
+          void selectChannel(nextCh.id);
+        }
+      }
+      return;
+    }
+    if (ev.key === "Escape" && activeSearchQuery) {
+      ev.preventDefault();
+      document.getElementById("btn-clear-search")?.click();
     }
   });
 
@@ -1493,6 +1645,7 @@
 
   let lastTypingSentAt = 0;
   elInput.addEventListener("input", () => {
+    saveLocalDraft(currentChannelId, elInput.value);
     updateMentionMenu();
     const now = Date.now();
     if (ws && ws.readyState === WebSocket.OPEN && elInput.value.trim() && now - lastTypingSentAt > 2500) {
