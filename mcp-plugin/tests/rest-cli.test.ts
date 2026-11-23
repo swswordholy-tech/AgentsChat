@@ -13,6 +13,7 @@ import {
   acquireWakePidFile,
   advanceChannelReadCursor,
   clampTimerMs,
+  computeSseRetryDelayMs,
   CURSOR_INIT_KEY,
   CURSOR_LAST_ACTIVE_KEY,
   CURSOR_MAX_IDLE_KEY,
@@ -23,6 +24,7 @@ import {
   loadSeenIds,
   MAX_TIMER_MS,
   parseMaxIdleMs,
+  parseRetryAfterMs,
   releaseWakePidFile,
   sendRestMessage,
   validateSafeRestBaseUrl,
@@ -907,6 +909,107 @@ describe("rest-cli (--join, --send, --wake-once) & unified per-channel cursor", 
       });
       expect(acquired).toBe(false);
       expect(readFileSync(victimPath, "utf8")).toBe("untouched");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("parseRetryAfterMs and computeSseRetryDelayMs compute capped exponential backoff with jitter and Retry-After", () => {
+    const now = Date.UTC(2026, 10, 24, 0, 0, 0);
+    expect(parseRetryAfterMs("5", now)).toBe(5_000);
+    expect(parseRetryAfterMs("999", now)).toBe(30_000);
+    expect(parseRetryAfterMs(new Date(now + 12_000).toUTCString(), now)).toBe(12_000);
+    expect(parseRetryAfterMs(new Date(now - 5_000).toUTCString(), now)).toBe(0);
+    expect(parseRetryAfterMs("", now)).toBeNull();
+    expect(parseRetryAfterMs("not-a-date", now)).toBeNull();
+
+    const deterministic = [0, 1, 2, 3, 4, 5].map((attempt) =>
+      computeSseRetryDelayMs(attempt, { random: () => 0.5 }),
+    );
+    expect(deterministic).toEqual([2_000, 4_000, 8_000, 16_000, 30_000, 30_000]);
+
+    expect(computeSseRetryDelayMs(0, { retryAfterHeader: "5", random: () => 0.5 })).toBe(5_000);
+    expect(computeSseRetryDelayMs(0, { random: () => 0 })).toBe(1_600);
+    expect(computeSseRetryDelayMs(0, { random: () => 1 })).toBe(2_400);
+    expect(computeSseRetryDelayMs(4, { random: () => 1 })).toBe(30_000);
+  });
+
+  test("wakeOnce backs off exponentially on 429 and immediate-EOF 200 SSE streams without hammering and aborts cleanly on wake", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "rest-cli-sse-backoff-"));
+    try {
+      const streamTimestamps: number[] = [];
+      let streamCalls = 0;
+
+      const wakeEv = await wakeOnce({
+        restUrl: "https://agents-chat.com",
+        configDir: dir,
+        agentId: "bot-backoff",
+        token: "ac_test_token_backoff",
+        pollIntervalMs: 5_000,
+        sseRetryBaseMs: 30,
+        sseRetryMaxMs: 240,
+        nowIso: () => "2026-11-24T00:00:00.000Z",
+        fetchImpl: (async (url: any) => {
+          const u = String(url);
+          if (u.endsWith("/api/channels/mine")) {
+            return Response.json({
+              channels: [{ id: "dm-backoff", last_message_at: "2026-11-24T00:00:00.000Z" }],
+            });
+          }
+          if (u.includes("/api/channels/dm-backoff/messages")) {
+            return Response.json({ messages: [] });
+          }
+          if (u.endsWith("/api/channels/dm-backoff/stream")) {
+            streamCalls++;
+            streamTimestamps.push(Date.now());
+            if (streamCalls <= 2) {
+              return new Response(JSON.stringify({ error: "Too many concurrent streams" }), {
+                status: 429,
+                headers: streamCalls === 1 ? { "Retry-After": "0.06" } : {},
+              });
+            }
+            if (streamCalls === 3) {
+              // Immediate-EOF 200 stream must still trigger backoff before the 4th connect attempt.
+              return new Response(
+                new ReadableStream({
+                  start(c) {
+                    c.enqueue(new TextEncoder().encode(": connected\n\n"));
+                    c.close();
+                  },
+                }),
+                { status: 200, headers: { "Content-Type": "text/event-stream" } },
+              );
+            }
+            // 4th attempt delivers an actionable message right away.
+            return new Response(
+              new ReadableStream({
+                start(c) {
+                  c.enqueue(
+                    new TextEncoder().encode(
+                      `data: ${JSON.stringify({
+                        id: "msg-wake-after-backoff",
+                        channel_id: "dm-backoff",
+                        sender_id: "owner",
+                        content: "ping after backoff",
+                        timestamp: "2026-11-24T00:00:01.000Z",
+                      })}\n\n`,
+                    ),
+                  );
+                },
+              }),
+              { status: 200, headers: { "Content-Type": "text/event-stream" } },
+            );
+          }
+          return Response.json({ messages: [] });
+        }) as any,
+      });
+
+      expect(wakeEv.event).toBe("agentschat_wake");
+      expect(wakeEv.message_id).toBe("msg-wake-after-backoff");
+      expect(streamCalls).toBe(4);
+      // 1->2 waited at least Retry-After (~60ms); 2->3 waited attempt=1 (~48-72ms); 3->4 (immediate EOF) waited attempt=2 (~96-144ms)
+      expect(streamTimestamps[1]! - streamTimestamps[0]!).toBeGreaterThanOrEqual(45);
+      expect(streamTimestamps[3]! - streamTimestamps[2]!).toBeGreaterThanOrEqual(75);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -67,6 +67,55 @@ export function parseMaxIdleMs(raw: string | number | undefined): number | undef
   return Number.isFinite(ms) && ms <= Number.MAX_SAFE_INTEGER ? ms : undefined;
 }
 const MAX_SSE_STREAMS = 3;
+export const SSE_RETRY_BASE_MS = 2_000;
+export const SSE_RETRY_MAX_MS = 30_000;
+
+/** Parse an HTTP Retry-After header (delay-seconds or HTTP-date) clamped to [0, maxMs]. */
+export function parseRetryAfterMs(
+  headerValue: string | null | undefined,
+  nowMs = Date.now(),
+  maxMs = SSE_RETRY_MAX_MS,
+): number | null {
+  if (typeof headerValue !== "string") return null;
+  const trimmed = headerValue.trim();
+  if (!trimmed) return null;
+  const cap = Math.max(0, Math.floor(maxMs));
+  if (/^\d+(?:\.\d+)?$/.test(trimmed)) {
+    const sec = Number(trimmed);
+    if (!Number.isFinite(sec) || sec < 0) return null;
+    return Math.min(cap, Math.round(sec * 1000));
+  }
+  const parsedDate = Date.parse(trimmed);
+  if (!Number.isFinite(parsedDate)) return null;
+  return Math.min(cap, Math.max(0, Math.round(parsedDate - nowMs)));
+}
+
+/** Compute capped exponential backoff with +/-20% jitter, honoring Retry-After when larger. */
+export function computeSseRetryDelayMs(
+  attempt: number,
+  opts?: {
+    retryAfterHeader?: string | null;
+    baseMs?: number;
+    maxMs?: number;
+    random?: () => number;
+    nowMs?: number;
+  },
+): number {
+  const rawMax = opts?.maxMs ?? SSE_RETRY_MAX_MS;
+  const maxMs = Number.isFinite(rawMax) && rawMax >= 10 ? Math.floor(rawMax) : SSE_RETRY_MAX_MS;
+  const rawBase = opts?.baseMs ?? SSE_RETRY_BASE_MS;
+  const baseMs =
+    Number.isFinite(rawBase) && rawBase >= 10 ? Math.min(maxMs, Math.floor(rawBase)) : Math.min(maxMs, SSE_RETRY_BASE_MS);
+  const safeAttempt = Number.isFinite(attempt) && attempt > 0 ? Math.min(20, Math.floor(attempt)) : 0;
+  const exp = Math.min(maxMs, baseMs * (2 ** safeAttempt));
+  const randFn = opts?.random ?? Math.random;
+  const r = Math.min(1, Math.max(0, randFn()));
+  const jitterFactor = 0.8 + r * 0.4;
+  const jittered = Math.round(exp * jitterFactor);
+  const retryAfterMs = parseRetryAfterMs(opts?.retryAfterHeader, opts?.nowMs, maxMs);
+  const delay = retryAfterMs !== null ? Math.max(jittered, retryAfterMs) : jittered;
+  return Math.min(maxMs, Math.max(10, delay));
+}
 const MAX_SSE_LINE_CHARS = 512 * 1024;
 const MAX_SEEN_IDS = 200;
 const DEFAULT_HTTP_TIMEOUT_MS = 15_000;
@@ -784,6 +833,8 @@ export async function wakeOnce(opts: {
   maxIdleMs?: number;
   pollIntervalMs?: number;
   enableSse?: boolean;
+  sseRetryBaseMs?: number;
+  sseRetryMaxMs?: number;
   nowIso?: () => string;
   fetchImpl?: typeof fetch;
   warn?: Warn;
@@ -803,6 +854,8 @@ export async function wakeOnce(opts: {
   const requestTimeoutMs = clampTimerMs(opts.requestTimeoutMs, DEFAULT_HTTP_TIMEOUT_MS, 0);
   const pollIntervalMs = clampTimerMs(opts.pollIntervalMs, 15_000, 10);
   const enableSse = opts.enableSse ?? true;
+  const sseRetryMaxMs = clampTimerMs(opts.sseRetryMaxMs, SSE_RETRY_MAX_MS, 10);
+  const sseRetryBaseMs = Math.min(sseRetryMaxMs, clampTimerMs(opts.sseRetryBaseMs, SSE_RETRY_BASE_MS, 10));
 
   ensureRealDirectory(configDir);
   const safeSlug = safeAgentCursorSlug(agentId);
@@ -1108,7 +1161,21 @@ export async function wakeOnce(opts: {
       if (activeSseChannels.has(channelId) || activeSseChannels.size >= MAX_SSE_STREAMS) return;
       activeSseChannels.add(channelId);
       void (async () => {
-        while (!resolved) {
+        let retryAttempt = 0;
+        const scheduleBackoff = async (retryAfterHeader?: string | null) => {
+          sseConnectedChannels.delete(channelId);
+          if (resolved || abortCtrl.signal.aborted) return false;
+          const delayMs = computeSseRetryDelayMs(retryAttempt, {
+            retryAfterHeader,
+            baseMs: sseRetryBaseMs,
+            maxMs: sseRetryMaxMs,
+          });
+          retryAttempt = Math.min(retryAttempt + 1, 10);
+          await sleepAbortable(delayMs, abortCtrl.signal);
+          return !resolved && !abortCtrl.signal.aborted;
+        };
+        while (!resolved && !abortCtrl.signal.aborted) {
+          let openedAt = 0;
           try {
             const res = await f(
               `${baseUrl}/api/channels/${encodeURIComponent(channelId)}/stream`,
@@ -1119,17 +1186,17 @@ export async function wakeOnce(opts: {
               },
             );
             if (!res.ok || !res.body) {
+              const retryAfterHeader = res.headers?.get?.("retry-after");
               try {
                 await res.body?.cancel();
               } catch {}
               if (res.status === 429 || res.status >= 500) {
-                sseConnectedChannels.delete(channelId);
-                if (resolved) return;
-                await sleepAbortable(2000, abortCtrl.signal);
+                if (!(await scheduleBackoff(retryAfterHeader))) return;
                 continue;
               }
               break;
             }
+            openedAt = Date.now();
             sseConnectedChannels.add(channelId);
             const reader = res.body.getReader();
             const onAbortCancel = () => {
@@ -1190,10 +1257,10 @@ export async function wakeOnce(opts: {
                 reader.releaseLock();
               } catch {}
             }
+            if (Date.now() - openedAt >= 5_000) retryAttempt = 0;
+            if (!(await scheduleBackoff())) return;
           } catch {
-            sseConnectedChannels.delete(channelId);
-            if (resolved) return;
-            await sleepAbortable(2000, abortCtrl.signal);
+            if (!(await scheduleBackoff())) return;
           }
         }
         sseConnectedChannels.delete(channelId);
