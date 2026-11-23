@@ -888,7 +888,8 @@ test("identity clients render null/non-object binds and malformed profiles witho
       }
     }
     const tree = renderIdentityChip(file, { binds: {}, profiles: [null, false, 7, { name: "missing" }, { name: "numeric", agentId: 42 }, { name: "null", agentId: null }] }, "session-ok");
-    expect(identityElements(tree).filter((el) => el.type === "button")).toHaveLength(5);
+    // 1 chip button + 3 valid profile rows + 1 agent self-naming create button + 1 manual custom-name create button
+    expect(identityElements(tree).filter((el) => el.type === "button")).toHaveLength(6);
   }
 });
 
@@ -1296,6 +1297,119 @@ test("wake validates the fallback WebSocket URL when the primary identity config
       expect((await postWake("m-arch", "session-archived")).status).toBe(200);
       expect(delivered.map((d) => d.sessionId)).toEqual(["session-cold"]);
     } finally {
+      stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("DSH identity/create delegates self-naming to live agent and uses readable sequential fallbacks (no DSH_<hex>)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dsh-selfname-"));
+    let stop = () => {};
+    const followups: any[] = [];
+    const steered: any[] = [];
+    const realFetch = globalThis.fetch;
+    let regSeq = 0;
+    const reqSpy = spyOn(globalThis, "fetch").mockImplementation(((input: any, init: any) => {
+      if (String(input).endsWith("/api/account/register")) {
+        regSeq += 1;
+        return Promise.resolve(
+          Response.json({
+            agentId: `readable-dsh-bot-${regSeq}`,
+            token: `ac_test_token_${regSeq}`,
+          }),
+        );
+      }
+      return realFetch(input, init);
+    }) as typeof fetch);
+    try {
+      const liveList: any[] = [
+        {
+          id: "session-idle-1",
+          status: "idle",
+          session: { id: "session-idle-1" },
+          followup(msg: any) {
+            followups.push(msg);
+          },
+        },
+        {
+          id: "session-busy-1",
+          status: "running",
+          session: { id: "session-busy-1" },
+          steer(msg: any) {
+            steered.push(msg);
+          },
+        },
+      ];
+      const base = await new Promise<string>((ready) => {
+        applyInboundBridge(
+          {
+            get(name: string) {
+              if (name === "agents") return { list: () => liveList };
+              if (name === "sessions") return { flush: async () => ({ ok: true }) };
+              return undefined;
+            },
+            effect(fn: () => () => void) {
+              stop = fn();
+            },
+          },
+          {
+            port: 0,
+            mcpBin: "",
+            apiUrl: "https://example.com",
+            agentschatDir: dir,
+            logPath: join(dir, "bridge.log"),
+            onListening({ port }: { port: number }) {
+              ready(`http://127.0.0.1:${port}`);
+            },
+          },
+        );
+      });
+
+      // 1. delegateToAgent on idle live session injects self-naming prompt via followup (0 instant register calls)
+      const idleRes = await postJson(base, "/identity/create", {
+        sessionId: "session-idle-1",
+        delegateToAgent: true,
+      });
+      expect(idleRes.status).toBe(200);
+      const idleBody = (await idleRes.json()) as any;
+      expect(idleBody.ok).toBe(true);
+      expect(idleBody.delegated).toBe(true);
+      expect(followups).toHaveLength(1);
+      expect(followups[0].content[0].text).toContain("connect_profile");
+      expect(regSeq).toBe(0);
+
+      // 2. delegateToAgent on busy live session injects self-naming prompt via steer
+      const busyRes = await postJson(base, "/identity/create", {
+        sessionId: "session-busy-1",
+        delegateToAgent: true,
+      });
+      expect(busyRes.status).toBe(200);
+      expect(((await busyRes.json()) as any).delegated).toBe(true);
+      expect(steered).toHaveLength(1);
+      expect(steered[0].content[0].text).toContain("connect_profile");
+
+      // 3. Fallback (no live agent or omitted name) produces readable DSH-1, DSH-2 (NEVER DSH_<6hex>!)
+      const fb1 = await postJson(base, "/identity/create", {
+        sessionId: "session-c5a9d6-cold",
+        delegateToAgent: true,
+      });
+      expect(fb1.status).toBe(200);
+      const fb1Body = (await fb1.json()) as any;
+      expect(fb1Body.delegated).toBeUndefined();
+      expect(fb1Body.profile.name).toBe("DSH-1");
+      expect(fb1Body.profile.displayName).toBe("DSH-1");
+
+      // 4. Non-ASCII display name preserves Chinese displayName and uses readable sequential ASCII profile slug DSH-2
+      const zhRes = await postJson(base, "/identity/create", {
+        sessionId: "session-deadbeef",
+        name: "星河架构师",
+      });
+      expect(zhRes.status).toBe(200);
+      const zhBody = (await zhRes.json()) as any;
+      expect(zhBody.profile.displayName).toBe("星河架构师");
+      expect(zhBody.profile.name).toBe("DSH-2");
+    } finally {
+      reqSpy.mockRestore();
       stop();
       rmSync(dir, { recursive: true, force: true });
     }

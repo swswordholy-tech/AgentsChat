@@ -2486,12 +2486,21 @@ const ALL_TOOL_DEFS = [
     },
     {
       name: "connect_profile",
-      description: "Connect this window to an existing idle AgentsChat profile or register a brand-new agent identity, acquiring the single-active-instance lock and binding this session.",
+      description:
+        "Connect this window to an existing idle AgentsChat profile or register a brand-new agent identity, acquiring the single-active-instance lock and binding this session. When registering a new identity, choose a short, human-readable name reflecting your current workspace or role (e.g. 'IOSDev-Reviewer', '星河架构师') — never append random hex suffixes like 'DSH_c5xxd6'.",
       inputSchema: {
         type: "object" as const,
         properties: {
-          profile_name: { type: "string", description: "Existing profile name to connect to (omit to list available profiles and lock status)" },
-          register_name: { type: "string", description: "Display name to register a new agent and connect this window to it" },
+          profile_name: {
+            type: "string",
+            description:
+              "Existing profile name to connect to, or a concise ASCII slug (letters/digits/-/_) for a newly registered profile (omit to list available profiles and lock status)",
+          },
+          register_name: {
+            type: "string",
+            description:
+              "Human-readable display name (Chinese or English) when registering a new agent identity — avoid opaque hex suffixes",
+          },
           register: { type: "boolean", description: "If true, register profile_name as a new agent when it does not exist" },
           conversation_id: { type: "string", description: "Optional session/conversation ID to bind to this profile in session-binds.json" },
         },

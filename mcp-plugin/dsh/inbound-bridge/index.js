@@ -1004,16 +1004,57 @@ export function apply(ctx, config = {}) {
           return;
         }
         const sessionId = rawSessionId;
-        const rawName = typeof body?.name === 'string' && body.name.trim()
+        const explicitName = typeof body?.name === 'string'
           ? body.name.trim().replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, '').slice(0, 48)
-          : `DSH_${sessionId ? sessionId.replace(/^session-/, '').slice(0, 6) : randomBytes(3).toString('hex')}`;
-        const sanitizedBase = rawName.replace(/[^a-zA-Z0-9_-]/g, '_').replace(/^_+|_+$/g, '');
-        const baseName =
-          isSafeKey(sanitizedBase) && !RESERVED_PROFILE_SIDECARS.has(sanitizedBase.toLowerCase())
-            ? sanitizedBase
-            : `DSH_${randomBytes(3).toString('hex')}`;
-        let profileName = baseName;
-        let suffix = 2;
+          : '';
+        // When the user clicks "让 Agent 自己取名并绑定" (delegateToAgent: true) without a manual name,
+        // ask the live DSH session agent to choose a human-readable name from its current workspace/role
+        // and call `connect_profile(..., register: true)` itself. Falls back to readable sequential naming
+        // if no live agent is attached to this session yet.
+        if (body?.delegateToAgent === true && sessionId && !explicitName) {
+          const target = await resolveBoundTargetAgent(sessionId);
+          if (target !== undefined) {
+            const selfNamingPrompt =
+              '[AgentsChat] 用户点击了「新建并绑定身份」，请你根据当前工作区、项目或对话角色，为自己取一个简短可读的中文或英文名字' +
+              '（例如 `IOSDev-Reviewer`、`星河架构师`，禁止使用 `DSH_c5xxd6` 这类随机十六进制后缀），' +
+              '然后调用 MCP 工具 `connect_profile`（传入可读的英文/数字/`-`/`_` `profile_name`、`register_name` 和 `register: true`）' +
+              '完成注册并自动绑定到当前 DSH 会话。完成后简短告知用户你取的名字即可。';
+            const message = {
+              id: randomUUID(),
+              role: 'user',
+              content: [{ type: 'text', text: selfNamingPrompt }],
+              source: { kind: SOURCE_KIND },
+            };
+            let delivered = false;
+            try {
+              if (target.status !== 'idle' && typeof target.steer === 'function') {
+                target.steer(message);
+                delivered = true;
+              } else if (typeof target.followup === 'function') {
+                target.followup(message);
+                delivered = true;
+                try {
+                  const sessions = ctx.get('sessions');
+                  if (sessions && target.session) {
+                    await settleWithin(sessions.flush(target.session), flushTimeoutMs);
+                  }
+                } catch {}
+              }
+            } catch (error) {
+              log(`identity self-naming delegation failed for ${sessionId}: ${error?.message ?? error}`);
+            }
+            if (delivered) {
+              log(`identity creation delegated to agent=${sessionId} for self-naming`);
+              sendJson(
+                res,
+                200,
+                { ok: true, delegated: true, profiles: listProfiles(), binds: readBinds() },
+                corsHeaders,
+              );
+              return;
+            }
+          }
+        }
         try {
           checkParentDirectory(join(profilesDir, 'placeholder'));
         } catch {
@@ -1021,6 +1062,26 @@ export function apply(ctx, config = {}) {
           return;
         }
         mkdirSync(profilesDir, { recursive: true, mode: 0o700 });
+        const nextReadableDshName = () => {
+          let idx = 1;
+          while (
+            existsSync(join(profilesDir, `DSH-${idx}.json`)) ||
+            existsSync(join(agentschatDir, `DSH-${idx}.json`)) ||
+            existsSync(join(profilesDir, `DSH_${idx}.json`)) ||
+            existsSync(join(agentschatDir, `DSH_${idx}.json`))
+          ) {
+            idx += 1;
+          }
+          return `DSH-${idx}`;
+        };
+        const rawName = explicitName || nextReadableDshName();
+        const sanitizedBase = rawName.replace(/[^a-zA-Z0-9_-]/g, '_').replace(/^_+|_+$/g, '');
+        const baseName =
+          isSafeKey(sanitizedBase) && !RESERVED_PROFILE_SIDECARS.has(sanitizedBase.toLowerCase())
+            ? sanitizedBase
+            : nextReadableDshName();
+        let profileName = baseName;
+        let suffix = 2;
         while (existsSync(join(profilesDir, `${profileName}.json`)) || existsSync(join(agentschatDir, `${profileName}.json`))) {
           profileName = `${baseName}_${suffix++}`;
         }

@@ -86,18 +86,38 @@ window.__ModuleLoader__.load({
       const [open, setOpen] = React.useState(false);
       const [error, setError] = React.useState('');
       const [busy, setBusy] = React.useState(false);
+      const [customName, setCustomName] = React.useState('');
+      const [pendingHint, setPendingHint] = React.useState('');
 
       const refresh = React.useCallback(async () => {
         if (!sessionId) return;
         try {
           const res = await fetch(API, { cache: 'no-store' });
           if (!res.ok) throw new Error('HTTP ' + res.status);
-          setData(await res.json());
+          const next = await res.json();
+          setData(next);
           setError('');
+          if (next && next.binds && Object.prototype.hasOwnProperty.call(next.binds, sessionId)) {
+            setPendingHint('');
+          }
         } catch {
           setError('bridge 未响应');
         }
       }, [sessionId]);
+
+      React.useEffect(() => {
+        if (!pendingHint) return;
+        let ticks = 0;
+        const timer = setInterval(() => {
+          ticks += 1;
+          void refresh();
+          if (ticks >= 12) {
+            clearInterval(timer);
+            setPendingHint('');
+          }
+        }, 2000);
+        return () => clearInterval(timer);
+      }, [pendingHint, refresh]);
 
       React.useEffect(() => {
         void refresh();
@@ -124,11 +144,13 @@ window.__ModuleLoader__.load({
           if (!res.ok || body.ok !== true) throw new Error(body.error || 'HTTP ' + res.status);
           setError('');
           setOpen(false);
+          setCustomName('');
           setData((prev) => ({
             ...(prev || { profiles: [] }),
             ...(Array.isArray(body.profiles) ? { profiles: body.profiles } : {}),
             binds: body.binds,
           }));
+          setPendingHint(body.delegated === true ? '正在让 Agent 自己取名…' : '');
         } catch (e) {
           setError(String((e && e.message) || e));
         } finally {
@@ -138,11 +160,13 @@ window.__ModuleLoader__.load({
 
       const label = profile
         ? profile.displayName || profile.agentId
-        : error
-          ? error
-          : sessionId
-            ? '未绑定身份'
-            : '无会话';
+        : pendingHint
+          ? pendingHint
+          : error
+            ? error
+            : sessionId
+              ? '未绑定身份'
+              : '无会话';
 
       return h(
         'div',
@@ -198,19 +222,85 @@ window.__ModuleLoader__.load({
               ),
               sessionId
                 ? h(
-                    'button',
+                    'div',
                     {
-                      type: 'button',
                       style: {
-                        ...rowStyle,
-                        marginTop: '2px',
-                        color: 'var(--dsw-alias-state-business-primary)',
+                        marginTop: '4px',
+                        paddingTop: '4px',
+                        borderTop: '0.5px solid var(--dsw-alias-border-l1)',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '4px',
                       },
-                      disabled: busy,
-                      onClick: () => void call('/create', { sessionId }),
                     },
-                    h('span', { style: { fontSize: '13px', lineHeight: 1 } }, '+'),
-                    h('span', null, busy ? '正在创建身份…' : '新建并绑定身份'),
+                    h(
+                      'button',
+                      {
+                        type: 'button',
+                        style: {
+                          ...rowStyle,
+                          color: 'var(--dsw-alias-state-business-primary)',
+                        },
+                        disabled: busy,
+                        onClick: () => void call('/create', { sessionId, delegateToAgent: true }),
+                      },
+                      h('span', { style: { fontSize: '13px', lineHeight: 1 } }, '✨'),
+                      h('span', null, busy ? '正在请求 Agent 取名…' : '让 Agent 自己取名并绑定'),
+                    ),
+                    h(
+                      'div',
+                      { style: { display: 'flex', alignItems: 'center', gap: '4px', padding: '0 4px 2px' } },
+                      h('input', {
+                        type: 'text',
+                        value: typeof customName === 'string' ? customName : '',
+                        maxLength: 48,
+                        placeholder: '或手动输入名字…',
+                        disabled: busy,
+                        style: {
+                          flex: '1',
+                          minWidth: 0,
+                          height: '24px',
+                          padding: '0 6px',
+                          borderRadius: 'var(--dsw-radius-sm)',
+                          border: '0.5px solid var(--dsw-alias-border-l1)',
+                          background: 'transparent',
+                          color: 'var(--dsw-alias-label-primary)',
+                          fontSize: '11.5px',
+                          outline: 'none',
+                        },
+                        onChange: (ev) => setCustomName(ev.target.value),
+                        onKeyDown: (ev) => {
+                          const trimmed = typeof customName === 'string' ? customName.trim() : '';
+                          if (ev.key === 'Enter' && trimmed && !busy) {
+                            ev.preventDefault();
+                            void call('/create', { sessionId, name: trimmed });
+                          }
+                        },
+                      }),
+                      h(
+                        'button',
+                        {
+                          type: 'button',
+                          style: {
+                            height: '24px',
+                            padding: '0 8px',
+                            borderRadius: 'var(--dsw-radius-sm)',
+                            border: '0.5px solid var(--dsw-alias-border-l1)',
+                            background: 'transparent',
+                            color: 'var(--dsw-alias-label-primary)',
+                            fontSize: '11.5px',
+                            cursor: typeof customName === 'string' && customName.trim() && !busy ? 'pointer' : 'default',
+                            opacity: typeof customName === 'string' && customName.trim() && !busy ? 1 : 0.45,
+                          },
+                          disabled: busy || !(typeof customName === 'string' && customName.trim()),
+                          onClick: () => {
+                            const trimmed = typeof customName === 'string' ? customName.trim() : '';
+                            if (trimmed) void call('/create', { sessionId, name: trimmed });
+                          },
+                        },
+                        '创建',
+                      ),
+                    ),
                   )
                 : null,
               profile
