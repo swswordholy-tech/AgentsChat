@@ -22,6 +22,23 @@
       --ease: cubic-bezier(0.16, 1, 0.3, 1);
     }
 
+    body.dark {
+      --rail-bg: #232323;
+      --rail-border: #2e2e2e;
+      --btn-hover: rgba(255, 255, 255, 0.08);
+      --btn-active: #323232;
+      --btn-active-shadow: 0 1px 4px rgba(0, 0, 0, 0.32), 0 0 0 1px rgba(255, 255, 255, 0.06);
+      --ink-primary: #ededed;
+      --ink-secondary: #9c9c9c;
+      --ink-muted: #727272;
+      --wechat-green-soft: rgba(7, 193, 96, 0.18);
+      --sep: rgba(255, 255, 255, 0.08);
+    }
+    body.dark .node-btn.active .node-lbl { color: #ffffff; }
+    body.dark .node-btn.active .dot { box-shadow: 0 0 0 2px #323232; }
+    body.dark .badge.live { color: #38d97c; }
+    body.dark .lan-chip { color: #38d97c; }
+
     * { box-sizing: border-box; user-select: none; }
     [hidden] { display: none !important; }
     html, body {
@@ -273,6 +290,15 @@
       <div class="rail-sep" aria-hidden="true"></div>
       <span class="lan-chip" id="lan-chip" title="局域网接入已开启 (0.0.0.0)" hidden>LAN</span>
       <span class="badge" id="local-port-badge" title="本机 Server 监听端口">:8787</span>
+      <button class="mini-btn" id="btn-shell-theme" type="button" title="切换浅色 / 深色模式 (⌘⇧D)" aria-label="切换浅色深色模式">
+        <svg id="icon-moon" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z" />
+        </svg>
+        <svg id="icon-sun" viewBox="0 0 24 24" aria-hidden="true" hidden>
+          <circle cx="12" cy="12" r="4" />
+          <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41" />
+        </svg>
+      </button>
       <button class="mini-btn" id="btn-copy-url" type="button" title="复制本机 MCP 接入命令" aria-label="复制本机 MCP 命令">
         <svg id="icon-copy" viewBox="0 0 24 24" aria-hidden="true">
           <rect x="9" y="9" width="11" height="11" rx="2.2" />
@@ -303,6 +329,9 @@
     const btnCopyUrl = document.getElementById("btn-copy-url");
     const iconCopy = document.getElementById("icon-copy");
     const iconCheck = document.getElementById("icon-check");
+    const btnShellTheme = document.getElementById("btn-shell-theme");
+    const iconMoon = document.getElementById("icon-moon");
+    const iconSun = document.getElementById("icon-sun");
     const btnPower = document.getElementById("btn-power");
 
     let latestState = null;
@@ -312,6 +341,12 @@
       if (!state) return;
       latestState = state;
       if (state.platform === "darwin") rail.classList.add("mac");
+      const isDark = state.settings?.theme === "dark";
+      document.body.classList.toggle("dark", isDark);
+      if (iconMoon && iconSun) {
+        iconMoon.toggleAttribute("hidden", isDark);
+        iconSun.toggleAttribute("hidden", !isDark);
+      }
       const active = state.settings?.activeWorkspace || "cloud";
       btnCloud.classList.toggle("active", active === "cloud");
       btnLocal.classList.toggle("active", active === "local");
@@ -334,6 +369,14 @@
 
     btnCloud.addEventListener("click", () => api?.switchWorkspace("cloud"));
     btnLocal.addEventListener("click", () => api?.switchWorkspace("local"));
+    btnShellTheme?.addEventListener("click", () => {
+      const next = document.body.classList.contains("dark") ? "light" : "dark";
+      const isDark = next === "dark";
+      document.body.classList.toggle("dark", isDark);
+      iconMoon?.toggleAttribute("hidden", isDark);
+      iconSun?.toggleAttribute("hidden", !isDark);
+      api?.setTheme?.(next);
+    });
     btnPower.addEventListener("click", () => {
       const next = !(latestState?.settings?.localServerEnabled !== false);
       api?.toggleLocalServer(next);
@@ -342,13 +385,13 @@
       const url = latestState?.localServer?.httpUrl || "http://127.0.0.1:8787";
       await api?.copyText(`npx -y agentschat-mcp@latest --url ${url}`);
       btnCopyUrl.classList.add("copied");
-      iconCopy.hidden = true;
-      iconCheck.hidden = false;
+      iconCopy.toggleAttribute("hidden", true);
+      iconCheck.toggleAttribute("hidden", false);
       clearTimeout(copyTimer);
       copyTimer = setTimeout(() => {
         btnCopyUrl.classList.remove("copied");
-        iconCopy.hidden = false;
-        iconCheck.hidden = true;
+        iconCopy.toggleAttribute("hidden", false);
+        iconCheck.toggleAttribute("hidden", true);
       }, 1400);
     });
 

@@ -6,12 +6,18 @@ contextBridge.exposeInMainWorld("agentschatLocalBridge", {
   platform: process.platform,
   getBootstrapSession: () => ipcRenderer.invoke("desktop:get-local-bootstrap"),
   getServerStatus: () => ipcRenderer.invoke("desktop:get-local-server-status"),
+  setTheme: (theme) => ipcRenderer.invoke("desktop:set-theme", theme),
   toggleAllowLan: (allowLan) => ipcRenderer.invoke("desktop:toggle-allow-lan", Boolean(allowLan)),
   updateLocalSettings: (patch) => ipcRenderer.invoke("desktop:update-local-settings", patch),
   registerLocalAgent: (req) => ipcRenderer.invoke("desktop:register-local-agent", req),
   activateDiscoveredProfile: (profileName) => ipcRenderer.invoke("desktop:activate-local-profile", profileName),
   switchToCloud: (targetPath) => ipcRenderer.invoke("desktop:open-cloud-path", targetPath || "/"),
   copyText: (text) => ipcRenderer.invoke("desktop:copy-text", text),
+  onThemeChanged: (cb) => {
+    const handler = (_ev, theme) => cb(theme);
+    ipcRenderer.on("desktop:theme-changed", handler);
+    return () => ipcRenderer.removeListener("desktop:theme-changed", handler);
+  },
   onWorkspaceActivated: (cb) => {
     const handler = () => cb();
     ipcRenderer.on("desktop:workspace-activated", handler);

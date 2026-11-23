@@ -809,6 +809,14 @@ body.dark .search-banner { color: #5ce695; }
 
 /* ── WeChat Iconic Bubble Message Stream ─────────────────────────────────── */
 
+.messages-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
 .messages-scroll {
   flex: 1;
   min-height: 0;
@@ -817,6 +825,40 @@ body.dark .search-banner { color: #5ce695; }
   display: flex;
   flex-direction: column;
   gap: 14px;
+}
+
+.scroll-bottom-pill {
+  position: absolute;
+  right: 22px;
+  bottom: 14px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-surface);
+  color: var(--green);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: var(--shadow-popover);
+  z-index: 15;
+  transition: transform 120ms ease, background-color 120ms ease;
+}
+.scroll-bottom-pill:hover {
+  background: var(--bg-sidebar-hover);
+  transform: translateY(-1px);
+}
+.scroll-bottom-pill svg {
+  width: 13px;
+  height: 13px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .load-more-wrap {
@@ -859,6 +901,12 @@ body.dark .search-banner { color: #5ce695; }
   flex-shrink: 0;
   user-select: none;
 }
+.wx-avatar.clickable {
+  cursor: pointer;
+  transition: filter 120ms ease, transform 110ms ease;
+}
+.wx-avatar.clickable:hover { filter: brightness(1.06); }
+.wx-avatar.clickable:active { transform: scale(0.95); }
 
 .wx-col {
   display: flex;

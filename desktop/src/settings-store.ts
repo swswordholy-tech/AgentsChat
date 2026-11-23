@@ -5,6 +5,7 @@ import type { DesktopSettings } from "./types.js";
 
 export const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   activeWorkspace: "cloud",
+  theme: "light",
   remoteServerUrl: DEFAULT_UPSTREAM_SERVER_URL,
   localServerEnabled: true,
   localServerPort: 8787,
@@ -48,6 +49,7 @@ export function sanitizeDesktopSettings(raw: Partial<DesktopSettings> | null | u
 
   return {
     activeWorkspace: s.activeWorkspace === "local" ? "local" : "cloud",
+    theme: s.theme === "dark" ? "dark" : "light",
     remoteServerUrl,
     localServerEnabled: s.localServerEnabled !== false,
     localServerPort,

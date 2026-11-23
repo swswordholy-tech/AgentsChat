@@ -133,7 +133,13 @@
 
       <div class="member-strip" id="member-strip"></div>
 
-      <div class="messages-scroll" id="messages-box"></div>
+      <div class="messages-wrap">
+        <div class="messages-scroll" id="messages-box"></div>
+        <button type="button" class="scroll-bottom-pill" id="btn-scroll-bottom" hidden>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14" /><path d="m19 12-7 7-7-7" /></svg>
+          <span id="scroll-bottom-text">回到底部</span>
+        </button>
+      </div>
 
       <!-- WeChat-Style Bottom Composer Panel -->
       <section class="composer-area">

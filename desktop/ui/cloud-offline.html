@@ -17,6 +17,19 @@
       --recessed: #f7f8fa;
     }
 
+    body.dark {
+      --bg: #191919;
+      --card: #242424;
+      --border: #333333;
+      --ink-0: #ededed;
+      --ink-1: #a6a6a6;
+      --ink-2: #7a7a7a;
+      --recessed: #1a1a1a;
+    }
+    body.dark .icon-badge { background: #2e2e2e; color: #a6a6a6; }
+    body.dark .btn-local { background: #2c2c2c; color: #ededed; border-color: #3d3d3d; }
+    body.dark .btn-local:hover { background: #363636; }
+
     * { box-sizing: border-box; }
     html, body {
       margin: 0;
@@ -162,6 +175,7 @@
   </main>
   <script>
     const params = new URLSearchParams(window.location.search);
+    if (params.get("theme") === "dark") document.body.classList.add("dark");
     const remote = params.get("remote") || "https://agents-chat.com";
     const reason = params.get("reason") || "NETWORK_UNREACHABLE";
     document.getElementById("err-meta").textContent = `${remote} (${reason})`;

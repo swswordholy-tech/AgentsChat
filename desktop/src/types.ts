@@ -60,8 +60,11 @@ export interface DesktopWindowBounds {
   y?: number;
 }
 
+export type DesktopTheme = "light" | "dark";
+
 export interface DesktopSettings {
   activeWorkspace: "cloud" | "local";
+  theme: DesktopTheme;
   remoteServerUrl: string;
   localServerEnabled: boolean;
   localServerPort: number;

@@ -61,11 +61,14 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     ).toBe("https://agents-chat.com");
 
     // Window bounds persistence & clamping
-    const withBounds = store.save({ windowBounds: { width: 1440, height: 900, x: 120, y: 80 } });
+    const withBounds = store.save({ windowBounds: { width: 1440, height: 900, x: 120, y: 80 }, theme: "dark" });
     expect(withBounds.windowBounds).toEqual({ width: 1440, height: 900, x: 120, y: 80 });
+    expect(withBounds.theme).toBe("dark");
     expect(store.load().windowBounds).toEqual({ width: 1440, height: 900, x: 120, y: 80 });
-    // Tiny or bogus window dimensions are dropped cleanly
-    expect(sanitizeDesktopSettings({ windowBounds: { width: 100, height: 100 } }).windowBounds).toBeUndefined();
+    expect(store.load().theme).toBe("dark");
+    // Tiny or bogus window dimensions and invalid theme values are sanitized cleanly
+    expect(sanitizeDesktopSettings({ windowBounds: { width: 100, height: 100 }, theme: "neon" as any }).windowBounds).toBeUndefined();
+    expect(sanitizeDesktopSettings({ theme: "neon" as any }).theme).toBe("light");
   });
 
   test("discoverLocalAgentProfiles finds valid ~/.agentschat profiles while skipping symlinks, internal files, and dev-token", () => {

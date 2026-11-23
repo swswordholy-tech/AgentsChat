@@ -159,6 +159,20 @@ function getCombinedState() {
   };
 }
 
+function applyDesktopTheme(nextTheme: "light" | "dark"): void {
+  settings = settingsStore.save({ theme: nextTheme });
+  const bg = nextTheme === "dark" ? "#232323" : "#e9eaec";
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    try {
+      mainWindow.setBackgroundColor(bg);
+    } catch {}
+  }
+  if (localView && !localView.webContents.isDestroyed()) {
+    localView.webContents.send("desktop:theme-changed", nextTheme);
+  }
+  broadcastState();
+}
+
 function broadcastState(): void {
   const snapshot = getCombinedState();
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -374,6 +388,12 @@ function setupApplicationMenu(): void {
         },
         { type: "separator" },
         {
+          label: "Toggle Light / Dark Appearance",
+          accelerator: "CmdOrCtrl+Shift+D",
+          click: () => applyDesktopTheme(settings.theme === "dark" ? "light" : "dark"),
+        },
+        { type: "separator" },
+        {
           label: "Reload Active View",
           accelerator: "CmdOrCtrl+R",
           click: reloadActiveView,
@@ -547,7 +567,7 @@ async function createDesktopWindow(): Promise<void> {
     show: !isSmokeTest && !startHidden,
     title: "AgentsChat",
     ...(existsSync(windowIconPath) ? { icon: windowIconPath } : {}),
-    backgroundColor: "#eaeaea",
+    backgroundColor: settings.theme === "dark" ? "#232323" : "#e9eaec",
     ...(isMac ? { titleBarStyle: "hiddenInset", trafficLightPosition: { x: 10, y: 15 } } : { autoHideMenuBar: true }),
     webPreferences: {
       preload: join(UI_DIR, "preload.cjs"),
@@ -629,6 +649,7 @@ async function createDesktopWindow(): Promise<void> {
       query: {
         remote: settings.remoteServerUrl,
         reason: errorDescription || `ERR_${errorCode}`,
+        theme: settings.theme || "light",
       },
     });
   });
@@ -694,6 +715,18 @@ function registerIpcHandlers(): void {
   ipcMain.handle("desktop:switch-workspace", async (_ev, ws: unknown) => {
     await switchWorkspace(ws === "local" ? "local" : "cloud");
     return getCombinedState();
+  });
+
+  ipcMain.handle("desktop:set-theme", (ev, theme: unknown) => {
+    const nextTheme = theme === "dark" ? "dark" : "light";
+    // Allow shell window or local mini-server view only
+    const senderUrl = ev.sender.getURL() || "";
+    const st = localServer?.getStatus();
+    const isShell = Boolean(mainWindow && !mainWindow.isDestroyed() && ev.sender === mainWindow.webContents);
+    const isLocal = Boolean(st && senderUrl.startsWith(st.httpUrl));
+    if (!isShell && !isLocal) return { ok: false };
+    applyDesktopTheme(nextTheme);
+    return { ok: true, theme: nextTheme };
   });
 
   ipcMain.handle("desktop:toggle-local-server", async (_ev, enabled: unknown) => {

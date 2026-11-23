@@ -51,6 +51,39 @@
   const elReplyBanner = document.getElementById("reply-banner");
   const elReplyBannerText = document.getElementById("reply-banner-text");
   const elMentionMenu = document.getElementById("mention-menu");
+  const elScrollBtn = document.getElementById("btn-scroll-bottom");
+  const elScrollBtnText = document.getElementById("scroll-bottom-text");
+
+  let pendingNewInRoom = 0;
+
+  function isNearBottom() {
+    if (!elMessages) return true;
+    return elMessages.scrollHeight - elMessages.scrollTop - elMessages.clientHeight < 96;
+  }
+
+  function updateScrollPill() {
+    if (!elScrollBtn || !elScrollBtnText) return;
+    if (isNearBottom()) {
+      pendingNewInRoom = 0;
+      elScrollBtn.hidden = true;
+      return;
+    }
+    if (pendingNewInRoom > 0) {
+      elScrollBtnText.textContent = `${pendingNewInRoom} 条新消息`;
+      elScrollBtn.hidden = false;
+    } else if (elMessages.scrollHeight - elMessages.clientHeight > 280) {
+      elScrollBtnText.textContent = "回到底部";
+      elScrollBtn.hidden = false;
+    } else {
+      elScrollBtn.hidden = true;
+    }
+  }
+
+  function applyLocalTheme(theme) {
+    const isDark = theme === "dark";
+    document.body.classList.toggle("dark", isDark);
+    try { localStorage.setItem("ac_desktop_theme", isDark ? "dark" : "light"); } catch {}
+  }
 
   elServerPill.textContent = originUrl.replace(/^https?:\/\//, "");
 
@@ -269,8 +302,14 @@
       } else if (frame.type === "message") {
         if (frame.channel_id === currentChannelId) {
           if (!activeSearchQuery && !messages.some((m) => m.id === frame.id)) {
+            const stick = isNearBottom() || frame.sender_id === currentPrincipal?.id;
             messages.push(frame);
-            renderMessages();
+            if (!stick) {
+              pendingNewInRoom += 1;
+              renderMessages({ keepScrollTop: elMessages.scrollTop });
+            } else {
+              renderMessages();
+            }
           }
           elTyping.textContent = "";
         } else if (frame.channel_id && frame.sender_id !== currentPrincipal?.id) {
@@ -805,9 +844,16 @@
       row.className = "wx-msg" + (isSelf ? " self" : "");
 
       const av = document.createElement("div");
-      av.className = "wx-avatar";
+      av.className = "wx-avatar" + (isSelf ? "" : " clickable");
       av.style.background = isSelf ? "#07c160" : avatarBg(m.sender_id);
       av.textContent = avatarInitials(m.sender_name, m.sender_id);
+      if (!isSelf) {
+        av.title = `点击插入 @${m.sender_id}`;
+        av.addEventListener("click", () => {
+          elInput.value = (elInput.value ? elInput.value + " " : "") + `@${m.sender_id} `;
+          elInput.focus();
+        });
+      }
       row.appendChild(av);
 
       const col = document.createElement("div");
@@ -844,6 +890,19 @@
       btnQuote.appendChild(createSvgIcon("reply"));
       btnQuote.addEventListener("click", () => setReplyTarget(m));
       actions.appendChild(btnQuote);
+
+      const btnCopyMsg = document.createElement("button");
+      btnCopyMsg.type = "button";
+      btnCopyMsg.className = "wx-act-btn";
+      btnCopyMsg.title = "复制消息内容";
+      btnCopyMsg.appendChild(createSvgIcon("copy"));
+      btnCopyMsg.addEventListener("click", async () => {
+        const txt = String(m.content || "");
+        if (bridge?.copyText) await bridge.copyText(txt);
+        else await navigator.clipboard?.writeText(txt);
+        showToast("已复制消息");
+      });
+      actions.appendChild(btnCopyMsg);
 
       if (isSelf) {
         const btnEdit = document.createElement("button");
@@ -922,9 +981,13 @@
 
     if (opts.preserveScrollFromBottom) {
       elMessages.scrollTop = Math.max(0, elMessages.scrollHeight - opts.preserveScrollFromBottom);
+    } else if (typeof opts.keepScrollTop === "number") {
+      elMessages.scrollTop = opts.keepScrollTop;
     } else {
+      pendingNewInRoom = 0;
       elMessages.scrollTop = elMessages.scrollHeight;
     }
+    updateScrollPill();
   }
 
   async function sendChatText(rawText) {
@@ -964,11 +1027,23 @@
     showToast("已复制本机地址：" + originUrl);
   });
 
-  // Light / Dark theme toggle
+  // Light / Dark theme toggle (synced across left rail + chat pane + persisted in Desktop settings)
   document.getElementById("btn-toggle-theme")?.addEventListener("click", () => {
-    const isDark = document.body.classList.toggle("dark");
-    try { localStorage.setItem("ac_desktop_theme", isDark ? "dark" : "light"); } catch {}
-    showToast(isDark ? "已切换至深色模式" : "已切换至浅色模式");
+    const next = document.body.classList.contains("dark") ? "light" : "dark";
+    applyLocalTheme(next);
+    if (bridge?.setTheme) void bridge.setTheme(next);
+    showToast(next === "dark" ? "已切换至深色模式" : "已切换至浅色模式");
+  });
+
+  if (bridge?.onThemeChanged) {
+    bridge.onThemeChanged((theme) => applyLocalTheme(theme));
+  }
+
+  elMessages?.addEventListener("scroll", () => updateScrollPill(), { passive: true });
+  elScrollBtn?.addEventListener("click", () => {
+    pendingNewInRoom = 0;
+    elMessages.scrollTo({ top: elMessages.scrollHeight, behavior: "smooth" });
+    elScrollBtn.hidden = true;
   });
 
   // Composer toolbar quick shortcuts
@@ -1456,6 +1531,11 @@
         return;
       }
     }
+    if (ev.key === "Escape" && replyTarget) {
+      ev.preventDefault();
+      setReplyTarget(null);
+      return;
+    }
     if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) {
       ev.preventDefault();
       sendChatText();
@@ -1528,6 +1608,12 @@
 
   // Boot
   (async () => {
+    if (bridge?.getServerStatus) {
+      try {
+        const st = await bridge.getServerStatus();
+        if (st?.ok && st.settings?.theme) applyLocalTheme(st.settings.theme);
+      } catch {}
+    }
     const hashCh = readHashChannelId();
     if (hashCh) currentChannelId = hashCh;
     if (authToken) {
