@@ -124,6 +124,11 @@ export const TOOL_ANNOTATIONS: Record<string, ToolAnnotation> = {
   upsert_channel_doc: W,
   archive_channel_doc: W,
   list_channel_doc_revisions: R,
+
+  // ── bot rental marketplace (read-only discovery & room lease inspection) ──
+  browse_bot_market: R,
+  get_bot_rental_listing: R,
+  channel_rental_status: R,
 };
 
 /** Attach annotations to a tools/list payload. Unknown tools fail loudly in tests. */

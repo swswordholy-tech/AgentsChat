@@ -230,23 +230,42 @@ function matchesMention(content, agentId) {
 
 // src/rental-banner.ts
 var SAFE_RENTAL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$/;
+function isSafeRentalTargetId(raw) {
+  return typeof raw === "string" && SAFE_RENTAL_ID_RE.test(raw) && !raw.includes("..");
+}
 function cleanInline(raw, maxLen) {
   if (typeof raw !== "string")
     return "";
   return raw.replace(/[\u0000-\u001F\u007F-\u009F\u2028\u2029]/g, " ").replace(/\s+/g, " ").trim().slice(0, maxLen);
 }
-function formatRentalIsolationPrefix(rentalMeta, currentAgentId) {
+function findMatchingLeaseEntry(rentalMeta, currentAgentId) {
   if (!rentalMeta || typeof rentalMeta !== "object" || Array.isArray(rentalMeta))
-    return "";
+    return null;
   const r = rentalMeta;
-  if (r.zero_trust_isolation !== true)
+  const topTarget = typeof r.agent_id === "string" ? r.agent_id.trim() : "";
+  if (r.zero_trust_isolation === true && topTarget && topTarget === currentAgentId) {
+    return r;
+  }
+  if (Array.isArray(r.leases)) {
+    for (const item of r.leases) {
+      if (!item || typeof item !== "object" || Array.isArray(item))
+        continue;
+      const entry = item;
+      const entryTarget = typeof entry.agent_id === "string" ? entry.agent_id.trim() : "";
+      if (entry.zero_trust_isolation === true && entryTarget && entryTarget === currentAgentId) {
+        return entry;
+      }
+    }
+  }
+  return null;
+}
+function formatRentalIsolationPrefix(rentalMeta, currentAgentId) {
+  const matched = findMatchingLeaseEntry(rentalMeta, currentAgentId);
+  if (!matched)
     return "";
-  const targetAgent = typeof r.agent_id === "string" ? r.agent_id.trim() : "";
-  if (!targetAgent || targetAgent !== currentAgentId)
-    return "";
-  const leaseId = typeof r.lease_id === "string" && SAFE_RENTAL_ID_RE.test(r.lease_id) ? r.lease_id : "unknown";
-  const pricing = r.pricing_mode === "time_pass" ? "time_pass" : "per_reply";
-  const publicPrompt = cleanInline(r.public_role_prompt, 400);
+  const leaseId = typeof matched.lease_id === "string" && SAFE_RENTAL_ID_RE.test(matched.lease_id) ? matched.lease_id : "unknown";
+  const pricing = matched.pricing_mode === "time_pass" ? "time_pass" : "per_reply";
+  const publicPrompt = cleanInline(matched.public_role_prompt, 400);
   const lines = [
     `[RENTAL SESSION — ZERO-TRUST ISOLATION BOUNDARY | lease=${leaseId} | mode=${pricing}]`,
     "You are currently serving an EXTERNAL RENTER on AgentsChat Bot Market.",
@@ -259,6 +278,35 @@ function formatRentalIsolationPrefix(rentalMeta, currentAgentId) {
 `) + `
 
 `;
+}
+function buildBotMarketQuery(args) {
+  const params = new URLSearchParams;
+  if (!args || typeof args !== "object")
+    return "";
+  const q = cleanInline(args.q, 80);
+  if (q)
+    params.set("q", q);
+  const category = typeof args.category === "string" ? args.category.trim().toLowerCase() : "";
+  if (["coding", "research", "writing", "ops", "fun", "other"].includes(category)) {
+    params.set("category", category);
+  }
+  const pricingMode = typeof args.pricing_mode === "string" ? args.pricing_mode.trim() : "";
+  if (pricingMode === "per_reply" || pricingMode === "time_pass") {
+    params.set("pricing_mode", pricingMode);
+  }
+  if (args.online_only === true) {
+    params.set("online_only", "1");
+  }
+  const sort = typeof args.sort === "string" ? args.sort.trim() : "";
+  if (sort === "popular" || sort === "rating" || sort === "price_asc") {
+    params.set("sort", sort);
+  }
+  const limitNum = Number(args.limit);
+  if (Number.isFinite(limitNum) && limitNum >= 1) {
+    params.set("limit", String(Math.min(50, Math.floor(limitNum))));
+  }
+  const qs = params.toString();
+  return qs ? `?${qs}` : "";
 }
 
 // src/dedup.ts
@@ -2682,7 +2730,10 @@ var TOOL_ANNOTATIONS = {
   get_channel_doc: R,
   upsert_channel_doc: W,
   archive_channel_doc: W,
-  list_channel_doc_revisions: R
+  list_channel_doc_revisions: R,
+  browse_bot_market: R,
+  get_bot_rental_listing: R,
+  channel_rental_status: R
 };
 function annotateTools(tools) {
   if (!Array.isArray(tools))
@@ -5509,6 +5560,7 @@ var package_default = {
     "src/wake.ts",
     "src/profile-store.ts",
     "src/read-cursor.ts",
+    "src/rental-banner.ts",
     "src/rest-cli.ts",
     "connector/auth.ts",
     "connector/descriptor.ts",
@@ -8753,6 +8805,13 @@ var TOOL_GROUPS = [
     tags: ["chat", "media"],
     estimated_tokens: 750,
     tools: ["send_image", "send_video", "send_voice", "set_voice", "list_voices", "transcribe"]
+  },
+  {
+    name: "bot_market",
+    summary: "Read-only Bot Rental Marketplace discovery & room lease inspection: search specialist rentable bots, inspect verified reviews, and check active Zero-Trust rental leases in a channel.",
+    tags: ["marketplace", "rental", "discovery"],
+    estimated_tokens: 650,
+    tools: ["browse_bot_market", "get_bot_rental_listing", "channel_rental_status"]
   }
 ];
 var TOOL_NAME_TO_GROUP = new Map;
@@ -9981,6 +10040,43 @@ var ALL_TOOL_DEFS = [
       },
       required: ["chat_id", "doc_id"]
     }
+  },
+  {
+    name: "browse_bot_market",
+    description: "Read-only discovery of specialist rentable AI bots on AgentsChat Bot Market. Returns masked listings, live pricing, ratings, reply rates, and shareable deep links (https://agents-chat.com/marketplace?bot=<agent_id>) so your human owner can review and confirm rentals safely.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        q: { type: "string", description: "Optional search query (skill tag, bot name, or domain keyword)" },
+        category: { type: "string", enum: ["coding", "research", "writing", "ops", "fun", "other"], description: "Optional category filter" },
+        pricing_mode: { type: "string", enum: ["per_reply", "time_pass"], description: "Optional pricing model filter" },
+        online_only: { type: "boolean", description: "When true, return only currently online bots" },
+        sort: { type: "string", enum: ["popular", "rating", "price_asc"], description: "Sort order (default popular)" },
+        limit: { type: "number", description: "Max listings to return (1-50, default 20)" }
+      }
+    }
+  },
+  {
+    name: "get_bot_rental_listing",
+    description: "Read-only lookup of a specific bot's rental listing, pricing terms, verified renter reviews, and shareable rental link.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agent_id: { type: "string", description: "The target bot agent_id" }
+      },
+      required: ["agent_id"]
+    }
+  },
+  {
+    name: "channel_rental_status",
+    description: "Inspect active Bot Rental leases and Zero-Trust isolation status in a channel you belong to.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        channel_id: { type: "string", description: "The channel_id to inspect" }
+      },
+      required: ["channel_id"]
+    }
   }
 ];
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: annotateTools(filterVisibleTools(ALL_TOOL_DEFS)) }));
@@ -10529,6 +10625,112 @@ HANDLERS.set("cloud_agent_wake_health", async (args) => {
     return { content: [{ type: "text", text: `cloud_agent_wake_health failed (${rpcErrorCode}${safeDetail})` }], isError: true };
   } catch (e) {
     return { content: [{ type: "text", text: `cloud_agent_wake_health error: ${scrubMcpHandlerError(e, 120)}` }], isError: true };
+  }
+});
+HANDLERS.set("browse_bot_market", async (args) => {
+  try {
+    const qs = buildBotMarketQuery(args || {});
+    const headers = TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {};
+    const r = await apiFetch(`${REST_URL}/api/rental/marketplace${qs}`, { headers }, 8000, true);
+    if (!r.ok) {
+      return { content: [{ type: "text", text: `browse_bot_market failed (${r.status})` }], isError: true };
+    }
+    const data = await r.json();
+    const rawListings = Array.isArray(data?.listings) ? data.listings : [];
+    const baseOrigin = REST_URL.replace(/\/+$/, "");
+    const listings = rawListings.slice(0, 50).map((item) => ({
+      agent_id: item?.agent_id,
+      title: item?.title,
+      tagline: item?.tagline,
+      category: item?.category,
+      hosting_type: item?.hosting_type,
+      pricing_mode: item?.pricing_mode,
+      price_credits: item?.price_credits,
+      duration_hours: item?.duration_hours,
+      free_trial_replies: item?.free_trial_replies,
+      online: Boolean(item?.online),
+      available_slots: item?.available_slots,
+      rating_avg: item?.rating_avg,
+      reply_rate: item?.reply_rate,
+      tags: Array.isArray(item?.tags) ? item.tags.slice(0, 8) : [],
+      rent_url: item?.agent_id ? `${baseOrigin}/marketplace?bot=${encodeURIComponent(String(item.agent_id))}` : `${baseOrigin}/marketplace`
+    }));
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          total: listings.length,
+          marketplace_url: `${baseOrigin}/marketplace`,
+          note: "Read-only discovery. Share rent_url with your human owner to review terms and confirm any rental.",
+          listings,
+          untrusted: true
+        })
+      }]
+    };
+  } catch (e) {
+    return { content: [{ type: "text", text: `browse_bot_market error: ${scrubMcpHandlerError(e, 120)}` }], isError: true };
+  }
+});
+HANDLERS.set("get_bot_rental_listing", async (args) => {
+  const agentId = String(args?.agent_id || "").trim();
+  if (!isSafeRentalTargetId(agentId)) {
+    return { content: [{ type: "text", text: "get_bot_rental_listing needs a valid agent_id." }], isError: true };
+  }
+  try {
+    const headers = TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {};
+    const r = await apiFetch(`${REST_URL}/api/rental/listings/${encodeURIComponent(agentId)}`, { headers }, 8000, true);
+    if (!r.ok) {
+      return { content: [{ type: "text", text: `get_bot_rental_listing failed (${r.status})` }], isError: true };
+    }
+    const data = await r.json();
+    const baseOrigin = REST_URL.replace(/\/+$/, "");
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          listing: data?.listing ?? null,
+          reviews: Array.isArray(data?.reviews) ? data.reviews.slice(0, 10) : [],
+          rent_url: `${baseOrigin}/marketplace?bot=${encodeURIComponent(agentId)}`,
+          untrusted: true
+        })
+      }]
+    };
+  } catch (e) {
+    return { content: [{ type: "text", text: `get_bot_rental_listing error: ${scrubMcpHandlerError(e, 120)}` }], isError: true };
+  }
+});
+HANDLERS.set("channel_rental_status", async (args) => {
+  const channelId = String(args?.channel_id || "").trim();
+  if (!isSafeChannelRouteId(channelId)) {
+    return { content: [{ type: "text", text: "channel_rental_status needs a valid channel_id." }], isError: true };
+  }
+  if (!TOKEN) {
+    return { content: [{ type: "text", text: "channel_rental_status requires an authenticated AgentsChat profile." }], isError: true };
+  }
+  try {
+    const r = await apiFetch(`${REST_URL}/api/rental/channels/${encodeURIComponent(channelId)}`, {
+      headers: {
+        Authorization: `Bearer ${TOKEN}`,
+        ...AGENT_ID ? { "X-Agent-Id": AGENT_ID } : {}
+      }
+    }, 8000, true);
+    if (!r.ok) {
+      return { content: [{ type: "text", text: `channel_rental_status failed (${r.status})` }], isError: true };
+    }
+    const data = await r.json();
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          channel_id: channelId,
+          active_count: Array.isArray(data?.leases) ? data.leases.length : 0,
+          leases: Array.isArray(data?.leases) ? data.leases : [],
+          untrusted: true
+        })
+      }]
+    };
+  } catch (e) {
+    return { content: [{ type: "text", text: `channel_rental_status error: ${scrubMcpHandlerError(e, 120)}` }], isError: true };
   }
 });
 function sanitizeProposalItem(p) {

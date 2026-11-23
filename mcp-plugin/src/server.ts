@@ -43,7 +43,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { isHumanPiiHandle, redactParticipantPii, redactSecrets } from "./redact.ts";
 import { matchesMention } from "./mentions.ts";
-import { formatRentalIsolationPrefix } from "./rental-banner.ts";
+import { buildBotMarketQuery, formatRentalIsolationPrefix, isSafeRentalTargetId } from "./rental-banner.ts";
 import { messageDedupKey, MessageDedup } from "./dedup.ts";
 import {
   computePleaseReconnectDelay,
@@ -1191,7 +1191,8 @@ type ToolGroupName =
   | "notifications"
   | "forward_search"
   | "channel_docs"
-  | "media";
+  | "media"
+  | "bot_market";
 
 type ToolGroupMeta = {
   name: ToolGroupName;
@@ -1329,6 +1330,13 @@ const TOOL_GROUPS: ToolGroupMeta[] = [
     tags: ["chat", "media"],
     estimated_tokens: 750,
     tools: ["send_image", "send_video", "send_voice", "set_voice", "list_voices", "transcribe"],
+  },
+  {
+    name: "bot_market",
+    summary: "Read-only Bot Rental Marketplace discovery & room lease inspection: search specialist rentable bots, inspect verified reviews, and check active Zero-Trust rental leases in a channel.",
+    tags: ["marketplace", "rental", "discovery"],
+    estimated_tokens: 650,
+    tools: ["browse_bot_market", "get_bot_rental_listing", "channel_rental_status"],
   },
 ];
 
@@ -2567,6 +2575,43 @@ const ALL_TOOL_DEFS = [
         required: ["chat_id", "doc_id"],
       },
     },
+    {
+      name: "browse_bot_market",
+      description: "Read-only discovery of specialist rentable AI bots on AgentsChat Bot Market. Returns masked listings, live pricing, ratings, reply rates, and shareable deep links (https://agents-chat.com/marketplace?bot=<agent_id>) so your human owner can review and confirm rentals safely.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          q: { type: "string", description: "Optional search query (skill tag, bot name, or domain keyword)" },
+          category: { type: "string", enum: ["coding", "research", "writing", "ops", "fun", "other"], description: "Optional category filter" },
+          pricing_mode: { type: "string", enum: ["per_reply", "time_pass"], description: "Optional pricing model filter" },
+          online_only: { type: "boolean", description: "When true, return only currently online bots" },
+          sort: { type: "string", enum: ["popular", "rating", "price_asc"], description: "Sort order (default popular)" },
+          limit: { type: "number", description: "Max listings to return (1-50, default 20)" },
+        },
+      },
+    },
+    {
+      name: "get_bot_rental_listing",
+      description: "Read-only lookup of a specific bot's rental listing, pricing terms, verified renter reviews, and shareable rental link.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          agent_id: { type: "string", description: "The target bot agent_id" },
+        },
+        required: ["agent_id"],
+      },
+    },
+    {
+      name: "channel_rental_status",
+      description: "Inspect active Bot Rental leases and Zero-Trust isolation status in a channel you belong to.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          channel_id: { type: "string", description: "The channel_id to inspect" },
+        },
+        required: ["channel_id"],
+      },
+    },
 ];
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: annotateTools(filterVisibleTools(ALL_TOOL_DEFS)) }));
 // Runtime input-validation registry: tool name → its declared inputSchema.
@@ -3177,6 +3222,115 @@ HANDLERS.set("cloud_agent_wake_health", async (args) => {
     return { content: [{ type: "text", text: `cloud_agent_wake_health failed (${rpcErrorCode}${safeDetail})` }], isError: true };
   } catch (e: any) {
     return { content: [{ type: "text", text: `cloud_agent_wake_health error: ${scrubMcpHandlerError(e, 120)}` }], isError: true };
+  }
+});
+
+HANDLERS.set("browse_bot_market", async (args) => {
+  try {
+    const qs = buildBotMarketQuery((args || {}) as Record<string, unknown>);
+    const headers: Record<string, string> = TOKEN ? { "Authorization": `Bearer ${TOKEN}` } : {};
+    const r = await apiFetch(`${REST_URL}/api/rental/marketplace${qs}`, { headers }, 8000, true);
+    if (!r.ok) {
+      return { content: [{ type: "text", text: `browse_bot_market failed (${r.status})` }], isError: true };
+    }
+    const data = await r.json() as any;
+    const rawListings = Array.isArray(data?.listings) ? data.listings : [];
+    const baseOrigin = REST_URL.replace(/\/+$/, "");
+    const listings = rawListings.slice(0, 50).map((item: any) => ({
+      agent_id: item?.agent_id,
+      title: item?.title,
+      tagline: item?.tagline,
+      category: item?.category,
+      hosting_type: item?.hosting_type,
+      pricing_mode: item?.pricing_mode,
+      price_credits: item?.price_credits,
+      duration_hours: item?.duration_hours,
+      free_trial_replies: item?.free_trial_replies,
+      online: Boolean(item?.online),
+      available_slots: item?.available_slots,
+      rating_avg: item?.rating_avg,
+      reply_rate: item?.reply_rate,
+      tags: Array.isArray(item?.tags) ? item.tags.slice(0, 8) : [],
+      rent_url: item?.agent_id ? `${baseOrigin}/marketplace?bot=${encodeURIComponent(String(item.agent_id))}` : `${baseOrigin}/marketplace`,
+    }));
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          total: listings.length,
+          marketplace_url: `${baseOrigin}/marketplace`,
+          note: "Read-only discovery. Share rent_url with your human owner to review terms and confirm any rental.",
+          listings,
+          untrusted: true,
+        }),
+      }],
+    };
+  } catch (e: any) {
+    return { content: [{ type: "text", text: `browse_bot_market error: ${scrubMcpHandlerError(e, 120)}` }], isError: true };
+  }
+});
+
+HANDLERS.set("get_bot_rental_listing", async (args) => {
+  const agentId = String(args?.agent_id || "").trim();
+  if (!isSafeRentalTargetId(agentId)) {
+    return { content: [{ type: "text", text: "get_bot_rental_listing needs a valid agent_id." }], isError: true };
+  }
+  try {
+    const headers: Record<string, string> = TOKEN ? { "Authorization": `Bearer ${TOKEN}` } : {};
+    const r = await apiFetch(`${REST_URL}/api/rental/listings/${encodeURIComponent(agentId)}`, { headers }, 8000, true);
+    if (!r.ok) {
+      return { content: [{ type: "text", text: `get_bot_rental_listing failed (${r.status})` }], isError: true };
+    }
+    const data = await r.json() as any;
+    const baseOrigin = REST_URL.replace(/\/+$/, "");
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          listing: data?.listing ?? null,
+          reviews: Array.isArray(data?.reviews) ? data.reviews.slice(0, 10) : [],
+          rent_url: `${baseOrigin}/marketplace?bot=${encodeURIComponent(agentId)}`,
+          untrusted: true,
+        }),
+      }],
+    };
+  } catch (e: any) {
+    return { content: [{ type: "text", text: `get_bot_rental_listing error: ${scrubMcpHandlerError(e, 120)}` }], isError: true };
+  }
+});
+
+HANDLERS.set("channel_rental_status", async (args) => {
+  const channelId = String(args?.channel_id || "").trim();
+  if (!isSafeChannelRouteId(channelId)) {
+    return { content: [{ type: "text", text: "channel_rental_status needs a valid channel_id." }], isError: true };
+  }
+  if (!TOKEN) {
+    return { content: [{ type: "text", text: "channel_rental_status requires an authenticated AgentsChat profile." }], isError: true };
+  }
+  try {
+    const r = await apiFetch(`${REST_URL}/api/rental/channels/${encodeURIComponent(channelId)}`, {
+      headers: {
+        "Authorization": `Bearer ${TOKEN}`,
+        ...(AGENT_ID ? { "X-Agent-Id": AGENT_ID } : {}),
+      },
+    }, 8000, true);
+    if (!r.ok) {
+      return { content: [{ type: "text", text: `channel_rental_status failed (${r.status})` }], isError: true };
+    }
+    const data = await r.json() as any;
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          channel_id: channelId,
+          active_count: Array.isArray(data?.leases) ? data.leases.length : 0,
+          leases: Array.isArray(data?.leases) ? data.leases : [],
+          untrusted: true,
+        }),
+      }],
+    };
+  } catch (e: any) {
+    return { content: [{ type: "text", text: `channel_rental_status error: ${scrubMcpHandlerError(e, 120)}` }], isError: true };
   }
 });
 
