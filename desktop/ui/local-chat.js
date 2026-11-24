@@ -24,6 +24,128 @@
   let activeSearchQuery = "";
   let replyTarget = null;
   let unreadByChannel = new Map();
+  const PINNED_KEY = "ac_local_pinned_channels";
+  const pinnedChannelIds = (() => {
+    const set = new Set();
+    try {
+      const parsed = JSON.parse(localStorage.getItem(PINNED_KEY) || "[]");
+      if (Array.isArray(parsed)) {
+        parsed.slice(0, 100).forEach((id) => {
+          if (typeof id === "string" && id.trim()) set.add(id.trim());
+        });
+      }
+    } catch {}
+    return set;
+  })();
+  let sidebarUnreadOnly = false;
+  let pendingUnreadBanner = null;
+  let ctxMenuEl = null;
+
+  function persistPinnedChannels() {
+    try {
+      localStorage.setItem(PINNED_KEY, JSON.stringify(Array.from(pinnedChannelIds).slice(0, 100)));
+    } catch {}
+  }
+  function isChannelPinned(channelId) {
+    return Boolean(channelId && pinnedChannelIds.has(channelId));
+  }
+  function toggleChannelPin(channelId) {
+    if (!channelId) return false;
+    let nowPinned;
+    if (pinnedChannelIds.has(channelId)) {
+      pinnedChannelIds.delete(channelId);
+      nowPinned = false;
+    } else {
+      pinnedChannelIds.add(channelId);
+      nowPinned = true;
+    }
+    persistPinnedChannels();
+    renderChannelList();
+    showToast(nowPinned ? "已置顶该会话" : "已取消置顶");
+    return nowPinned;
+  }
+  function getTotalLocalUnread() {
+    let total = 0;
+    for (const [id, count] of unreadByChannel.entries()) {
+      if (id !== currentChannelId && Number(count) > 0) total += Number(count);
+    }
+    return total;
+  }
+  function updateUnreadFilterUI() {
+    const total = getTotalLocalUnread();
+    if (elChFilterAll) {
+      elChFilterAll.classList.toggle("active", !sidebarUnreadOnly);
+      elChFilterAll.setAttribute("aria-selected", String(!sidebarUnreadOnly));
+    }
+    if (elChFilterUnread) {
+      elChFilterUnread.classList.toggle("active", sidebarUnreadOnly);
+      elChFilterUnread.setAttribute("aria-selected", String(sidebarUnreadOnly));
+      elChFilterUnread.textContent = total > 0 ? `未读 ${total > 99 ? "99+" : total}` : "未读";
+    }
+    document.title = total > 0 ? `(${total > 99 ? "99+" : total}) AgentsChat Local Server` : "AgentsChat Local Server";
+  }
+  function closeChannelContextMenu() {
+    if (ctxMenuEl) {
+      ctxMenuEl.remove();
+      ctxMenuEl = null;
+    }
+  }
+  function openChannelContextMenu(ch, clientX, clientY) {
+    closeChannelContextMenu();
+    if (!ch || !ch.id) return;
+    const menu = document.createElement("div");
+    menu.id = "local-ctx-menu";
+    menu.className = "local-ctx-menu";
+    menu.setAttribute("role", "menu");
+
+    const pinned = isChannelPinned(ch.id);
+    const unread = ch.id === currentChannelId ? 0 : (unreadByChannel.get(ch.id) || 0);
+
+    const addItem = (label, onClick, disabled = false) => {
+      const item = document.createElement("button");
+      item.type = "button";
+      item.className = "local-ctx-item";
+      item.setAttribute("role", "menuitem");
+      item.disabled = disabled;
+      item.textContent = label;
+      item.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        closeChannelContextMenu();
+        onClick();
+      });
+      menu.appendChild(item);
+    };
+
+    addItem(pinned ? "📌 取消置顶" : "📌 置顶会话", () => toggleChannelPin(ch.id));
+    addItem(unread > 0 ? `✓ 标记已读 (${unread})` : "✓ 标记已读", () => {
+      unreadByChannel.delete(ch.id);
+      updateUnreadFilterUI();
+      renderChannelList();
+      showToast("已标为已读");
+    }, unread <= 0);
+
+    const sep = document.createElement("div");
+    sep.className = "local-ctx-sep";
+    menu.appendChild(sep);
+
+    addItem("🔗 复制频道 ID", async () => {
+      await copyTextToClipboard(ch.id);
+      showToast(`已复制频道 ID: ${ch.id}`);
+    });
+
+    document.body.appendChild(menu);
+    const rect = menu.getBoundingClientRect();
+    const x = Math.min(Math.max(8, clientX), Math.max(8, window.innerWidth - rect.width - 8));
+    const y = Math.min(Math.max(8, clientY), Math.max(8, window.innerHeight - rect.height - 8));
+    menu.style.left = `${x}px`;
+    menu.style.top = `${y}px`;
+    ctxMenuEl = menu;
+  }
+  document.addEventListener("click", (ev) => {
+    if (ctxMenuEl && !ctxMenuEl.contains(ev.target)) closeChannelContextMenu();
+  });
+  window.addEventListener("blur", closeChannelContextMenu);
+  window.addEventListener("resize", closeChannelContextMenu);
   const draftsByChannel = (() => {
     const map = new Map();
     try {
@@ -74,6 +196,18 @@
   const elAuthName = document.getElementById("auth-name");
   const elAuthId = document.getElementById("auth-id-text");
   const elChannelList = document.getElementById("channel-list");
+  const elChFilterAll = document.getElementById("ch-filter-all");
+  const elChFilterUnread = document.getElementById("ch-filter-unread");
+  elChFilterAll?.addEventListener("click", () => {
+    sidebarUnreadOnly = false;
+    updateUnreadFilterUI();
+    renderChannelList();
+  });
+  elChFilterUnread?.addEventListener("click", () => {
+    sidebarUnreadOnly = true;
+    updateUnreadFilterUI();
+    renderChannelList();
+  });
   const elBots = document.getElementById("discovered-bots");
   const elRoomTitle = document.getElementById("room-title");
   const elRoomTopic = document.getElementById("room-topic");
@@ -375,6 +509,7 @@
         } else if (frame.channel_id && frame.sender_id !== currentPrincipal?.id) {
           const prev = unreadByChannel.get(frame.channel_id) || 0;
           unreadByChannel.set(frame.channel_id, prev + 1);
+          updateUnreadFilterUI();
           void loadChannels();
         }
       } else if (frame.type === "message_edited" && frame.channel_id === currentChannelId) {
@@ -464,14 +599,49 @@
     return true;
   }
 
-  async function loadChannels() {
-    const res = await api("/api/channels");
-    channels = Array.isArray(res.data?.channels) ? res.data.channels : [];
+  function renderChannelList() {
+    updateUnreadFilterUI();
     elChannelList.replaceChildren();
-    channels.forEach((ch) => {
+    const ordered = channels
+      .map((ch, index) => ({ ch, index, pinned: isChannelPinned(ch?.id) }))
+      .filter(({ ch }) => {
+        if (!ch || !ch.id) return false;
+        if (!sidebarUnreadOnly) return true;
+        return ch.id !== currentChannelId && (unreadByChannel.get(ch.id) || 0) > 0;
+      })
+      .sort((a, b) => {
+        if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+        return a.index - b.index;
+      });
+
+    if (ordered.length === 0 && sidebarUnreadOnly) {
+      const empty = document.createElement("div");
+      empty.className = "ch-filter-empty";
+      const txt = document.createElement("span");
+      txt.textContent = "全部消息已读 🎉";
+      const backBtn = document.createElement("button");
+      backBtn.type = "button";
+      backBtn.className = "btn btn-ghost btn-xs";
+      backBtn.textContent = "查看全部会话";
+      backBtn.addEventListener("click", () => {
+        sidebarUnreadOnly = false;
+        updateUnreadFilterUI();
+        renderChannelList();
+      });
+      empty.appendChild(txt);
+      empty.appendChild(backBtn);
+      elChannelList.appendChild(empty);
+      return;
+    }
+
+    ordered.forEach(({ ch, pinned }) => {
       const btn = document.createElement("button");
       btn.type = "button";
-      btn.className = "channel-item" + (ch.id === currentChannelId ? " active" : "");
+      btn.className =
+        "channel-item" +
+        (ch.id === currentChannelId ? " active" : "") +
+        (pinned ? " pinned" : "");
+      btn.dataset.channelId = ch.id;
 
       const av = document.createElement("div");
       av.className = "ch-avatar";
@@ -497,6 +667,13 @@
       name.className = "ch-name";
       name.textContent = ch.type === "direct" ? (ch.name || ch.id) : `#${ch.name || ch.id}`;
       top.appendChild(name);
+      if (pinned) {
+        const pin = document.createElement("span");
+        pin.className = "ch-pin-mark";
+        pin.title = "已置顶（右键取消）";
+        pin.textContent = "📌";
+        top.appendChild(pin);
+      }
       if (ch.member_count !== undefined && ch.member_count !== null) {
         const count = document.createElement("span");
         count.className = "ch-count";
@@ -521,8 +698,18 @@
       btn.appendChild(av);
       btn.appendChild(body);
       btn.addEventListener("click", () => selectChannel(ch.id));
+      btn.addEventListener("contextmenu", (ev) => {
+        ev.preventDefault();
+        openChannelContextMenu(ch, ev.clientX, ev.clientY);
+      });
       elChannelList.appendChild(btn);
     });
+  }
+
+  async function loadChannels() {
+    const res = await api("/api/channels");
+    channels = Array.isArray(res.data?.channels) ? res.data.channels : [];
+    renderChannelList();
   }
 
   async function loadDiscoveredBots() {
@@ -642,7 +829,10 @@
     if (elInput && prevChannelId !== channelId) {
       elInput.value = getLocalDraft(channelId);
     }
+    const prevUnread = prevChannelId !== channelId ? (unreadByChannel.get(channelId) || 0) : 0;
+    pendingUnreadBanner = prevUnread > 0 ? { channelId, count: prevUnread } : null;
     unreadByChannel.delete(channelId);
+    updateUnreadFilterUI();
     activeSearchQuery = "";
     if (elSearchInput) elSearchInput.value = "";
     if (elSearchBanner) elSearchBanner.hidden = true;
@@ -726,8 +916,40 @@
     });
   }
 
+  const LOCAL_SYN_TOKEN =
+    /((?<!:)\/\/[^\n]*|(?:^|(?<=\s))#[^\n]*)|("(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*')|\b(\d+(?:\.\d+)?)\b|\b(function|const|let|var|if|else|for|while|return|import|export|class|def|self|from|async|await|try|catch|throw|new|switch|case|break|continue|yield|struct|enum|protocol|guard|nil|null|undefined|true|false|print|println)\b/gm;
+
+  function appendSyntaxHighlightedCode(codeEl, rawCode) {
+    const src = String(rawCode || "");
+    LOCAL_SYN_TOKEN.lastIndex = 0;
+    let last = 0;
+    let m;
+    while ((m = LOCAL_SYN_TOKEN.exec(src)) !== null) {
+      if (m.index > last) {
+        codeEl.appendChild(document.createTextNode(src.slice(last, m.index)));
+      }
+      const span = document.createElement("span");
+      span.className = m[1] ? "syn-cm" : m[2] ? "syn-str" : m[3] ? "syn-num" : "syn-kw";
+      span.textContent = m[0];
+      codeEl.appendChild(span);
+      last = m.index + m[0].length;
+    }
+    if (last < src.length) {
+      codeEl.appendChild(document.createTextNode(src.slice(last)));
+    }
+  }
+
+  function isMentionMe(handle) {
+    const clean = String(handle || "").replace(/^@/, "").toLowerCase();
+    if (!clean || !currentPrincipal) return false;
+    const pid = String(currentPrincipal.id || "").toLowerCase();
+    const pname = String(currentPrincipal.display_name || currentPrincipal.name || "").toLowerCase();
+    return Boolean((pid && clean === pid) || (pname && clean === pname));
+  }
+
   function appendInlineRichText(parent, text) {
-    const tokenRe = /(`[^`\n]+`)|(https?:\/\/[^\s<>"'`]+)|((?:^|(?<=[\s(\[]))@[a-zA-Z0-9][a-zA-Z0-9._-]{1,62})/g;
+    const tokenRe =
+      /(`[^`\n]+`)|(\*\*[^*\n]+?\*\*)|(\*[^*\n]+?\*)|(https?:\/\/[^\s<>"'`]+)|((?:^|(?<=[\s(\[，。、]))@[a-zA-Z0-9][a-zA-Z0-9._-]{1,62})/g;
     let last = 0;
     let m;
     while ((m = tokenRe.exec(text)) !== null) {
@@ -740,17 +962,25 @@
         code.textContent = m[1].slice(1, -1);
         parent.appendChild(code);
       } else if (m[2]) {
+        const strong = document.createElement("strong");
+        strong.textContent = m[2].slice(2, -2);
+        parent.appendChild(strong);
+      } else if (m[3]) {
+        const em = document.createElement("em");
+        em.textContent = m[3].slice(1, -1);
+        parent.appendChild(em);
+      } else if (m[4]) {
         const a = document.createElement("a");
         a.className = "msg-link";
-        a.href = m[2];
+        a.href = m[4];
         a.target = "_blank";
         a.rel = "noopener noreferrer";
-        a.textContent = m[2];
+        a.textContent = m[4];
         parent.appendChild(a);
-      } else if (m[3]) {
+      } else if (m[5]) {
         const chip = document.createElement("span");
-        chip.className = "mention-chip";
-        chip.textContent = m[3];
+        chip.className = "mention-chip" + (isMentionMe(m[5]) ? " mention-me" : "");
+        chip.textContent = m[5];
         parent.appendChild(chip);
       }
       last = m.index + m[0].length;
@@ -760,24 +990,111 @@
     }
   }
 
+  function parseTableCells(line) {
+    let trimmed = String(line || "").trim();
+    if (trimmed.startsWith("|")) trimmed = trimmed.slice(1);
+    if (trimmed.endsWith("|")) trimmed = trimmed.slice(0, -1);
+    return trimmed.split("|").map((c) => c.trim());
+  }
+
+  function parseTableAlignments(line) {
+    const trimmed = String(line || "").trim();
+    if (!trimmed.includes("|") || !/^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?$/.test(trimmed)) {
+      return null;
+    }
+    return parseTableCells(trimmed).map((cell) => {
+      const left = cell.startsWith(":");
+      const right = cell.endsWith(":");
+      if (left && right) return "center";
+      if (right) return "right";
+      return "left";
+    });
+  }
+
+  function appendRichBlocks(container, rawSegment, trimEdges) {
+    const seg = trimEdges ? String(rawSegment || "").replace(/^\n+|\n+$/g, "") : String(rawSegment || "");
+    if (!seg) return;
+    const lines = seg.split("\n");
+    let proseBuf = [];
+
+    const flushProse = (trimTrailing) => {
+      if (!proseBuf.length) return;
+      let joined = proseBuf.join("\n");
+      proseBuf = [];
+      if (trimTrailing) joined = joined.replace(/\n+$/, "");
+      if (!joined) return;
+      const span = document.createElement("span");
+      appendInlineRichText(span, joined);
+      container.appendChild(span);
+    };
+
+    let i = 0;
+    while (i < lines.length) {
+      const aligns =
+        lines[i].includes("|") && i + 1 < lines.length ? parseTableAlignments(lines[i + 1]) : null;
+      if (aligns && aligns.length >= 2) {
+        flushProse(true);
+        const headerCells = parseTableCells(lines[i]);
+        const colCount = Math.max(headerCells.length, aligns.length);
+        const wrap = document.createElement("div");
+        wrap.className = "ac-table-wrap";
+        const table = document.createElement("table");
+        const thead = document.createElement("thead");
+        const headTr = document.createElement("tr");
+        for (let c = 0; c < colCount; c++) {
+          const th = document.createElement("th");
+          if (aligns[c] && aligns[c] !== "left") th.style.textAlign = aligns[c];
+          appendInlineRichText(th, headerCells[c] || "");
+          headTr.appendChild(th);
+        }
+        thead.appendChild(headTr);
+        table.appendChild(thead);
+
+        const tbody = document.createElement("tbody");
+        i += 2;
+        while (i < lines.length && lines[i].trim() && lines[i].includes("|")) {
+          const rowCells = parseTableCells(lines[i]);
+          const tr = document.createElement("tr");
+          for (let c = 0; c < colCount; c++) {
+            const td = document.createElement("td");
+            if (aligns[c] && aligns[c] !== "left") td.style.textAlign = aligns[c];
+            appendInlineRichText(td, rowCells[c] || "");
+            tr.appendChild(td);
+          }
+          tbody.appendChild(tr);
+          i += 1;
+        }
+        table.appendChild(tbody);
+        wrap.appendChild(table);
+        container.appendChild(wrap);
+        while (i < lines.length && !lines[i].trim()) i += 1;
+        continue;
+      }
+      proseBuf.push(lines[i]);
+      i += 1;
+    }
+    flushProse(false);
+  }
+
   function renderFormattedBody(container, rawText) {
     const text = String(rawText || "");
-    const fenceRe = /```([a-zA-Z0-9_+-]*)\n?([\s\S]*?)```/g;
+    const fenceRe = /```([a-zA-Z0-9_#+-]*)\n?([\s\S]*?)```/g;
     let last = 0;
     let match;
+    let hasBlocks = false;
     while ((match = fenceRe.exec(text)) !== null) {
+      hasBlocks = true;
       if (match.index > last) {
-        const seg = document.createElement("span");
-        appendInlineRichText(seg, text.slice(last, match.index));
-        container.appendChild(seg);
+        appendRichBlocks(container, text.slice(last, match.index), true);
       }
-      const lang = match[1] || "text";
+      const lang = (match[1] || "code").toUpperCase();
       const codeText = match[2].replace(/\n$/, "");
       const wrap = document.createElement("div");
       wrap.className = "code-block-wrap";
       const head = document.createElement("div");
       head.className = "code-block-head";
       const langEl = document.createElement("span");
+      langEl.className = "code-block-lang";
       langEl.textContent = lang;
       const copyBtn = document.createElement("button");
       copyBtn.type = "button";
@@ -802,7 +1119,7 @@
       const pre = document.createElement("pre");
       pre.className = "code-block-pre";
       const codeEl = document.createElement("code");
-      codeEl.textContent = codeText;
+      appendSyntaxHighlightedCode(codeEl, codeText);
       pre.appendChild(codeEl);
       wrap.appendChild(head);
       wrap.appendChild(pre);
@@ -810,7 +1127,7 @@
       last = match.index + match[0].length;
     }
     if (last < text.length) {
-      appendInlineRichText(container, text.slice(last));
+      appendRichBlocks(container, text.slice(last), hasBlocks);
     }
   }
 
@@ -950,7 +1267,28 @@
     }
 
     const msgById = new Map(messages.map((m) => [m.id, m]));
+    const showUnreadDivider =
+      pendingUnreadBanner &&
+      pendingUnreadBanner.channelId === currentChannelId &&
+      pendingUnreadBanner.count > 0 &&
+      !activeSearchQuery &&
+      messages.length > 0;
+    const unreadDividerIdx = showUnreadDivider
+      ? Math.max(0, messages.length - pendingUnreadBanner.count)
+      : -1;
+    let unreadDividerEl = null;
+
     messages.forEach((m, idx) => {
+      if (showUnreadDivider && idx === unreadDividerIdx) {
+        const udiv = document.createElement("div");
+        udiv.id = "localUnreadDivider";
+        udiv.className = "unread-divider";
+        const uSpan = document.createElement("span");
+        uSpan.textContent = `以下为 ${pendingUnreadBanner.count} 条新消息`;
+        udiv.appendChild(uSpan);
+        elMessages.appendChild(udiv);
+        unreadDividerEl = udiv;
+      }
       if (shouldShowTimeDivider(messages[idx - 1], m)) {
         const divider = document.createElement("div");
         divider.className = "time-divider";
@@ -1116,6 +1454,9 @@
       elMessages.scrollTop = Math.max(0, elMessages.scrollHeight - opts.preserveScrollFromBottom);
     } else if (typeof opts.keepScrollTop === "number") {
       elMessages.scrollTop = opts.keepScrollTop;
+    } else if (unreadDividerEl && pendingUnreadBanner && pendingUnreadBanner.count > 2) {
+      pendingNewInRoom = 0;
+      elMessages.scrollTop = Math.max(0, unreadDividerEl.offsetTop - 24);
     } else {
       pendingNewInRoom = 0;
       elMessages.scrollTop = elMessages.scrollHeight;
@@ -1130,6 +1471,7 @@
       showToast("请先同步或填入全局账号凭证");
       return;
     }
+    pendingUnreadBanner = null;
     elInput.value = "";
     clearLocalDraft(currentChannelId);
     const payload = { content: text };
@@ -1211,17 +1553,18 @@
       const isDm = ch.channel_type === "direct" || ch.id.startsWith("dm-");
       const label = ch.name || ch.id;
       const unread = unreadByChannel.get(ch.id) || 0;
+      const pinned = isChannelPinned(ch.id);
       const hasDraft = Boolean(getLocalDraft(ch.id));
       const haystack = `${label} ${ch.id} ${ch.topic || ""}`.toLowerCase();
       if (q && !haystack.includes(q)) continue;
       chEntries.push({
         section: "本地房间与私聊",
-        icon: isDm ? "👤" : "#",
+        icon: pinned ? "📌" : isDm ? "👤" : "#",
         label,
-        meta: hasDraft ? "[草稿]" : ch.id === currentChannelId ? "当前" : "",
+        meta: hasDraft ? "[草稿]" : ch.id === currentChannelId ? "当前" : pinned ? "置顶" : "",
         isDraft: hasDraft,
         unread,
-        score: (unread > 0 ? 4 : 0) + (hasDraft ? 2 : 0) + (ch.id === currentChannelId ? 1 : 0),
+        score: (pinned ? 8 : 0) + (unread > 0 ? 4 : 0) + (hasDraft ? 2 : 0) + (ch.id === currentChannelId ? 1 : 0),
         run: () => {
           void selectChannel(ch.id);
         },
@@ -1296,6 +1639,13 @@
         meta: "",
         kw: "theme dark light 主题 深色 浅色",
         run: () => document.getElementById("btn-toggle-theme")?.click(),
+      },
+      {
+        icon: "⌨️",
+        label: "快捷键一览",
+        meta: "?",
+        kw: "shortcut keyboard help cheatsheet 快捷键 帮助",
+        run: () => openLocalShortcutsCheatsheet(),
       },
     ];
     for (const act of actions) {
@@ -1486,11 +1836,137 @@
     }
   }
 
+  let kbdBg = null;
+  let kbdPrevFocus = null;
+
+  function closeLocalShortcutsCheatsheet() {
+    if (!kbdBg || kbdBg.hidden) return;
+    kbdBg.hidden = true;
+    if (kbdPrevFocus && typeof kbdPrevFocus.focus === "function") {
+      try {
+        kbdPrevFocus.focus();
+      } catch {}
+    }
+  }
+
+  function openLocalShortcutsCheatsheet() {
+    closeLocalSwitcher();
+    closeChannelContextMenu();
+    kbdPrevFocus = document.activeElement;
+    const isMac = /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent || "");
+    const mod = isMac ? "⌘" : "Ctrl";
+    const alt = isMac ? "⌥" : "Alt";
+    const shift = isMac ? "⇧" : "Shift";
+    if (!kbdBg) {
+      kbdBg = document.createElement("div");
+      kbdBg.id = "localKbdCheatsheet";
+      kbdBg.className = "local-kbd-bg";
+      kbdBg.hidden = true;
+      kbdBg.setAttribute("role", "dialog");
+      kbdBg.setAttribute("aria-modal", "true");
+      kbdBg.setAttribute("aria-label", "快捷键一览");
+      kbdBg.addEventListener("click", (ev) => {
+        if (ev.target === kbdBg) closeLocalShortcutsCheatsheet();
+      });
+      document.body.appendChild(kbdBg);
+    }
+    kbdBg.replaceChildren();
+    const card = document.createElement("div");
+    card.className = "local-kbd-card";
+
+    const head = document.createElement("div");
+    head.className = "local-kbd-head";
+    const title = document.createElement("h3");
+    title.textContent = "⌨️ 本地协同快捷键一览";
+    const closeBtn = document.createElement("button");
+    closeBtn.type = "button";
+    closeBtn.className = "local-kbd-close";
+    closeBtn.setAttribute("aria-label", "关闭");
+    closeBtn.textContent = "✕";
+    closeBtn.addEventListener("click", () => closeLocalShortcutsCheatsheet());
+    head.appendChild(title);
+    head.appendChild(closeBtn);
+    card.appendChild(head);
+
+    const sections = [
+      {
+        title: "导航与会话",
+        rows: [
+          ["快速切换房间与指令面板", [mod, "K"]],
+          ["搜索当前房间消息", [mod, "F"]],
+          ["切换上 / 下一个会话", [alt, "↑", "/", "↓"]],
+          ["打开快捷键一览", ["?"]],
+        ],
+      },
+      {
+        title: "消息与编辑",
+        rows: [
+          ["发送消息 / 插入换行", ["Enter", "/", shift, "Enter"]],
+          ["唤起 @ 成员自动补全", ["@"]],
+          ["关闭浮层 / 退出搜索", ["Esc"]],
+        ],
+      },
+      {
+        title: "桌面客户端（macOS）",
+        rows: [
+          ["全局截屏并自动粘贴到聊天", ["⌘", "⇧", "X"]],
+          ["界面放大 / 缩小 / 还原默认", [mod, "+", "/", "−", "/", "0"]],
+        ],
+      },
+    ];
+
+    for (const sec of sections) {
+      const h = document.createElement("div");
+      h.className = "local-kbd-sec";
+      h.textContent = sec.title;
+      card.appendChild(h);
+      for (const [label, keys] of sec.rows) {
+        const row = document.createElement("div");
+        row.className = "local-kbd-row";
+        const sp = document.createElement("span");
+        sp.textContent = label;
+        const kWrap = document.createElement("span");
+        kWrap.className = "local-kbd-keys";
+        for (const k of keys) {
+          if (k === "/" && keys.length > 2) {
+            const sep = document.createElement("span");
+            sep.className = "local-kbd-sep";
+            sep.textContent = "/";
+            kWrap.appendChild(sep);
+            continue;
+          }
+          const el = document.createElement("kbd");
+          el.textContent = k;
+          kWrap.appendChild(el);
+        }
+        row.appendChild(sp);
+        row.appendChild(kWrap);
+        card.appendChild(row);
+      }
+    }
+
+    kbdBg.appendChild(card);
+    kbdBg.hidden = false;
+    closeBtn.focus();
+  }
+
+  window._acLocalUi = {
+    toggleChannelPin,
+    setUnreadFilter(unreadOnly) {
+      sidebarUnreadOnly = Boolean(unreadOnly);
+      updateUnreadFilterUI();
+      renderChannelList();
+    },
+    openShortcutsCheatsheet: openLocalShortcutsCheatsheet,
+    closeShortcutsCheatsheet: closeLocalShortcutsCheatsheet,
+    openChannelContextMenu,
+  };
+
   document.getElementById("btn-quick-switcher")?.addEventListener("click", () => {
     openLocalSwitcher();
   });
 
-  // Global shortcuts: Cmd/Ctrl+K command palette, Cmd/Ctrl+F search room, Alt+Up/Down switch channel, Esc close/clear
+  // Global shortcuts: Cmd/Ctrl+K command palette, Cmd/Ctrl+F search room, ? shortcuts modal, Alt+Up/Down switch channel, Esc close/clear
   window.addEventListener("keydown", (ev) => {
     if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "k") {
       ev.preventDefault();
@@ -1498,17 +1974,49 @@
       else openLocalSwitcher();
       return;
     }
+    if ((ev.metaKey || ev.ctrlKey) && ev.shiftKey && (ev.key === "/" || ev.key === "?")) {
+      ev.preventDefault();
+      if (kbdBg && !kbdBg.hidden) closeLocalShortcutsCheatsheet();
+      else openLocalShortcutsCheatsheet();
+      return;
+    }
     if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "f") {
       ev.preventDefault();
       closeLocalSwitcher();
+      closeLocalShortcutsCheatsheet();
       elSearchInput?.focus();
       elSearchInput?.select();
+      return;
+    }
+    if (ev.key === "Escape" && ctxMenuEl) {
+      ev.preventDefault();
+      closeChannelContextMenu();
+      return;
+    }
+    if (ev.key === "Escape" && kbdBg && !kbdBg.hidden) {
+      ev.preventDefault();
+      closeLocalShortcutsCheatsheet();
       return;
     }
     if (ev.key === "Escape" && switcherBg && !switcherBg.hidden) {
       ev.preventDefault();
       closeLocalSwitcher();
       return;
+    }
+    if (ev.key === "?" && !ev.metaKey && !ev.ctrlKey && !ev.altKey) {
+      const active = document.activeElement;
+      const tag = active ? String(active.tagName || "").toUpperCase() : "";
+      const editable = !!(
+        active &&
+        (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || active.isContentEditable)
+      );
+      const anyModal = !!document.querySelector(".modal-backdrop:not([hidden])");
+      if (!editable && !anyModal && (!switcherBg || switcherBg.hidden)) {
+        ev.preventDefault();
+        if (kbdBg && !kbdBg.hidden) closeLocalShortcutsCheatsheet();
+        else openLocalShortcutsCheatsheet();
+        return;
+      }
     }
     if (ev.altKey && !ev.metaKey && !ev.ctrlKey && (ev.key === "ArrowUp" || ev.key === "ArrowDown")) {
       if (channels.length > 1) {

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -309,5 +309,35 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     expect(sanitized.zoomFactor).toBe(1.35);
     expect(sanitizeDesktopSettings({ zoomFactor: 5 }).zoomFactor).toBe(1.75);
     expect(sanitizeDesktopSettings({}).zoomFactor).toBe(1);
+  });
+
+  test("local-chat UI keeps zero HTML-injection sinks and wires WeChat 4.0 sidebar, rich Markdown, and shortcuts parity", () => {
+    const uiDir = join(import.meta.dir, "..", "ui");
+    const js = readFileSync(join(uiDir, "local-chat.js"), "utf8");
+    const html = readFileSync(join(uiDir, "local-chat.html"), "utf8");
+    const css = readFileSync(join(uiDir, "local-chat.css"), "utf8");
+
+    // Zero HTML injection sinks and valid JS syntax
+    expect(js).not.toMatch(/\.(?:innerHTML|outerHTML)\s*=|insertAdjacentHTML|document\.write\s*\(/);
+    expect(() => new Function(js)).not.toThrow();
+
+    // Sidebar filter pills, pinning, context menu, and unread divider
+    expect(html).toContain('id="ch-filter-all"');
+    expect(html).toContain('id="ch-filter-unread"');
+    expect(js).toContain('ac_local_pinned_channels');
+    expect(js).toContain('openChannelContextMenu');
+    expect(js).toContain('localUnreadDivider');
+
+    // Pure-DOM rich Markdown (tables + single-pass syntax highlighter + mention-me) & shortcuts cheatsheet
+    expect(js).toContain('appendSyntaxHighlightedCode');
+    expect(js).toContain('parseTableAlignments');
+    expect(js).toContain('mention-me');
+    expect(js).toContain('openLocalShortcutsCheatsheet');
+
+    expect(css).toContain('.ac-table-wrap');
+    expect(css).toContain('.unread-divider');
+    expect(css).toContain('.local-ctx-menu');
+    expect(css).toContain('.local-kbd-card');
+    expect(css).toContain('.mention-chip.mention-me');
   });
 });
