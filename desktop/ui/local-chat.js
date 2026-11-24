@@ -9,6 +9,7 @@
   // Restore saved theme (default = WeChat crisp Light mode)
   try {
     if (localStorage.getItem("ac_desktop_theme") === "dark") {
+      document.documentElement.classList.add("dark");
       document.body.classList.add("dark");
     }
   } catch {}
@@ -220,6 +221,9 @@
   const elSearchInput = document.getElementById("search-input");
   const elSearchBanner = document.getElementById("search-banner");
   const elSearchBannerText = document.getElementById("search-banner-text");
+  const elSearchMatchCount = document.getElementById("search-match-count");
+  const elBtnSearchPrev = document.getElementById("btn-search-prev");
+  const elBtnSearchNext = document.getElementById("btn-search-next");
   const elReplyBanner = document.getElementById("reply-banner");
   const elReplyBannerText = document.getElementById("reply-banner-text");
   const elMentionMenu = document.getElementById("mention-menu");
@@ -227,6 +231,8 @@
   const elScrollBtnText = document.getElementById("scroll-bottom-text");
 
   let pendingNewInRoom = 0;
+  let searchMatchEls = [];
+  let searchMatchIdx = -1;
 
   function isNearBottom() {
     if (!elMessages) return true;
@@ -253,6 +259,7 @@
 
   function applyLocalTheme(theme) {
     const isDark = theme === "dark";
+    document.documentElement.classList.toggle("dark", isDark);
     document.body.classList.toggle("dark", isDark);
     try { localStorage.setItem("ac_desktop_theme", isDark ? "dark" : "light"); } catch {}
   }
@@ -980,40 +987,464 @@
     return Boolean((pid && clean === pid) || (pname && clean === pname));
   }
 
+  function isSafeLocalImageUrl(raw) {
+    if (typeof raw !== "string") return false;
+    const s = raw.trim();
+    if (!s || /[\u0000-\u001f\u007f]/.test(s)) return false;
+    if (s.startsWith("//")) return false;
+    if (s.startsWith("/")) return true;
+    return /^(?:https?:|blob:)/i.test(s);
+  }
+
+  // Pure-DOM Pro Image Lightbox 2.0 (focal zoom, smooth trackpad pinch, clamped 2D pan, 1:1, rotate & filmstrip)
+  const localLbState = {
+    open: false,
+    items: [],
+    index: 0,
+    scale: 1,
+    rotate: 0,
+    tx: 0,
+    ty: 0,
+    dragging: false,
+    dragStartX: 0,
+    dragStartY: 0,
+    originTx: 0,
+    originTy: 0,
+  };
+  let localLbDom = null;
+  let localLbWheelTimer = null;
+
+  function lbClampScale(val) {
+    const n = Number(val);
+    if (!Number.isFinite(n)) return 1;
+    return Math.min(5, Math.max(0.25, Math.round(n * 100) / 100));
+  }
+
+  function lbStageMetrics() {
+    if (!localLbDom) return { baseW: 0, baseH: 0, stageW: 0, stageH: 0, cx: 0, cy: 0 };
+    const sr = localLbDom.stage.getBoundingClientRect();
+    return {
+      baseW: localLbDom.img.offsetWidth || 0,
+      baseH: localLbDom.img.offsetHeight || 0,
+      stageW: sr.width || 0,
+      stageH: sr.height || 0,
+      cx: sr.left + sr.width / 2,
+      cy: sr.top + sr.height / 2,
+    };
+  }
+
+  function lbClampPan(tx, ty, scale) {
+    const s = lbClampScale(scale);
+    if (s <= 1.01) return { tx: 0, ty: 0 };
+    const m = lbStageMetrics();
+    if (!m.baseW || !m.baseH || !m.stageW || !m.stageH) return { tx: Math.round(tx), ty: Math.round(ty) };
+    const swapped = localLbState.rotate === 90 || localLbState.rotate === 270;
+    const effW = (swapped ? m.baseH : m.baseW) * s;
+    const effH = (swapped ? m.baseW : m.baseH) * s;
+    const maxX = Math.max(0, (effW - m.stageW) / 2);
+    const maxY = Math.max(0, (effH - m.stageH) / 2);
+    return {
+      tx: Math.round(Math.max(-maxX, Math.min(maxX, tx)) * 10) / 10,
+      ty: Math.round(Math.max(-maxY, Math.min(maxY, ty)) * 10) / 10,
+    };
+  }
+
+  function lbApplyTransform(instant) {
+    if (!localLbDom) return;
+    const img = localLbDom.img;
+    if (instant) {
+      img.classList.add("instant");
+      clearTimeout(localLbWheelTimer);
+      localLbWheelTimer = setTimeout(() => {
+        if (localLbDom) localLbDom.img.classList.remove("instant");
+      }, 90);
+    } else {
+      img.classList.remove("instant");
+    }
+    img.style.transform = `translate3d(${localLbState.tx}px,${localLbState.ty}px,0) scale(${localLbState.scale}) rotate(${localLbState.rotate}deg)`;
+    img.classList.toggle("zoomed", localLbState.scale > 1.01);
+    localLbDom.pctBtn.textContent = `${Math.round(localLbState.scale * 100)}%`;
+    localLbDom.oneBtn.classList.toggle("active", localLbState.scale > 1.05);
+  }
+
+  function lbSetScaleAt(nextScale, clientX, clientY, instant) {
+    const cur = localLbState.scale;
+    const next = lbClampScale(nextScale);
+    if (next <= 1.01) {
+      localLbState.scale = next;
+      localLbState.tx = 0;
+      localLbState.ty = 0;
+      lbApplyTransform(!!instant);
+      return;
+    }
+    const m = lbStageMetrics();
+    const fx = typeof clientX === "number" && m.stageW > 0 ? clientX - m.cx : 0;
+    const fy = typeof clientY === "number" && m.stageH > 0 ? clientY - m.cy : 0;
+    const ratio = next / cur;
+    const cl = lbClampPan(fx - (fx - localLbState.tx) * ratio, fy - (fy - localLbState.ty) * ratio, next);
+    localLbState.scale = next;
+    localLbState.tx = cl.tx;
+    localLbState.ty = cl.ty;
+    lbApplyTransform(!!instant);
+  }
+
+  function lbResetTransform() {
+    localLbState.scale = 1;
+    localLbState.rotate = 0;
+    localLbState.tx = 0;
+    localLbState.ty = 0;
+    lbApplyTransform(false);
+  }
+
+  function lbUpdateMeta() {
+    if (!localLbDom || !localLbState.items.length) return;
+    const cur = localLbState.items[localLbState.index] || localLbState.items[0];
+    const parts = [];
+    if (localLbDom.img.naturalWidth > 0 && localLbDom.img.naturalHeight > 0) {
+      parts.push(`${localLbDom.img.naturalWidth} × ${localLbDom.img.naturalHeight}`);
+    }
+    if (cur.alt && cur.alt.toLowerCase() !== "image") {
+      parts.push(cur.alt.length > 30 ? cur.alt.slice(0, 29) + "…" : cur.alt);
+    }
+    if (parts.length) {
+      localLbDom.meta.textContent = parts.join(" · ");
+      localLbDom.meta.style.display = "inline-flex";
+    } else {
+      localLbDom.meta.style.display = "none";
+    }
+  }
+
+  function lbUpdateView() {
+    if (!localLbDom || !localLbState.items.length) return;
+    const cur = localLbState.items[localLbState.index] || localLbState.items[0];
+    localLbDom.img.src = cur.src;
+    localLbDom.img.alt = cur.alt || "";
+    lbResetTransform();
+    lbUpdateMeta();
+
+    const multi = localLbState.items.length > 1;
+    localLbDom.root.classList.toggle("has-strip", multi);
+    localLbDom.counter.style.display = multi ? "inline-flex" : "none";
+    localLbDom.counter.textContent = `${localLbState.index + 1} / ${localLbState.items.length}`;
+    localLbDom.prevBtn.style.display = multi ? "flex" : "none";
+    localLbDom.nextBtn.style.display = multi ? "flex" : "none";
+    localLbDom.prevBtn.disabled = localLbState.index <= 0;
+    localLbDom.nextBtn.disabled = localLbState.index >= localLbState.items.length - 1;
+
+    localLbDom.strip.replaceChildren();
+    if (multi) {
+      localLbState.items.forEach((item, idx) => {
+        const tb = document.createElement("button");
+        tb.type = "button";
+        tb.className = "local-lb-thumb" + (idx === localLbState.index ? " active" : "");
+        tb.setAttribute("aria-label", `图片 ${idx + 1}`);
+        const ti = document.createElement("img");
+        ti.src = item.src;
+        ti.alt = "";
+        ti.loading = "lazy";
+        ti.draggable = false;
+        tb.appendChild(ti);
+        tb.addEventListener("click", (e) => {
+          e.stopPropagation();
+          if (localLbState.index !== idx) {
+            localLbState.index = idx;
+            lbUpdateView();
+          }
+        });
+        localLbDom.strip.appendChild(tb);
+      });
+    }
+  }
+
+  function lbStep(delta) {
+    if (!localLbState.open || localLbState.items.length <= 1) return;
+    const next = localLbState.index + delta;
+    if (next < 0 || next >= localLbState.items.length) return;
+    localLbState.index = next;
+    lbUpdateView();
+  }
+
+  async function lbCopyImage() {
+    const cur = localLbState.items[localLbState.index];
+    if (!cur || !isSafeLocalImageUrl(cur.src)) return;
+    try {
+      if (navigator.clipboard?.write && typeof ClipboardItem !== "undefined") {
+        const resp = await fetch(cur.src);
+        const blob = await resp.blob();
+        let pngBlob = blob;
+        if (blob.type !== "image/png" && typeof createImageBitmap === "function") {
+          const bmp = await createImageBitmap(blob);
+          const canvas = document.createElement("canvas");
+          canvas.width = bmp.width;
+          canvas.height = bmp.height;
+          canvas.getContext("2d").drawImage(bmp, 0, 0);
+          pngBlob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+        }
+        if (pngBlob) {
+          await navigator.clipboard.write([new ClipboardItem({ "image/png": pngBlob })]);
+          showToast("已复制图片到剪贴板");
+          return;
+        }
+      }
+      await copyTextToClipboard(cur.src);
+      showToast("已复制图片链接");
+    } catch {
+      await copyTextToClipboard(cur.src);
+      showToast("已复制图片链接");
+    }
+  }
+
+  function lbDownloadImage() {
+    const cur = localLbState.items[localLbState.index];
+    if (!cur || !isSafeLocalImageUrl(cur.src)) return;
+    const clean = cur.src.split("?")[0].split("#")[0];
+    const last = (clean.split("/").pop() || "").replace(/[^a-zA-Z0-9._-]/g, "").slice(0, 80);
+    const name = last && /\.(?:png|jpe?g|gif|webp|avif|svg)$/i.test(last) ? last : "agentschat-image.png";
+    const a = document.createElement("a");
+    a.href = cur.src;
+    a.download = name;
+    a.rel = "noopener noreferrer";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }
+
+  function closeLocalImageLightbox() {
+    if (!localLbState.open) return;
+    localLbState.open = false;
+    localLbState.dragging = false;
+    if (localLbDom) {
+      localLbDom.root.classList.remove("open");
+      localLbDom.img.src = "";
+    }
+  }
+
+  function ensureLocalLightboxDom() {
+    if (localLbDom && localLbDom.root.isConnected) return localLbDom;
+    const root = document.createElement("div");
+    root.id = "localImageLightbox";
+    root.className = "local-lb-backdrop";
+    root.setAttribute("role", "dialog");
+    root.setAttribute("aria-modal", "true");
+    root.setAttribute("aria-label", "图片查看器");
+
+    const topbar = document.createElement("div");
+    topbar.className = "local-lb-topbar";
+    const topLeft = document.createElement("div");
+    topLeft.className = "local-lb-top-left";
+    const counter = document.createElement("span");
+    counter.className = "local-lb-counter";
+    const meta = document.createElement("span");
+    meta.className = "local-lb-meta";
+    meta.style.display = "none";
+    topLeft.append(counter, meta);
+    const closeBtn = document.createElement("button");
+    closeBtn.type = "button";
+    closeBtn.className = "local-lb-close";
+    closeBtn.setAttribute("aria-label", "关闭图片查看器");
+    closeBtn.textContent = "✕";
+    closeBtn.addEventListener("click", closeLocalImageLightbox);
+    topbar.append(topLeft, closeBtn);
+
+    const stage = document.createElement("div");
+    stage.className = "local-lb-stage";
+    const img = document.createElement("img");
+    img.className = "local-lb-img";
+    img.draggable = false;
+    img.addEventListener("load", lbUpdateMeta);
+    stage.appendChild(img);
+
+    const prevBtn = document.createElement("button");
+    prevBtn.type = "button";
+    prevBtn.className = "local-lb-nav local-lb-prev";
+    prevBtn.setAttribute("aria-label", "上一张图片");
+    prevBtn.textContent = "‹";
+    prevBtn.addEventListener("click", (e) => { e.stopPropagation(); lbStep(-1); });
+
+    const nextBtn = document.createElement("button");
+    nextBtn.type = "button";
+    nextBtn.className = "local-lb-nav local-lb-next";
+    nextBtn.setAttribute("aria-label", "下一张图片");
+    nextBtn.textContent = "›";
+    nextBtn.addEventListener("click", (e) => { e.stopPropagation(); lbStep(1); });
+
+    const dock = document.createElement("div");
+    dock.className = "local-lb-dock";
+    const strip = document.createElement("div");
+    strip.className = "local-lb-strip";
+    strip.addEventListener("click", (e) => e.stopPropagation());
+    const toolbar = document.createElement("div");
+    toolbar.className = "local-lb-toolbar";
+    toolbar.addEventListener("click", (e) => e.stopPropagation());
+
+    const mkBtn = (cls, label, title, onClick) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "local-lb-btn" + (cls ? " " + cls : "");
+      b.textContent = label;
+      if (title) b.title = title;
+      b.addEventListener("click", onClick);
+      return b;
+    };
+    const mkSep = () => {
+      const s = document.createElement("span");
+      s.className = "local-lb-sep";
+      return s;
+    };
+
+    const zoomOutBtn = mkBtn("", "−", "缩小 (-)", () => lbSetScaleAt(localLbState.scale - 0.25, null, null, false));
+    const pctBtn = mkBtn("local-lb-pct", "100%", "还原适应屏幕 (0)", lbResetTransform);
+    const zoomInBtn = mkBtn("", "+", "放大 (+)", () => lbSetScaleAt(localLbState.scale + 0.25, null, null, false));
+    const oneBtn = mkBtn("", "1:1", "原尺寸 / 适应屏幕切换 (1)", () => {
+      if (localLbState.scale > 1.05) {
+        localLbState.scale = 1; localLbState.tx = 0; localLbState.ty = 0; lbApplyTransform(false);
+      } else {
+        lbSetScaleAt(2.5, null, null, false);
+      }
+    });
+    const rotLeftBtn = mkBtn("", "↺", "逆时针旋转 90° (Shift+R)", () => {
+      localLbState.rotate = (localLbState.rotate + 270) % 360;
+      const cl = lbClampPan(localLbState.tx, localLbState.ty, localLbState.scale);
+      localLbState.tx = cl.tx; localLbState.ty = cl.ty;
+      lbApplyTransform(false);
+    });
+    const rotRightBtn = mkBtn("", "↻", "顺时针旋转 90° (R)", () => {
+      localLbState.rotate = (localLbState.rotate + 90) % 360;
+      const cl = lbClampPan(localLbState.tx, localLbState.ty, localLbState.scale);
+      localLbState.tx = cl.tx; localLbState.ty = cl.ty;
+      lbApplyTransform(false);
+    });
+    const copyBtn = mkBtn("", "📋 复制", "复制图片 (C)", () => { void lbCopyImage(); });
+    const dlBtn = mkBtn("", "⬇ 下载", "下载图片 (D)", lbDownloadImage);
+    toolbar.append(zoomOutBtn, pctBtn, zoomInBtn, oneBtn, mkSep(), rotLeftBtn, rotRightBtn, mkSep(), copyBtn, dlBtn);
+    dock.append(strip, toolbar);
+
+    stage.addEventListener("click", (e) => { if (e.target === stage) closeLocalImageLightbox(); });
+    stage.addEventListener("wheel", (e) => {
+      e.preventDefault();
+      const dy = e.ctrlKey ? Math.max(-80, Math.min(80, e.deltaY)) : Math.max(-140, Math.min(140, e.deltaY));
+      const factor = Math.exp(-dy * (e.ctrlKey ? 0.012 : 0.0022));
+      lbSetScaleAt(localLbState.scale * factor, e.clientX, e.clientY, true);
+    }, { passive: false });
+    img.addEventListener("dblclick", (e) => {
+      e.stopPropagation();
+      if (localLbState.scale > 1.05) {
+        localLbState.scale = 1; localLbState.tx = 0; localLbState.ty = 0; lbApplyTransform(false);
+      } else {
+        lbSetScaleAt(2.5, e.clientX, e.clientY, false);
+      }
+    });
+    img.addEventListener("mousedown", (e) => {
+      if (localLbState.scale <= 1.01) return;
+      e.preventDefault();
+      localLbState.dragging = true;
+      localLbState.dragStartX = e.clientX;
+      localLbState.dragStartY = e.clientY;
+      localLbState.originTx = localLbState.tx;
+      localLbState.originTy = localLbState.ty;
+      img.classList.add("dragging");
+    });
+    document.addEventListener("mousemove", (e) => {
+      if (!localLbState.dragging || !localLbState.open) return;
+      const cl = lbClampPan(
+        localLbState.originTx + (e.clientX - localLbState.dragStartX),
+        localLbState.originTy + (e.clientY - localLbState.dragStartY),
+        localLbState.scale,
+      );
+      localLbState.tx = cl.tx;
+      localLbState.ty = cl.ty;
+      lbApplyTransform(true);
+    });
+    document.addEventListener("mouseup", () => {
+      if (!localLbState.dragging) return;
+      localLbState.dragging = false;
+      if (localLbDom) localLbDom.img.classList.remove("dragging");
+    });
+
+    root.append(topbar, stage, prevBtn, nextBtn, dock);
+    document.body.appendChild(root);
+    localLbDom = { root, counter, meta, closeBtn, stage, img, prevBtn, nextBtn, strip, toolbar, pctBtn, oneBtn };
+    return localLbDom;
+  }
+
+  function openLocalImageLightbox(src, triggerEl) {
+    if (!isSafeLocalImageUrl(src)) return false;
+    const dom = ensureLocalLightboxDom();
+    const items = [];
+    let activeIdx = -1;
+    const nodes = elMessages ? elMessages.querySelectorAll("img.wx-inline-img") : [];
+    nodes.forEach((node) => {
+      const s = (node.getAttribute("src") || "").trim();
+      if (!isSafeLocalImageUrl(s)) return;
+      if (triggerEl && node === triggerEl) activeIdx = items.length;
+      items.push({ src: s, alt: (node.getAttribute("alt") || "").trim() });
+    });
+    if (activeIdx < 0) {
+      activeIdx = items.findIndex((it) => it.src === src.trim());
+    }
+    if (activeIdx < 0) {
+      items.push({ src: src.trim(), alt: "" });
+      activeIdx = items.length - 1;
+    }
+    localLbState.items = items;
+    localLbState.index = activeIdx;
+    localLbState.open = true;
+    lbUpdateView();
+    dom.root.classList.add("open");
+    return true;
+  }
+
   function appendInlineRichText(parent, text) {
     const tokenRe =
-      /(`[^`\n]+`)|(\*\*[^*\n]+?\*\*)|(\*[^*\n]+?\*)|(https?:\/\/[^\s<>"'`]+)|((?:^|(?<=[\s(\[，。、]))@[a-zA-Z0-9][a-zA-Z0-9._-]{1,62})/g;
+      /!\[([^\]\n]{0,120})\]\(([^)\s\n]+)\)|(`[^`\n]+`)|(\*\*[^*\n]+?\*\*)|(\*[^*\n]+?\*)|(https?:\/\/[^\s<>"'`]+)|((?:^|(?<=[\s(\[，。、]))@[a-zA-Z0-9][a-zA-Z0-9._-]{1,62})/g;
     let last = 0;
     let m;
     while ((m = tokenRe.exec(text)) !== null) {
       if (m.index > last) {
         parent.appendChild(document.createTextNode(text.slice(last, m.index)));
       }
-      if (m[1]) {
+      if (m[2] !== undefined) {
+        const imgUrl = m[2].trim();
+        if (isSafeLocalImageUrl(imgUrl)) {
+          const wrap = document.createElement("span");
+          wrap.className = "wx-inline-img-wrap";
+          const img = document.createElement("img");
+          img.className = "wx-inline-img";
+          img.src = imgUrl;
+          img.alt = (m[1] || "image").trim();
+          img.loading = "lazy";
+          img.title = img.alt && img.alt !== "image" ? `${img.alt}（点击放大查看）` : "点击放大查看";
+          img.addEventListener("click", () => openLocalImageLightbox(imgUrl, img));
+          wrap.appendChild(img);
+          parent.appendChild(wrap);
+        } else {
+          parent.appendChild(document.createTextNode(m[0]));
+        }
+      } else if (m[3]) {
         const code = document.createElement("code");
         code.className = "inline-code";
-        code.textContent = m[1].slice(1, -1);
+        code.textContent = m[3].slice(1, -1);
         parent.appendChild(code);
-      } else if (m[2]) {
-        const strong = document.createElement("strong");
-        strong.textContent = m[2].slice(2, -2);
-        parent.appendChild(strong);
-      } else if (m[3]) {
-        const em = document.createElement("em");
-        em.textContent = m[3].slice(1, -1);
-        parent.appendChild(em);
       } else if (m[4]) {
+        const strong = document.createElement("strong");
+        strong.textContent = m[4].slice(2, -2);
+        parent.appendChild(strong);
+      } else if (m[5]) {
+        const em = document.createElement("em");
+        em.textContent = m[5].slice(1, -1);
+        parent.appendChild(em);
+      } else if (m[6]) {
         const a = document.createElement("a");
         a.className = "msg-link";
-        a.href = m[4];
+        a.href = m[6];
         a.target = "_blank";
         a.rel = "noopener noreferrer";
-        a.textContent = m[4];
+        a.textContent = m[6];
         parent.appendChild(a);
-      } else if (m[5]) {
+      } else if (m[7]) {
         const chip = document.createElement("span");
-        chip.className = "mention-chip" + (isMentionMe(m[5]) ? " mention-me" : "");
-        chip.textContent = m[5];
+        chip.className = "mention-chip" + (isMentionMe(m[7]) ? " mention-me" : "");
+        chip.textContent = m[7];
         parent.appendChild(chip);
       }
       last = m.index + m[0].length;
@@ -1562,6 +1993,7 @@
       elMessages.scrollTop = elMessages.scrollHeight;
     }
     updateScrollPill();
+    syncSearchMatches();
   }
 
   async function sendChatText(rawText) {
@@ -1994,6 +2426,7 @@
         rows: [
           ["快速切换房间与指令面板", [mod, "K"]],
           ["搜索当前房间消息", [mod, "F"]],
+          ["跳转下一处 / 上一处搜索匹配", [mod, "G", "/", shift, "Enter"]],
           ["切换上 / 下一个会话", [alt, "↑", "/", "↓"]],
           ["打开快捷键一览", ["?"]],
         ],
@@ -2004,6 +2437,7 @@
           ["发送消息 / 插入换行", ["Enter", "/", shift, "Enter"]],
           ["编辑上一条发出的消息（空输入框）", ["↑"]],
           ["唤起 @ 成员自动补全", ["@"]],
+          ["看图缩放 / 1:1 / 旋转 / 复制", ["+", "−", "1", "R", "C"]],
           ["关闭浮层 / 退出搜索", ["Esc"]],
         ],
       },
@@ -2115,14 +2549,61 @@
     openShortcutsCheatsheet: openLocalShortcutsCheatsheet,
     closeShortcutsCheatsheet: closeLocalShortcutsCheatsheet,
     openChannelContextMenu,
+    openLocalImageLightbox,
+    closeLocalImageLightbox,
+    getLightboxState: () => ({ ...localLbState, total: localLbState.items.length }),
+    stepSearchMatch: (delta) => stepSearchMatch(delta),
+    getSearchMatchState: () => ({ total: searchMatchEls.length, index: searchMatchIdx }),
+    isSafeLocalImageUrl,
   };
 
   document.getElementById("btn-quick-switcher")?.addEventListener("click", () => {
     openLocalSwitcher();
   });
 
-  // Global shortcuts: Cmd/Ctrl+K command palette, Cmd/Ctrl+F search room, ? shortcuts modal, Alt+Up/Down switch channel, Esc close/clear
+  // Global shortcuts: Lightbox, Cmd/Ctrl+K command palette, Cmd/Ctrl+F search room, Cmd/Ctrl+G match stepper, ? shortcuts modal, Alt+Up/Down switch channel, Esc close/clear
   window.addEventListener("keydown", (ev) => {
+    if (localLbState.open) {
+      if (ev.key === "Escape") { ev.preventDefault(); closeLocalImageLightbox(); return; }
+      if (ev.key === "ArrowLeft") { ev.preventDefault(); lbStep(-1); return; }
+      if (ev.key === "ArrowRight") { ev.preventDefault(); lbStep(1); return; }
+      if (ev.key === "+" || ev.key === "=") { ev.preventDefault(); lbSetScaleAt(localLbState.scale + 0.25, null, null, false); return; }
+      if (ev.key === "-" || ev.key === "_") { ev.preventDefault(); lbSetScaleAt(localLbState.scale - 0.25, null, null, false); return; }
+      if (ev.key === "0") { ev.preventDefault(); lbResetTransform(); return; }
+      if (ev.key === "1") {
+        ev.preventDefault();
+        if (localLbState.scale > 1.05) {
+          localLbState.scale = 1; localLbState.tx = 0; localLbState.ty = 0; lbApplyTransform(false);
+        } else {
+          lbSetScaleAt(2.5, null, null, false);
+        }
+        return;
+      }
+      if (ev.key === "r" || ev.key === "R") {
+        ev.preventDefault();
+        localLbState.rotate = (localLbState.rotate + (ev.shiftKey ? 270 : 90)) % 360;
+        const cl = lbClampPan(localLbState.tx, localLbState.ty, localLbState.scale);
+        localLbState.tx = cl.tx; localLbState.ty = cl.ty;
+        lbApplyTransform(false);
+        return;
+      }
+      if ((ev.key === "c" || ev.key === "C") && !ev.altKey) {
+        ev.preventDefault();
+        void lbCopyImage();
+        return;
+      }
+      if ((ev.key === "d" || ev.key === "D") && !ev.metaKey && !ev.ctrlKey && !ev.altKey) {
+        ev.preventDefault();
+        lbDownloadImage();
+        return;
+      }
+      return;
+    }
+    if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "g" && activeSearchQuery && searchMatchEls.length > 0) {
+      ev.preventDefault();
+      stepSearchMatch(ev.shiftKey ? -1 : 1);
+      return;
+    }
     if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "k") {
       ev.preventDefault();
       if (switcherBg && !switcherBg.hidden) closeLocalSwitcher();
@@ -2393,11 +2874,63 @@
 
   document.getElementById("btn-cancel-reply")?.addEventListener("click", () => setReplyTarget(null));
 
+  function focusSearchMatch(idx) {
+    if (!searchMatchEls.length) {
+      searchMatchIdx = -1;
+      if (elSearchMatchCount) {
+        elSearchMatchCount.textContent = "0 / 0";
+        elSearchMatchCount.hidden = !activeSearchQuery;
+      }
+      if (elBtnSearchPrev) elBtnSearchPrev.disabled = true;
+      if (elBtnSearchNext) elBtnSearchNext.disabled = true;
+      return;
+    }
+    const norm = ((idx % searchMatchEls.length) + searchMatchEls.length) % searchMatchEls.length;
+    searchMatchEls.forEach((el, i) => el.classList.toggle("current", i === norm));
+    searchMatchIdx = norm;
+    const activeEl = searchMatchEls[norm];
+    if (activeEl && typeof activeEl.scrollIntoView === "function") {
+      try { activeEl.scrollIntoView({ behavior: "smooth", block: "center" }); } catch {}
+    }
+    if (elSearchMatchCount) {
+      elSearchMatchCount.textContent = `${norm + 1} / ${searchMatchEls.length}`;
+      elSearchMatchCount.hidden = false;
+    }
+    if (elBtnSearchPrev) elBtnSearchPrev.disabled = searchMatchEls.length <= 1;
+    if (elBtnSearchNext) elBtnSearchNext.disabled = searchMatchEls.length <= 1;
+  }
+
+  function syncSearchMatches() {
+    if (!activeSearchQuery || !elMessages) {
+      searchMatchEls = [];
+      searchMatchIdx = -1;
+      if (elSearchMatchCount) elSearchMatchCount.hidden = true;
+      if (elBtnSearchPrev) elBtnSearchPrev.disabled = true;
+      if (elBtnSearchNext) elBtnSearchNext.disabled = true;
+      return;
+    }
+    searchMatchEls = Array.from(elMessages.querySelectorAll("mark.search-hit"));
+    if (searchMatchEls.length > 0) {
+      focusSearchMatch(0);
+    } else {
+      focusSearchMatch(-1);
+    }
+  }
+
+  function stepSearchMatch(delta) {
+    if (!searchMatchEls.length) return;
+    const base = searchMatchIdx < 0 ? 0 : searchMatchIdx;
+    focusSearchMatch(base + (delta < 0 ? -1 : 1));
+  }
+
   async function runSearch(query) {
     const q = String(query || "").trim();
     if (!q) {
       activeSearchQuery = "";
+      searchMatchEls = [];
+      searchMatchIdx = -1;
       if (elSearchBanner) elSearchBanner.hidden = true;
+      if (elSearchMatchCount) elSearchMatchCount.hidden = true;
       await selectChannel(currentChannelId);
       return;
     }
@@ -2415,15 +2948,22 @@
     messages = Array.isArray(res.data?.messages) ? res.data.messages.slice().reverse() : [];
     if (elSearchBanner) {
       elSearchBanner.hidden = false;
-      elSearchBannerText.textContent = `在 #${currentChannelId} 中搜索 “${q}”：命中 ${messages.length} 条`;
+      elSearchBannerText.textContent = `在 #${currentChannelId} 中搜索 “${q}”：命中 ${messages.length} 条消息`;
     }
     renderMessages();
   }
 
+  elBtnSearchPrev?.addEventListener("click", () => stepSearchMatch(-1));
+  elBtnSearchNext?.addEventListener("click", () => stepSearchMatch(1));
   elSearchInput?.addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") {
       ev.preventDefault();
-      void runSearch(elSearchInput.value);
+      const val = elSearchInput.value.trim();
+      if (val && val === activeSearchQuery && searchMatchEls.length > 0) {
+        stepSearchMatch(ev.shiftKey ? -1 : 1);
+      } else {
+        void runSearch(elSearchInput.value);
+      }
     } else if (ev.key === "Escape") {
       elSearchInput.value = "";
       elSearchInput.blur();

@@ -4,6 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>AgentsChat Local Server</title>
+  <script data-ac-theme-init>(function(){try{if(localStorage.getItem("ac_desktop_theme")==="dark")document.documentElement.classList.add("dark");}catch(e){}})();</script>
   <link rel="stylesheet" href="/local-chat.css" />
 </head>
 <body>
@@ -133,8 +134,13 @@
       </header>
 
       <div class="search-banner" id="search-banner" hidden>
-        <span id="search-banner-text"></span>
-        <button type="button" class="btn btn-ghost btn-xs" id="btn-clear-search">退出搜索</button>
+        <span class="search-banner-label" id="search-banner-text"></span>
+        <div class="search-banner-controls">
+          <span class="search-match-count" id="search-match-count" hidden>0 / 0</span>
+          <button type="button" class="search-step-btn" id="btn-search-prev" title="上一处匹配 (Shift+Enter / ⌘⇧G)" aria-label="上一处匹配" disabled>▲</button>
+          <button type="button" class="search-step-btn" id="btn-search-next" title="下一处匹配 (Enter / ⌘G)" aria-label="下一处匹配" disabled>▼</button>
+          <button type="button" class="btn btn-ghost btn-xs" id="btn-clear-search">退出搜索</button>
+        </div>
       </div>
 
       <div class="member-strip" id="member-strip"></div>

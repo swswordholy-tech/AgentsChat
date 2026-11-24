@@ -341,11 +341,24 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     expect(js).toContain('openMessageContextMenu');
     expect(js).toContain('editLocalMessage');
 
+    // Zero-FOUC theme init, in-channel search match stepper, safe inline images & pure-DOM Pro Image Lightbox 2.0
+    expect(html).toContain('data-ac-theme-init');
+    expect(html).toContain('id="search-match-count"');
+    expect(html).toContain('id="btn-search-prev"');
+    expect(html).toContain('id="btn-search-next"');
+    expect(js).toContain('stepSearchMatch');
+    expect(js).toContain('isSafeLocalImageUrl');
+    expect(js).toContain('openLocalImageLightbox');
+    expect(js).toContain('lbClampPan');
+
     expect(css).toContain('.ac-table-wrap');
     expect(css).toContain('.unread-divider');
     expect(css).toContain('.local-ctx-menu');
     expect(css).toContain('.local-kbd-card');
     expect(css).toContain('.mention-chip.mention-me');
     expect(css).toContain('.local-sidebar-resizer');
+    expect(css).toContain('mark.search-hit.current');
+    expect(css).toContain('.wx-inline-img');
+    expect(css).toContain('.local-lb-backdrop');
   });
 });
