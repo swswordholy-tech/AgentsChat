@@ -10,6 +10,8 @@ contextBridge.exposeInMainWorld("agentschatShell", {
   updateSettings: (patch) => ipcRenderer.invoke("desktop:update-settings", patch),
   copyText: (text) => ipcRenderer.invoke("desktop:copy-text", text),
   captureScreenshot: () => ipcRenderer.invoke("desktop:capture-screenshot"),
+  navigateCloudRoute: (route) => ipcRenderer.invoke("desktop:navigate-cloud-route", route),
+  cloudHistory: (direction) => ipcRenderer.invoke("desktop:cloud-history", direction),
   onStateChanged: (cb) => {
     const handler = (_ev, state) => cb(state);
     ipcRenderer.on("desktop:state-changed", handler);

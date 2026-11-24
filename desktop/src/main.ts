@@ -21,8 +21,11 @@ import { fileURLToPath } from "node:url";
 import {
   checkLatestDesktopRelease,
   clampDesktopZoomFactor,
+  classifyCloudRailSection,
   parseDeepLink,
   parseUnreadCountFromTitle,
+  resolveCloudQuickRoute,
+  type CloudQuickRoute,
 } from "./desktop-helpers.js";
 import { GlobalIdentityAuthority, resolveHomeDir } from "./identity-authority.js";
 import { LocalMiniServer } from "./local-server.js";
@@ -211,6 +214,19 @@ function attachNativeContextMenu(wc: Electron.WebContents): void {
       );
     }
 
+    if (items.length === 0) {
+      const canBack = wc.navigationHistory?.canGoBack?.() ?? false;
+      const canFwd = wc.navigationHistory?.canGoForward?.() ?? false;
+      if (canBack || canFwd) {
+        items.push(
+          { label: "Back", enabled: canBack, click: () => wc.navigationHistory.goBack() },
+          { label: "Forward", enabled: canFwd, click: () => wc.navigationHistory.goForward() },
+          { type: "separator" },
+          { label: "Reload", click: () => wc.reload() },
+        );
+      }
+    }
+
     if (items.length === 0) return;
     Menu.buildFromTemplate(items).popup({ window: mainWindow ?? undefined });
   });
@@ -279,6 +295,18 @@ async function ensureLocalServerStarted(): Promise<LocalServerStatus | null> {
   }
 }
 
+function getCloudNavState() {
+  if (!cloudView || cloudView.webContents.isDestroyed()) {
+    return { section: "lobby" as CloudQuickRoute, canGoBack: false, canGoForward: false };
+  }
+  const currentUrl = cloudView.webContents.getURL();
+  return {
+    section: classifyCloudRailSection(currentUrl, settings.remoteServerUrl),
+    canGoBack: cloudView.webContents.navigationHistory?.canGoBack?.() ?? false,
+    canGoForward: cloudView.webContents.navigationHistory?.canGoForward?.() ?? false,
+  };
+}
+
 function getCombinedState() {
   return {
     platform: process.platform,
@@ -286,6 +314,7 @@ function getCombinedState() {
     localServer: localServer ? localServer.getStatus() : null,
     localUnreadCount,
     cloudUnreadCount,
+    cloudNav: getCloudNavState(),
     discoveredProfiles: GlobalIdentityAuthority.discoverLocalAgentProfiles(),
   };
 }
@@ -392,6 +421,39 @@ async function switchWorkspace(target: "cloud" | "local"): Promise<void> {
   }
   layoutViews();
   broadcastState();
+}
+
+async function navigateCloudQuickRoute(route: unknown): Promise<boolean> {
+  const targetUrl = resolveCloudQuickRoute(route, settings.remoteServerUrl);
+  if (!targetUrl) return false;
+  await switchWorkspace("cloud");
+  if (!cloudView || cloudView.webContents.isDestroyed()) return false;
+  const currentUrl = cloudView.webContents.getURL();
+  const currentSection = classifyCloudRailSection(currentUrl, settings.remoteServerUrl);
+  // Clicking Lobby when already on Lobby/Chat preserves the active room without reloading
+  if (route === "lobby" && currentSection === "lobby" && currentUrl.startsWith(new URL(settings.remoteServerUrl).origin)) {
+    broadcastState();
+    return true;
+  }
+  await cloudView.webContents.loadURL(targetUrl);
+  broadcastState();
+  return true;
+}
+
+function navigateCloudHistory(direction: "back" | "forward"): boolean {
+  if (settings.activeWorkspace !== "cloud") return false;
+  if (!cloudView || cloudView.webContents.isDestroyed()) return false;
+  const nav = cloudView.webContents.navigationHistory;
+  if (!nav) return false;
+  if (direction === "back" && nav.canGoBack()) {
+    nav.goBack();
+    return true;
+  }
+  if (direction === "forward" && nav.canGoForward()) {
+    nav.goForward();
+    return true;
+  }
+  return false;
 }
 
 function showMainWindow(): void {
@@ -535,14 +597,41 @@ function setupApplicationMenu(): void {
       label: "Workspace",
       submenu: [
         {
-          label: "AgentsChat Cloud",
+          label: "AgentsChat Cloud (Lobby)",
           accelerator: "CmdOrCtrl+1",
-          click: () => void switchWorkspace("cloud"),
+          click: () => void navigateCloudQuickRoute("lobby"),
         },
         {
           label: "Local Mini-Server",
           accelerator: "CmdOrCtrl+2",
           click: () => void switchWorkspace("local"),
+        },
+        { type: "separator" },
+        {
+          label: "Cloud Studio (算力工坊)",
+          accelerator: "CmdOrCtrl+3",
+          click: () => void navigateCloudQuickRoute("cloud-agents"),
+        },
+        {
+          label: "OKR Board",
+          accelerator: "CmdOrCtrl+4",
+          click: () => void navigateCloudQuickRoute("okr-board"),
+        },
+        {
+          label: "Bot Market",
+          accelerator: "CmdOrCtrl+5",
+          click: () => void navigateCloudQuickRoute("marketplace"),
+        },
+        { type: "separator" },
+        {
+          label: "Back",
+          accelerator: "CmdOrCtrl+[",
+          click: () => void navigateCloudHistory("back"),
+        },
+        {
+          label: "Forward",
+          accelerator: "CmdOrCtrl+]",
+          click: () => void navigateCloudHistory("forward"),
         },
         { type: "separator" },
         {
@@ -832,6 +921,13 @@ async function createDesktopWindow(): Promise<void> {
   cloudView.webContents.on("dom-ready", () => {
     syncThemeToCloudView(settings.theme || "light");
     try { cloudView?.webContents.setZoomFactor(clampDesktopZoomFactor(settings.zoomFactor ?? 1)); } catch {}
+    broadcastState();
+  });
+  cloudView.webContents.on("did-navigate", () => broadcastState());
+  cloudView.webContents.on("did-navigate-in-page", () => broadcastState());
+  mainWindow.on("swipe", (_ev, direction) => {
+    if (direction === "right") navigateCloudHistory("back");
+    else if (direction === "left") navigateCloudHistory("forward");
   });
   localView.webContents.on("dom-ready", () => {
     try { localView?.webContents.setZoomFactor(clampDesktopZoomFactor(settings.zoomFactor ?? 1)); } catch {}
@@ -973,6 +1069,17 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle("desktop:capture-screenshot", async () => {
     return captureScreenshotToChat();
+  });
+
+  ipcMain.handle("desktop:navigate-cloud-route", async (_ev, route: unknown) => {
+    return navigateCloudQuickRoute(route);
+  });
+
+  ipcMain.handle("desktop:cloud-history", (_ev, direction: unknown) => {
+    if (direction === "back" || direction === "forward") {
+      return navigateCloudHistory(direction);
+    }
+    return false;
   });
 
   ipcMain.handle("desktop:open-cloud-path", async (_ev, targetPath: unknown) => {

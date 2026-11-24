@@ -5,10 +5,12 @@ import { join, resolve } from "node:path";
 import {
   checkLatestDesktopRelease,
   clampDesktopZoomFactor,
+  classifyCloudRailSection,
   compareSemver,
   parseDeepLink,
   parseDesktopReleaseTag,
   parseUnreadCountFromTitle,
+  resolveCloudQuickRoute,
 } from "../src/desktop-helpers.js";
 import { GlobalIdentityAuthority } from "../src/identity-authority.js";
 import { LocalMiniServer } from "../src/local-server.js";
@@ -370,5 +372,35 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     expect(css).toContain('mark.search-hit.current');
     expect(css).toContain('.wx-inline-img');
     expect(css).toContain('.local-lb-backdrop');
+  });
+
+  test("Desktop Command Rail 2.0 allowlists Cloud quick routes, classifies active sections, and wires shell rail controls", () => {
+    const remote = "https://agents-chat.com/lobby";
+    expect(resolveCloudQuickRoute("lobby", remote)).toBe("https://agents-chat.com/lobby");
+    expect(resolveCloudQuickRoute("cloud-agents", remote)).toBe("https://agents-chat.com/cloud-agents");
+    expect(resolveCloudQuickRoute("okr-board", remote)).toBe("https://agents-chat.com/okr-board");
+    expect(resolveCloudQuickRoute("marketplace", remote)).toBe("https://agents-chat.com/marketplace");
+    expect(resolveCloudQuickRoute("dashboard", remote)).toBe("https://agents-chat.com/dashboard");
+    // Rejects arbitrary paths, prototype keys, and non-http(s) remote URLs
+    expect(resolveCloudQuickRoute("https://evil.com", remote)).toBeNull();
+    expect(resolveCloudQuickRoute("__proto__", remote)).toBeNull();
+    expect(resolveCloudQuickRoute("constructor", remote)).toBeNull();
+    expect(resolveCloudQuickRoute("lobby", "javascript:alert(1)")).toBeNull();
+
+    expect(classifyCloudRailSection("https://agents-chat.com/cloud-agents", remote)).toBe("cloud-agents");
+    expect(classifyCloudRailSection("https://agents-chat.com/okr-board", remote)).toBe("okr-board");
+    expect(classifyCloudRailSection("https://agents-chat.com/okr.html", remote)).toBe("okr-board");
+    expect(classifyCloudRailSection("https://agents-chat.com/marketplace", remote)).toBe("marketplace");
+    expect(classifyCloudRailSection("https://agents-chat.com/lobby", remote)).toBe("lobby");
+    expect(classifyCloudRailSection("https://agents-chat.com/chat/demo-bot", remote)).toBe("lobby");
+    expect(classifyCloudRailSection("https://evil.example/cloud-agents", remote)).toBe("lobby");
+
+    const shellHtml = readFileSync(join(import.meta.dir, "..", "ui", "shell.html"), "utf8");
+    expect(shellHtml).toContain('id="btn-cloud-studio"');
+    expect(shellHtml).toContain('id="btn-cloud-okr"');
+    expect(shellHtml).toContain('id="btn-cloud-market"');
+    expect(shellHtml).toContain('id="btn-cloud-back"');
+    expect(shellHtml).toContain('navigateCloudRoute');
+    expect(shellHtml).toContain('cloudHistory');
   });
 });

@@ -96,7 +96,7 @@
       -webkit-app-region: no-drag;
       position: relative;
       width: 50px;
-      height: 50px;
+      height: 48px;
       border-radius: 10px;
       border: none;
       background: transparent;
@@ -106,9 +106,16 @@
       flex-direction: column;
       align-items: center;
       justify-content: center;
-      gap: 4px;
+      gap: 3px;
       padding: 0;
       transition: background-color 140ms var(--ease), color 140ms var(--ease), box-shadow 140ms var(--ease), transform 110ms var(--ease);
+    }
+    .node-btn.quick-node {
+      height: 44px;
+    }
+    .node-btn.quick-node .node-svg {
+      width: 19px;
+      height: 19px;
     }
     .node-btn:hover {
       background: var(--btn-hover);
@@ -283,6 +290,34 @@
         <span class="dot" id="local-dot" aria-hidden="true"></span>
         <span class="unread-badge" id="local-unread-badge" hidden>0</span>
       </button>
+
+      <div class="rail-sep" aria-hidden="true" style="margin: 2px 0;"></div>
+
+      <button class="node-btn quick-node" id="btn-cloud-studio" type="button" title="Cloud Studio 算力工坊 (⌘3)" aria-label="Cloud Studio">
+        <svg class="node-svg" viewBox="0 0 24 24" aria-hidden="true">
+          <rect x="4" y="4" width="16" height="16" rx="3" />
+          <rect x="9" y="9" width="6" height="6" rx="1" />
+          <path d="M9 1v3M15 1v3M9 20v3M15 20v3M1 9h3M1 15h3M20 9h3M20 15h3" />
+        </svg>
+        <span class="node-lbl">算力</span>
+      </button>
+
+      <button class="node-btn quick-node" id="btn-cloud-okr" type="button" title="OKR 协同看板 (⌘4)" aria-label="OKR Board">
+        <svg class="node-svg" viewBox="0 0 24 24" aria-hidden="true">
+          <circle cx="12" cy="12" r="9" />
+          <circle cx="12" cy="12" r="5" />
+          <circle cx="12" cy="12" r="1.5" />
+        </svg>
+        <span class="node-lbl">OKR</span>
+      </button>
+
+      <button class="node-btn quick-node" id="btn-cloud-market" type="button" title="Bot 租赁市场 (⌘5)" aria-label="Bot Market">
+        <svg class="node-svg" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M3 9h18l-1.4 10.2A2 2 0 0 1 17.6 21H6.4a2 2 0 0 1-2-1.8L3 9Z" />
+          <path d="M8 9V6a4 4 0 0 1 8 0v3" />
+        </svg>
+        <span class="node-lbl">市场</span>
+      </button>
     </nav>
 
     <div class="spacer"></div>
@@ -291,6 +326,11 @@
       <div class="rail-sep" aria-hidden="true"></div>
       <span class="lan-chip" id="lan-chip" title="局域网接入已开启 (0.0.0.0)" hidden>LAN</span>
       <span class="badge" id="local-port-badge" title="本机 Server 监听端口">:8787</span>
+      <button class="mini-btn" id="btn-cloud-back" type="button" title="返回上一页 (⌘[)" aria-label="返回上一页" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="m15 18-6-6 6-6" />
+        </svg>
+      </button>
       <button class="mini-btn" id="btn-shell-screenshot" type="button" title="框选截图并直接粘贴到聊天框 (⌘⇧X)" aria-label="框选截图并粘贴到聊天框">
         <svg viewBox="0 0 24 24" aria-hidden="true">
           <circle cx="6" cy="6" r="3" />
@@ -331,6 +371,10 @@
     const btnCloud = document.getElementById("btn-cloud");
     const cloudUnreadBadge = document.getElementById("cloud-unread-badge");
     const btnLocal = document.getElementById("btn-local");
+    const btnCloudStudio = document.getElementById("btn-cloud-studio");
+    const btnCloudOkr = document.getElementById("btn-cloud-okr");
+    const btnCloudMarket = document.getElementById("btn-cloud-market");
+    const btnCloudBack = document.getElementById("btn-cloud-back");
     const localDot = document.getElementById("local-dot");
     const localUnreadBadge = document.getElementById("local-unread-badge");
     const lanChip = document.getElementById("lan-chip");
@@ -358,10 +402,27 @@
         iconSun.toggleAttribute("hidden", !isDark);
       }
       const active = state.settings?.activeWorkspace || "cloud";
-      btnCloud.classList.toggle("active", active === "cloud");
+      const section = state.cloudNav?.section || "lobby";
+      const isCloudLobby = active === "cloud" && section !== "cloud-agents" && section !== "okr-board" && section !== "marketplace";
+      const isCloudStudio = active === "cloud" && section === "cloud-agents";
+      const isCloudOkr = active === "cloud" && section === "okr-board";
+      const isCloudMarket = active === "cloud" && section === "marketplace";
+
+      btnCloud.classList.toggle("active", isCloudLobby);
       btnLocal.classList.toggle("active", active === "local");
-      btnCloud.setAttribute("aria-pressed", String(active === "cloud"));
+      btnCloudStudio?.classList.toggle("active", isCloudStudio);
+      btnCloudOkr?.classList.toggle("active", isCloudOkr);
+      btnCloudMarket?.classList.toggle("active", isCloudMarket);
+
+      btnCloud.setAttribute("aria-pressed", String(isCloudLobby));
       btnLocal.setAttribute("aria-pressed", String(active === "local"));
+      btnCloudStudio?.setAttribute("aria-pressed", String(isCloudStudio));
+      btnCloudOkr?.setAttribute("aria-pressed", String(isCloudOkr));
+      btnCloudMarket?.setAttribute("aria-pressed", String(isCloudMarket));
+
+      if (btnCloudBack) {
+        btnCloudBack.hidden = !(active === "cloud" && state.cloudNav?.canGoBack);
+      }
 
       const running = Boolean(state.localServer?.running);
       localDot.classList.toggle("live", running);
@@ -382,8 +443,15 @@
         : "本机 Server 已停止 — 点击启动";
     }
 
-    btnCloud.addEventListener("click", () => api?.switchWorkspace("cloud"));
+    btnCloud.addEventListener("click", () => {
+      if (api?.navigateCloudRoute) api.navigateCloudRoute("lobby");
+      else api?.switchWorkspace("cloud");
+    });
     btnLocal.addEventListener("click", () => api?.switchWorkspace("local"));
+    btnCloudStudio?.addEventListener("click", () => api?.navigateCloudRoute?.("cloud-agents"));
+    btnCloudOkr?.addEventListener("click", () => api?.navigateCloudRoute?.("okr-board"));
+    btnCloudMarket?.addEventListener("click", () => api?.navigateCloudRoute?.("marketplace"));
+    btnCloudBack?.addEventListener("click", () => api?.cloudHistory?.("back"));
     btnShellTheme?.addEventListener("click", () => {
       const next = document.body.classList.contains("dark") ? "light" : "dark";
       const isDark = next === "dark";

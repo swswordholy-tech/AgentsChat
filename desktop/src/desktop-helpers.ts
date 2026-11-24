@@ -72,6 +72,55 @@ export function parseDeepLink(rawUrl: string): ParsedDeepLink | null {
 export const DESKTOP_MIN_ZOOM = 0.75;
 export const DESKTOP_MAX_ZOOM = 1.75;
 
+export type CloudQuickRoute = "lobby" | "cloud-agents" | "okr-board" | "marketplace" | "dashboard";
+
+const CLOUD_QUICK_ROUTE_PATHS: Record<CloudQuickRoute, string> = {
+  lobby: "/lobby",
+  "cloud-agents": "/cloud-agents",
+  "okr-board": "/okr-board",
+  marketplace: "/marketplace",
+  dashboard: "/dashboard",
+};
+
+/**
+ * Resolve an allowlisted Desktop Rail quick-route key to a same-origin Cloud URL.
+ * Rejects unknown route keys or malformed remoteServerUrl values.
+ */
+export function resolveCloudQuickRoute(route: unknown, remoteServerUrl: string): string | null {
+  if (typeof route !== "string") return null;
+  const path = Object.prototype.hasOwnProperty.call(CLOUD_QUICK_ROUTE_PATHS, route)
+    ? CLOUD_QUICK_ROUTE_PATHS[route as CloudQuickRoute]
+    : null;
+  if (!path) return null;
+  try {
+    const base = new URL(remoteServerUrl);
+    if (base.protocol !== "https:" && base.protocol !== "http:") return null;
+    return new URL(path, base.origin).toString();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Map the current Cloud WebView URL to the corresponding Desktop Rail section highlight.
+ */
+export function classifyCloudRailSection(rawUrl: unknown, remoteServerUrl: string): CloudQuickRoute {
+  if (typeof rawUrl !== "string" || !rawUrl.trim()) return "lobby";
+  try {
+    const cur = new URL(rawUrl);
+    const expectedOrigin = new URL(remoteServerUrl).origin;
+    if (cur.origin !== expectedOrigin) return "lobby";
+    const p = cur.pathname.toLowerCase();
+    if (p === "/cloud-agents" || p.startsWith("/cloud-agents/")) return "cloud-agents";
+    if (p === "/okr-board" || p === "/okr" || p === "/okr.html" || p === "/okr-board.html") return "okr-board";
+    if (p === "/marketplace" || p === "/marketplace.html") return "marketplace";
+    if (p === "/dashboard" || p === "/dashboard.html") return "dashboard";
+    return "lobby";
+  } catch {
+    return "lobby";
+  }
+}
+
 /**
  * Extract leading `(N)` unread count from a Web page title (e.g. "(3) AgentsChat" -> 3).
  */
