@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // dsh/src/cli.ts
-import { chmodSync as chmodSync3, copyFileSync as copyFileSync3, lstatSync as lstatSync7, mkdirSync as mkdirSync4, readFileSync as readFileSync7, renameSync as renameSync3, unlinkSync as unlinkSync4, writeFileSync as writeFileSync3 } from "node:fs";
+import { chmodSync as chmodSync4, copyFileSync as copyFileSync3, lstatSync as lstatSync7, mkdirSync as mkdirSync5, readFileSync as readFileSync7, renameSync as renameSync4, unlinkSync as unlinkSync5, writeFileSync as writeFileSync4 } from "node:fs";
 import { randomBytes as randomBytes3 } from "node:crypto";
 import { spawn } from "node:child_process";
 import { dirname as dirname6, join as join6 } from "node:path";
@@ -1421,7 +1421,7 @@ function resolveSessionForAgent(agentId, opts = {}) {
 }
 
 // src/wake.ts
-import { existsSync as existsSync2, lstatSync as lstatSync5, readFileSync as readFileSync5, readlinkSync as readlinkSync3 } from "node:fs";
+import { chmodSync as chmodSync2, existsSync as existsSync2, lstatSync as lstatSync5, mkdirSync as mkdirSync3, readFileSync as readFileSync5, readlinkSync as readlinkSync3, renameSync as renameSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2 } from "node:fs";
 import { homedir as homedir3 } from "node:os";
 import { dirname as dirname4, isAbsolute as isAbsolute4, join as join4, parse as parse3, resolve as resolve3, win32 as pathWin32 } from "node:path";
 var PROTOTYPE_WAKE_KEYS = new Set([
@@ -1499,7 +1499,7 @@ function resolveWindowsCliSpawn(cmd, args, opts) {
 
 // dsh/src/patch.ts
 import { randomBytes as randomBytes2 } from "node:crypto";
-import { chmodSync as chmodSync2, copyFileSync as copyFileSync2, lstatSync as lstatSync6, mkdirSync as mkdirSync3, readFileSync as readFileSync6, realpathSync as realpathSync4, renameSync as renameSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2 } from "node:fs";
+import { chmodSync as chmodSync3, copyFileSync as copyFileSync2, lstatSync as lstatSync6, mkdirSync as mkdirSync4, readFileSync as readFileSync6, realpathSync as realpathSync4, renameSync as renameSync3, unlinkSync as unlinkSync4, writeFileSync as writeFileSync3 } from "node:fs";
 import { dirname as dirname5, isAbsolute as isAbsolute5, join as join5, resolve as resolve4 } from "node:path";
 import { homedir as homedir4 } from "node:os";
 var FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
@@ -1773,12 +1773,12 @@ function applyDshCordisPatchFile(opts = {}) {
   const existing = existed ? readFileSync6(patchPath, "utf8") : "";
   const { content, changed } = mergeDshCordisPatch(existing, opts);
   if (changed) {
-    mkdirSync3(dirname5(patchPath), { recursive: true });
+    mkdirSync4(dirname5(patchPath), { recursive: true });
     checkParentDirectory(patchPath);
     const tmp = `${patchPath}.${process.pid}.${randomBytes2(4).toString("hex")}.tmp`;
     let created = false;
     try {
-      writeFileSync2(tmp, content, { encoding: "utf8", mode, flag: "wx" });
+      writeFileSync3(tmp, content, { encoding: "utf8", mode, flag: "wx" });
       created = true;
       checkParentDirectory(patchPath);
       try {
@@ -1790,7 +1790,7 @@ function applyDshCordisPatchFile(opts = {}) {
         if (err?.code !== "ENOENT")
           throw err;
       }
-      const doRename = opts.fsOps?.renameSync ?? renameSync2;
+      const doRename = opts.fsOps?.renameSync ?? renameSync3;
       const doCopy = opts.fsOps?.copyFileSync ?? copyFileSync2;
       try {
         doRename(tmp, patchPath);
@@ -1810,19 +1810,19 @@ function applyDshCordisPatchFile(opts = {}) {
         }
         doCopy(tmp, patchPath);
         try {
-          unlinkSync3(tmp);
+          unlinkSync4(tmp);
         } catch {}
         created = false;
       }
       if (process.platform !== "win32") {
         try {
-          chmodSync2(patchPath, mode);
+          chmodSync3(patchPath, mode);
         } catch {}
       }
     } catch (err) {
       try {
         if (created)
-          unlinkSync3(tmp);
+          unlinkSync4(tmp);
       } catch {}
       throw err;
     }
@@ -2029,12 +2029,12 @@ async function registerOnly(name, restUrl, profilePath = DSH_PROFILE_PATH) {
       throw err;
   }
   checkParentDirectory(profilePath);
-  mkdirSync4(dirname6(profilePath), { recursive: true, mode: 448 });
+  mkdirSync5(dirname6(profilePath), { recursive: true, mode: 448 });
   checkParentDirectory(profilePath);
   const tmp = `${profilePath}.${process.pid}.${randomBytes3(4).toString("hex")}.tmp`;
   let created = false;
   try {
-    writeFileSync3(tmp, JSON.stringify({ agentId, token }, null, 2), { mode: 384, flag: "wx" });
+    writeFileSync4(tmp, JSON.stringify({ agentId, token }, null, 2), { mode: 384, flag: "wx" });
     created = true;
     checkParentDirectory(profilePath);
     try {
@@ -2046,7 +2046,7 @@ async function registerOnly(name, restUrl, profilePath = DSH_PROFILE_PATH) {
         throw err;
     }
     try {
-      renameSync3(tmp, profilePath);
+      renameSync4(tmp, profilePath);
     } catch (renameErr) {
       if (renameErr?.code !== "EPERM" && renameErr?.code !== "EACCES") {
         throw renameErr;
@@ -2062,19 +2062,19 @@ async function registerOnly(name, restUrl, profilePath = DSH_PROFILE_PATH) {
       }
       copyFileSync3(tmp, profilePath);
       try {
-        unlinkSync4(tmp);
+        unlinkSync5(tmp);
       } catch {}
       created = false;
     }
     if (process.platform !== "win32") {
       try {
-        chmodSync3(profilePath, 384);
+        chmodSync4(profilePath, 384);
       } catch {}
     }
   } catch (err) {
     if (created) {
       try {
-        unlinkSync4(tmp);
+        unlinkSync5(tmp);
       } catch {}
     }
     throw err;

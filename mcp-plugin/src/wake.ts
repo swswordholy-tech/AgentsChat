@@ -22,10 +22,11 @@
  * notification path (which is how Claude Code wakes). One bounded retry, short
  * timeout, then drop with a stderr note.
  */
-import { createHmac, timingSafeEqual } from "node:crypto";
-import { existsSync, lstatSync, readFileSync, readlinkSync, type Stats } from "node:fs";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, renameSync, unlinkSync, writeFileSync, type Stats } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, parse, resolve, win32 as pathWin32 } from "node:path";
+import { fileURLToPath } from "node:url";
 import { redactSecrets } from "./redact.ts";
 
 /** Signature header the receiver reads to verify a wake POST. */
@@ -1020,6 +1021,174 @@ export async function fireAntigravitySidecarWake(
     return false;
   } finally {
     clearTimeout(t);
+  }
+}
+
+export const ANTIGRAVITY_SIDECAR_DIR_NAME = "agentschat-wake";
+export const ANTIGRAVITY_SIDECAR_SCRIPT_NAME = "wake-sidecar.mjs";
+export const ANTIGRAVITY_SIDECAR_MANIFEST_NAME = "sidecar.json";
+
+export interface AntigravitySidecarInstallResult {
+  status: "installed" | "updated" | "up_to_date" | "error";
+  dir: string;
+  scriptPath: string;
+  manifestPath: string;
+  error?: string;
+}
+
+function writeTextFileAtomicallySafe(filePath: string, content: string, mode: number, platform: NodeJS.Platform): void {
+  const existing = lstatSync(filePath, { throwIfNoEntry: false });
+  if (existing && existing.isSymbolicLink()) {
+    throw new Error(`Refusing to overwrite symlink: ${filePath}`);
+  }
+  const tmpPath = `${filePath}.tmp.${process.pid}.${randomBytes(4).toString("hex")}`;
+  try {
+    writeFileSync(tmpPath, content, { encoding: "utf8", mode });
+    if (platform !== "win32") {
+      try {
+        chmodSync(tmpPath, mode);
+      } catch {}
+    }
+    try {
+      renameSync(tmpPath, filePath);
+    } catch (renameErr: any) {
+      const code = renameErr?.code || "";
+      if (platform !== "win32" || !["EPERM", "EACCES", "EBUSY", "EEXIST"].includes(code)) {
+        throw renameErr;
+      }
+      const recheck = lstatSync(filePath, { throwIfNoEntry: false });
+      if (recheck && recheck.isSymbolicLink()) {
+        throw new Error(`Refusing to overwrite symlink: ${filePath}`);
+      }
+      try {
+        if (recheck) unlinkSync(filePath);
+        renameSync(tmpPath, filePath);
+      } catch {
+        const finalCheck = lstatSync(filePath, { throwIfNoEntry: false });
+        if (finalCheck && finalCheck.isSymbolicLink()) {
+          throw new Error(`Refusing to overwrite symlink: ${filePath}`);
+        }
+        writeFileSync(filePath, content, { encoding: "utf8" });
+        try {
+          unlinkSync(tmpPath);
+        } catch {}
+      }
+    }
+  } catch (err) {
+    try {
+      unlinkSync(tmpPath);
+    } catch {}
+    throw err;
+  }
+}
+
+/**
+ * Install or self-heal the official Antigravity Wake Bridge sidecar
+ * (`~/.gemini/config/sidecars/agentschat-wake/{sidecar.json,wake-sidecar.mjs}`).
+ * Preserves existing user-customized `sidecar.json` while keeping `wake-sidecar.mjs`
+ * synced to the bundled cross-platform script (macOS / Linux / Windows).
+ */
+export function ensureAntigravityWakeSidecarInstalled(opts?: {
+  geminiConfigDir?: string;
+  sourceScriptPath?: string;
+  platform?: NodeJS.Platform;
+}): AntigravitySidecarInstallResult {
+  const platform = opts?.platform ?? process.platform;
+  const home = process.env.HOME || process.env.USERPROFILE || homedir() || ".";
+  const geminiConfigDir =
+    opts?.geminiConfigDir?.trim() ||
+    process.env.AGENTSCHAT_GEMINI_CONFIG_DIR?.trim() ||
+    join(home, ".gemini", "config");
+  const dir = join(geminiConfigDir, "sidecars", ANTIGRAVITY_SIDECAR_DIR_NAME);
+  const scriptPath = join(dir, ANTIGRAVITY_SIDECAR_SCRIPT_NAME);
+  const manifestPath = join(dir, ANTIGRAVITY_SIDECAR_MANIFEST_NAME);
+
+  if (!hasSafeWakeDirChain(dir)) {
+    return { status: "error", dir, scriptPath, manifestPath, error: "unsafe_sidecar_dir_chain" };
+  }
+
+  const sourceScriptPath =
+    opts?.sourceScriptPath?.trim() ||
+    join(dirname(fileURLToPath(import.meta.url)), "..", "scripts", "antigravity-wake-sidecar.mjs");
+
+  let bundledScript: string;
+  try {
+    bundledScript = readFileSync(sourceScriptPath, "utf8");
+  } catch (err) {
+    return {
+      status: "error",
+      dir,
+      scriptPath,
+      manifestPath,
+      error: `bundled_script_unreadable: ${redactSecrets(String(err)).slice(0, 120)}`,
+    };
+  }
+
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const dirStat = lstatSync(dir);
+    if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) {
+      return { status: "error", dir, scriptPath, manifestPath, error: "sidecar_dir_not_directory" };
+    }
+
+    const scriptStat = lstatSync(scriptPath, { throwIfNoEntry: false });
+    if (scriptStat && scriptStat.isSymbolicLink()) {
+      return { status: "error", dir, scriptPath, manifestPath, error: "sidecar_script_is_symlink" };
+    }
+    const manifestStat = lstatSync(manifestPath, { throwIfNoEntry: false });
+    if (manifestStat && manifestStat.isSymbolicLink()) {
+      return { status: "error", dir, scriptPath, manifestPath, error: "sidecar_manifest_is_symlink" };
+    }
+
+    const hadScript = Boolean(scriptStat && scriptStat.isFile());
+    const hadManifest = Boolean(manifestStat && manifestStat.isFile());
+    let scriptChanged = !hadScript;
+    if (hadScript) {
+      try {
+        scriptChanged = readFileSync(scriptPath, "utf8") !== bundledScript;
+      } catch {
+        scriptChanged = true;
+      }
+    }
+
+    if (scriptChanged) {
+      writeTextFileAtomicallySafe(scriptPath, bundledScript, 0o755, platform);
+    }
+
+    let manifestWritten = false;
+    if (!hadManifest) {
+      const manifest =
+        JSON.stringify(
+          {
+            display_name: "AgentsChat Wake Bridge",
+            description:
+              "Delivers AgentsChat DM, @mention, and /loop wakes to bound Antigravity conversations via agentapi send-message.",
+            command: "node",
+            args: [ANTIGRAVITY_SIDECAR_SCRIPT_NAME],
+            restart_policy: "always",
+          },
+          null,
+          2,
+        ) + "\n";
+      writeTextFileAtomicallySafe(manifestPath, manifest, 0o644, platform);
+      manifestWritten = true;
+    }
+
+    if (!hadScript || manifestWritten) {
+      return { status: "installed", dir, scriptPath, manifestPath };
+    }
+    if (scriptChanged) {
+      return { status: "updated", dir, scriptPath, manifestPath };
+    }
+    return { status: "up_to_date", dir, scriptPath, manifestPath };
+  } catch (err) {
+    return {
+      status: "error",
+      dir,
+      scriptPath,
+      manifestPath,
+      error: redactSecrets(String(err)).slice(0, 180),
+    };
   }
 }
 

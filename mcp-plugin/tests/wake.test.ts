@@ -26,6 +26,7 @@ import {
   buildWakePayload,
   buildWakePrompt,
   clampWakeTimerMs,
+  ensureAntigravityWakeSidecarInstalled,
   fireAntigravitySidecarWake,
   fireAntigravityWake,
   fireGrokWake,
@@ -687,6 +688,181 @@ fs.appendFileSync(${JSON.stringify(mockLogFile)}, JSON.stringify(process.argv.sl
       try {
         child.kill("SIGKILL");
       } catch {}
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("antigravity-wake-sidecar.mjs resolves Windows .bat shims to language_server.exe (shell:false) and handles Windows EPERM atomic state replace", async () => {
+    const sidecarMod = await import("../scripts/antigravity-wake-sidecar.mjs");
+    const { parseBatchExecTarget, resolveAgentApiCommand, writeStateFileAtomically } = sidecarMod;
+
+    // 1. Windows agentapi.bat delegating to quoted D:\Apps\Antigravity\resources\bin\language_server.exe
+    const winBat = "C:\\Users\\Administrator\\.gemini\\antigravity\\bin\\agentapi.bat";
+    const winLsExe = "D:\\Apps\\Antigravity\\resources\\bin\\language_server.exe";
+    const parsedAbsolute = parseBatchExecTarget(
+      winBat,
+      `@echo off\r\n"${winLsExe}" agentapi %*\r\n`,
+      { existsSyncFn: (p: string) => p.toLowerCase() === winLsExe.toLowerCase() },
+    );
+    expect(parsedAbsolute).toEqual({
+      command: winLsExe,
+      prefixArgs: ["agentapi"],
+    });
+
+    // 2. Windows %~dp0 relative batch shim
+    const dp0Bat = "D:\\Apps\\Antigravity\\resources\\bin\\agentapi.cmd";
+    const parsedDp0 = parseBatchExecTarget(
+      dp0Bat,
+      `@"%~dp0language_server.exe" agentapi %*\r\n`,
+      { existsSyncFn: (p: string) => p.toLowerCase() === winLsExe.toLowerCase() },
+    );
+    expect(parsedDp0).toEqual({
+      command: winLsExe,
+      prefixArgs: ["agentapi"],
+    });
+
+    // 3. resolveAgentApiCommand on Windows finds agentapi.bat in ~/.gemini/antigravity/bin and unwraps to .exe
+    const resolvedFromHome = resolveAgentApiCommand({
+      platform: "win32",
+      env: { USERPROFILE: "C:\\Users\\Administrator", PATH: "C:\\Windows\\System32" },
+      existsSyncFn: (p: string) => {
+        const lower = p.toLowerCase();
+        return lower === winBat.toLowerCase() || lower === winLsExe.toLowerCase();
+      },
+      readFileSyncFn: () => `@"${winLsExe}" agentapi %*\r\n`,
+    });
+    expect(resolvedFromHome).toEqual({
+      command: winLsExe,
+      prefixArgs: ["agentapi"],
+    });
+
+    // 4. Explicit AGENTSCHAT_AGENTAPI_BIN pointing straight to language_server.exe adds "agentapi" subcommand
+    const resolvedDirectLs = resolveAgentApiCommand({
+      platform: "win32",
+      env: { AGENTSCHAT_AGENTAPI_BIN: winLsExe },
+      existsSyncFn: () => true,
+    });
+    expect(resolvedDirectLs).toEqual({
+      command: winLsExe,
+      prefixArgs: ["agentapi"],
+    });
+
+    // 5. Fallback to %LOCALAPPDATA%\Programs\Antigravity\resources\bin\language_server.exe when no shim on PATH
+    const defaultInstallExe = "C:\\Users\\Alice\\AppData\\Local\\Programs\\Antigravity\\resources\\bin\\language_server.exe";
+    const resolvedFallback = resolveAgentApiCommand({
+      platform: "win32",
+      env: {
+        USERPROFILE: "C:\\Users\\Alice",
+        LOCALAPPDATA: "C:\\Users\\Alice\\AppData\\Local",
+        PATH: "C:\\Windows\\System32",
+      },
+      existsSyncFn: (p: string) => p.toLowerCase() === defaultInstallExe.toLowerCase(),
+      readFileSyncFn: () => "",
+    });
+    expect(resolvedFallback).toEqual({
+      command: defaultInstallExe,
+      prefixArgs: ["agentapi"],
+    });
+
+    // 6. Unresolved .bat fails closed with unresolvedBatch instead of invoking cmd.exe
+    const unresolved = resolveAgentApiCommand({
+      platform: "win32",
+      env: { AGENTSCHAT_AGENTAPI_BIN: "C:\\Custom\\agentapi.bat", PATH: "" },
+      existsSyncFn: (p: string) => p.toLowerCase() === "c:\\custom\\agentapi.bat",
+      readFileSyncFn: () => "@echo broken shim\r\n",
+    });
+    expect((unresolved as { unresolvedBatch?: string }).unresolvedBatch).toBe("C:\\Custom\\agentapi.bat");
+
+    // 7. writeStateFileAtomically handles Windows EPERM on rename over existing file without leaving .tmp files
+    const root = mkdtempSync(join(tmpdir(), "ac-win-atomic-"));
+    try {
+      const target = join(root, "antigravity-sidecar.json");
+      writeFileSync(target, JSON.stringify({ url: "http://127.0.0.1:1/wake", secret: "old", pid: 1 }));
+      const realFs = await import("node:fs");
+      let renameAttempts = 0;
+      const winMockFs = {
+        ...realFs,
+        renameSync(from: string, to: string) {
+          renameAttempts++;
+          if (renameAttempts === 1) {
+            const err: any = new Error("EPERM: operation not permitted");
+            err.code = "EPERM";
+            throw err;
+          }
+          return realFs.renameSync(from, to);
+        },
+      };
+      writeStateFileAtomically(
+        target,
+        { url: "http://127.0.0.1:54321/wake", secret: "fresh-secret", pid: process.pid },
+        { fs: winMockFs, platform: "win32" },
+      );
+      expect(renameAttempts).toBe(2);
+      const written = JSON.parse(readFileSync(target, "utf8"));
+      expect(written.secret).toBe("fresh-secret");
+      expect(written.pid).toBe(process.pid);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("ensureAntigravityWakeSidecarInstalled installs, upgrades wake-sidecar.mjs while preserving sidecar.json, rejects symlinks, and works via --install-agy-sidecar CLI", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ac-sidecar-install-"));
+    try {
+      const geminiCfg = join(root, ".gemini", "config");
+      const first = ensureAntigravityWakeSidecarInstalled({ geminiConfigDir: geminiCfg });
+      expect(first.status).toBe("installed");
+      expect(existsSync(first.scriptPath)).toBe(true);
+      expect(existsSync(first.manifestPath)).toBe(true);
+      const manifest = JSON.parse(readFileSync(first.manifestPath, "utf8"));
+      expect(manifest.display_name).toBe("AgentsChat Wake Bridge");
+      expect(manifest.command).toBe("node");
+      expect(manifest.args).toEqual(["wake-sidecar.mjs"]);
+
+      // Second run is idempotent
+      const second = ensureAntigravityWakeSidecarInstalled({ geminiConfigDir: geminiCfg });
+      expect(second.status).toBe("up_to_date");
+
+      // Customize sidecar.json and simulate outdated script -> upgrades script while preserving manifest
+      writeFileSync(
+        first.manifestPath,
+        JSON.stringify({ ...manifest, env: { AGENTSCHAT_AGENTAPI_BIN: "D:\\Custom\\language_server.exe" } }, null, 2),
+      );
+      writeFileSync(first.scriptPath, "// stale sidecar v1\n");
+      const upgraded = ensureAntigravityWakeSidecarInstalled({ geminiConfigDir: geminiCfg });
+      expect(upgraded.status).toBe("updated");
+      expect(readFileSync(first.scriptPath, "utf8")).toContain("parseBatchExecTarget");
+      expect(JSON.parse(readFileSync(first.manifestPath, "utf8")).env.AGENTSCHAT_AGENTAPI_BIN).toBe(
+        "D:\\Custom\\language_server.exe",
+      );
+
+      // Symlinked sidecar script is refused safely
+      const symGemini = join(root, "sym-gemini");
+      const symDir = join(symGemini, "sidecars", "agentschat-wake");
+      mkdirSync(symDir, { recursive: true });
+      const victim = join(root, "victim.txt");
+      writeFileSync(victim, "untouched");
+      symlinkSync(victim, join(symDir, "wake-sidecar.mjs"));
+      const blocked = ensureAntigravityWakeSidecarInstalled({ geminiConfigDir: symGemini });
+      expect(blocked.status).toBe("error");
+      expect(readFileSync(victim, "utf8")).toBe("untouched");
+
+      // One-shot CLI `--install-agy-sidecar`
+      const cliGemini = join(root, "cli-gemini");
+      const cliPath = resolve(import.meta.dir, "../src/cli.mjs");
+      const proc = spawn("bun", [cliPath, "--install-agy-sidecar"], {
+        env: { ...process.env, AGENTSCHAT_GEMINI_CONFIG_DIR: cliGemini },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "";
+      proc.stdout.on("data", (c) => { stdout += c.toString(); });
+      const exitCode = await new Promise<number>((res) => proc.on("exit", (c) => res(c ?? 1)));
+      expect(exitCode).toBe(0);
+      const outJson = JSON.parse(stdout);
+      expect(outJson.ok).toBe(true);
+      expect(outJson.status).toBe("installed");
+      expect(existsSync(outJson.script)).toBe(true);
+    } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });

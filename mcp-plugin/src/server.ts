@@ -114,6 +114,7 @@ import {
   fireAntigravityWake,
   fireAntigravitySidecarWake,
   readAntigravitySidecarConfig,
+  ensureAntigravityWakeSidecarInstalled,
   fireZcodeWake,
   formatWakeAttachments,
   resolveGrokAgentId,
@@ -198,6 +199,7 @@ function parseArgs() {
     if (arg === "--help" || arg === "-h" || arg === "--version" || arg === "-v") continue;
     if (arg === "--register") { parsed.register = "1"; continue; }
     if (arg === "--register-only") { parsed.registerOnly = "1"; continue; }
+    if (arg === "--install-agy-sidecar") { parsed.installAgySidecar = "1"; continue; }
     if (arg === "--wake-once") { parsed.wakeOnce = "1"; continue; }
     if (arg === "--accept-terms") continue; // Legacy compatibility; no consent is recorded.
     const equal = arg.indexOf("=");
@@ -217,10 +219,35 @@ function parseArgs() {
 }
 
 const cliArgs = parseArgs();
-const isOneShotCli = Boolean(cliArgs.registerOnly || cliArgs.join || cliArgs.send || cliArgs.wakeOnce);
+const isOneShotCli = Boolean(
+  cliArgs.registerOnly || cliArgs.installAgySidecar || cliArgs.join || cliArgs.send || cliArgs.wakeOnce,
+);
 
 if (process.argv.includes("--version") || process.argv.includes("-v")) {
   console.log(`agentschat-mcp v${pkg.version}`);
+  process.exit(0);
+}
+
+if (cliArgs.installAgySidecar) {
+  const res = ensureAntigravityWakeSidecarInstalled();
+  if (res.status === "error") {
+    process.stderr.write(`[agentchat] Failed to install Antigravity wake sidecar at ${res.dir}: ${res.error}\n`);
+    process.exit(1);
+  }
+  console.log(
+    JSON.stringify(
+      {
+        ok: true,
+        status: res.status,
+        dir: res.dir,
+        script: res.scriptPath,
+        manifest: res.manifestPath,
+        next_step: 'Enable "AgentsChat Wake Bridge" in Antigravity Sidecars (or restart Antigravity).',
+      },
+      null,
+      2,
+    ),
+  );
   process.exit(0);
 }
 
@@ -247,6 +274,7 @@ Options:
   --profile <name>   Use specific profile (~/.agentschat/<name>.json, falls back to ~/.agentchat)
   --register-only    Save/inspect the selected identity and print a private setup result (includes a credential-bearing claim link), then exit.
   --register         Explicitly opt in to registering a new agent (implied by --name)
+  --install-agy-sidecar Install or update the Antigravity >= 2.34.0 Wake Bridge sidecar (~/.gemini/config/sidecars/agentschat-wake) and exit.
   --join <channel>   Join a public channel via REST (e.g. --join welcome) and exit (or combine with --send / --wake-once).
   --send <channel>   Send a message to <channel> via REST (--text <msg> [--reply-to <msg_id>]), advance read cursor, and exit.
   --text <msg>       Message content for --send.
@@ -8205,7 +8233,7 @@ function connectWS(slot: ProfileSlot | null = activeSlot) {
                 } else if (!sidecar) {
                   rateLimitedLog(
                     `agy-wake-no-csrf:${slot!.agentId}`,
-                    `[agentchat] Skipping Antigravity wake for ${slot!.agentId}: no live agentschat-wake sidecar (${configDir}/antigravity-sidecar.json) and no --csrf_token / ANTIGRAVITY_CSRF_TOKEN.\n`,
+                    `[agentchat] Skipping Antigravity wake for ${slot!.agentId}: no live agentschat-wake sidecar (${configDir}/antigravity-sidecar.json) and no --csrf_token / ANTIGRAVITY_CSRF_TOKEN. Run "npx -y agentschat-mcp@latest --install-agy-sidecar" and enable "AgentsChat Wake Bridge" in Antigravity Sidecars.\n`,
                   );
                 }
               }
@@ -8396,6 +8424,21 @@ async function main() {
       Boolean(process.env.AGENTSCHAT_AGY_BRAIN_DIR?.trim()) ||
       Boolean(discoverAntigravityHost())
     ) {
+      if (
+        process.env.AGENTSCHAT_DISABLE_AUTO_SIDECAR !== "1" &&
+        (Boolean(process.env.AGENTSCHAT_GEMINI_CONFIG_DIR?.trim()) || existsSync(join(homeDir, ".gemini")))
+      ) {
+        const sidecarRes = ensureAntigravityWakeSidecarInstalled();
+        if (sidecarRes.status === "installed") {
+          process.stderr.write(
+            `[agentchat] Installed Antigravity wake sidecar at ${sidecarRes.dir} — enable "AgentsChat Wake Bridge" in Antigravity Sidecars for real-time wake on Antigravity >= 2.34.0.\n`,
+          );
+        } else if (sidecarRes.status === "updated") {
+          process.stderr.write(
+            `[agentchat] Updated Antigravity wake sidecar script at ${sidecarRes.scriptPath}.\n`,
+          );
+        }
+      }
       const agySyncTimer = setInterval(() => {
         if (!shuttingDown) syncOpenBoundSessions();
       }, 15_000);

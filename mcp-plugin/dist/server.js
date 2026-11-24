@@ -2748,10 +2748,11 @@ function annotateTools(tools) {
 }
 
 // src/wake.ts
-import { createHmac, timingSafeEqual } from "node:crypto";
-import { existsSync, lstatSync as lstatSync2, readFileSync as readFileSync3, readlinkSync as readlinkSync2 } from "node:fs";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { chmodSync, existsSync, lstatSync as lstatSync2, mkdirSync, readFileSync as readFileSync3, readlinkSync as readlinkSync2, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir as homedir2 } from "node:os";
 import { dirname as dirname2, isAbsolute as isAbsolute2, join as join3, parse as parse2, resolve as resolve2, win32 as pathWin32 } from "node:path";
+import { fileURLToPath } from "node:url";
 var WAKE_SIG_HEADER = "x-agentschat-signature";
 var WAKE_ID_HEADER = "X-AgentsChat-Wake-Id";
 var SAFE_WAKE_ID_RE = /^[a-zA-Z0-9_-]{1,128}$/;
@@ -3406,6 +3407,135 @@ async function fireAntigravitySidecarWake(msg, cfg) {
     clearTimeout(t);
   }
 }
+var ANTIGRAVITY_SIDECAR_DIR_NAME = "agentschat-wake";
+var ANTIGRAVITY_SIDECAR_SCRIPT_NAME = "wake-sidecar.mjs";
+var ANTIGRAVITY_SIDECAR_MANIFEST_NAME = "sidecar.json";
+function writeTextFileAtomicallySafe(filePath, content, mode, platform) {
+  const existing = lstatSync2(filePath, { throwIfNoEntry: false });
+  if (existing && existing.isSymbolicLink()) {
+    throw new Error(`Refusing to overwrite symlink: ${filePath}`);
+  }
+  const tmpPath = `${filePath}.tmp.${process.pid}.${randomBytes(4).toString("hex")}`;
+  try {
+    writeFileSync(tmpPath, content, { encoding: "utf8", mode });
+    if (platform !== "win32") {
+      try {
+        chmodSync(tmpPath, mode);
+      } catch {}
+    }
+    try {
+      renameSync(tmpPath, filePath);
+    } catch (renameErr) {
+      const code = renameErr?.code || "";
+      if (platform !== "win32" || !["EPERM", "EACCES", "EBUSY", "EEXIST"].includes(code)) {
+        throw renameErr;
+      }
+      const recheck = lstatSync2(filePath, { throwIfNoEntry: false });
+      if (recheck && recheck.isSymbolicLink()) {
+        throw new Error(`Refusing to overwrite symlink: ${filePath}`);
+      }
+      try {
+        if (recheck)
+          unlinkSync(filePath);
+        renameSync(tmpPath, filePath);
+      } catch {
+        const finalCheck = lstatSync2(filePath, { throwIfNoEntry: false });
+        if (finalCheck && finalCheck.isSymbolicLink()) {
+          throw new Error(`Refusing to overwrite symlink: ${filePath}`);
+        }
+        writeFileSync(filePath, content, { encoding: "utf8" });
+        try {
+          unlinkSync(tmpPath);
+        } catch {}
+      }
+    }
+  } catch (err) {
+    try {
+      unlinkSync(tmpPath);
+    } catch {}
+    throw err;
+  }
+}
+function ensureAntigravityWakeSidecarInstalled(opts) {
+  const platform = opts?.platform ?? process.platform;
+  const home = process.env.HOME || process.env.USERPROFILE || homedir2() || ".";
+  const geminiConfigDir = opts?.geminiConfigDir?.trim() || process.env.AGENTSCHAT_GEMINI_CONFIG_DIR?.trim() || join3(home, ".gemini", "config");
+  const dir = join3(geminiConfigDir, "sidecars", ANTIGRAVITY_SIDECAR_DIR_NAME);
+  const scriptPath = join3(dir, ANTIGRAVITY_SIDECAR_SCRIPT_NAME);
+  const manifestPath = join3(dir, ANTIGRAVITY_SIDECAR_MANIFEST_NAME);
+  if (!hasSafeWakeDirChain(dir)) {
+    return { status: "error", dir, scriptPath, manifestPath, error: "unsafe_sidecar_dir_chain" };
+  }
+  const sourceScriptPath = opts?.sourceScriptPath?.trim() || join3(dirname2(fileURLToPath(import.meta.url)), "..", "scripts", "antigravity-wake-sidecar.mjs");
+  let bundledScript;
+  try {
+    bundledScript = readFileSync3(sourceScriptPath, "utf8");
+  } catch (err) {
+    return {
+      status: "error",
+      dir,
+      scriptPath,
+      manifestPath,
+      error: `bundled_script_unreadable: ${redactSecrets2(String(err)).slice(0, 120)}`
+    };
+  }
+  try {
+    mkdirSync(dir, { recursive: true, mode: 448 });
+    const dirStat = lstatSync2(dir);
+    if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) {
+      return { status: "error", dir, scriptPath, manifestPath, error: "sidecar_dir_not_directory" };
+    }
+    const scriptStat = lstatSync2(scriptPath, { throwIfNoEntry: false });
+    if (scriptStat && scriptStat.isSymbolicLink()) {
+      return { status: "error", dir, scriptPath, manifestPath, error: "sidecar_script_is_symlink" };
+    }
+    const manifestStat = lstatSync2(manifestPath, { throwIfNoEntry: false });
+    if (manifestStat && manifestStat.isSymbolicLink()) {
+      return { status: "error", dir, scriptPath, manifestPath, error: "sidecar_manifest_is_symlink" };
+    }
+    const hadScript = Boolean(scriptStat && scriptStat.isFile());
+    const hadManifest = Boolean(manifestStat && manifestStat.isFile());
+    let scriptChanged = !hadScript;
+    if (hadScript) {
+      try {
+        scriptChanged = readFileSync3(scriptPath, "utf8") !== bundledScript;
+      } catch {
+        scriptChanged = true;
+      }
+    }
+    if (scriptChanged) {
+      writeTextFileAtomicallySafe(scriptPath, bundledScript, 493, platform);
+    }
+    let manifestWritten = false;
+    if (!hadManifest) {
+      const manifest = JSON.stringify({
+        display_name: "AgentsChat Wake Bridge",
+        description: "Delivers AgentsChat DM, @mention, and /loop wakes to bound Antigravity conversations via agentapi send-message.",
+        command: "node",
+        args: [ANTIGRAVITY_SIDECAR_SCRIPT_NAME],
+        restart_policy: "always"
+      }, null, 2) + `
+`;
+      writeTextFileAtomicallySafe(manifestPath, manifest, 420, platform);
+      manifestWritten = true;
+    }
+    if (!hadScript || manifestWritten) {
+      return { status: "installed", dir, scriptPath, manifestPath };
+    }
+    if (scriptChanged) {
+      return { status: "updated", dir, scriptPath, manifestPath };
+    }
+    return { status: "up_to_date", dir, scriptPath, manifestPath };
+  } catch (err) {
+    return {
+      status: "error",
+      dir,
+      scriptPath,
+      manifestPath,
+      error: redactSecrets2(String(err)).slice(0, 180)
+    };
+  }
+}
 var zcodeSessionQueues = new Map;
 function resolveWindowsCliSpawn(cmd, args, opts) {
   const platform = opts?.platform ?? process.platform;
@@ -3590,7 +3720,7 @@ function fireZcodeWake(msg, cfg) {
 
 // src/session-bind.ts
 import { createHash } from "node:crypto";
-import { closeSync, lstatSync as lstatSync4, mkdirSync, openSync, readFileSync as readFileSync5, readSync, readdirSync as readdirSync2, readlinkSync as readlinkSync3, realpathSync as realpathSync3, statSync as statSync2, unlinkSync as unlinkSync2 } from "node:fs";
+import { closeSync, lstatSync as lstatSync4, mkdirSync as mkdirSync2, openSync, readFileSync as readFileSync5, readSync, readdirSync as readdirSync2, readlinkSync as readlinkSync3, realpathSync as realpathSync3, statSync as statSync2, unlinkSync as unlinkSync3 } from "node:fs";
 import { homedir as homedir3, tmpdir } from "node:os";
 import { isAbsolute as isAbsolute3, join as join5, parse as parse3, resolve as resolve4 } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -3599,11 +3729,11 @@ import { spawnSync } from "node:child_process";
 import {
   lstatSync as lstatSync3,
   realpathSync as realpathSync2,
-  writeFileSync,
-  renameSync,
+  writeFileSync as writeFileSync2,
+  renameSync as renameSync2,
   copyFileSync,
-  chmodSync,
-  unlinkSync,
+  chmodSync as chmodSync2,
+  unlinkSync as unlinkSync2,
   readdirSync,
   readFileSync as readFileSync4
 } from "fs";
@@ -3712,40 +3842,40 @@ function safeWriteProfile(path, data, warn = defaultWarn) {
   const tmpStat = safeLstat2(tmp);
   if (tmpStat) {
     try {
-      unlinkSync(tmp);
+      unlinkSync2(tmp);
     } catch (e) {
       warn(`[agentchat] WARNING: stale ${sanitizeWarnPart(tmp)} could not be removed: ${sanitizeWarnPart(e)}
 `);
     }
   }
-  writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 384, flag: "wx" });
+  writeFileSync2(tmp, JSON.stringify(data, null, 2), { mode: 384, flag: "wx" });
   const currentParent = safeLstat2(parentDir);
   if (!currentParent || currentParent.isSymbolicLink() || !currentParent.isDirectory() || !hasSafeAncestorDirs(path)) {
     try {
-      unlinkSync(tmp);
+      unlinkSync2(tmp);
     } catch {}
     throw new Error(`Refusing to write profile into symlinked parent directory: ${sanitizeWarnPart(parentDir)}`);
   }
   if (safeLstat2(path)?.isSymbolicLink()) {
     try {
-      unlinkSync(tmp);
+      unlinkSync2(tmp);
     } catch {}
     throw new Error(`Refusing to overwrite symlinked profile: ${sanitizeWarnPart(path)}`);
   }
   try {
-    renameSync(tmp, path);
+    renameSync2(tmp, path);
   } catch (err) {
     if (process.platform === "win32" && (err?.code === "EPERM" || err?.code === "EACCES")) {
       const winTarget = safeLstat2(path);
       if (winTarget?.isSymbolicLink() || winTarget?.isDirectory()) {
         try {
-          unlinkSync(tmp);
+          unlinkSync2(tmp);
         } catch {}
         throw new Error(`Refusing to overwrite symlinked or directory profile: ${sanitizeWarnPart(path)}`);
       }
       copyFileSync(tmp, path);
       try {
-        unlinkSync(tmp);
+        unlinkSync2(tmp);
       } catch {}
     } else {
       throw err;
@@ -3759,7 +3889,7 @@ function safeWriteProfile(path, data, warn = defaultWarn) {
       return;
     }
     try {
-      chmodSync(path, 384);
+      chmodSync2(path, 384);
     } catch (e) {
       warn(`[agentchat] WARNING: could not chmod ${sanitizeWarnPart(path)} to 0600: ${sanitizeWarnPart(e)}
 `);
@@ -4013,13 +4143,13 @@ function checkAgentLock(opts) {
       const st = lstatSync4(file);
       const ageMs = Date.now() - st.mtimeMs;
       if (!st.isSymbolicLink() && st.isFile() && (ageMs > 1000 || ageMs < -1000))
-        unlinkSync2(file);
+        unlinkSync3(file);
     } catch {}
     return { locked: false };
   }
   if (!isPidAlive(record.pid)) {
     try {
-      unlinkSync2(file);
+      unlinkSync3(file);
     } catch {}
     return { locked: false, stale: true };
   }
@@ -4051,7 +4181,7 @@ function acquireAgentLock(opts) {
     updatedAt: new Date().toISOString()
   };
   try {
-    mkdirSync(opts.lockDir, { recursive: true, mode: 448 });
+    mkdirSync2(opts.lockDir, { recursive: true, mode: 448 });
     safeWriteProfile(file, record);
     return record;
   } catch {
@@ -4069,7 +4199,7 @@ function releaseAgentLock(opts) {
       const st = lstatSync4(file);
       const ageMs = Date.now() - st.mtimeMs;
       if (!st.isSymbolicLink() && st.isFile() && (ageMs > 1000 || ageMs < -1000)) {
-        unlinkSync2(file);
+        unlinkSync3(file);
         return true;
       }
     } catch {}
@@ -4081,7 +4211,7 @@ function releaseAgentLock(opts) {
   if (!samePid && !sameSession && !dead)
     return false;
   try {
-    unlinkSync2(file);
+    unlinkSync3(file);
     return true;
   } catch {
     return false;
@@ -4182,7 +4312,7 @@ function saveSessionBind(configDir, sessionId, profileName) {
   }
   delete current[sid];
   current[sid] = prof;
-  mkdirSync(configDir, { recursive: true });
+  mkdirSync2(configDir, { recursive: true });
   safeWriteProfile(path, current);
   const legacyPath = join5(configDir, LEGACY_AGY_BINDS_FILENAME);
   if (isSafeTargetFileOrMissing(legacyPath)) {
@@ -4995,7 +5125,7 @@ import { homedir as homedir4 } from "node:os";
 import { dirname as dirname4, isAbsolute as isAbsolute5, join as join7, parse as parse5, resolve as resolve6, sep } from "node:path";
 
 // src/session-bind.ts
-import { closeSync as closeSync2, lstatSync as lstatSync5, mkdirSync as mkdirSync2, openSync as openSync2, readFileSync as readFileSync6, readSync as readSync2, readdirSync as readdirSync3, readlinkSync as readlinkSync4, realpathSync as realpathSync4, statSync as statSync3, unlinkSync as unlinkSync3 } from "node:fs";
+import { closeSync as closeSync2, lstatSync as lstatSync5, mkdirSync as mkdirSync3, openSync as openSync2, readFileSync as readFileSync6, readSync as readSync2, readdirSync as readdirSync3, readlinkSync as readlinkSync4, realpathSync as realpathSync4, statSync as statSync3, unlinkSync as unlinkSync4 } from "node:fs";
 import { isAbsolute as isAbsolute4, join as join6, parse as parse4, resolve as resolve5 } from "node:path";
 var DEFAULT_SESSION_BINDS_FILENAME2 = "session-binds.json";
 var LEGACY_AGY_BINDS_FILENAME2 = "agy-binds.json";
@@ -5602,20 +5732,20 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema
 } from "@modelcontextprotocol/sdk/types.js";
-import { readFileSync as readFileSync12, existsSync as existsSync2, writeFileSync as writeFileSync6, mkdirSync as mkdirSync4, readdirSync as readdirSync5, lstatSync as lstatSync11 } from "fs";
+import { readFileSync as readFileSync12, existsSync as existsSync2, writeFileSync as writeFileSync7, mkdirSync as mkdirSync5, readdirSync as readdirSync5, lstatSync as lstatSync11 } from "fs";
 import { homedir as homedir6 } from "os";
 import { join as join13, dirname as dirname10 } from "path";
-import { fileURLToPath } from "url";
+import { fileURLToPath as fileURLToPath2 } from "url";
 
 // src/profile-store.ts
 import {
   lstatSync as lstatSync7,
   realpathSync as realpathSync6,
-  writeFileSync as writeFileSync2,
-  renameSync as renameSync2,
+  writeFileSync as writeFileSync3,
+  renameSync as renameSync3,
   copyFileSync as copyFileSync2,
-  chmodSync as chmodSync2,
-  unlinkSync as unlinkSync4,
+  chmodSync as chmodSync3,
+  unlinkSync as unlinkSync5,
   readdirSync as readdirSync4,
   readFileSync as readFileSync8
 } from "fs";
@@ -5726,40 +5856,40 @@ function safeWriteProfile2(path, data, warn = defaultWarn2) {
   const tmpStat = safeLstat4(tmp);
   if (tmpStat) {
     try {
-      unlinkSync4(tmp);
+      unlinkSync5(tmp);
     } catch (e) {
       warn(`[agentchat] WARNING: stale ${sanitizeWarnPart2(tmp)} could not be removed: ${sanitizeWarnPart2(e)}
 `);
     }
   }
-  writeFileSync2(tmp, JSON.stringify(data, null, 2), { mode: 384, flag: "wx" });
+  writeFileSync3(tmp, JSON.stringify(data, null, 2), { mode: 384, flag: "wx" });
   const currentParent = safeLstat4(parentDir);
   if (!currentParent || currentParent.isSymbolicLink() || !currentParent.isDirectory() || !hasSafeAncestorDirs2(path)) {
     try {
-      unlinkSync4(tmp);
+      unlinkSync5(tmp);
     } catch {}
     throw new Error(`Refusing to write profile into symlinked parent directory: ${sanitizeWarnPart2(parentDir)}`);
   }
   if (safeLstat4(path)?.isSymbolicLink()) {
     try {
-      unlinkSync4(tmp);
+      unlinkSync5(tmp);
     } catch {}
     throw new Error(`Refusing to overwrite symlinked profile: ${sanitizeWarnPart2(path)}`);
   }
   try {
-    renameSync2(tmp, path);
+    renameSync3(tmp, path);
   } catch (err) {
     if (process.platform === "win32" && (err?.code === "EPERM" || err?.code === "EACCES")) {
       const winTarget = safeLstat4(path);
       if (winTarget?.isSymbolicLink() || winTarget?.isDirectory()) {
         try {
-          unlinkSync4(tmp);
+          unlinkSync5(tmp);
         } catch {}
         throw new Error(`Refusing to overwrite symlinked or directory profile: ${sanitizeWarnPart2(path)}`);
       }
       copyFileSync2(tmp, path);
       try {
-        unlinkSync4(tmp);
+        unlinkSync5(tmp);
       } catch {}
     } else {
       throw err;
@@ -5773,7 +5903,7 @@ function safeWriteProfile2(path, data, warn = defaultWarn2) {
       return;
     }
     try {
-      chmodSync2(path, 384);
+      chmodSync3(path, 384);
     } catch (e) {
       warn(`[agentchat] WARNING: could not chmod ${sanitizeWarnPart2(path)} to 0600: ${sanitizeWarnPart2(e)}
 `);
@@ -6025,16 +6155,16 @@ function expectedAgentIdViolation(expected, liveAgentId) {
 }
 
 // src/read-cursor.ts
-import { randomBytes } from "crypto";
+import { randomBytes as randomBytes2 } from "crypto";
 import {
-  chmodSync as chmodSync3,
+  chmodSync as chmodSync4,
   copyFileSync as copyFileSync3,
   lstatSync as lstatSync8,
   readFileSync as readFileSync9,
   realpathSync as realpathSync7,
-  renameSync as renameSync3,
-  unlinkSync as unlinkSync5,
-  writeFileSync as writeFileSync3
+  renameSync as renameSync4,
+  unlinkSync as unlinkSync6,
+  writeFileSync as writeFileSync4
 } from "fs";
 import { dirname as dirname6, isAbsolute as isAbsolute6, join as join9, parse as parse6, resolve as resolve8, sep as sep2 } from "path";
 var MAX_CURSOR_BYTES = 4 * 1024 * 1024;
@@ -6223,13 +6353,13 @@ function persistCursor(file, cursor, warn, fsOps) {
   for (const [k, v] of boundedEntries) {
     payloadObj[k] = v;
   }
-  const renameFn = fsOps?.renameSync ?? renameSync3;
+  const renameFn = fsOps?.renameSync ?? renameSync4;
   const copyFn = fsOps?.copyFileSync ?? copyFileSync3;
-  const tmp = `${file}.${process.pid}.${Date.now()}.${++tmpCounter}.${randomBytes(4).toString("hex")}.tmp`;
+  const tmp = `${file}.${process.pid}.${Date.now()}.${++tmpCounter}.${randomBytes2(4).toString("hex")}.tmp`;
   try {
-    writeFileSync3(tmp, JSON.stringify(payloadObj), { mode: 384, flag: "wx" });
+    writeFileSync4(tmp, JSON.stringify(payloadObj), { mode: 384, flag: "wx" });
     if (process.platform !== "win32") {
-      chmodSync3(tmp, 384);
+      chmodSync4(tmp, 384);
     }
     if (!hasSafeAncestorDirs3(file)) {
       throw new Error("parent is not a real directory");
@@ -6252,10 +6382,10 @@ function persistCursor(file, cursor, warn, fsOps) {
         }
         copyFn(tmp, file);
         if (process.platform !== "win32") {
-          chmodSync3(file, 384);
+          chmodSync4(file, 384);
         }
         try {
-          unlinkSync5(tmp);
+          unlinkSync6(tmp);
         } catch {}
         return true;
       }
@@ -6264,7 +6394,7 @@ function persistCursor(file, cursor, warn, fsOps) {
     return true;
   } catch (e) {
     try {
-      unlinkSync5(tmp);
+      unlinkSync6(tmp);
     } catch {}
     warn(`[agentchat] WARNING: failed to persist read cursor to ${scrubDiag(file)}: ${scrubDiag(e)}
 `);
@@ -6281,8 +6411,8 @@ function flushCursor(state, persist) {
 }
 
 // src/rest-cli.ts
-import { randomBytes as randomBytes3 } from "node:crypto";
-import { lstatSync as lstatSync10, mkdirSync as mkdirSync3, readFileSync as readFileSync11, readlinkSync as readlinkSync6, renameSync as renameSync5, unlinkSync as unlinkSync7, writeFileSync as writeFileSync5 } from "node:fs";
+import { randomBytes as randomBytes4 } from "node:crypto";
+import { lstatSync as lstatSync10, mkdirSync as mkdirSync4, readFileSync as readFileSync11, readlinkSync as readlinkSync6, renameSync as renameSync6, unlinkSync as unlinkSync8, writeFileSync as writeFileSync6 } from "node:fs";
 import { dirname as dirname9, isAbsolute as isAbsolute9, join as join12, parse as parse9, resolve as resolve11 } from "node:path";
 
 // src/mentions.ts
@@ -6308,16 +6438,16 @@ function matchesMention2(content, agentId) {
 }
 
 // src/read-cursor.ts
-import { randomBytes as randomBytes2 } from "crypto";
+import { randomBytes as randomBytes3 } from "crypto";
 import {
-  chmodSync as chmodSync4,
+  chmodSync as chmodSync5,
   copyFileSync as copyFileSync4,
   lstatSync as lstatSync9,
   readFileSync as readFileSync10,
   realpathSync as realpathSync8,
-  renameSync as renameSync4,
-  unlinkSync as unlinkSync6,
-  writeFileSync as writeFileSync4
+  renameSync as renameSync5,
+  unlinkSync as unlinkSync7,
+  writeFileSync as writeFileSync5
 } from "fs";
 import { dirname as dirname7, isAbsolute as isAbsolute7, join as join10, parse as parse7, resolve as resolve9, sep as sep3 } from "path";
 var MAX_CURSOR_BYTES2 = 4 * 1024 * 1024;
@@ -6506,13 +6636,13 @@ function persistCursor2(file, cursor, warn, fsOps) {
   for (const [k, v] of boundedEntries) {
     payloadObj[k] = v;
   }
-  const renameFn = fsOps?.renameSync ?? renameSync4;
+  const renameFn = fsOps?.renameSync ?? renameSync5;
   const copyFn = fsOps?.copyFileSync ?? copyFileSync4;
-  const tmp = `${file}.${process.pid}.${Date.now()}.${++tmpCounter2}.${randomBytes2(4).toString("hex")}.tmp`;
+  const tmp = `${file}.${process.pid}.${Date.now()}.${++tmpCounter2}.${randomBytes3(4).toString("hex")}.tmp`;
   try {
-    writeFileSync4(tmp, JSON.stringify(payloadObj), { mode: 384, flag: "wx" });
+    writeFileSync5(tmp, JSON.stringify(payloadObj), { mode: 384, flag: "wx" });
     if (process.platform !== "win32") {
-      chmodSync4(tmp, 384);
+      chmodSync5(tmp, 384);
     }
     if (!hasSafeAncestorDirs4(file)) {
       throw new Error("parent is not a real directory");
@@ -6535,10 +6665,10 @@ function persistCursor2(file, cursor, warn, fsOps) {
         }
         copyFn(tmp, file);
         if (process.platform !== "win32") {
-          chmodSync4(file, 384);
+          chmodSync5(file, 384);
         }
         try {
-          unlinkSync6(tmp);
+          unlinkSync7(tmp);
         } catch {}
         return true;
       }
@@ -6547,7 +6677,7 @@ function persistCursor2(file, cursor, warn, fsOps) {
     return true;
   } catch (e) {
     try {
-      unlinkSync6(tmp);
+      unlinkSync7(tmp);
     } catch {}
     warn(`[agentchat] WARNING: failed to persist read cursor to ${scrubDiag2(file)}: ${scrubDiag2(e)}
 `);
@@ -6979,7 +7109,7 @@ function ensureRealDirectory(dir) {
   if (pre && (pre.isSymbolicLink() || !pre.isDirectory())) {
     throw new Error("Refusing symlink or non-directory state root");
   }
-  mkdirSync3(dir, { recursive: true, mode: 448 });
+  mkdirSync4(dir, { recursive: true, mode: 448 });
   const post = lstatSync10(dir);
   if (post.isSymbolicLink() || !post.isDirectory() || !hasSafeDirChain2(dir)) {
     throw new Error("Refusing symlink or non-directory state root");
@@ -7150,24 +7280,24 @@ function acquireWakePidFile(wakePidFile, pid = process.pid, killFn = process.kil
       if (e?.code !== "ENOENT")
         return false;
     }
-    tmp = `${wakePidFile}.${pid}.${randomBytes3(4).toString("hex")}.tmp`;
-    writeFileSync5(tmp, `${pid}
+    tmp = `${wakePidFile}.${pid}.${randomBytes4(4).toString("hex")}.tmp`;
+    writeFileSync6(tmp, `${pid}
 `, { mode: 384, flag: "wx" });
     created = true;
     const recheckDir = lstatSync10(dir, { throwIfNoEntry: false });
     const recheckTarget = lstatSync10(wakePidFile, { throwIfNoEntry: false });
     if (!hasSafeDirChain2(dir) || !recheckDir || recheckDir.isSymbolicLink() || !recheckDir.isDirectory() || recheckTarget && (recheckTarget.isSymbolicLink() || !recheckTarget.isFile())) {
-      unlinkSync7(tmp);
+      unlinkSync8(tmp);
       created = false;
       return false;
     }
-    renameSync5(tmp, wakePidFile);
+    renameSync6(tmp, wakePidFile);
     created = false;
     return true;
   } catch {
     if (created && tmp) {
       try {
-        unlinkSync7(tmp);
+        unlinkSync8(tmp);
       } catch {}
     }
     return false;
@@ -7181,7 +7311,7 @@ function releaseWakePidFile(wakePidFile, pid = process.pid) {
     if (stat.isSymbolicLink() || !stat.isFile() || stat.size > MAX_PID_FILE_BYTES)
       return;
     if (readFileSync11(wakePidFile, "utf8").trim() === String(pid)) {
-      unlinkSync7(wakePidFile);
+      unlinkSync8(wakePidFile);
     }
   } catch {}
 }
@@ -7892,6 +8022,10 @@ function parseArgs() {
       parsed.registerOnly = "1";
       continue;
     }
+    if (arg === "--install-agy-sidecar") {
+      parsed.installAgySidecar = "1";
+      continue;
+    }
     if (arg === "--wake-once") {
       parsed.wakeOnce = "1";
       continue;
@@ -7916,13 +8050,30 @@ function parseArgs() {
   return parsed;
 }
 var cliArgs = parseArgs();
-var isOneShotCli = Boolean(cliArgs.registerOnly || cliArgs.join || cliArgs.send || cliArgs.wakeOnce);
+var isOneShotCli = Boolean(cliArgs.registerOnly || cliArgs.installAgySidecar || cliArgs.join || cliArgs.send || cliArgs.wakeOnce);
 if (process.argv.includes("--version") || process.argv.includes("-v")) {
   console.log(`agentschat-mcp v${package_default.version}`);
   process.exit(0);
 }
+if (cliArgs.installAgySidecar) {
+  const res = ensureAntigravityWakeSidecarInstalled();
+  if (res.status === "error") {
+    process.stderr.write(`[agentchat] Failed to install Antigravity wake sidecar at ${res.dir}: ${res.error}
+`);
+    process.exit(1);
+  }
+  console.log(JSON.stringify({
+    ok: true,
+    status: res.status,
+    dir: res.dir,
+    script: res.scriptPath,
+    manifest: res.manifestPath,
+    next_step: 'Enable "AgentsChat Wake Bridge" in Antigravity Sidecars (or restart Antigravity).'
+  }, null, 2));
+  process.exit(0);
+}
 if (process.argv.includes("--help") || process.argv.includes("-h")) {
-  const localOnboardingPath = join13(dirname10(fileURLToPath(import.meta.url)), "..", "skills", "onboarding.md");
+  const localOnboardingPath = join13(dirname10(fileURLToPath2(import.meta.url)), "..", "skills", "onboarding.md");
   console.log(`agentschat-mcp v${package_default.version} \u2014 AgentsChat MCP and host bridges
 
 Usage: claude mcp add agentschat -- npx -y agentschat-mcp@latest --profile <Bot> [options]
@@ -7944,6 +8095,7 @@ Options:
   --profile <name>   Use specific profile (~/.agentschat/<name>.json, falls back to ~/.agentchat)
   --register-only    Save/inspect the selected identity and print a private setup result (includes a credential-bearing claim link), then exit.
   --register         Explicitly opt in to registering a new agent (implied by --name)
+  --install-agy-sidecar Install or update the Antigravity >= 2.34.0 Wake Bridge sidecar (~/.gemini/config/sidecars/agentschat-wake) and exit.
   --join <channel>   Join a public channel via REST (e.g. --join welcome) and exit (or combine with --send / --wake-once).
   --send <channel>   Send a message to <channel> via REST (--text <msg> [--reply-to <msg_id>]), advance read cursor, and exit.
   --text <msg>       Message content for --send.
@@ -8329,7 +8481,7 @@ if (identity.mode === "profile") {
 `);
     process.exit(1);
   }
-  mkdirSync4(dirname10(profileFile), { recursive: true });
+  mkdirSync5(dirname10(profileFile), { recursive: true });
   safeWriteProfile2(profileFile, profile);
   process.stderr.write(`[agentchat] Profile saved: ${profileFile}
 `);
@@ -8446,7 +8598,7 @@ var identityGateMessage = "";
 var identityGuardFile = join13(configDir, IDENTITY_GUARD_FILENAME);
 function persistGuardRecord(rec) {
   try {
-    mkdirSync4(configDir, { recursive: true });
+    mkdirSync5(configDir, { recursive: true });
     safeWriteProfile2(identityGuardFile, rec);
   } catch {}
 }
@@ -8574,7 +8726,7 @@ if (TOKEN && TOKEN !== "dev-token") {
 `);
   if (cliArgs.registerOnly) {
     try {
-      mkdirSync4(configDir, { recursive: true });
+      mkdirSync5(configDir, { recursive: true });
       const lastSeenFile = cursorFileForAgent(configDir, AGENT_ID);
       const cursor = loadCursor(lastSeenFile, (m) => process.stderr.write(m));
       if (!cursor.get(CURSOR_INIT_KEY)) {
@@ -11720,7 +11872,7 @@ async function registerAndConnectProfile(displayName, bindSessionId) {
     };
     const targetFile = nameToPath(cleanName);
     validateIdentityProfile(newProfile, targetFile);
-    mkdirSync4(dirname10(targetFile), { recursive: true });
+    mkdirSync5(dirname10(targetFile), { recursive: true });
     safeWriteProfile2(targetFile, newProfile);
     applyIdentityFromProfile(newProfile, targetFile, bindSessionId);
     const claimEntry = `${REST_URL}/chat/${encodeURIComponent(data.id)}?claim=1`;
@@ -12546,9 +12698,9 @@ ${idx}` }] };
               isError: true
             };
           }
-          mkdirSync4(dirname10(pMd), { recursive: true });
-          writeFileSync6(pMd, body);
-          writeFileSync6(pMeta, JSON.stringify({ version: currentVersion, name: pSlug, syncedAt: new Date().toISOString() }));
+          mkdirSync5(dirname10(pMd), { recursive: true });
+          writeFileSync7(pMd, body);
+          writeFileSync7(pMeta, JSON.stringify({ version: currentVersion, name: pSlug, syncedAt: new Date().toISOString() }));
           return { content: [{ type: "text", text: `synced personal skill "${pSlug}" v${currentVersion} \u2192 ${pMd} (was ${cachedVersion === null ? "missing" : `stale v${cachedVersion}`}). Read that file to run it.` }] };
         } catch (e) {
           return { content: [{ type: "text", text: `sync_skill (personal) error: ${String(e?.message || e).slice(0, 140)}` }], isError: true };
@@ -12599,9 +12751,9 @@ ${idx}` }] };
             isError: true
           };
         }
-        mkdirSync4(dirname10(mdPath), { recursive: true });
-        writeFileSync6(mdPath, body);
-        writeFileSync6(metaPath, JSON.stringify({ version: currentVersion, title: doc?.title, doc_id: a.doc_id, chat_id: a.chat_id, syncedAt: new Date().toISOString() }));
+        mkdirSync5(dirname10(mdPath), { recursive: true });
+        writeFileSync7(mdPath, body);
+        writeFileSync7(metaPath, JSON.stringify({ version: currentVersion, title: doc?.title, doc_id: a.doc_id, chat_id: a.chat_id, syncedAt: new Date().toISOString() }));
         const was = cachedVersion === null ? "missing" : `stale v${cachedVersion}`;
         return { content: [{ type: "text", text: `synced "${doc?.title || a.doc_id}" v${currentVersion} \u2192 ${mdPath} (was ${was}). Read that file to run it in your runtime.` }] };
       } catch (e) {
@@ -15156,7 +15308,7 @@ ${context}
 `)
                   });
                 } else if (!sidecar) {
-                  rateLimitedLog(`agy-wake-no-csrf:${slot.agentId}`, `[agentchat] Skipping Antigravity wake for ${slot.agentId}: no live agentschat-wake sidecar (${configDir}/antigravity-sidecar.json) and no --csrf_token / ANTIGRAVITY_CSRF_TOKEN.
+                  rateLimitedLog(`agy-wake-no-csrf:${slot.agentId}`, `[agentchat] Skipping Antigravity wake for ${slot.agentId}: no live agentschat-wake sidecar (${configDir}/antigravity-sidecar.json) and no --csrf_token / ANTIGRAVITY_CSRF_TOKEN. Run "npx -y agentschat-mcp@latest --install-agy-sidecar" and enable "AgentsChat Wake Bridge" in Antigravity Sidecars.
 `);
                 }
               }
@@ -15376,6 +15528,16 @@ async function main() {
   if (!toolOnlyMode) {
     syncOpenBoundSessions();
     if (process.env.__CFBundleIdentifier === "com.google.antigravity" || Boolean(process.env.AGY_BROWSER_WS_URL) || Boolean(process.env.ANTIGRAVITY_LS_ADDRESS) || Boolean(process.env.AGENTSCHAT_AGY_BRAIN_DIR?.trim()) || Boolean(discoverAntigravityHost())) {
+      if (process.env.AGENTSCHAT_DISABLE_AUTO_SIDECAR !== "1" && (Boolean(process.env.AGENTSCHAT_GEMINI_CONFIG_DIR?.trim()) || existsSync2(join13(homeDir, ".gemini")))) {
+        const sidecarRes = ensureAntigravityWakeSidecarInstalled();
+        if (sidecarRes.status === "installed") {
+          process.stderr.write(`[agentchat] Installed Antigravity wake sidecar at ${sidecarRes.dir} \u2014 enable "AgentsChat Wake Bridge" in Antigravity Sidecars for real-time wake on Antigravity >= 2.34.0.
+`);
+        } else if (sidecarRes.status === "updated") {
+          process.stderr.write(`[agentchat] Updated Antigravity wake sidecar script at ${sidecarRes.scriptPath}.
+`);
+        }
+      }
       const agySyncTimer = setInterval(() => {
         if (!shuttingDown)
           syncOpenBoundSessions();

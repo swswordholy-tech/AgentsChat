@@ -37,6 +37,7 @@ const helpRequested = args.includes("--help") || args.includes("-h");
 const oneShotRequested =
   helpRequested ||
   args.includes("--register-only") ||
+  args.includes("--install-agy-sidecar") ||
   args.includes("--version") ||
   args.includes("-v") ||
   args.includes("--check") ||

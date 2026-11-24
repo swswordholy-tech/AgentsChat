@@ -1864,7 +1864,7 @@ import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 
 // src/wake.ts
-import { existsSync as existsSync2, lstatSync as lstatSync5, readFileSync as readFileSync4, readlinkSync as readlinkSync2 } from "node:fs";
+import { chmodSync, existsSync as existsSync2, lstatSync as lstatSync5, mkdirSync as mkdirSync4, readFileSync as readFileSync4, readlinkSync as readlinkSync2, renameSync as renameSync2, unlinkSync as unlinkSync2, writeFileSync as writeFileSync2 } from "node:fs";
 import { homedir as homedir4 } from "node:os";
 import { dirname as dirname3, isAbsolute as isAbsolute4, join as join5, parse as parse2, resolve as resolve4, win32 as pathWin32 } from "node:path";
 var PROTOTYPE_WAKE_KEYS = new Set([
@@ -2318,13 +2318,13 @@ function isTeamLeadSkillInvocation(prompt) {
 }
 
 // codex/bridge.ts
-import { lstatSync as lstatSync10, mkdirSync as mkdirSync6, readFileSync as readFileSync9, writeFileSync as writeFileSync4, openSync as openSync2, closeSync as closeSync2, unlinkSync as unlinkSync5 } from "node:fs";
+import { lstatSync as lstatSync10, mkdirSync as mkdirSync7, readFileSync as readFileSync9, writeFileSync as writeFileSync5, openSync as openSync2, closeSync as closeSync2, unlinkSync as unlinkSync6 } from "node:fs";
 import { join as join10 } from "node:path";
 import { randomBytes as randomBytes2 } from "node:crypto";
 
 // codex/thread-history.ts
 import { createHash as createHash2, randomBytes } from "node:crypto";
-import { chmodSync, lstatSync as lstatSync6, mkdirSync as mkdirSync4, unlinkSync as unlinkSync2, writeFileSync as writeFileSync2 } from "node:fs";
+import { chmodSync as chmodSync2, lstatSync as lstatSync6, mkdirSync as mkdirSync5, unlinkSync as unlinkSync3, writeFileSync as writeFileSync3 } from "node:fs";
 import { join as join6 } from "node:path";
 var HISTORY_FORBIDDEN_KEYS = new Set([
   "__proto__",
@@ -2369,10 +2369,10 @@ function preserveChannelHistory(directory, channel, histories, redact) {
   const root = join6(directory, "history");
   checkDirectory(directory);
   checkDirectory(root);
-  mkdirSync4(root, { recursive: true, mode: 448 });
+  mkdirSync5(root, { recursive: true, mode: 448 });
   checkDirectory(root);
   if (process.platform !== "win32")
-    chmodSync(root, 448);
+    chmodSync2(root, 448);
   const file = join6(root, createHash2("sha256").update(channel).digest("hex").slice(0, 24) + ".json");
   try {
     const stat = lstatSync6(file);
@@ -2384,9 +2384,9 @@ function preserveChannelHistory(directory, channel, histories, redact) {
   }
   const tmp = `${file}.${process.pid}.${Date.now()}.${randomBytes(4).toString("hex")}.tmp`;
   try {
-    writeFileSync2(tmp, redact(JSON.stringify({ channel_id: channel, threads: histories })), { flag: "wx", mode: 384 });
+    writeFileSync3(tmp, redact(JSON.stringify({ channel_id: channel, threads: histories })), { flag: "wx", mode: 384 });
     if (process.platform !== "win32")
-      chmodSync(tmp, 384);
+      chmodSync2(tmp, 384);
     atomicReplaceRegularFile(tmp, file, () => {
       try {
         const stat = lstatSync6(file);
@@ -2399,7 +2399,7 @@ function preserveChannelHistory(directory, channel, histories, redact) {
     });
   } catch (err) {
     try {
-      unlinkSync2(tmp);
+      unlinkSync3(tmp);
     } catch {}
     throw err;
   }
@@ -2547,7 +2547,7 @@ async function verifyLoopTick(raw, config, owner, list, opts) {
 
 // src/session-bind.ts
 import { createHash as createHash3 } from "node:crypto";
-import { closeSync, lstatSync as lstatSync9, mkdirSync as mkdirSync5, openSync, readFileSync as readFileSync8, readSync, readdirSync as readdirSync4, readlinkSync as readlinkSync3, realpathSync as realpathSync5, statSync, unlinkSync as unlinkSync4 } from "node:fs";
+import { closeSync, lstatSync as lstatSync9, mkdirSync as mkdirSync6, openSync, readFileSync as readFileSync8, readSync, readdirSync as readdirSync4, readlinkSync as readlinkSync3, realpathSync as realpathSync5, statSync, unlinkSync as unlinkSync5 } from "node:fs";
 import { homedir as homedir5, tmpdir } from "node:os";
 import { isAbsolute as isAbsolute5, join as join9, parse as parse3, resolve as resolve6 } from "node:path";
 
@@ -2555,11 +2555,11 @@ import { isAbsolute as isAbsolute5, join as join9, parse as parse3, resolve as r
 import {
   lstatSync as lstatSync8,
   realpathSync as realpathSync4,
-  writeFileSync as writeFileSync3,
-  renameSync as renameSync2,
+  writeFileSync as writeFileSync4,
+  renameSync as renameSync3,
   copyFileSync as copyFileSync2,
-  chmodSync as chmodSync2,
-  unlinkSync as unlinkSync3,
+  chmodSync as chmodSync3,
+  unlinkSync as unlinkSync4,
   readdirSync as readdirSync3,
   readFileSync as readFileSync7
 } from "fs";
@@ -2668,40 +2668,40 @@ function safeWriteProfile(path, data, warn = defaultWarn) {
   const tmpStat = safeLstat(tmp);
   if (tmpStat) {
     try {
-      unlinkSync3(tmp);
+      unlinkSync4(tmp);
     } catch (e) {
       warn(`[agentchat] WARNING: stale ${sanitizeWarnPart(tmp)} could not be removed: ${sanitizeWarnPart(e)}
 `);
     }
   }
-  writeFileSync3(tmp, JSON.stringify(data, null, 2), { mode: 384, flag: "wx" });
+  writeFileSync4(tmp, JSON.stringify(data, null, 2), { mode: 384, flag: "wx" });
   const currentParent = safeLstat(parentDir);
   if (!currentParent || currentParent.isSymbolicLink() || !currentParent.isDirectory() || !hasSafeAncestorDirs(path)) {
     try {
-      unlinkSync3(tmp);
+      unlinkSync4(tmp);
     } catch {}
     throw new Error(`Refusing to write profile into symlinked parent directory: ${sanitizeWarnPart(parentDir)}`);
   }
   if (safeLstat(path)?.isSymbolicLink()) {
     try {
-      unlinkSync3(tmp);
+      unlinkSync4(tmp);
     } catch {}
     throw new Error(`Refusing to overwrite symlinked profile: ${sanitizeWarnPart(path)}`);
   }
   try {
-    renameSync2(tmp, path);
+    renameSync3(tmp, path);
   } catch (err) {
     if (process.platform === "win32" && (err?.code === "EPERM" || err?.code === "EACCES")) {
       const winTarget = safeLstat(path);
       if (winTarget?.isSymbolicLink() || winTarget?.isDirectory()) {
         try {
-          unlinkSync3(tmp);
+          unlinkSync4(tmp);
         } catch {}
         throw new Error(`Refusing to overwrite symlinked or directory profile: ${sanitizeWarnPart(path)}`);
       }
       copyFileSync2(tmp, path);
       try {
-        unlinkSync3(tmp);
+        unlinkSync4(tmp);
       } catch {}
     } else {
       throw err;
@@ -2715,7 +2715,7 @@ function safeWriteProfile(path, data, warn = defaultWarn) {
       return;
     }
     try {
-      chmodSync2(path, 384);
+      chmodSync3(path, 384);
     } catch (e) {
       warn(`[agentchat] WARNING: could not chmod ${sanitizeWarnPart(path)} to 0600: ${sanitizeWarnPart(e)}
 `);
@@ -2946,13 +2946,13 @@ function checkAgentLock(opts) {
       const st = lstatSync9(file);
       const ageMs = Date.now() - st.mtimeMs;
       if (!st.isSymbolicLink() && st.isFile() && (ageMs > 1000 || ageMs < -1000))
-        unlinkSync4(file);
+        unlinkSync5(file);
     } catch {}
     return { locked: false };
   }
   if (!isPidAlive(record.pid)) {
     try {
-      unlinkSync4(file);
+      unlinkSync5(file);
     } catch {}
     return { locked: false, stale: true };
   }
@@ -2984,7 +2984,7 @@ function acquireAgentLock(opts) {
     updatedAt: new Date().toISOString()
   };
   try {
-    mkdirSync5(opts.lockDir, { recursive: true, mode: 448 });
+    mkdirSync6(opts.lockDir, { recursive: true, mode: 448 });
     safeWriteProfile(file, record);
     return record;
   } catch {
@@ -3002,7 +3002,7 @@ function releaseAgentLock(opts) {
       const st = lstatSync9(file);
       const ageMs = Date.now() - st.mtimeMs;
       if (!st.isSymbolicLink() && st.isFile() && (ageMs > 1000 || ageMs < -1000)) {
-        unlinkSync4(file);
+        unlinkSync5(file);
         return true;
       }
     } catch {}
@@ -3014,7 +3014,7 @@ function releaseAgentLock(opts) {
   if (!samePid && !sameSession && !dead)
     return false;
   try {
-    unlinkSync4(file);
+    unlinkSync5(file);
     return true;
   } catch {
     return false;
@@ -3098,7 +3098,7 @@ class Bridge {
     this.owner = owner;
     this.loops = loops;
     checkStateDir(config.stateDir, true);
-    mkdirSync6(config.stateDir, { recursive: true, mode: 448 });
+    mkdirSync7(config.stateDir, { recursive: true, mode: 448 });
     checkStateDir(config.stateDir);
     this.file = join10(config.stateDir, "state.json");
     this.lock = join10(config.stateDir, "bridge.lock");
@@ -3108,12 +3108,12 @@ class Bridge {
         const content = readFileSync9(this.lock, "utf8");
         const holderPid = /^\d+$/.test(content) && content.trim() === content ? Number(content) : NaN;
         if (!Number.isSafeInteger(holderPid) || holderPid <= 0 || !isPidAlive(holderPid))
-          unlinkSync5(this.lock);
+          unlinkSync6(this.lock);
       }
     } catch {}
     try {
       const fd = openSync2(this.lock, "wx", 384);
-      writeFileSync4(fd, String(process.pid));
+      writeFileSync5(fd, String(process.pid));
       closeSync2(fd);
     } catch {
       throw new Error(`Bridge already locked: ${this.lock}. If its process has exited, remove that lock manually.`);
@@ -3145,7 +3145,7 @@ class Bridge {
       this.save();
     } catch {
       try {
-        unlinkSync5(this.lock);
+        unlinkSync6(this.lock);
       } catch {}
       throw new Error("Cannot load bridge state; refusing to discard history");
     }
@@ -3163,7 +3163,7 @@ class Bridge {
       }
     } catch (err) {
       try {
-        unlinkSync5(this.lock);
+        unlinkSync6(this.lock);
       } catch {}
       throw err;
     }
@@ -3189,7 +3189,7 @@ class Bridge {
     try {
       const serialized = JSON.stringify(this.state);
       checkStateDir(this.config.stateDir);
-      writeFileSync4(tmp, serialized, { mode: 384, flag: "wx" });
+      writeFileSync5(tmp, serialized, { mode: 384, flag: "wx" });
       atomicReplaceRegularFile(tmp, this.file, () => {
         try {
           const stat = lstatSync10(this.file);
@@ -3203,7 +3203,7 @@ class Bridge {
       });
     } catch (err) {
       try {
-        unlinkSync5(tmp);
+        unlinkSync6(tmp);
       } catch {}
       throw err;
     }
@@ -3394,7 +3394,7 @@ AgentsChat message:
     try {
       const stat = lstatSync10(this.lock);
       if (!stat.isSymbolicLink() && stat.isFile() && stat.size <= 64 * 1024 && readFileSync9(this.lock, "utf8") === String(process.pid))
-        unlinkSync5(this.lock);
+        unlinkSync6(this.lock);
     } catch (error) {
       if (error.code !== "ENOENT")
         throw error;
@@ -3522,7 +3522,7 @@ function resolveDrainReconnectDelay(frame, rand = Math.random) {
 }
 
 // codex/inbox-sync.ts
-import { chmodSync as chmodSync3, lstatSync as lstatSync11, mkdirSync as mkdirSync7, readFileSync as readFileSync10, unlinkSync as unlinkSync6, writeFileSync as writeFileSync5 } from "node:fs";
+import { chmodSync as chmodSync4, lstatSync as lstatSync11, mkdirSync as mkdirSync8, readFileSync as readFileSync10, unlinkSync as unlinkSync7, writeFileSync as writeFileSync6 } from "node:fs";
 import { randomBytes as randomBytes3 } from "node:crypto";
 import { join as join11 } from "node:path";
 
@@ -3626,12 +3626,12 @@ class InboxSync {
     if (existing && (existing.isSymbolicLink() || !existing.isDirectory()))
       throw new Error("Invalid inbound state directory");
     assertDirectoryAncestors(stateDir);
-    mkdirSync7(stateDir, { recursive: true, mode: 448 });
+    mkdirSync8(stateDir, { recursive: true, mode: 448 });
     const dirStat = lstatSync11(stateDir);
     if (dirStat.isSymbolicLink() || !dirStat.isDirectory())
       throw new Error("Invalid inbound state directory");
     if (process.platform !== "win32")
-      chmodSync3(stateDir, 448);
+      chmodSync4(stateDir, 448);
     this.file = join11(stateDir, "inbound-cursors.json");
     let fileStat;
     try {
@@ -3660,7 +3660,7 @@ class InboxSync {
     const tmp = `${this.file}.${process.pid}.${Date.now()}.${randomBytes3(4).toString("hex")}.tmp`;
     let created = false;
     try {
-      writeFileSync5(tmp, JSON.stringify(this.state), { mode: 384, flag: "wx" });
+      writeFileSync6(tmp, JSON.stringify(this.state), { mode: 384, flag: "wx" });
       created = true;
       atomicReplaceRegularFile(tmp, this.file, () => {
         const current = lstatSync11(this.file, { throwIfNoEntry: false });
@@ -3670,7 +3670,7 @@ class InboxSync {
     } catch (err) {
       if (created) {
         try {
-          unlinkSync6(tmp);
+          unlinkSync7(tmp);
         } catch {}
       }
       throw err;
