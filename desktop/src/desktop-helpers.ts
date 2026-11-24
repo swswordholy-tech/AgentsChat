@@ -69,6 +69,30 @@ export function parseDeepLink(rawUrl: string): ParsedDeepLink | null {
   return null;
 }
 
+export const DESKTOP_MIN_ZOOM = 0.75;
+export const DESKTOP_MAX_ZOOM = 1.75;
+
+/**
+ * Extract leading `(N)` unread count from a Web page title (e.g. "(3) AgentsChat" -> 3).
+ */
+export function parseUnreadCountFromTitle(title: unknown): number {
+  if (typeof title !== "string") return 0;
+  const m = title.trim().match(/^\((\d{1,4})\)(?:\s+|$)/);
+  if (!m) return 0;
+  const n = Number.parseInt(m[1], 10);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.min(999, n);
+}
+
+/**
+ * Clamp and round Electron webContents zoom factor to a safe, comfortable range [0.75, 1.75].
+ */
+export function clampDesktopZoomFactor(raw: unknown): number {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return 1;
+  return Math.min(DESKTOP_MAX_ZOOM, Math.max(DESKTOP_MIN_ZOOM, Math.round(n * 100) / 100));
+}
+
 export function parseDesktopReleaseTag(tagName: string): string | null {
   const m = String(tagName || "").trim().match(/^desktop-v(\d+)\.(\d+)\.(\d+)$/i);
   if (!m) return null;

@@ -71,6 +71,7 @@ export interface DesktopSettings {
   allowLan: boolean;
   minimizeToTray: boolean;
   launchAtLogin: boolean;
+  zoomFactor?: number;
   windowBounds?: DesktopWindowBounds;
 }
 

@@ -18,7 +18,12 @@ import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { checkLatestDesktopRelease, parseDeepLink } from "./desktop-helpers.js";
+import {
+  checkLatestDesktopRelease,
+  clampDesktopZoomFactor,
+  parseDeepLink,
+  parseUnreadCountFromTitle,
+} from "./desktop-helpers.js";
 import { GlobalIdentityAuthority, resolveHomeDir } from "./identity-authority.js";
 import { LocalMiniServer } from "./local-server.js";
 import { DesktopSettingsStore } from "./settings-store.js";
@@ -39,6 +44,7 @@ let localView: WebContentsView | null = null;
 let tray: Tray | null = null;
 let isQuitting = false;
 let localUnreadCount = 0;
+let cloudUnreadCount = 0;
 let pendingDeepLinkUrl: string | null = null;
 let screenshotInFlight = false;
 
@@ -122,14 +128,92 @@ function isOAuthPopupUrl(rawUrl: string, remoteOrigin: string): boolean {
 }
 
 function syncUnreadBadge(): void {
+  const totalUnread = Math.max(0, localUnreadCount + cloudUnreadCount);
   try {
     if (typeof app.setBadgeCount === "function") {
-      app.setBadgeCount(localUnreadCount);
+      app.setBadgeCount(totalUnread);
     }
   } catch {}
   if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.setTitle(localUnreadCount > 0 ? `(${localUnreadCount}) AgentsChat` : "AgentsChat");
+    mainWindow.setTitle(totalUnread > 0 ? `(${totalUnread}) AgentsChat` : "AgentsChat");
   }
+  if (tray) {
+    try {
+      tray.setToolTip(totalUnread > 0 ? `AgentsChat (${totalUnread} unread)` : "AgentsChat");
+    } catch {}
+  }
+}
+
+function applyDesktopZoom(nextFactor: number): void {
+  const clamped = clampDesktopZoomFactor(nextFactor);
+  settings = settingsStore.save({ zoomFactor: clamped });
+  if (cloudView && !cloudView.webContents.isDestroyed()) {
+    try { cloudView.webContents.setZoomFactor(clamped); } catch {}
+  }
+  if (localView && !localView.webContents.isDestroyed()) {
+    try { localView.webContents.setZoomFactor(clamped); } catch {}
+  }
+  broadcastState();
+}
+
+function attachNativeContextMenu(wc: Electron.WebContents): void {
+  wc.on("context-menu", (_ev, params) => {
+    const items: Electron.MenuItemConstructorOptions[] = [];
+    const hasSelection = Boolean(params.selectionText && params.selectionText.trim().length > 0);
+    const hasSafeLink = Boolean(params.linkURL && isAllowedExternalUrl(params.linkURL));
+    const hasSafeImage = Boolean(params.mediaType === "image" && params.srcURL && isAllowedExternalUrl(params.srcURL));
+
+    if (params.isEditable) {
+      items.push(
+        { role: "cut", enabled: hasSelection },
+        { role: "copy", enabled: hasSelection },
+        { role: "paste" },
+        { type: "separator" },
+        { role: "selectAll" },
+      );
+    } else if (hasSelection) {
+      items.push({ role: "copy" });
+    }
+
+    if (hasSafeLink) {
+      if (items.length > 0) items.push({ type: "separator" });
+      items.push(
+        {
+          label: "Copy Link Address",
+          click: () => clipboard.writeText(params.linkURL),
+        },
+        {
+          label: "Open Link in Browser",
+          click: () => void shell.openExternal(params.linkURL),
+        },
+      );
+    }
+
+    if (hasSafeImage) {
+      if (items.length > 0) items.push({ type: "separator" });
+      items.push(
+        {
+          label: "Copy Image",
+          click: () => {
+            try { wc.copyImageAt(params.x, params.y); } catch {}
+          },
+        },
+        {
+          label: "Copy Image Link",
+          click: () => clipboard.writeText(params.srcURL),
+        },
+        {
+          label: "Save Image As…",
+          click: () => {
+            try { wc.downloadURL(params.srcURL); } catch {}
+          },
+        },
+      );
+    }
+
+    if (items.length === 0) return;
+    Menu.buildFromTemplate(items).popup({ window: mainWindow ?? undefined });
+  });
 }
 
 function clearLocalUnread(): void {
@@ -201,6 +285,7 @@ function getCombinedState() {
     settings,
     localServer: localServer ? localServer.getStatus() : null,
     localUnreadCount,
+    cloudUnreadCount,
     discoveredProfiles: GlobalIdentityAuthority.discoverLocalAgentProfiles(),
   };
 }
@@ -472,6 +557,22 @@ function setupApplicationMenu(): void {
         },
         { type: "separator" },
         {
+          label: "Zoom In",
+          accelerator: "CmdOrCtrl+=",
+          click: () => applyDesktopZoom((settings.zoomFactor ?? 1) + 0.1),
+        },
+        {
+          label: "Zoom Out",
+          accelerator: "CmdOrCtrl+-",
+          click: () => applyDesktopZoom((settings.zoomFactor ?? 1) - 0.1),
+        },
+        {
+          label: "Actual Size (100%)",
+          accelerator: "CmdOrCtrl+0",
+          click: () => applyDesktopZoom(1),
+        },
+        { type: "separator" },
+        {
           label: "Reload Active View",
           accelerator: "CmdOrCtrl+R",
           click: reloadActiveView,
@@ -724,9 +825,29 @@ async function createDesktopWindow(): Promise<void> {
     return { action: "deny" };
   });
 
+  const initialZoom = clampDesktopZoomFactor(settings.zoomFactor ?? 1);
+  attachNativeContextMenu(cloudView.webContents);
+  attachNativeContextMenu(localView.webContents);
+
   cloudView.webContents.on("dom-ready", () => {
     syncThemeToCloudView(settings.theme || "light");
+    try { cloudView?.webContents.setZoomFactor(clampDesktopZoomFactor(settings.zoomFactor ?? 1)); } catch {}
   });
+  localView.webContents.on("dom-ready", () => {
+    try { localView?.webContents.setZoomFactor(clampDesktopZoomFactor(settings.zoomFactor ?? 1)); } catch {}
+  });
+  cloudView.webContents.on("page-title-updated", (_ev, title) => {
+    const nextCloudUnread = parseUnreadCountFromTitle(title);
+    if (nextCloudUnread !== cloudUnreadCount) {
+      cloudUnreadCount = nextCloudUnread;
+      syncUnreadBadge();
+      broadcastState();
+    }
+  });
+  try {
+    cloudView.webContents.setZoomFactor(initialZoom);
+    localView.webContents.setZoomFactor(initialZoom);
+  } catch {}
 
   cloudView.webContents.on("did-fail-load", (_ev, errorCode, errorDescription, validatedURL, isMainFrame) => {
     if (!isMainFrame || errorCode === -3 || isSmokeTest) return;
@@ -1106,6 +1227,7 @@ if (!gotSingleInstanceLock) {
               running: Boolean(st?.localServer?.running),
               hasLocalBtn: Boolean(document.getElementById("btn-local")),
               hasUnreadBadge: Boolean(document.getElementById("local-unread-badge")),
+              hasCloudUnreadBadge: Boolean(document.getElementById("cloud-unread-badge")),
             };
           })()`,
           true,
@@ -1142,6 +1264,7 @@ if (!gotSingleInstanceLock) {
           !shellProbe?.running ||
           !shellProbe?.hasLocalBtn ||
           !shellProbe?.hasUnreadBadge ||
+          !shellProbe?.hasCloudUnreadBadge ||
           localProbe?.title !== "AgentsChat Local Server" ||
           !localProbe?.hasLocalBridge ||
           !localProbe?.ipcOk ||

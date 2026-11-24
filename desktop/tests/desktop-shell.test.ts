@@ -4,9 +4,11 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
   checkLatestDesktopRelease,
+  clampDesktopZoomFactor,
   compareSemver,
   parseDeepLink,
   parseDesktopReleaseTag,
+  parseUnreadCountFromTitle,
 } from "../src/desktop-helpers.js";
 import { GlobalIdentityAuthority } from "../src/identity-authority.js";
 import { LocalMiniServer } from "../src/local-server.js";
@@ -287,5 +289,25 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
 
     const same = await checkLatestDesktopRelease("0.2.0", mockFetch);
     expect(same.hasUpdate).toBe(false);
+  });
+
+  test("parseUnreadCountFromTitle & clampDesktopZoomFactor sanitize Cloud badge counts and persisted zoom", () => {
+    expect(parseUnreadCountFromTitle("(3) AgentsChat")).toBe(3);
+    expect(parseUnreadCountFromTitle("(128) AgentChat")).toBe(128);
+    expect(parseUnreadCountFromTitle("(2500) AgentsChat")).toBe(999);
+    expect(parseUnreadCountFromTitle("(0) AgentsChat")).toBe(0);
+    expect(parseUnreadCountFromTitle("AgentsChat")).toBe(0);
+    expect(parseUnreadCountFromTitle("(-5) AgentsChat")).toBe(0);
+    expect(parseUnreadCountFromTitle(null)).toBe(0);
+
+    expect(clampDesktopZoomFactor(0.1)).toBe(0.75);
+    expect(clampDesktopZoomFactor(1.2)).toBe(1.2);
+    expect(clampDesktopZoomFactor(9.5)).toBe(1.75);
+    expect(clampDesktopZoomFactor(Number.NaN)).toBe(1);
+
+    const sanitized = sanitizeDesktopSettings({ zoomFactor: 1.35 });
+    expect(sanitized.zoomFactor).toBe(1.35);
+    expect(sanitizeDesktopSettings({ zoomFactor: 5 }).zoomFactor).toBe(1.75);
+    expect(sanitizeDesktopSettings({}).zoomFactor).toBe(1);
   });
 });

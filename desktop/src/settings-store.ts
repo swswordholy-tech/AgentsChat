@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { clampDesktopZoomFactor } from "./desktop-helpers.js";
 import { DEFAULT_UPSTREAM_SERVER_URL } from "./identity-authority.js";
 import type { DesktopSettings } from "./types.js";
 
@@ -12,6 +13,7 @@ export const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   allowLan: false,
   minimizeToTray: true,
   launchAtLogin: false,
+  zoomFactor: 1,
 };
 
 export function sanitizeDesktopSettings(raw: Partial<DesktopSettings> | null | undefined): DesktopSettings {
@@ -56,6 +58,7 @@ export function sanitizeDesktopSettings(raw: Partial<DesktopSettings> | null | u
     allowLan: s.allowLan === true,
     minimizeToTray: s.minimizeToTray !== false,
     launchAtLogin: s.launchAtLogin === true,
+    zoomFactor: s.zoomFactor !== undefined ? clampDesktopZoomFactor(s.zoomFactor) : 1,
     ...(windowBounds ? { windowBounds } : {}),
   };
 }

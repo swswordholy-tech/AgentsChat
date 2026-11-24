@@ -272,6 +272,7 @@
           <path d="M17.5 19H7a4.5 4.5 0 0 1-.4-8.98A5.5 5.5 0 0 1 17.3 8.5 3.75 3.75 0 0 1 17.5 19Z" />
         </svg>
         <span class="node-lbl">云端</span>
+        <span class="unread-badge" id="cloud-unread-badge" hidden>0</span>
       </button>
 
       <button class="node-btn" id="btn-local" type="button" title="本机 Server (⌘2) — 本机低延迟多 Agent 群聊与私聊" aria-label="本机聊天">
@@ -328,6 +329,7 @@
     const api = window.agentschatShell;
     const rail = document.getElementById("rail");
     const btnCloud = document.getElementById("btn-cloud");
+    const cloudUnreadBadge = document.getElementById("cloud-unread-badge");
     const btnLocal = document.getElementById("btn-local");
     const localDot = document.getElementById("local-dot");
     const localUnreadBadge = document.getElementById("local-unread-badge");
@@ -363,6 +365,11 @@
 
       const running = Boolean(state.localServer?.running);
       localDot.classList.toggle("live", running);
+      const cloudUnread = Number(state.cloudUnreadCount || 0);
+      if (cloudUnreadBadge) {
+        cloudUnreadBadge.hidden = cloudUnread <= 0;
+        cloudUnreadBadge.textContent = cloudUnread > 99 ? "99+" : String(cloudUnread);
+      }
       const unread = Number(state.localUnreadCount || 0);
       localUnreadBadge.hidden = unread <= 0;
       localUnreadBadge.textContent = unread > 99 ? "99+" : String(unread);
