@@ -1180,6 +1180,18 @@ if (!gotSingleInstanceLock) {
   });
 
   app.whenReady().then(async () => {
+    try {
+      app.setName("AgentsChat");
+    } catch {}
+    if (process.platform === "darwin" && app.dock) {
+      try {
+        const dockIconPath = join(ASSETS_DIR, "icon.png");
+        if (existsSync(dockIconPath)) {
+          const dockImg = nativeImage.createFromPath(dockIconPath);
+          if (!dockImg.isEmpty()) app.dock.setIcon(dockImg);
+        }
+      } catch {}
+    }
     registerIpcHandlers();
     if (!isSmokeTest) {
       try {
@@ -1197,6 +1209,9 @@ if (!gotSingleInstanceLock) {
         const trayImg = existsSync(trayIconPath)
           ? nativeImage.createFromPath(trayIconPath)
           : nativeImage.createFromDataURL(TRAY_ICON_DATA_URL);
+        if (process.platform === "darwin") {
+          trayImg.setTemplateImage(true);
+        }
         tray = new Tray(trayImg);
         tray.setToolTip("AgentsChat Desktop");
         tray.on("click", () => showMainWindow());
