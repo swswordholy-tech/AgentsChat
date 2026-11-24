@@ -9,6 +9,7 @@ contextBridge.exposeInMainWorld("agentschatShell", {
   toggleLocalServer: (enabled) => ipcRenderer.invoke("desktop:toggle-local-server", enabled),
   updateSettings: (patch) => ipcRenderer.invoke("desktop:update-settings", patch),
   copyText: (text) => ipcRenderer.invoke("desktop:copy-text", text),
+  captureScreenshot: () => ipcRenderer.invoke("desktop:capture-screenshot"),
   onStateChanged: (cb) => {
     const handler = (_ev, state) => cb(state);
     ipcRenderer.on("desktop:state-changed", handler);

@@ -290,6 +290,13 @@
       <div class="rail-sep" aria-hidden="true"></div>
       <span class="lan-chip" id="lan-chip" title="局域网接入已开启 (0.0.0.0)" hidden>LAN</span>
       <span class="badge" id="local-port-badge" title="本机 Server 监听端口">:8787</span>
+      <button class="mini-btn" id="btn-shell-screenshot" type="button" title="框选截图并直接粘贴到聊天框 (⌘⇧X)" aria-label="框选截图并粘贴到聊天框">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <circle cx="6" cy="6" r="3" />
+          <circle cx="6" cy="18" r="3" />
+          <path d="M20 4 8.12 15.88M14.47 14.48 20 20M8.12 8.12 12 12" />
+        </svg>
+      </button>
       <button class="mini-btn" id="btn-shell-theme" type="button" title="切换浅色 / 深色模式 (⌘⇧D)" aria-label="切换浅色深色模式">
         <svg id="icon-moon" viewBox="0 0 24 24" aria-hidden="true">
           <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z" />
@@ -330,6 +337,7 @@
     const iconCopy = document.getElementById("icon-copy");
     const iconCheck = document.getElementById("icon-check");
     const btnShellTheme = document.getElementById("btn-shell-theme");
+    const btnShellScreenshot = document.getElementById("btn-shell-screenshot");
     const iconMoon = document.getElementById("icon-moon");
     const iconSun = document.getElementById("icon-sun");
     const btnPower = document.getElementById("btn-power");
@@ -376,6 +384,9 @@
       iconMoon?.toggleAttribute("hidden", isDark);
       iconSun?.toggleAttribute("hidden", !isDark);
       api?.setTheme?.(next);
+    });
+    btnShellScreenshot?.addEventListener("click", () => {
+      api?.captureScreenshot?.();
     });
     btnPower.addEventListener("click", () => {
       const next = !(latestState?.settings?.localServerEnabled !== false);

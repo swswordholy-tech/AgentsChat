@@ -3,6 +3,7 @@ import {
   BrowserWindow,
   clipboard,
   dialog,
+  globalShortcut,
   ipcMain,
   Menu,
   nativeImage,
@@ -12,6 +13,7 @@ import {
   Tray,
   WebContentsView,
 } from "electron";
+import { execFile } from "node:child_process";
 import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -38,6 +40,50 @@ let tray: Tray | null = null;
 let isQuitting = false;
 let localUnreadCount = 0;
 let pendingDeepLinkUrl: string | null = null;
+let screenshotInFlight = false;
+
+async function captureScreenshotToChat(): Promise<{ ok: boolean; pasted?: boolean; reason?: string }> {
+  if (screenshotInFlight) return { ok: false, reason: "in_flight" };
+  if (process.platform !== "darwin") {
+    return { ok: false, reason: "unsupported_platform" };
+  }
+  screenshotInFlight = true;
+  try {
+    const beforePng = clipboard.readImage().toPNG();
+    const exitCode = await new Promise<number>((resolve) => {
+      execFile("/usr/sbin/screencapture", ["-i", "-c"], { timeout: 120_000 }, (err) => {
+        resolve(err ? 1 : 0);
+      });
+    });
+    if (exitCode !== 0) return { ok: false, reason: "cancelled" };
+    const afterImg = clipboard.readImage();
+    if (afterImg.isEmpty()) return { ok: false, reason: "empty" };
+    const afterPng = afterImg.toPNG();
+    if (beforePng.length > 0 && beforePng.equals(afterPng)) {
+      return { ok: false, reason: "cancelled" };
+    }
+    showMainWindow();
+    if (settings.activeWorkspace === "cloud" && cloudView && !cloudView.webContents.isDestroyed()) {
+      cloudView.webContents.focus();
+      setTimeout(() => {
+        if (cloudView && !cloudView.webContents.isDestroyed()) {
+          cloudView.webContents.paste();
+        }
+      }, 90);
+      return { ok: true, pasted: true };
+    }
+    // In local workspace, keep image on clipboard and notify user
+    if (Notification.isSupported()) {
+      new Notification({
+        title: "截图已复制到剪贴板",
+        body: "切换到云端聊天室按 ⌘V 即可直接粘贴发送",
+      }).show();
+    }
+    return { ok: true, pasted: false };
+  } finally {
+    screenshotInFlight = false;
+  }
+}
 let boundsSaveTimer: NodeJS.Timeout | null = null;
 const smokeRendererErrors: string[] = [];
 
@@ -419,6 +465,11 @@ function setupApplicationMenu(): void {
           accelerator: "CmdOrCtrl+Shift+D",
           click: () => applyDesktopTheme(settings.theme === "dark" ? "light" : "dark"),
         },
+        {
+          label: "Capture Screenshot to Chat",
+          accelerator: "CmdOrCtrl+Shift+X",
+          click: () => void captureScreenshotToChat(),
+        },
         { type: "separator" },
         {
           label: "Reload Active View",
@@ -481,6 +532,10 @@ function rebuildTrayMenu(): void {
     {
       label: "Open AgentsChat",
       click: () => showMainWindow(),
+    },
+    {
+      label: "Capture Screenshot to Chat (⌘⇧X)",
+      click: () => void captureScreenshotToChat(),
     },
     { type: "separator" },
     {
@@ -795,6 +850,10 @@ function registerIpcHandlers(): void {
     return false;
   });
 
+  ipcMain.handle("desktop:capture-screenshot", async () => {
+    return captureScreenshotToChat();
+  });
+
   ipcMain.handle("desktop:open-cloud-path", async (_ev, targetPath: unknown) => {
     const safePath = typeof targetPath === "string" && targetPath.startsWith("/") ? targetPath : "/";
     await switchWorkspace("cloud");
@@ -1008,6 +1067,11 @@ if (!gotSingleInstanceLock) {
       applyLaunchAtLoginSetting();
       setupApplicationMenu();
       try {
+        globalShortcut.register("CmdOrCtrl+Shift+X", () => {
+          void captureScreenshotToChat();
+        });
+      } catch {}
+      try {
         const trayIconPath = join(UI_DIR, "tray-icon.png");
         const trayImg = existsSync(trayIconPath)
           ? nativeImage.createFromPath(trayIconPath)
@@ -1114,6 +1178,12 @@ if (!gotSingleInstanceLock) {
         showMainWindow();
       }
     });
+  });
+
+  app.on("will-quit", () => {
+    try {
+      globalShortcut.unregisterAll();
+    } catch {}
   });
 
   app.on("before-quit", () => {
