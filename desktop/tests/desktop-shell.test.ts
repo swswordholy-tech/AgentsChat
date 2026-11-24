@@ -334,10 +334,18 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     expect(js).toContain('mention-me');
     expect(js).toContain('openLocalShortcutsCheatsheet');
 
+    // Resizable sidebar split-pane, right-click message context menu, multiline editor & ArrowUp edit-last-message
+    expect(html).toContain('id="local-sidebar-resizer"');
+    expect(html).toContain('id="dialog-textarea"');
+    expect(js).toContain('ac_local_sidebar_width');
+    expect(js).toContain('openMessageContextMenu');
+    expect(js).toContain('editLocalMessage');
+
     expect(css).toContain('.ac-table-wrap');
     expect(css).toContain('.unread-divider');
     expect(css).toContain('.local-ctx-menu');
     expect(css).toContain('.local-kbd-card');
     expect(css).toContain('.mention-chip.mention-me');
+    expect(css).toContain('.local-sidebar-resizer');
   });
 });

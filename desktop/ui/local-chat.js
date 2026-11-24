@@ -383,14 +383,32 @@
     return { ok: res.ok, status: res.status, data };
   }
 
-  function openPromptDialog({ title, hint, placeholder1, placeholder2, value1 }) {
+  function openPromptDialog({ title, hint, placeholder1, placeholder2, value1, multiline }) {
     const dlg = document.getElementById("prompt-dialog");
     const i1 = document.getElementById("dialog-input-1");
+    const ta = document.getElementById("dialog-textarea");
     const i2 = document.getElementById("dialog-input-2");
+    const useMulti = Boolean(multiline && ta);
     document.getElementById("dialog-title").textContent = title;
     document.getElementById("dialog-hint").textContent = hint || "";
-    i1.value = value1 || "";
-    i1.placeholder = placeholder1 || "";
+    if (useMulti) {
+      i1.hidden = true;
+      i1.style.display = "none";
+      ta.hidden = false;
+      ta.style.display = "block";
+      ta.value = value1 || "";
+      ta.placeholder = placeholder1 || "";
+      ta.rows = Math.min(10, Math.max(4, String(value1 || "").split("\n").length + 1));
+    } else {
+      if (ta) {
+        ta.hidden = true;
+        ta.style.display = "none";
+      }
+      i1.hidden = false;
+      i1.style.display = "block";
+      i1.value = value1 || "";
+      i1.placeholder = placeholder1 || "";
+    }
     if (placeholder2) {
       i2.style.display = "block";
       i2.value = "";
@@ -398,18 +416,31 @@
     } else {
       i2.style.display = "none";
     }
+    const activeField = useMulti ? ta : i1;
     return new Promise((resolve) => {
       const form = document.getElementById("dialog-form");
       const cancelBtn = document.getElementById("dialog-cancel");
+      const onFieldKey = (ev) => {
+        if (useMulti && ev.key === "Enter" && (ev.metaKey || ev.ctrlKey)) {
+          ev.preventDefault();
+          onSubmit(ev);
+        }
+      };
+      const onDialogCancel = (ev) => {
+        ev.preventDefault();
+        onCancel();
+      };
       const cleanup = () => {
         form.removeEventListener("submit", onSubmit);
         cancelBtn.removeEventListener("click", onCancel);
+        dlg.removeEventListener("cancel", onDialogCancel);
+        activeField.removeEventListener("keydown", onFieldKey);
       };
       const onSubmit = (ev) => {
         ev.preventDefault();
         cleanup();
         dlg.close();
-        resolve({ v1: i1.value.trim(), v2: i2.value.trim() });
+        resolve({ v1: activeField.value.trim(), v2: i2.value.trim() });
       };
       const onCancel = () => {
         cleanup();
@@ -418,9 +449,11 @@
       };
       form.addEventListener("submit", onSubmit);
       cancelBtn.addEventListener("click", onCancel);
+      dlg.addEventListener("cancel", onDialogCancel);
+      activeField.addEventListener("keydown", onFieldKey);
       dlg.showModal();
-      i1.focus();
-      if (value1) i1.select();
+      activeField.focus();
+      if (value1 && !useMulti) activeField.select();
     });
   }
 
@@ -1184,6 +1217,105 @@
     return Math.abs(t2 - t1) >= 5 * 60 * 1000;
   }
 
+  async function editLocalMessage(m) {
+    if (!m || !m.id || m.sender_id !== currentPrincipal?.id) return;
+    const r = await openPromptDialog({
+      title: "✏️ 编辑消息",
+      hint: "支持多行 Markdown 与代码块，⌘/Ctrl + Enter 快捷保存并实时同步给所有成员。",
+      placeholder1: "输入新的消息内容",
+      value1: m.content || "",
+      multiline: true,
+    });
+    if (!r?.v1 || r.v1 === m.content) return;
+    const res = await api(
+      `/api/channels/${encodeURIComponent(currentChannelId)}/messages/${encodeURIComponent(m.id)}`,
+      { method: "PATCH", body: JSON.stringify({ content: r.v1 }) },
+    );
+    if (res.ok && res.data?.message) {
+      m.content = res.data.message.content;
+      m.edited_at = res.data.message.edited_at;
+      renderMessages();
+      showToast("消息已更新");
+    } else {
+      showToast(res.data?.error || "编辑失败");
+    }
+  }
+
+  async function deleteLocalMessage(m) {
+    if (!m || !m.id || m.sender_id !== currentPrincipal?.id) return;
+    const res = await api(
+      `/api/channels/${encodeURIComponent(currentChannelId)}/messages/${encodeURIComponent(m.id)}`,
+      { method: "DELETE" },
+    );
+    if (res.ok) {
+      messages = messages.filter((itemMsg) => itemMsg.id !== m.id);
+      renderMessages();
+      showToast("消息已撤回");
+    } else {
+      showToast(res.data?.error || "撤回失败");
+    }
+  }
+
+  function openMessageContextMenu(m, isSelf, clientX, clientY) {
+    closeChannelContextMenu();
+    if (!m) return;
+    const menu = document.createElement("div");
+    menu.id = "local-ctx-menu";
+    menu.className = "local-ctx-menu";
+    menu.setAttribute("role", "menu");
+
+    const addItem = (label, onClick, isDanger = false) => {
+      const item = document.createElement("button");
+      item.type = "button";
+      item.className = "local-ctx-item" + (isDanger ? " danger" : "");
+      item.setAttribute("role", "menuitem");
+      item.textContent = label;
+      item.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        closeChannelContextMenu();
+        onClick();
+      });
+      menu.appendChild(item);
+    };
+
+    addItem("↩ 引用回复", () => setReplyTarget(m));
+    addItem("📋 复制消息", async () => {
+      await copyTextToClipboard(String(m.content || ""));
+      showToast("已复制消息");
+    });
+
+    if (isSelf && m.id) {
+      const sep = document.createElement("div");
+      sep.className = "local-ctx-sep";
+      menu.appendChild(sep);
+      addItem("✏️ 编辑消息", () => { void editLocalMessage(m); });
+      addItem("🗑️ 撤回消息", () => { void deleteLocalMessage(m); }, true);
+    }
+
+    document.body.appendChild(menu);
+    const rect = menu.getBoundingClientRect();
+    const x = Math.min(Math.max(8, clientX), Math.max(8, window.innerWidth - rect.width - 8));
+    const y = Math.min(Math.max(8, clientY), Math.max(8, window.innerHeight - rect.height - 8));
+    menu.style.left = `${x}px`;
+    menu.style.top = `${y}px`;
+    ctxMenuEl = menu;
+  }
+
+  elMessages?.addEventListener("contextmenu", (ev) => {
+    const bubble = ev.target?.closest?.(".wx-bubble");
+    if (!bubble) return;
+    const selText = window.getSelection ? String(window.getSelection().toString() || "").trim() : "";
+    if (selText) return;
+    const row = bubble.closest(".wx-msg");
+    const msgId = row?.dataset?.msgId;
+    if (!msgId) return;
+    const found = messages.find((item) => item && item.id === msgId);
+    if (!found) return;
+    ev.preventDefault();
+    const isSelf = found.sender_id === currentPrincipal?.id;
+    openMessageContextMenu(found, isSelf, ev.clientX, ev.clientY);
+  });
+
   function renderMessages(opts = {}) {
     elMessages.replaceChildren();
     if (!authToken) {
@@ -1367,46 +1499,14 @@
         btnEdit.className = "wx-act-btn";
         btnEdit.title = "编辑消息";
         btnEdit.appendChild(createSvgIcon("edit"));
-        btnEdit.addEventListener("click", async () => {
-          const r = await openPromptDialog({
-            title: "编辑消息",
-            hint: "修改后将实时同步给房间内所有成员。",
-            placeholder1: "输入新的消息内容",
-            value1: m.content || "",
-          });
-          if (!r?.v1) return;
-          const res = await api(
-            `/api/channels/${encodeURIComponent(currentChannelId)}/messages/${encodeURIComponent(m.id)}`,
-            { method: "PATCH", body: JSON.stringify({ content: r.v1 }) },
-          );
-          if (res.ok && res.data?.message) {
-            m.content = res.data.message.content;
-            m.edited_at = res.data.message.edited_at;
-            renderMessages();
-            showToast("消息已更新");
-          } else {
-            showToast(res.data?.error || "编辑失败");
-          }
-        });
+        btnEdit.addEventListener("click", () => { void editLocalMessage(m); });
 
         const btnDel = document.createElement("button");
         btnDel.type = "button";
         btnDel.className = "wx-act-btn danger";
         btnDel.title = "撤回消息";
         btnDel.appendChild(createSvgIcon("trash"));
-        btnDel.addEventListener("click", async () => {
-          const res = await api(
-            `/api/channels/${encodeURIComponent(currentChannelId)}/messages/${encodeURIComponent(m.id)}`,
-            { method: "DELETE" },
-          );
-          if (res.ok) {
-            messages = messages.filter((itemMsg) => itemMsg.id !== m.id);
-            renderMessages();
-            showToast("消息已撤回");
-          } else {
-            showToast(res.data?.error || "撤回失败");
-          }
-        });
+        btnDel.addEventListener("click", () => { void deleteLocalMessage(m); });
 
         actions.appendChild(btnEdit);
         actions.appendChild(btnDel);
@@ -1902,6 +2002,7 @@
         title: "消息与编辑",
         rows: [
           ["发送消息 / 插入换行", ["Enter", "/", shift, "Enter"]],
+          ["编辑上一条发出的消息（空输入框）", ["↑"]],
           ["唤起 @ 成员自动补全", ["@"]],
           ["关闭浮层 / 退出搜索", ["Esc"]],
         ],
@@ -1948,6 +2049,60 @@
     kbdBg.appendChild(card);
     kbdBg.hidden = false;
     closeBtn.focus();
+  }
+
+  // WeChat macOS 4.0 Resizable Sidebar Split-Pane (220px–420px, double-click resets to 276px)
+  const LOCAL_SB_W_KEY = "ac_local_sidebar_width";
+  const LOCAL_SB_DEFAULT_W = 276;
+  function applyLocalSidebarWidth(px, persist) {
+    const clamped = Math.max(220, Math.min(420, Math.round(Number(px) || LOCAL_SB_DEFAULT_W)));
+    document.documentElement.style.setProperty("--local-sb-w", `${clamped}px`);
+    if (persist) {
+      try {
+        localStorage.setItem(LOCAL_SB_W_KEY, String(clamped));
+      } catch {}
+    }
+    return clamped;
+  }
+  try {
+    const savedW = Number(localStorage.getItem(LOCAL_SB_W_KEY));
+    if (Number.isFinite(savedW) && savedW >= 220 && savedW <= 420) {
+      applyLocalSidebarWidth(savedW, false);
+    }
+  } catch {}
+  const elSidebarResizer = document.getElementById("local-sidebar-resizer");
+  if (elSidebarResizer) {
+    let dragging = false;
+    elSidebarResizer.addEventListener("pointerdown", (ev) => {
+      if (ev.button !== 0) return;
+      dragging = true;
+      elSidebarResizer.classList.add("dragging");
+      document.body.classList.add("resizing-sidebar");
+      if (typeof elSidebarResizer.setPointerCapture === "function") {
+        try {
+          elSidebarResizer.setPointerCapture(ev.pointerId);
+        } catch {}
+      }
+      ev.preventDefault();
+    });
+    const onMove = (ev) => {
+      if (!dragging) return;
+      applyLocalSidebarWidth(ev.clientX, false);
+    };
+    const onUp = (ev) => {
+      if (!dragging) return;
+      dragging = false;
+      elSidebarResizer.classList.remove("dragging");
+      document.body.classList.remove("resizing-sidebar");
+      applyLocalSidebarWidth(ev.clientX, true);
+    };
+    elSidebarResizer.addEventListener("pointermove", onMove);
+    elSidebarResizer.addEventListener("pointerup", onUp);
+    elSidebarResizer.addEventListener("pointercancel", onUp);
+    elSidebarResizer.addEventListener("dblclick", () => {
+      applyLocalSidebarWidth(LOCAL_SB_DEFAULT_W, true);
+      showToast("已还原侧边栏默认宽度");
+    });
   }
 
   window._acLocalUi = {
@@ -2498,6 +2653,18 @@
         ev.preventDefault();
         closeMentionMenu();
         return;
+      }
+    }
+    if (ev.key === "ArrowUp" && !ev.shiftKey && !ev.metaKey && !ev.ctrlKey && !ev.altKey) {
+      if (elInput.value === "" && currentPrincipal?.id && messages.length > 0) {
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const item = messages[i];
+          if (item && item.id && item.sender_id === currentPrincipal.id && typeof item.content === "string" && item.content) {
+            ev.preventDefault();
+            void editLocalMessage(item);
+            return;
+          }
+        }
       }
     }
     if (ev.key === "Escape" && replyTarget) {
