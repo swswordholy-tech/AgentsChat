@@ -1194,12 +1194,320 @@
     document.getElementById("btn-export-md")?.click();
   });
 
-  // Global shortcuts: Cmd/Ctrl+K search, Alt+Up/Down switch channel, Esc clear search
+  // Pure-DOM Cmd/Ctrl+K Quick Channel Switcher & Command Palette
+  let switcherBg = null;
+  let switcherInput = null;
+  let switcherList = null;
+  let switcherItems = [];
+  let switcherIdx = 0;
+  let switcherPrevFocus = null;
+
+  function buildLocalSwitcherEntries(query) {
+    const q = (query || "").trim().toLowerCase();
+    const entries = [];
+    const chEntries = [];
+    for (const ch of channels) {
+      if (!ch || !ch.id) continue;
+      const isDm = ch.channel_type === "direct" || ch.id.startsWith("dm-");
+      const label = ch.name || ch.id;
+      const unread = unreadByChannel.get(ch.id) || 0;
+      const hasDraft = Boolean(getLocalDraft(ch.id));
+      const haystack = `${label} ${ch.id} ${ch.topic || ""}`.toLowerCase();
+      if (q && !haystack.includes(q)) continue;
+      chEntries.push({
+        section: "本地房间与私聊",
+        icon: isDm ? "👤" : "#",
+        label,
+        meta: hasDraft ? "[草稿]" : ch.id === currentChannelId ? "当前" : "",
+        isDraft: hasDraft,
+        unread,
+        score: (unread > 0 ? 4 : 0) + (hasDraft ? 2 : 0) + (ch.id === currentChannelId ? 1 : 0),
+        run: () => {
+          void selectChannel(ch.id);
+        },
+      });
+    }
+    chEntries.sort((a, b) => b.score - a.score);
+    entries.push(...chEntries);
+
+    const actions = [
+      {
+        icon: "🔍",
+        label: "搜索当前房间消息",
+        meta: "⌘F",
+        kw: "search find 搜索",
+        run: () => {
+          elSearchInput?.focus();
+          elSearchInput?.select();
+        },
+      },
+      {
+        icon: "＋",
+        label: "新建本地群聊",
+        meta: "",
+        kw: "new group create channel 新建 群聊",
+        run: () => document.getElementById("btn-new-group")?.click(),
+      },
+      {
+        icon: "💬",
+        label: "发起 1v1 私聊",
+        meta: "",
+        kw: "dm direct message 私聊",
+        run: () => document.getElementById("btn-new-dm")?.click(),
+      },
+      {
+        icon: "👥",
+        label: "拉入成员到当前房间",
+        meta: "",
+        kw: "invite member agent 拉人 成员",
+        run: () => document.getElementById("btn-invite-member")?.click(),
+      },
+      {
+        icon: "🔌",
+        label: "查看 MCP 接入配置 / LAN 局域网",
+        meta: "",
+        kw: "mcp lan connect setup 接入",
+        run: () => document.getElementById("btn-copy-mcp")?.click(),
+      },
+      {
+        icon: "☁️",
+        label: "切换到 AgentsChat Cloud（云端母机 / OKR）",
+        meta: "",
+        kw: "cloud okr loop 云端",
+        run: () => document.getElementById("btn-go-cloud")?.click(),
+      },
+      {
+        icon: "🏪",
+        label: "打开 Bot 租赁市场",
+        meta: "",
+        kw: "marketplace rental bot 租赁 广场",
+        run: () => document.getElementById("btn-go-marketplace")?.click(),
+      },
+      {
+        icon: "📄",
+        label: "导出当前对话为 Markdown",
+        meta: "",
+        kw: "export markdown md 导出",
+        run: () => document.getElementById("btn-export-md")?.click(),
+      },
+      {
+        icon: "🌓",
+        label: "切换浅色 / 深色模式",
+        meta: "",
+        kw: "theme dark light 主题 深色 浅色",
+        run: () => document.getElementById("btn-toggle-theme")?.click(),
+      },
+    ];
+    for (const act of actions) {
+      if (q && !(act.label.toLowerCase().includes(q) || act.kw.includes(q))) continue;
+      entries.push({
+        section: "快捷操作",
+        icon: act.icon,
+        label: act.label,
+        meta: act.meta,
+        isDraft: false,
+        unread: 0,
+        run: act.run,
+      });
+    }
+    return entries;
+  }
+
+  function renderLocalSwitcherList() {
+    if (!switcherList) return;
+    switcherItems = buildLocalSwitcherEntries(switcherInput ? switcherInput.value : "");
+    if (switcherIdx >= switcherItems.length) switcherIdx = Math.max(0, switcherItems.length - 1);
+    switcherList.replaceChildren();
+    if (switcherItems.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "local-switcher-empty";
+      empty.textContent = "没有匹配的本地房间或快捷指令";
+      switcherList.appendChild(empty);
+      return;
+    }
+    let lastSec = "";
+    switcherItems.forEach((item, idx) => {
+      if (item.section !== lastSec) {
+        lastSec = item.section;
+        const sec = document.createElement("div");
+        sec.className = "local-switcher-sec";
+        sec.textContent = lastSec;
+        switcherList.appendChild(sec);
+      }
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "local-switcher-item" + (idx === switcherIdx ? " active" : "");
+      const ic = document.createElement("span");
+      ic.className = "local-switcher-icon";
+      ic.textContent = item.icon;
+      const lbl = document.createElement("span");
+      lbl.className = "local-switcher-label";
+      lbl.textContent = item.label;
+      btn.appendChild(ic);
+      btn.appendChild(lbl);
+      if (item.meta) {
+        const meta = document.createElement("span");
+        meta.className = item.isDraft ? "local-switcher-draft" : "local-switcher-meta";
+        meta.textContent = item.meta;
+        btn.appendChild(meta);
+      }
+      if (item.unread > 0) {
+        const badge = document.createElement("span");
+        badge.className = "local-switcher-unread";
+        badge.textContent = item.unread > 99 ? "99+" : String(item.unread);
+        btn.appendChild(badge);
+      }
+      btn.addEventListener("mouseenter", () => {
+        switcherIdx = idx;
+        switcherList.querySelectorAll(".local-switcher-item").forEach((n, i) => {
+          n.classList.toggle("active", i === idx);
+        });
+      });
+      btn.addEventListener("click", () => {
+        closeLocalSwitcher();
+        item.run();
+      });
+      switcherList.appendChild(btn);
+    });
+    const activeNode = switcherList.querySelector(".local-switcher-item.active");
+    activeNode?.scrollIntoView?.({ block: "nearest" });
+  }
+
+  function ensureLocalSwitcher() {
+    if (switcherBg) return;
+    switcherBg = document.createElement("div");
+    switcherBg.className = "local-switcher-bg";
+    switcherBg.id = "local-switcher-modal";
+    switcherBg.hidden = true;
+
+    const panel = document.createElement("div");
+    panel.className = "local-switcher";
+    panel.setAttribute("role", "dialog");
+    panel.setAttribute("aria-modal", "true");
+    panel.setAttribute("aria-label", "快速跳转与指令面板");
+
+    const head = document.createElement("div");
+    head.className = "local-switcher-head";
+    const svg = document.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("class", "local-switcher-search-icon");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("aria-hidden", "true");
+    const c = document.createElementNS(SVG_NS, "circle");
+    c.setAttribute("cx", "11");
+    c.setAttribute("cy", "11");
+    c.setAttribute("r", "7");
+    const p = document.createElementNS(SVG_NS, "path");
+    p.setAttribute("d", "m20 20-3.5-3.5");
+    svg.appendChild(c);
+    svg.appendChild(p);
+
+    switcherInput = document.createElement("input");
+    switcherInput.type = "search";
+    switcherInput.className = "local-switcher-input";
+    switcherInput.placeholder = "快速跳转本地房间、私聊或执行快捷指令…";
+    switcherInput.autocomplete = "off";
+
+    const escPill = document.createElement("span");
+    escPill.className = "local-switcher-esc";
+    escPill.textContent = "ESC";
+
+    head.appendChild(svg);
+    head.appendChild(switcherInput);
+    head.appendChild(escPill);
+
+    switcherList = document.createElement("div");
+    switcherList.className = "local-switcher-list";
+
+    const foot = document.createElement("div");
+    foot.className = "local-switcher-foot";
+    for (const tip of ["↑↓ 选择", "↵ 执行", "⌥↑↓ 切换频道", "⌘F 搜消息"]) {
+      const sp = document.createElement("span");
+      sp.textContent = tip;
+      foot.appendChild(sp);
+    }
+
+    panel.appendChild(head);
+    panel.appendChild(switcherList);
+    panel.appendChild(foot);
+    switcherBg.appendChild(panel);
+    document.body.appendChild(switcherBg);
+
+    switcherBg.addEventListener("click", (ev) => {
+      if (ev.target === switcherBg) closeLocalSwitcher();
+    });
+    switcherInput.addEventListener("input", () => {
+      switcherIdx = 0;
+      renderLocalSwitcherList();
+    });
+    switcherInput.addEventListener("keydown", (ev) => {
+      if (ev.key === "ArrowDown") {
+        ev.preventDefault();
+        if (switcherItems.length) {
+          switcherIdx = (switcherIdx + 1) % switcherItems.length;
+          renderLocalSwitcherList();
+        }
+      } else if (ev.key === "ArrowUp") {
+        ev.preventDefault();
+        if (switcherItems.length) {
+          switcherIdx = (switcherIdx - 1 + switcherItems.length) % switcherItems.length;
+          renderLocalSwitcherList();
+        }
+      } else if (ev.key === "Enter") {
+        ev.preventDefault();
+        const chosen = switcherItems[switcherIdx];
+        if (chosen) {
+          closeLocalSwitcher();
+          chosen.run();
+        }
+      } else if (ev.key === "Escape") {
+        ev.preventDefault();
+        closeLocalSwitcher();
+      }
+    });
+  }
+
+  function openLocalSwitcher() {
+    ensureLocalSwitcher();
+    switcherPrevFocus = document.activeElement;
+    switcherInput.value = "";
+    switcherIdx = 0;
+    switcherBg.hidden = false;
+    renderLocalSwitcherList();
+    switcherInput.focus();
+  }
+
+  function closeLocalSwitcher() {
+    if (!switcherBg || switcherBg.hidden) return;
+    switcherBg.hidden = true;
+    if (switcherPrevFocus && typeof switcherPrevFocus.focus === "function") {
+      try {
+        switcherPrevFocus.focus();
+      } catch {}
+    }
+  }
+
+  document.getElementById("btn-quick-switcher")?.addEventListener("click", () => {
+    openLocalSwitcher();
+  });
+
+  // Global shortcuts: Cmd/Ctrl+K command palette, Cmd/Ctrl+F search room, Alt+Up/Down switch channel, Esc close/clear
   window.addEventListener("keydown", (ev) => {
     if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "k") {
       ev.preventDefault();
+      if (switcherBg && !switcherBg.hidden) closeLocalSwitcher();
+      else openLocalSwitcher();
+      return;
+    }
+    if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "f") {
+      ev.preventDefault();
+      closeLocalSwitcher();
       elSearchInput?.focus();
       elSearchInput?.select();
+      return;
+    }
+    if (ev.key === "Escape" && switcherBg && !switcherBg.hidden) {
+      ev.preventDefault();
+      closeLocalSwitcher();
       return;
     }
     if (ev.altKey && !ev.metaKey && !ev.ctrlKey && (ev.key === "ArrowUp" || ev.key === "ArrowDown")) {
