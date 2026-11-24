@@ -132,13 +132,20 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
       expect(indexRes.status).toBe(200);
       expect(indexRes.headers.get("content-type")).toContain("text/html");
       expect(indexRes.headers.get("content-security-policy")).toContain("default-src 'self'");
+      expect(indexRes.headers.get("content-security-policy")).toContain("script-src 'self'");
+      expect(indexRes.headers.get("content-security-policy")).toContain("img-src 'self' data: https:");
       const html = await indexRes.text();
       expect(html).toContain("AgentsChat Local Server");
       expect(html).toContain("local-chat.js");
+      expect(html).toContain("local-theme-init.js");
 
       const jsRes = await fetch(`${status.httpUrl}/local-chat.js`);
       expect(jsRes.status).toBe(200);
       expect(jsRes.headers.get("content-type")).toContain("javascript");
+
+      const themeInitRes = await fetch(`${status.httpUrl}/local-theme-init.js`);
+      expect(themeInitRes.status).toBe(200);
+      expect(themeInitRes.headers.get("content-type")).toContain("javascript");
 
       // Internal Electron preloads & shell files must NEVER be exposed over HTTP
       for (const secretPath of ["/preload.cjs", "/local-preload.cjs", "/shell.html", "/cloud-offline.html"]) {
@@ -341,8 +348,11 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     expect(js).toContain('openMessageContextMenu');
     expect(js).toContain('editLocalMessage');
 
-    // Zero-FOUC theme init, in-channel search match stepper, safe inline images & pure-DOM Pro Image Lightbox 2.0
-    expect(html).toContain('data-ac-theme-init');
+    // Zero-FOUC theme init (strict external script for CSP script-src 'self'), in-channel search stepper, safe inline images & Lightbox 2.0
+    const themeInitJs = readFileSync(join(uiDir, "local-theme-init.js"), "utf8");
+    expect(() => new Function(themeInitJs)).not.toThrow();
+    expect(html).toContain('<script src="/local-theme-init.js" data-ac-theme-init></script>');
+    expect(html).not.toMatch(/<script(?![^>]*\bsrc=)[^>]*>[\s\S]*?\S[\s\S]*?<\/script>/i);
     expect(html).toContain('id="search-match-count"');
     expect(html).toContain('id="btn-search-prev"');
     expect(html).toContain('id="btn-search-next"');

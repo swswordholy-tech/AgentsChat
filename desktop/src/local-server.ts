@@ -92,6 +92,7 @@ const ALLOWED_PUBLIC_UI_FILES = new Set([
   "local-chat.html",
   "local-chat.css",
   "local-chat.js",
+  "local-theme-init.js",
   "tray-icon.png",
   "tray-icon@2x.png",
 ]);
@@ -959,7 +960,7 @@ export class LocalMiniServer {
               };
               if (ext === ".html") {
                 headers["Content-Security-Policy"] =
-                  "default-src 'self'; connect-src 'self' ws: wss:; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:;";
+                  "default-src 'self'; connect-src 'self' ws: wss:; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data: https:;";
               }
               res.writeHead(200, headers);
               res.end(method === "HEAD" ? undefined : content);
