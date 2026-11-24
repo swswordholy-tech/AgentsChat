@@ -3,10 +3,15 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
+  buildCloudThemeSyncScript,
+  buildOfflineThemeSyncScript,
   checkLatestDesktopRelease,
   clampDesktopZoomFactor,
   classifyCloudRailSection,
+  CLOUD_THEME_TOGGLE_SELECTOR,
   compareSemver,
+  isCloudOfflinePageUrl,
+  isTrustedCloudThemeOrigin,
   parseDeepLink,
   parseDesktopReleaseTag,
   parseUnreadCountFromTitle,
@@ -400,7 +405,118 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     expect(shellHtml).toContain('id="btn-cloud-okr"');
     expect(shellHtml).toContain('id="btn-cloud-market"');
     expect(shellHtml).toContain('id="btn-cloud-back"');
+    expect(shellHtml).toContain('id="btn-cloud-forward"');
+    expect(shellHtml).toContain('id="rail-load-bar"');
+    expect(shellHtml).toContain('id="btn-brand-home"');
     expect(shellHtml).toContain('navigateCloudRoute');
     expect(shellHtml).toContain('cloudHistory');
+  });
+
+  test("Desktop 2.1 two-way theme sync validates origins, handles cloud-offline, preserves SVG buttons, and keeps cloud-preload zero-privilege", () => {
+    const remote = "https://agents-chat.com/lobby";
+    expect(isTrustedCloudThemeOrigin("https://agents-chat.com/okr-board", remote)).toBe(true);
+    expect(isTrustedCloudThemeOrigin("https://agents-chat.com/chat/bot-1?x=1", remote)).toBe(true);
+    expect(isTrustedCloudThemeOrigin("https://evil.example/lobby", remote)).toBe(false);
+    expect(isTrustedCloudThemeOrigin("file:///tmp/cloud-offline.html", remote)).toBe(false);
+    expect(isTrustedCloudThemeOrigin("javascript:alert(1)", remote)).toBe(false);
+
+    expect(isCloudOfflinePageUrl("file:///Applications/AgentsChat.app/ui/cloud-offline.html?reason=ERR")).toBe(true);
+    expect(isCloudOfflinePageUrl("https://agents-chat.com/cloud-offline.html")).toBe(false);
+    expect(isCloudOfflinePageUrl("file:///tmp/evil.html")).toBe(false);
+
+    expect(CLOUD_THEME_TOGGLE_SELECTOR).toContain(".theme-toggle:not(#shortcutsBtn)");
+    expect(CLOUD_THEME_TOGGLE_SELECTOR).toContain("#analyticsThemeToggle");
+    expect(CLOUD_THEME_TOGGLE_SELECTOR).toContain("#approvalsThemeToggle");
+
+    // Execute generated cloud sync script against a synthetic DOM containing an SVG shortcuts button + real theme toggles
+    const htmlClasses = new Set<string>();
+    const bodyClasses = new Set<string>();
+    const dataset: Record<string, string> = {};
+    const htmlStyle: Record<string, string> = {};
+    const store = new Map<string, string>();
+    const svgShortcutsBtn = {
+      id: "shortcutsBtn",
+      textContent: "KEEP_SVG",
+      querySelector: (sel: string) => (sel === "svg" ? {} : null),
+    };
+    const realThemeBtn = {
+      id: "themeToggleBtn",
+      textContent: "🌙",
+      querySelector: () => null,
+    };
+    const analyticsThemeBtn = {
+      id: "analyticsThemeToggle",
+      textContent: "🌙",
+      querySelector: () => null,
+    };
+    const fakeDocument = {
+      documentElement: {
+        dataset,
+        style: htmlStyle,
+        classList: {
+          toggle: (cls: string, force?: boolean) => (force ? htmlClasses.add(cls) : htmlClasses.delete(cls)),
+        },
+      },
+      body: {
+        classList: {
+          toggle: (cls: string, force?: boolean) => (force ? bodyClasses.add(cls) : bodyClasses.delete(cls)),
+        },
+      },
+      querySelectorAll: () => [svgShortcutsBtn, realThemeBtn, analyticsThemeBtn],
+    };
+    const fakeLocalStorage = {
+      setItem: (k: string, v: string) => store.set(k, v),
+      getItem: (k: string) => store.get(k) ?? null,
+    };
+    const scheduled: Array<() => void> = [];
+    const fakeSetTimeout = (fn: () => void) => {
+      scheduled.push(fn);
+      return 1;
+    };
+
+    const runCloudSync = new Function(
+      "document",
+      "localStorage",
+      "setTimeout",
+      buildCloudThemeSyncScript("light"),
+    );
+    runCloudSync(fakeDocument, fakeLocalStorage, fakeSetTimeout);
+
+    expect(store.get("ac_theme")).toBe("light");
+    expect(htmlClasses.has("light")).toBe(true);
+    expect(bodyClasses.has("light")).toBe(true);
+    expect(htmlStyle.colorScheme).toBe("light");
+    expect(dataset.acDesktopThemeReady).toBe("1");
+    expect(dataset.acDesktopSyncing).toBe("1");
+    // SVG icon button must NEVER be overwritten; real theme toggles must update
+    expect(svgShortcutsBtn.textContent).toBe("KEEP_SVG");
+    expect(realThemeBtn.textContent).toBe("☀️");
+    expect(analyticsThemeBtn.textContent).toBe("☀️");
+    // Flushing scheduled micro-timer clears syncing flag so subsequent user clicks sync back to Desktop
+    scheduled.forEach((fn) => fn());
+    expect(dataset.acDesktopSyncing).toBeUndefined();
+
+    // Verify offline page sync script toggles body.dark
+    const offlineBodyClasses = new Set<string>();
+    const offlineDoc = {
+      documentElement: { style: {} as Record<string, string> },
+      body: {
+        classList: {
+          toggle: (cls: string, force?: boolean) => (force ? offlineBodyClasses.add(cls) : offlineBodyClasses.delete(cls)),
+        },
+      },
+    };
+    new Function("document", buildOfflineThemeSyncScript("dark"))(offlineDoc);
+    expect(offlineBodyClasses.has("dark")).toBe(true);
+    new Function("document", buildOfflineThemeSyncScript("light"))(offlineDoc);
+    expect(offlineBodyClasses.has("dark")).toBe(false);
+
+    // Zero-privilege security invariant on cloud-preload.cjs
+    const cloudPreload = readFileSync(join(import.meta.dir, "..", "ui", "cloud-preload.cjs"), "utf8");
+    const cloudPreloadCode = cloudPreload.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
+    expect(() => new Function("require", cloudPreload)).not.toThrow();
+    expect(cloudPreloadCode).not.toContain("contextBridge");
+    expect(cloudPreloadCode).not.toContain("exposeInMainWorld");
+    expect(cloudPreloadCode).toContain("desktop:cloud-theme-observed");
   });
 });

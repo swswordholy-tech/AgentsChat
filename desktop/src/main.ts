@@ -7,6 +7,7 @@ import {
   ipcMain,
   Menu,
   nativeImage,
+  nativeTheme,
   Notification,
   screen,
   shell,
@@ -19,9 +20,13 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  buildCloudThemeSyncScript,
+  buildOfflineThemeSyncScript,
   checkLatestDesktopRelease,
   clampDesktopZoomFactor,
   classifyCloudRailSection,
+  isCloudOfflinePageUrl,
+  isTrustedCloudThemeOrigin,
   parseDeepLink,
   parseUnreadCountFromTitle,
   resolveCloudQuickRoute,
@@ -48,6 +53,7 @@ let tray: Tray | null = null;
 let isQuitting = false;
 let localUnreadCount = 0;
 let cloudUnreadCount = 0;
+let cloudLoading = false;
 let pendingDeepLinkUrl: string | null = null;
 let screenshotInFlight = false;
 
@@ -297,13 +303,14 @@ async function ensureLocalServerStarted(): Promise<LocalServerStatus | null> {
 
 function getCloudNavState() {
   if (!cloudView || cloudView.webContents.isDestroyed()) {
-    return { section: "lobby" as CloudQuickRoute, canGoBack: false, canGoForward: false };
+    return { section: "lobby" as CloudQuickRoute, canGoBack: false, canGoForward: false, isLoading: false };
   }
   const currentUrl = cloudView.webContents.getURL();
   return {
     section: classifyCloudRailSection(currentUrl, settings.remoteServerUrl),
     canGoBack: cloudView.webContents.navigationHistory?.canGoBack?.() ?? false,
     canGoForward: cloudView.webContents.navigationHistory?.canGoForward?.() ?? false,
+    isLoading: cloudLoading,
   };
 }
 
@@ -324,29 +331,20 @@ function syncThemeToCloudView(nextTheme: "light" | "dark"): void {
   try {
     const currentUrl = cloudView.webContents.getURL();
     if (!currentUrl) return;
-    const expectedOrigin = new URL(settings.remoteServerUrl).origin;
-    if (new URL(currentUrl).origin !== expectedOrigin) return;
-    const isLight = nextTheme === "light";
-    const safeTheme = isLight ? "light" : "dark";
-    void cloudView.webContents
-      .executeJavaScript(
-        `(() => {
-          try {
-            localStorage.setItem('ac_theme', ${JSON.stringify(safeTheme)});
-            document.documentElement.classList.toggle('light', ${isLight});
-            if (document.body) document.body.classList.toggle('light', ${isLight});
-            const tt = document.querySelector('.theme-toggle');
-            if (tt) tt.textContent = ${isLight ? "'☀️'" : "'🌙'"};
-          } catch {}
-        })()`,
-        true,
-      )
-      .catch(() => {});
+    if (isCloudOfflinePageUrl(currentUrl)) {
+      void cloudView.webContents.executeJavaScript(buildOfflineThemeSyncScript(nextTheme), true).catch(() => {});
+      return;
+    }
+    if (!isTrustedCloudThemeOrigin(currentUrl, settings.remoteServerUrl)) return;
+    void cloudView.webContents.executeJavaScript(buildCloudThemeSyncScript(nextTheme), true).catch(() => {});
   } catch {}
 }
 
-function applyDesktopTheme(nextTheme: "light" | "dark"): void {
+function applyDesktopTheme(nextTheme: "light" | "dark", opts?: { skipCloudSync?: boolean }): void {
   settings = settingsStore.save({ theme: nextTheme });
+  try {
+    nativeTheme.themeSource = nextTheme;
+  } catch {}
   const bg = nextTheme === "dark" ? "#232323" : "#e9eaec";
   if (mainWindow && !mainWindow.isDestroyed()) {
     try {
@@ -356,7 +354,9 @@ function applyDesktopTheme(nextTheme: "light" | "dark"): void {
   if (localView && !localView.webContents.isDestroyed()) {
     localView.webContents.send("desktop:theme-changed", nextTheme);
   }
-  syncThemeToCloudView(nextTheme);
+  if (!opts?.skipCloudSync) {
+    syncThemeToCloudView(nextTheme);
+  }
   broadcastState();
 }
 
@@ -830,6 +830,10 @@ async function createDesktopWindow(): Promise<void> {
     } catch {}
   }
 
+  try {
+    nativeTheme.themeSource = settings.theme === "dark" ? "dark" : "light";
+  } catch {}
+
   mainWindow = new BrowserWindow({
     width: initialWidth,
     height: initialHeight,
@@ -854,6 +858,7 @@ async function createDesktopWindow(): Promise<void> {
   cloudView = new WebContentsView({
     webPreferences: {
       partition: "persist:agentschat-cloud",
+      preload: join(UI_DIR, "cloud-preload.cjs"),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
@@ -918,6 +923,14 @@ async function createDesktopWindow(): Promise<void> {
   attachNativeContextMenu(cloudView.webContents);
   attachNativeContextMenu(localView.webContents);
 
+  cloudView.webContents.on("did-start-loading", () => {
+    cloudLoading = true;
+    broadcastState();
+  });
+  cloudView.webContents.on("did-stop-loading", () => {
+    cloudLoading = false;
+    broadcastState();
+  });
   cloudView.webContents.on("dom-ready", () => {
     syncThemeToCloudView(settings.theme || "light");
     try { cloudView?.webContents.setZoomFactor(clampDesktopZoomFactor(settings.zoomFactor ?? 1)); } catch {}
@@ -931,6 +944,7 @@ async function createDesktopWindow(): Promise<void> {
   });
   localView.webContents.on("dom-ready", () => {
     try { localView?.webContents.setZoomFactor(clampDesktopZoomFactor(settings.zoomFactor ?? 1)); } catch {}
+    try { localView?.webContents.send("desktop:theme-changed", settings.theme || "light"); } catch {}
   });
   cloudView.webContents.on("page-title-updated", (_ev, title) => {
     const nextCloudUnread = parseUnreadCountFromTitle(title);
@@ -946,6 +960,10 @@ async function createDesktopWindow(): Promise<void> {
   } catch {}
 
   cloudView.webContents.on("did-fail-load", (_ev, errorCode, errorDescription, validatedURL, isMainFrame) => {
+    if (isMainFrame) {
+      cloudLoading = false;
+      broadcastState();
+    }
     if (!isMainFrame || errorCode === -3 || isSmokeTest) return;
     if (validatedURL && validatedURL.includes("cloud-offline.html")) return;
     void cloudView?.webContents.loadFile(join(UI_DIR, "cloud-offline.html"), {
@@ -1030,6 +1048,14 @@ function registerIpcHandlers(): void {
     if (!isShell && !isLocal) return { ok: false };
     applyDesktopTheme(nextTheme);
     return { ok: true, theme: nextTheme };
+  });
+
+  ipcMain.on("desktop:cloud-theme-observed", (ev, rawTheme: unknown) => {
+    if (rawTheme !== "light" && rawTheme !== "dark") return;
+    if (!cloudView || cloudView.webContents.isDestroyed() || ev.sender !== cloudView.webContents) return;
+    if (!isTrustedCloudThemeOrigin(ev.sender.getURL(), settings.remoteServerUrl)) return;
+    if (rawTheme === settings.theme) return;
+    applyDesktopTheme(rawTheme, { skipCloudSync: true });
   });
 
   ipcMain.handle("desktop:toggle-local-server", async (_ev, enabled: unknown) => {

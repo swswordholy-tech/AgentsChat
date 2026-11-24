@@ -54,6 +54,7 @@
     }
 
     .rail {
+      position: relative;
       width: 72px;
       height: 100vh;
       background: var(--rail-bg);
@@ -67,15 +68,50 @@
     }
     .rail.mac { padding-top: 48px; }
 
+    .rail-load-bar {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 2px;
+      overflow: hidden;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 160ms var(--ease);
+    }
+    .rail-load-bar.active { opacity: 1; }
+    .rail-load-bar::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      width: 55%;
+      background: linear-gradient(90deg, transparent, var(--wechat-green), transparent);
+      animation: railLoadSlide 1.05s ease-in-out infinite;
+    }
+    @keyframes railLoadSlide {
+      0% { transform: translateX(-120%); }
+      100% { transform: translateX(240%); }
+    }
+
     .brand-avatar {
+      -webkit-app-region: no-drag;
       width: 44px;
       height: 44px;
+      border-radius: 11px;
+      border: none;
+      background: transparent;
+      padding: 0;
+      cursor: pointer;
       display: flex;
       align-items: center;
       justify-content: center;
       margin-bottom: 4px;
       flex-shrink: 0;
+      transition: transform 120ms var(--ease), opacity 140ms var(--ease);
     }
+    .brand-avatar:hover { opacity: 0.92; }
+    .brand-avatar:active { transform: scale(0.95); }
+    .brand-avatar:focus-visible { outline: 2px solid var(--wechat-green); outline-offset: 2px; }
     .brand-avatar img {
       width: 44px;
       height: 44px;
@@ -264,14 +300,55 @@
       background: var(--wechat-green-soft);
     }
 
+    .history-row {
+      -webkit-app-region: no-drag;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+    }
+    .history-btn {
+      width: 24px;
+      height: 24px;
+      border-radius: 7px;
+      border: none;
+      background: transparent;
+      color: var(--ink-secondary);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+      transition: background-color 140ms var(--ease), color 140ms var(--ease), opacity 140ms var(--ease);
+    }
+    .history-btn:hover:not(:disabled) {
+      background: var(--btn-hover);
+      color: var(--ink-primary);
+    }
+    .history-btn:disabled {
+      opacity: 0.32;
+      cursor: default;
+    }
+    .history-btn:focus-visible { outline: 2px solid var(--wechat-green); outline-offset: 1px; }
+    .history-btn svg {
+      width: 14px;
+      height: 14px;
+      stroke: currentColor;
+      fill: none;
+      stroke-width: 1.9;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
     @media (prefers-reduced-motion: reduce) {
-      *, *::before, *::after { transition-duration: 0.01ms !important; }
+      *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
     }
   </style>
 </head>
 <body>
   <aside class="rail" id="rail" aria-label="工作区切换">
-    <div class="brand-avatar" title="AgentsChat Desktop"><img src="../assets/icon.png" alt="AgentsChat" /></div>
+    <div class="rail-load-bar" id="rail-load-bar" aria-hidden="true"></div>
+    <button class="brand-avatar" id="btn-brand-home" type="button" title="AgentsChat Desktop — 返回云端大厅 (⌘1)" aria-label="返回云端大厅"><img src="../assets/icon.png" alt="AgentsChat" /></button>
 
     <nav class="nav-group">
       <button class="node-btn active" id="btn-cloud" type="button" title="AgentsChat Cloud (⌘1) — 云端多 Agent 协同、/loop 与 Bot 市场" aria-label="云端工作区">
@@ -326,11 +403,18 @@
       <div class="rail-sep" aria-hidden="true"></div>
       <span class="lan-chip" id="lan-chip" title="局域网接入已开启 (0.0.0.0)" hidden>LAN</span>
       <span class="badge" id="local-port-badge" title="本机 Server 监听端口">:8787</span>
-      <button class="mini-btn" id="btn-cloud-back" type="button" title="返回上一页 (⌘[)" aria-label="返回上一页" hidden>
-        <svg viewBox="0 0 24 24" aria-hidden="true">
-          <path d="m15 18-6-6 6-6" />
-        </svg>
-      </button>
+      <div class="history-row" id="cloud-history-row" hidden>
+        <button class="history-btn" id="btn-cloud-back" type="button" title="返回上一页 (⌘[)" aria-label="返回上一页" disabled>
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="m15 18-6-6 6-6" />
+          </svg>
+        </button>
+        <button class="history-btn" id="btn-cloud-forward" type="button" title="前进下一页 (⌘])" aria-label="前进下一页" disabled>
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="m9 18 6-6-6-6" />
+          </svg>
+        </button>
+      </div>
       <button class="mini-btn" id="btn-shell-screenshot" type="button" title="框选截图并直接粘贴到聊天框 (⌘⇧X)" aria-label="框选截图并粘贴到聊天框">
         <svg viewBox="0 0 24 24" aria-hidden="true">
           <circle cx="6" cy="6" r="3" />
@@ -368,13 +452,17 @@
   <script>
     const api = window.agentschatShell;
     const rail = document.getElementById("rail");
+    const railLoadBar = document.getElementById("rail-load-bar");
+    const btnBrandHome = document.getElementById("btn-brand-home");
     const btnCloud = document.getElementById("btn-cloud");
     const cloudUnreadBadge = document.getElementById("cloud-unread-badge");
     const btnLocal = document.getElementById("btn-local");
     const btnCloudStudio = document.getElementById("btn-cloud-studio");
     const btnCloudOkr = document.getElementById("btn-cloud-okr");
     const btnCloudMarket = document.getElementById("btn-cloud-market");
+    const cloudHistoryRow = document.getElementById("cloud-history-row");
     const btnCloudBack = document.getElementById("btn-cloud-back");
+    const btnCloudForward = document.getElementById("btn-cloud-forward");
     const localDot = document.getElementById("local-dot");
     const localUnreadBadge = document.getElementById("local-unread-badge");
     const lanChip = document.getElementById("lan-chip");
@@ -420,8 +508,15 @@
       btnCloudOkr?.setAttribute("aria-pressed", String(isCloudOkr));
       btnCloudMarket?.setAttribute("aria-pressed", String(isCloudMarket));
 
-      if (btnCloudBack) {
-        btnCloudBack.hidden = !(active === "cloud" && state.cloudNav?.canGoBack);
+      const canGoBack = Boolean(active === "cloud" && state.cloudNav?.canGoBack);
+      const canGoForward = Boolean(active === "cloud" && state.cloudNav?.canGoForward);
+      if (cloudHistoryRow) {
+        cloudHistoryRow.hidden = !(canGoBack || canGoForward);
+      }
+      if (btnCloudBack) btnCloudBack.disabled = !canGoBack;
+      if (btnCloudForward) btnCloudForward.disabled = !canGoForward;
+      if (railLoadBar) {
+        railLoadBar.classList.toggle("active", Boolean(active === "cloud" && state.cloudNav?.isLoading));
       }
 
       const running = Boolean(state.localServer?.running);
@@ -443,6 +538,10 @@
         : "本机 Server 已停止 — 点击启动";
     }
 
+    btnBrandHome?.addEventListener("click", () => {
+      if (api?.navigateCloudRoute) api.navigateCloudRoute("lobby");
+      else api?.switchWorkspace("cloud");
+    });
     btnCloud.addEventListener("click", () => {
       if (api?.navigateCloudRoute) api.navigateCloudRoute("lobby");
       else api?.switchWorkspace("cloud");
@@ -452,6 +551,7 @@
     btnCloudOkr?.addEventListener("click", () => api?.navigateCloudRoute?.("okr-board"));
     btnCloudMarket?.addEventListener("click", () => api?.navigateCloudRoute?.("marketplace"));
     btnCloudBack?.addEventListener("click", () => api?.cloudHistory?.("back"));
+    btnCloudForward?.addEventListener("click", () => api?.cloudHistory?.("forward"));
     btnShellTheme?.addEventListener("click", () => {
       const next = document.body.classList.contains("dark") ? "light" : "dark";
       const isDark = next === "dark";

@@ -122,6 +122,94 @@ export function classifyCloudRailSection(rawUrl: unknown, remoteServerUrl: strin
 }
 
 /**
+ * Selector covering every theme toggle button across AgentsChat Cloud pages
+ * while explicitly excluding non-theme icon buttons (such as `#shortcutsBtn`
+ * on OKR Board that shares the `.theme-toggle` utility class).
+ */
+export const CLOUD_THEME_TOGGLE_SELECTOR =
+  ".theme-toggle:not(#shortcutsBtn), .theme-btn, #themeToggleBtn, #agentThemeToggle, #approvalsThemeToggle, #analyticsThemeToggle, #landingThemeToggle, #lkThemeToggle, #docThemeToggle, #protocolThemeToggle";
+
+/**
+ * Verify that an IPC theme signal from Cloud WebContentsView comes from the
+ * configured AgentsChat remote origin (http/https only).
+ */
+export function isTrustedCloudThemeOrigin(senderUrl: unknown, remoteServerUrl: string): boolean {
+  if (typeof senderUrl !== "string" || !senderUrl.trim()) return false;
+  try {
+    const sender = new URL(senderUrl);
+    const expected = new URL(remoteServerUrl);
+    if (sender.protocol !== "https:" && sender.protocol !== "http:") return false;
+    return sender.origin === expected.origin;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Identify whether a WebContentsView URL is the bundled `cloud-offline.html` fallback page.
+ */
+export function isCloudOfflinePageUrl(rawUrl: unknown): boolean {
+  if (typeof rawUrl !== "string" || !rawUrl.trim()) return false;
+  try {
+    const u = new URL(rawUrl);
+    return u.protocol === "file:" && /(?:^|\/)cloud-offline\.html$/i.test(u.pathname);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Build the safe IIFE injected into same-origin Cloud pages to sync theme
+ * state from Desktop without triggering an echo loop in `cloud-preload.cjs`
+ * and without clobbering SVG icon buttons.
+ */
+export function buildCloudThemeSyncScript(nextTheme: "light" | "dark"): string {
+  const isLight = nextTheme === "light";
+  const safeTheme = isLight ? "light" : "dark";
+  const icon = isLight ? "☀️" : "🌙";
+  return `(() => {
+    try {
+      const html = document.documentElement;
+      if (html && html.dataset) {
+        html.dataset.acDesktopSyncing = '1';
+        html.dataset.acDesktopThemeReady = '1';
+      }
+      localStorage.setItem('ac_theme', ${JSON.stringify(safeTheme)});
+      if (html) {
+        html.classList.toggle('light', ${isLight});
+        if (html.style) html.style.colorScheme = ${JSON.stringify(safeTheme)};
+      }
+      if (document.body) document.body.classList.toggle('light', ${isLight});
+      const toggles = document.querySelectorAll(${JSON.stringify(CLOUD_THEME_TOGGLE_SELECTOR)});
+      for (const el of toggles) {
+        if (!el || (typeof el.querySelector === 'function' && el.querySelector('svg'))) continue;
+        el.textContent = ${JSON.stringify(icon)};
+      }
+      setTimeout(() => {
+        try {
+          if (html && html.dataset) delete html.dataset.acDesktopSyncing;
+        } catch {}
+      }, 0);
+    } catch {}
+  })()`;
+}
+
+/**
+ * Build the safe IIFE injected into `cloud-offline.html` to sync Light/Dark mode.
+ */
+export function buildOfflineThemeSyncScript(nextTheme: "light" | "dark"): string {
+  const isDark = nextTheme === "dark";
+  return `(() => {
+    try {
+      if (document.body) document.body.classList.toggle('dark', ${isDark});
+      if (document.documentElement && document.documentElement.style) {
+        document.documentElement.style.colorScheme = ${JSON.stringify(nextTheme)};
+      }
+    } catch {}
+  })()`;
+}
+
+/**
  * Extract leading `(N)` unread count from a Web page title (e.g. "(3) AgentsChat" -> 3).
  */
 export function parseUnreadCountFromTitle(title: unknown): number {
