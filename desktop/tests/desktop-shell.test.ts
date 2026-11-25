@@ -14,9 +14,11 @@ import {
   computeCenteredWindowBounds,
   formatCopyableCloudUrl,
   formatDesktopWindowTitle,
+  formatDownloadCompleteNotice,
   formatTrayTooltip,
   formatZoomBadge,
   isCloudOfflinePageUrl,
+  isLocalStoppedPageUrl,
   isTrustedCloudThemeOrigin,
   parseDeepLink,
   parseDesktopReleaseTag,
@@ -162,7 +164,7 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
       expect(themeInitRes.headers.get("content-type")).toContain("javascript");
 
       // Internal Electron preloads & shell files must NEVER be exposed over HTTP
-      for (const secretPath of ["/preload.cjs", "/local-preload.cjs", "/shell.html", "/cloud-offline.html"]) {
+      for (const secretPath of ["/preload.cjs", "/local-preload.cjs", "/shell.html", "/cloud-offline.html", "/local-stopped.html"]) {
         const res = await fetch(`${status.httpUrl}${secretPath}`);
         expect(res.status).toBe(404);
       }
@@ -891,5 +893,64 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     expect(localCss).toContain(".tab-btn:focus-visible");
     expect(localCss).toContain(".local-ctx-item:focus-visible:not(:disabled)");
     expect(localCss).toContain(".local-lb-close:focus-visible");
+  });
+
+  test("Desktop 2.10 adds graceful local-stopped recovery view, renderer crash recovery, native download reveal & spellcheck, rail power lock, Markdown lists/checklists/strikethrough & resilient api()", () => {
+    // 1. Pure helpers: isLocalStoppedPageUrl & formatDownloadCompleteNotice
+    expect(isLocalStoppedPageUrl("file:///Applications/AgentsChat.app/ui/local-stopped.html?theme=dark&port=8787")).toBe(true);
+    expect(isLocalStoppedPageUrl("http://127.0.0.1:8787/local-stopped.html")).toBe(false);
+    expect(isLocalStoppedPageUrl("file:///tmp/other.html")).toBe(false);
+    expect(isLocalStoppedPageUrl(null)).toBe(false);
+
+    expect(formatDownloadCompleteNotice("/Users/test/Downloads/agentschat-welcome-2026.md")).toEqual({
+      title: "文件已保存",
+      body: "agentschat-welcome-2026.md · 点击在访达 / 文件夹中显示",
+    });
+    expect(formatDownloadCompleteNotice("evil\n\rname.png").body).toContain("evil  name.png");
+    expect(formatDownloadCompleteNotice("").body).toContain("文件");
+
+    // 2. local-stopped.html: valid script, CSP, Light/Dark & keyboard shortcuts
+    const stoppedHtml = readFileSync(join(import.meta.dir, "..", "ui", "local-stopped.html"), "utf8");
+    const stoppedScript = stoppedHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1] || "";
+    expect(stoppedScript.length).toBeGreaterThan(0);
+    expect(() => new Function(stoppedScript)).not.toThrow();
+    expect(stoppedHtml).toContain("agentschat-action://start-local");
+    expect(stoppedHtml).toContain("agentschat-action://switch-cloud");
+    expect(stoppedHtml).toContain("@media (prefers-reduced-motion: reduce)");
+
+    // 3. Main process: local-stopped routing, theme sync, renderer crash recovery, download completion reveal & spellcheck
+    const mainTs = readFileSync(join(import.meta.dir, "..", "src", "main.ts"), "utf8");
+    expect(mainTs).toContain("function attachDownloadFeedback(wc: Electron.WebContents)");
+    expect(mainTs).toContain("shell.showItemInFolder(savePath)");
+    expect(mainTs).toContain("wc.replaceMisspelling(suggestion)");
+    expect(mainTs).toContain("async function loadLocalStoppedPage()");
+    expect(mainTs).toContain("function syncThemeToLocalView(");
+    expect(mainTs).toContain('agentschat-action://start-local');
+    expect(mainTs).toContain('cloudView.webContents.on("render-process-gone"');
+    expect(mainTs).toContain('localView.webContents.on("render-process-gone"');
+
+    // 4. Shell rail power toggle lock
+    const shellHtml = readFileSync(join(import.meta.dir, "..", "ui", "shell.html"), "utf8");
+    const shellScript = shellHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1] || "";
+    expect(() => new Function(shellScript)).not.toThrow();
+    expect(shellHtml).toContain("let powerToggling = false;");
+
+    // 5. Local Hub: resilient api(), pure-DOM lists/checklists/strikethrough, timestamp tooltips & refresh bots feedback
+    const localJs = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.js"), "utf8");
+    expect(localJs).not.toMatch(/\.(?:innerHTML|outerHTML)\s*=|insertAdjacentHTML|document\.write\s*\(/);
+    expect(() => new Function(localJs)).not.toThrow();
+    expect(localJs).toContain("networkError: true");
+    expect(localJs).toContain("wx-md-del");
+    expect(localJs).toContain("wx-md-checklist");
+    expect(localJs).toContain("wx-md-ol");
+    expect(localJs).toContain("function formatFullLocalTimestamp(iso)");
+    expect(localJs).toContain("wx-sender-time");
+    expect(localJs).toContain('btnRefreshBots.classList.add("spinning")');
+
+    const localCss = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.css"), "utf8");
+    expect(localCss).toContain(".wx-md-list");
+    expect(localCss).toContain(".wx-md-check-box.done");
+    expect(localCss).toContain(".wx-sender-time");
+    expect(localCss).toContain(".micro-btn.spinning svg");
   });
 });

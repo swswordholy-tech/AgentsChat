@@ -444,9 +444,18 @@
     const headers = Object.assign({}, opts.headers || {});
     if (authToken) headers.Authorization = "Bearer " + authToken;
     if (opts.body && !headers["Content-Type"]) headers["Content-Type"] = "application/json";
-    const res = await fetch(path, Object.assign({}, opts, { headers }));
-    const data = await res.json().catch(() => ({}));
-    return { ok: res.ok, status: res.status, data };
+    try {
+      const res = await fetch(path, Object.assign({}, opts, { headers }));
+      const data = await res.json().catch(() => ({}));
+      return { ok: res.ok, status: res.status, data };
+    } catch {
+      return {
+        ok: false,
+        status: 0,
+        networkError: true,
+        data: { error: "本机服务暂不可达，请稍后重试" },
+      };
+    }
   }
 
   function openPromptDialog({ title, hint, placeholder1, placeholder2, value1, multiline }) {
@@ -1881,7 +1890,7 @@
 
   function appendInlineRichText(parent, text) {
     const tokenRe =
-      /!\[([^\]\n]{0,120})\]\(([^)\s\n]+)\)|\[([^\]\n]{1,120})\]\((https?:\/\/[^)\s\n]+)\)|(`[^`\n]+`)|(\*\*[^*\n]+?\*\*)|(\*[^*\n]+?\*)|(https?:\/\/[^\s<>"'`]+)|((?:^|(?<=[\s(\[，。、]))@[a-zA-Z0-9][a-zA-Z0-9._-]{1,62})/g;
+      /!\[([^\]\n]{0,120})\]\(([^)\s\n]+)\)|\[([^\]\n]{1,120})\]\((https?:\/\/[^)\s\n]+)\)|(`[^`\n]+`)|(\*\*[^*\n]+?\*\*)|(\*[^*\n]+?\*)|(~~[^~\n]+?~~)|(https?:\/\/[^\s<>"'`]+)|((?:^|(?<=[\s(\[，。、]))@[a-zA-Z0-9][a-zA-Z0-9._-]{1,62})/g;
     let last = 0;
     let m;
     while ((m = tokenRe.exec(text)) !== null) {
@@ -1928,15 +1937,20 @@
         em.textContent = m[7].slice(1, -1);
         parent.appendChild(em);
       } else if (m[8]) {
+        const del = document.createElement("del");
+        del.className = "wx-md-del";
+        del.textContent = m[8].slice(2, -2);
+        parent.appendChild(del);
+      } else if (m[9]) {
         const a = document.createElement("a");
         a.className = "msg-link";
-        a.href = m[8];
+        a.href = m[9];
         a.target = "_blank";
         a.rel = "noopener noreferrer";
-        a.textContent = m[8];
+        a.textContent = m[9];
         parent.appendChild(a);
-      } else if (m[9]) {
-        const handle = m[9];
+      } else if (m[10]) {
+        const handle = m[10];
         const chip = document.createElement("span");
         chip.className = "mention-chip clickable" + (isMentionMe(handle) ? " mention-me" : "");
         chip.textContent = handle;
@@ -2067,6 +2081,50 @@
         container.appendChild(bq);
         continue;
       }
+      if (/^[-*+]\s+/.test(trimmedLine)) {
+        flushProse(true);
+        const ul = document.createElement("ul");
+        ul.className = "wx-md-list";
+        let hasChecklist = false;
+        while (i < lines.length && /^[-*+]\s+/.test(lines[i].trim())) {
+          const itemText = lines[i].trim().replace(/^[-*+]\s+/, "");
+          const li = document.createElement("li");
+          const chk = itemText.match(/^\[(x|X| )\]\s+(.+)$/);
+          if (chk) {
+            hasChecklist = true;
+            const checked = chk[1].toLowerCase() === "x";
+            li.className = "wx-md-check-item" + (checked ? " done" : "");
+            const box = document.createElement("span");
+            box.className = "wx-md-check-box" + (checked ? " done" : "");
+            box.setAttribute("aria-hidden", "true");
+            box.textContent = checked ? "✓" : "";
+            const bodySpan = document.createElement("span");
+            appendInlineRichText(bodySpan, chk[2]);
+            li.append(box, bodySpan);
+          } else {
+            appendInlineRichText(li, itemText);
+          }
+          ul.appendChild(li);
+          i += 1;
+        }
+        if (hasChecklist) ul.classList.add("wx-md-checklist");
+        container.appendChild(ul);
+        continue;
+      }
+      if (/^\d+\.\s+/.test(trimmedLine)) {
+        flushProse(true);
+        const ol = document.createElement("ol");
+        ol.className = "wx-md-list wx-md-ol";
+        while (i < lines.length && /^\d+\.\s+/.test(lines[i].trim())) {
+          const itemText = lines[i].trim().replace(/^\d+\.\s+/, "");
+          const li = document.createElement("li");
+          appendInlineRichText(li, itemText);
+          ol.appendChild(li);
+          i += 1;
+        }
+        container.appendChild(ol);
+        continue;
+      }
       proseBuf.push(lines[i]);
       i += 1;
     }
@@ -2170,6 +2228,20 @@
     const d = new Date(iso);
     if (Number.isNaN(d.getTime())) return "";
     return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }
+
+  function formatFullLocalTimestamp(iso) {
+    if (!iso) return "";
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return "";
+    return d.toLocaleString([], {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
   }
 
   function shouldShowTimeDivider(prev, curr) {
@@ -2435,6 +2507,15 @@
         });
         sender.appendChild(nameSpan);
         sender.appendChild(idSpan);
+        const shortTs = formatWeChatTime(m.timestamp);
+        if (shortTs) {
+          const tsSpan = document.createElement("span");
+          tsSpan.className = "wx-sender-time";
+          tsSpan.textContent = shortTs;
+          const fullTs = formatFullLocalTimestamp(m.timestamp);
+          if (fullTs) tsSpan.title = fullTs;
+          sender.appendChild(tsSpan);
+        }
         col.appendChild(sender);
       }
 
@@ -2443,6 +2524,8 @@
 
       const bubble = document.createElement("div");
       bubble.className = "wx-bubble";
+      const fullBubbleTs = formatFullLocalTimestamp(m.timestamp);
+      if (fullBubbleTs) bubble.title = fullBubbleTs;
       renderFormattedBody(bubble, m.content);
       if (activeSearchQuery) highlightSearchHits(bubble, activeSearchQuery);
       bubbleRow.appendChild(bubble);
@@ -3557,7 +3640,19 @@
     showToast("已复制 MCP 接入配置");
   });
 
-  document.getElementById("btn-refresh-bots").addEventListener("click", () => loadDiscoveredBots());
+  const btnRefreshBots = document.getElementById("btn-refresh-bots");
+  btnRefreshBots?.addEventListener("click", async () => {
+    if (btnRefreshBots.disabled) return;
+    btnRefreshBots.disabled = true;
+    btnRefreshBots.classList.add("spinning");
+    try {
+      await loadDiscoveredBots();
+      showToast(`已刷新本机 Agent（检测到 ${discoveredProfilesCache.length} 个）`);
+    } finally {
+      btnRefreshBots.disabled = false;
+      btnRefreshBots.classList.remove("spinning");
+    }
+  });
   document.getElementById("btn-go-cloud").addEventListener("click", () => {
     if (bridge?.switchToCloud) bridge.switchToCloud("/cloud-agents");
     else window.open("https://agents-chat.com/cloud-agents", "_blank", "noopener");

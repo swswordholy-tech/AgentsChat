@@ -289,6 +289,35 @@ export function isCloudOfflinePageUrl(rawUrl: unknown): boolean {
 }
 
 /**
+ * Identify whether a WebContentsView URL is the bundled `local-stopped.html` status page.
+ */
+export function isLocalStoppedPageUrl(rawUrl: unknown): boolean {
+  if (typeof rawUrl !== "string" || !rawUrl.trim()) return false;
+  try {
+    const u = new URL(rawUrl);
+    return u.protocol === "file:" && /(?:^|\/)local-stopped\.html$/i.test(u.pathname);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Format a concise native download-completed notification title & body,
+ * stripping control characters and clamping long filenames safely.
+ */
+export function formatDownloadCompleteNotice(rawFilename: unknown): { title: string; body: string } {
+  const cleaned = String(rawFilename || "")
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .trim();
+  const base = cleaned.split(/[\\/]/).pop()?.trim() || "文件";
+  const display = base.length > 72 ? `${base.slice(0, 71)}…` : base;
+  return {
+    title: "文件已保存",
+    body: `${display} · 点击在访达 / 文件夹中显示`,
+  };
+}
+
+/**
  * Build the safe IIFE injected into same-origin Cloud pages to sync theme
  * state from Desktop without triggering an echo loop in `cloud-preload.cjs`
  * and without clobbering SVG icon buttons.

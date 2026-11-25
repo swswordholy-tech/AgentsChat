@@ -758,9 +758,20 @@
       iconBellOff?.toggleAttribute("hidden", !next);
       api?.setNotificationsMuted?.(next);
     });
-    btnPower.addEventListener("click", () => {
-      const next = !(latestState?.settings?.localServerEnabled !== false);
-      api?.toggleLocalServer(next);
+    let powerToggling = false;
+    btnPower.addEventListener("click", async () => {
+      if (powerToggling) return;
+      powerToggling = true;
+      btnPower.disabled = true;
+      btnPower.style.opacity = "0.55";
+      try {
+        const next = !(latestState?.settings?.localServerEnabled !== false);
+        await api?.toggleLocalServer(next);
+      } finally {
+        powerToggling = false;
+        btnPower.disabled = false;
+        btnPower.style.opacity = "";
+      }
     });
     btnCopyUrl.addEventListener("contextmenu", (ev) => {
       const isCloud = (latestState?.settings?.activeWorkspace || "cloud") === "cloud";

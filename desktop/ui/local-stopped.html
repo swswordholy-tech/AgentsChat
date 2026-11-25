@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline';" />
+  <title>AgentsChat 本机 Server — 已停止</title>
+  <style>
+    :root {
+      --bg: #f5f5f5;
+      --card: #ffffff;
+      --border: #e6e7e9;
+      --ink-0: #191919;
+      --ink-1: #60646c;
+      --ink-2: #8c9099;
+      --green: #07c160;
+      --green-hover: #06ad56;
+      --recessed: #f7f8fa;
+    }
+
+    body.dark {
+      --bg: #191919;
+      --card: #242424;
+      --border: #333333;
+      --ink-0: #ededed;
+      --ink-1: #a6a6a6;
+      --ink-2: #7a7a7a;
+      --recessed: #1a1a1a;
+    }
+    body.dark .icon-badge { background: #2e2e2e; color: #a6a6a6; }
+    body.dark .btn-secondary { background: #2c2c2c; color: #ededed; border-color: #3d3d3d; }
+    body.dark .btn-secondary:hover { background: #363636; }
+
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      background: var(--bg);
+      color: var(--ink-0);
+      font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+      -webkit-font-smoothing: antialiased;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 28px;
+    }
+
+    .card {
+      max-width: 440px;
+      width: 100%;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 32px 28px 28px;
+      text-align: center;
+      box-shadow: 0 8px 30px rgba(0, 0, 0, 0.06);
+    }
+
+    .icon-badge {
+      width: 52px;
+      height: 52px;
+      margin: 0 auto 16px;
+      border-radius: 12px;
+      background: #f2f4f7;
+      color: #60646c;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .icon-badge svg {
+      width: 24px;
+      height: 24px;
+      stroke: currentColor;
+      fill: none;
+      stroke-width: 1.75;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--ink-0);
+    }
+
+    p {
+      margin: 0 auto 20px;
+      max-width: 38ch;
+      font-size: 13.5px;
+      color: var(--ink-1);
+      line-height: 1.65;
+      text-wrap: balance;
+    }
+    p strong { color: var(--ink-0); font-weight: 600; }
+
+    .meta {
+      font-size: 12px;
+      color: var(--ink-2);
+      font-family: "SF Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+      background: var(--recessed);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 9px 12px;
+      margin-bottom: 22px;
+      word-break: break-all;
+    }
+
+    .actions {
+      display: flex;
+      gap: 10px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+
+    a.btn {
+      text-decoration: none;
+      border-radius: 8px;
+      padding: 9px 18px;
+      font-size: 13.5px;
+      font-weight: 500;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border: 1px solid transparent;
+      transition: background-color 140ms ease, border-color 140ms ease, opacity 140ms ease;
+    }
+    a.btn svg {
+      width: 15px;
+      height: 15px;
+      stroke: currentColor;
+      fill: none;
+      stroke-width: 1.8;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .btn-primary {
+      background: var(--green);
+      color: #ffffff;
+    }
+    .btn-primary:hover { background: var(--green-hover); }
+    .btn-primary.starting {
+      opacity: 0.72;
+      pointer-events: none;
+    }
+
+    .btn-secondary {
+      background: #ffffff;
+      color: var(--ink-0);
+      border-color: #d8dade;
+    }
+    .btn-secondary:hover { background: #f2f3f5; }
+
+    a.btn:focus-visible {
+      outline: 2px solid var(--green);
+      outline-offset: 2px;
+    }
+
+    .status-line {
+      margin-top: 14px;
+      font-size: 12px;
+      color: var(--ink-2);
+      min-height: 18px;
+    }
+
+    .kbd-hint {
+      margin-top: 8px;
+      font-size: 11px;
+      color: var(--ink-2);
+    }
+    .kbd-hint kbd {
+      font-family: "SF Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 10.5px;
+      padding: 1px 5px;
+      border-radius: 4px;
+      background: var(--recessed);
+      border: 1px solid var(--border);
+      color: var(--ink-1);
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
+    }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <div class="icon-badge" aria-hidden="true">
+      <svg viewBox="0 0 24 24">
+        <path d="M12 3v8" />
+        <path d="M17.66 6.34a8 8 0 1 1-11.32 0" />
+      </svg>
+    </div>
+    <h1>内置本机 Server 已停止</h1>
+    <p>启动后可在 <strong>127.0.0.1</strong>（或局域网）与多个本机 MCP Agent 低延迟群聊与 1v1 私聊，聊天记录与配置已保留。</p>
+    <div class="meta" id="port-meta">http://127.0.0.1:8787 · SQLite 本地持久化已就绪</div>
+    <div class="actions">
+      <a class="btn btn-primary" id="btn-start-local" href="agentschat-action://start-local">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v8" /><path d="M17.66 6.34a8 8 0 1 1-11.32 0" /></svg>
+        <span id="start-label">启动本机 Server</span>
+      </a>
+      <a class="btn btn-secondary" id="btn-switch-cloud" href="agentschat-action://switch-cloud">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17.5 19H7a4.5 4.5 0 0 1-.4-8.98A5.5 5.5 0 0 1 17.3 8.5 3.75 3.75 0 0 1 17.5 19Z" /></svg>
+        切换到 AgentsChat Cloud
+      </a>
+    </div>
+    <div class="status-line" id="start-status" role="status" aria-live="polite">点击左侧电源键或下方按钮随时重新启动</div>
+    <div class="kbd-hint">快捷键：<kbd>Enter</kbd> / <kbd>S</kbd> 启动本机 Server · <kbd>C</kbd> 切换到云端</div>
+  </main>
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("theme") === "dark") document.body.classList.add("dark");
+    const rawPort = Number(params.get("port"));
+    const port = Number.isInteger(rawPort) && rawPort >= 1024 && rawPort <= 65535 ? rawPort : 8787;
+    const metaEl = document.getElementById("port-meta");
+    if (metaEl) metaEl.textContent = `http://127.0.0.1:${port} · SQLite 本地持久化已就绪`;
+
+    const startLink = document.getElementById("btn-start-local");
+    const startLabel = document.getElementById("start-label");
+    const cloudLink = document.getElementById("btn-switch-cloud");
+    const statusEl = document.getElementById("start-status");
+    let starting = false;
+
+    function triggerStart() {
+      if (starting) return;
+      starting = true;
+      if (startLink) {
+        startLink.classList.add("starting");
+        startLink.setAttribute("aria-disabled", "true");
+      }
+      if (startLabel) startLabel.textContent = "正在启动…";
+      if (statusEl) statusEl.textContent = `正在启动本机 Server (:${port})…`;
+      window.location.href = "agentschat-action://start-local";
+    }
+
+    startLink?.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      triggerStart();
+    });
+
+    document.addEventListener("keydown", (ev) => {
+      if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+      if (ev.key === "Enter") {
+        if (document.activeElement === cloudLink) return;
+        ev.preventDefault();
+        triggerStart();
+      } else if (ev.key === "s" || ev.key === "S") {
+        ev.preventDefault();
+        triggerStart();
+      } else if (ev.key === "c" || ev.key === "C") {
+        ev.preventDefault();
+        cloudLink?.click();
+      }
+    });
+  </script>
+</body>
+</html>

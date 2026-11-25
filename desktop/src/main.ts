@@ -29,8 +29,10 @@ import {
   computeCenteredWindowBounds,
   formatCopyableCloudUrl,
   formatDesktopWindowTitle,
+  formatDownloadCompleteNotice,
   formatTrayTooltip,
   isCloudOfflinePageUrl,
+  isLocalStoppedPageUrl,
   isTrustedCloudThemeOrigin,
   parseDeepLink,
   parseUnreadCountFromTitle,
@@ -227,6 +229,31 @@ function openCurrentCloudUrlInBrowser(): boolean {
   return true;
 }
 
+const downloadSessionsAttached = new WeakSet<Electron.Session>();
+
+function attachDownloadFeedback(wc: Electron.WebContents): void {
+  const ses = wc.session;
+  if (!ses || downloadSessionsAttached.has(ses)) return;
+  downloadSessionsAttached.add(ses);
+  ses.on("will-download", (_ev, item) => {
+    item.once("done", (_doneEv, state) => {
+      if (isSmokeTest || state !== "completed") return;
+      const savePath = item.getSavePath();
+      if (!savePath || !Notification.isSupported()) return;
+      const notice = formatDownloadCompleteNotice(item.getFilename() || savePath);
+      const notif = new Notification({
+        title: notice.title,
+        body: notice.body,
+        silent: settings.notificationsMuted === true,
+      });
+      notif.on("click", () => {
+        try { shell.showItemInFolder(savePath); } catch {}
+      });
+      notif.show();
+    });
+  });
+}
+
 function attachNativeContextMenu(wc: Electron.WebContents): void {
   wc.on("context-menu", (_ev, params) => {
     const items: Electron.MenuItemConstructorOptions[] = [];
@@ -235,6 +262,17 @@ function attachNativeContextMenu(wc: Electron.WebContents): void {
     const hasSafeImage = Boolean(params.mediaType === "image" && params.srcURL && isAllowedExternalUrl(params.srcURL));
 
     if (params.isEditable) {
+      if (params.misspelledWord && Array.isArray(params.dictionarySuggestions) && params.dictionarySuggestions.length > 0) {
+        for (const suggestion of params.dictionarySuggestions.slice(0, 5)) {
+          items.push({
+            label: suggestion,
+            click: () => {
+              try { wc.replaceMisspelling(suggestion); } catch {}
+            },
+          });
+        }
+        items.push({ type: "separator" });
+      }
       items.push(
         { role: "cut", enabled: hasSelection },
         { role: "copy", enabled: hasSelection },
@@ -424,6 +462,28 @@ function syncThemeToCloudView(nextTheme: "light" | "dark"): void {
   } catch {}
 }
 
+function syncThemeToLocalView(nextTheme: "light" | "dark"): void {
+  if (!localView || localView.webContents.isDestroyed()) return;
+  try {
+    const currentUrl = localView.webContents.getURL();
+    if (isLocalStoppedPageUrl(currentUrl)) {
+      void localView.webContents.executeJavaScript(buildOfflineThemeSyncScript(nextTheme), true).catch(() => {});
+      return;
+    }
+    localView.webContents.send("desktop:theme-changed", nextTheme);
+  } catch {}
+}
+
+async function loadLocalStoppedPage(): Promise<void> {
+  if (!localView || localView.webContents.isDestroyed() || isSmokeTest) return;
+  await localView.webContents.loadFile(join(UI_DIR, "local-stopped.html"), {
+    query: {
+      theme: settings.theme || "light",
+      port: String(settings.localServerPort || 8787),
+    },
+  });
+}
+
 function applyDesktopTheme(nextTheme: "light" | "dark", opts?: { skipCloudSync?: boolean }): void {
   settings = settingsStore.save({ theme: nextTheme });
   try {
@@ -435,9 +495,7 @@ function applyDesktopTheme(nextTheme: "light" | "dark", opts?: { skipCloudSync?:
       mainWindow.setBackgroundColor(bg);
     } catch {}
   }
-  if (localView && !localView.webContents.isDestroyed()) {
-    localView.webContents.send("desktop:theme-changed", nextTheme);
-  }
+  syncThemeToLocalView(nextTheme);
   if (!opts?.skipCloudSync) {
     syncThemeToCloudView(nextTheme);
   }
@@ -510,6 +568,10 @@ async function switchWorkspace(target: "cloud" | "local"): Promise<void> {
         await localView.webContents.loadURL(st.httpUrl);
       } else {
         localView.webContents.send("desktop:workspace-activated");
+      }
+    } else if (!st && localView && !localView.webContents.isDestroyed()) {
+      if (!isLocalStoppedPageUrl(localView.webContents.getURL())) {
+        await loadLocalStoppedPage();
       }
     }
   }
@@ -1007,7 +1069,12 @@ function rebuildTrayMenu(): void {
       click: () => {
         void (async () => {
           settings = settingsStore.save({ localServerEnabled: !settings.localServerEnabled });
-          await ensureLocalServerStarted();
+          const nextStatus = await ensureLocalServerStarted();
+          if (nextStatus && localView && !localView.webContents.isDestroyed()) {
+            await localView.webContents.loadURL(nextStatus.httpUrl);
+          } else if (!nextStatus) {
+            await loadLocalStoppedPage();
+          }
           broadcastState();
         })();
       },
@@ -1181,6 +1248,8 @@ async function createDesktopWindow(): Promise<void> {
   const initialZoom = clampDesktopZoomFactor(settings.zoomFactor ?? 1);
   attachNativeContextMenu(cloudView.webContents);
   attachNativeContextMenu(localView.webContents);
+  attachDownloadFeedback(cloudView.webContents);
+  attachDownloadFeedback(localView.webContents);
 
   cloudView.webContents.on("did-start-loading", () => {
     cloudLoading = true;
@@ -1203,7 +1272,48 @@ async function createDesktopWindow(): Promise<void> {
   });
   localView.webContents.on("dom-ready", () => {
     try { localView?.webContents.setZoomFactor(clampDesktopZoomFactor(settings.zoomFactor ?? 1)); } catch {}
-    try { localView?.webContents.send("desktop:theme-changed", settings.theme || "light"); } catch {}
+    syncThemeToLocalView(settings.theme || "light");
+  });
+  localView.webContents.on("will-navigate", (ev, navUrl) => {
+    const currentUrl = localView?.webContents.getURL() || "";
+    if (!isLocalStoppedPageUrl(currentUrl)) return;
+    if (navUrl === "agentschat-action://start-local") {
+      ev.preventDefault();
+      void (async () => {
+        settings = settingsStore.save({ localServerEnabled: true });
+        const nextStatus = await ensureLocalServerStarted();
+        if (nextStatus && localView && !localView.webContents.isDestroyed()) {
+          await localView.webContents.loadURL(nextStatus.httpUrl);
+        }
+        broadcastState();
+      })();
+    } else if (navUrl === "agentschat-action://switch-cloud") {
+      ev.preventDefault();
+      void switchWorkspace("cloud");
+    }
+  });
+  cloudView.webContents.on("render-process-gone", (_ev, details) => {
+    if (isSmokeTest || details.reason === "clean-exit") return;
+    cloudLoading = false;
+    const retryUrl = resolveOfflineRetryUrl(cloudView?.webContents.getURL() || lastCloudFailedUrl, settings.remoteServerUrl);
+    lastCloudFailedUrl = retryUrl;
+    void cloudView?.webContents.loadFile(join(UI_DIR, "cloud-offline.html"), {
+      query: {
+        remote: retryUrl,
+        reason: `RENDERER_${String(details.reason || "GONE").toUpperCase()}`,
+        theme: settings.theme || "light",
+      },
+    });
+    broadcastState();
+  });
+  localView.webContents.on("render-process-gone", (_ev, details) => {
+    if (isSmokeTest || details.reason === "clean-exit") return;
+    const runningStatus = localServer?.getStatus();
+    if (runningStatus?.running) {
+      void localView?.webContents.loadURL(runningStatus.httpUrl);
+    } else {
+      void loadLocalStoppedPage();
+    }
   });
   cloudView.webContents.on("page-title-updated", (_ev, title) => {
     const nextCloudUnread = parseUnreadCountFromTitle(title);
@@ -1262,6 +1372,8 @@ async function createDesktopWindow(): Promise<void> {
   const st = await ensureLocalServerStarted();
   if (st) {
     await localView.webContents.loadURL(st.httpUrl);
+  } else {
+    await loadLocalStoppedPage();
   }
 
   const scheduleBoundsSave = () => {
@@ -1346,6 +1458,8 @@ function registerIpcHandlers(): void {
     const st = await ensureLocalServerStarted();
     if (st && localView && !localView.webContents.isDestroyed()) {
       await localView.webContents.loadURL(st.httpUrl);
+    } else if (!st) {
+      await loadLocalStoppedPage();
     }
     broadcastState();
     return getCombinedState();
