@@ -437,16 +437,25 @@
     showToast._t = setTimeout(() => { elToast.hidden = true; }, 2600);
   }
 
+  function getScrollBehavior() {
+    try {
+      if (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+        return "auto";
+      }
+    } catch {}
+    return "smooth";
+  }
+
   async function copyTextToClipboard(text) {
     const val = String(text ?? "");
     try {
       if (bridge?.copyText) {
         await bridge.copyText(val);
-        return;
+        return true;
       }
       if (navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(val);
-        return;
+        return true;
       }
     } catch {}
     const ta = document.createElement("textarea");
@@ -455,8 +464,10 @@
     ta.style.opacity = "0";
     document.body.appendChild(ta);
     ta.select();
-    try { document.execCommand("copy"); } catch {}
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch {}
     ta.remove();
+    return Boolean(ok);
   }
 
   async function api(path, opts = {}) {
@@ -479,6 +490,7 @@
 
   function openPromptDialog({ title, hint, placeholder1, placeholder2, value1, multiline }) {
     const dlg = document.getElementById("prompt-dialog");
+    if (!dlg || dlg.open) return Promise.resolve(null);
     const i1 = document.getElementById("dialog-input-1");
     const ta = document.getElementById("dialog-textarea");
     const i2 = document.getElementById("dialog-input-2");
@@ -523,6 +535,7 @@
     return new Promise((resolve) => {
       const form = document.getElementById("dialog-form");
       const cancelBtn = document.getElementById("dialog-cancel");
+      let settled = false;
       const onFieldKey = (ev) => {
         if (ev.key === "Enter" && isImeComposing(ev)) {
           ev.preventDefault();
@@ -538,15 +551,6 @@
           try { prevFocus.focus(); } catch {}
         }
       };
-      const onDialogCancel = (ev) => {
-        ev.preventDefault();
-        onCancel();
-      };
-      const onDialogClose = () => {
-        cleanup();
-        restoreFocus();
-        resolve(null);
-      };
       const cleanup = () => {
         form.removeEventListener("submit", onSubmit);
         cancelBtn.removeEventListener("click", onCancel);
@@ -554,19 +558,24 @@
         dlg.removeEventListener("close", onDialogClose);
         activeField.removeEventListener("keydown", onFieldKey);
       };
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (dlg.open) dlg.close();
+        restoreFocus();
+        resolve(result);
+      };
+      const onDialogCancel = (ev) => {
+        ev.preventDefault();
+        finish(null);
+      };
+      const onDialogClose = () => finish(null);
       const onSubmit = (ev) => {
         ev.preventDefault();
-        cleanup();
-        dlg.close();
-        restoreFocus();
-        resolve({ v1: activeField.value.trim(), v2: i2.value.trim() });
+        finish({ v1: activeField.value.trim(), v2: i2.value.trim() });
       };
-      const onCancel = () => {
-        cleanup();
-        dlg.close();
-        restoreFocus();
-        resolve(null);
-      };
+      const onCancel = () => finish(null);
       form.addEventListener("submit", onSubmit);
       cancelBtn.addEventListener("click", onCancel);
       dlg.addEventListener("cancel", onDialogCancel);
@@ -585,7 +594,7 @@
     const i2 = document.getElementById("dialog-input-2");
     const confirmBtn = document.getElementById("dialog-confirm");
     const cancelBtn = document.getElementById("dialog-cancel");
-    if (!dlg) return Promise.resolve(false);
+    if (!dlg || dlg.open) return Promise.resolve(false);
     document.getElementById("dialog-title").textContent = title || "确认操作";
     document.getElementById("dialog-hint").textContent = hint || "";
     if (i1) {
@@ -670,7 +679,7 @@
   }, true);
 
   function openNativeDialog(dlg) {
-    if (!dlg || typeof dlg.showModal !== "function") return;
+    if (!dlg || typeof dlg.showModal !== "function" || dlg.open) return;
     const prevFocus = document.activeElement;
     if (dlg.dataset.focusRestoreBound !== "1") {
       dlg.dataset.focusRestoreBound = "1";
@@ -1172,8 +1181,7 @@
       const copyBotHandle = async (ev) => {
         ev.stopPropagation();
         const handle = `@${p.agent_id}`;
-        if (bridge?.copyText) await bridge.copyText(handle);
-        else await navigator.clipboard?.writeText(handle);
+        await copyTextToClipboard(handle);
         showToast(`已复制 ${handle}`);
       };
       idEl.addEventListener("click", copyBotHandle);
@@ -1267,8 +1275,7 @@
       btnCmd.title = "复制该 Profile 连接本机 Server 的 MCP 启动命令";
       btnCmd.addEventListener("click", async () => {
         const cmd = `npx -y agentschat-mcp@latest --profile ${p.profile_name} --url ${originUrl}`;
-        if (bridge?.copyText) await bridge.copyText(cmd);
-        else await navigator.clipboard?.writeText(cmd);
+        await copyTextToClipboard(cmd);
         flashCopyButton(btnCmd, "MCP");
         showToast(`已复制 ${p.profile_name} 本机 MCP 命令`);
       });
@@ -1504,8 +1511,7 @@
       const copyMemberId = async (ev) => {
         ev.preventDefault();
         const handle = `@${m.agent_id}`;
-        if (bridge?.copyText) await bridge.copyText(handle);
-        else await navigator.clipboard?.writeText(handle);
+        await copyTextToClipboard(handle);
         showToast(`已复制 ${handle}`);
       };
       pill.addEventListener("click", (ev) => {
@@ -2736,7 +2742,7 @@
               (el) => el.dataset.msgId === quoted.id,
             );
             if (!targetRow) return;
-            targetRow.scrollIntoView({ behavior: "smooth", block: "center" });
+            targetRow.scrollIntoView({ behavior: getScrollBehavior(), block: "center" });
             targetRow.classList.remove("wx-jump-flash");
             void targetRow.offsetWidth;
             targetRow.classList.add("wx-jump-flash");
@@ -2841,12 +2847,11 @@
 
   // Click local URL pill to copy
   elServerPill?.addEventListener("click", async () => {
-    try {
-      if (bridge?.copyText) await bridge.copyText(originUrl);
-      else await navigator.clipboard?.writeText(originUrl);
+    const copied = await copyTextToClipboard(originUrl);
+    if (copied) {
       flashCopyButton(elServerPill, originUrl.replace(/^https?:\/\//, ""));
       showToast("已复制本机地址：" + originUrl);
-    } catch {
+    } else {
       showToast("复制本机地址失败");
     }
   });
@@ -3503,7 +3508,7 @@
 
   // Capture-phase Lightbox shortcuts (prevents Escape from cancelling underlying composer replyTarget)
   window.addEventListener("keydown", (ev) => {
-    if (!localLbState.open) return;
+    if (!localLbState.open || isImeComposing(ev)) return;
     if (ev.key === "Escape") { ev.preventDefault(); ev.stopPropagation(); closeLocalImageLightbox(); return; }
     if (ev.key === "ArrowLeft") { ev.preventDefault(); ev.stopPropagation(); lbStep(-1); return; }
     if (ev.key === "ArrowRight") { ev.preventDefault(); ev.stopPropagation(); lbStep(1); return; }
@@ -3545,7 +3550,7 @@
 
   // Global shortcuts: Cmd/Ctrl+K command palette, Cmd/Ctrl+F search room, Cmd/Ctrl+G match stepper, ? shortcuts modal, Alt+Up/Down switch channel, Esc close/clear
   window.addEventListener("keydown", (ev) => {
-    if (localLbState.open) return;
+    if (localLbState.open || isImeComposing(ev)) return;
     if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "g" && activeSearchQuery && searchMatchEls.length > 0) {
       ev.preventDefault();
       stepSearchMatch(ev.shiftKey ? -1 : 1);
@@ -3827,8 +3832,7 @@
         pill.addEventListener("click", async () => {
           activeConnectBaseUrl = u;
           snippetBox.textContent = buildHarnessSnippet(activeHarness, activeConnectBaseUrl);
-          if (bridge?.copyText) await bridge.copyText(u);
-          else await navigator.clipboard?.writeText(u);
+          await copyTextToClipboard(u);
           showToast("已复制局域网地址：" + u);
         });
         lanList.appendChild(pill);
@@ -3899,6 +3903,7 @@
     selectHarnessTab(btn, false);
   });
   elSnippetTabs?.addEventListener("keydown", (ev) => {
+    if (isImeComposing(ev)) return;
     const tabs = Array.from(elSnippetTabs.querySelectorAll(".tab-btn"));
     if (!tabs.length) return;
     const curIdx = tabs.indexOf(document.activeElement);
@@ -3916,10 +3921,13 @@
 
   document.getElementById("btn-copy-snippet").addEventListener("click", async (ev) => {
     const txt = document.getElementById("mcp-snippet-box").textContent || "";
-    if (bridge?.copyText) await bridge.copyText(txt);
-    else await navigator.clipboard?.writeText(txt);
-    flashCopyButton(ev.currentTarget, "复制配置命令");
-    showToast("已复制 MCP 接入配置");
+    const copied = await copyTextToClipboard(txt);
+    if (copied) {
+      flashCopyButton(ev.currentTarget, "复制配置命令");
+      showToast("已复制 MCP 接入配置");
+    } else {
+      showToast("复制 MCP 接入配置失败");
+    }
   });
 
   const btnRefreshBots = document.getElementById("btn-refresh-bots");
@@ -3962,7 +3970,7 @@
     searchMatchIdx = norm;
     const activeEl = searchMatchEls[norm];
     if (activeEl && typeof activeEl.scrollIntoView === "function") {
-      try { activeEl.scrollIntoView({ behavior: "smooth", block: "center" }); } catch {}
+      try { activeEl.scrollIntoView({ behavior: getScrollBehavior(), block: "center" }); } catch {}
     }
     if (elSearchMatchCount) {
       elSearchMatchCount.textContent = `${norm + 1} / ${searchMatchEls.length}`;
@@ -4013,7 +4021,6 @@
       return;
     }
     const targetCh = currentChannelId;
-    activeSearchQuery = q;
     const params = new URLSearchParams({ q, channel_id: targetCh, limit: "50" });
     const res = await api(`/api/search?${params.toString()}`);
     if (seq !== searchRequestSeq || targetCh !== currentChannelId) return;
@@ -4021,6 +4028,7 @@
       showToast(res.data?.error || "搜索失败");
       return;
     }
+    activeSearchQuery = q;
     messages = Array.isArray(res.data?.messages) ? res.data.messages.slice().reverse() : [];
     if (elSearchBanner) {
       elSearchBanner.hidden = false;
@@ -4176,10 +4184,13 @@
   });
   document.getElementById("btn-copy-registered-cmd")?.addEventListener("click", async (ev) => {
     if (!latestRegisteredCmd) return;
-    if (bridge?.copyText) await bridge.copyText(latestRegisteredCmd);
-    else await navigator.clipboard?.writeText(latestRegisteredCmd);
-    flashCopyButton(ev.currentTarget, "复制本机 MCP 命令");
-    showToast("已复制新 Agent 本机 MCP 启动命令");
+    const copied = await copyTextToClipboard(latestRegisteredCmd);
+    if (copied) {
+      flashCopyButton(ev.currentTarget, "复制本机 MCP 命令");
+      showToast("已复制新 Agent 本机 MCP 启动命令");
+    } else {
+      showToast("复制本机 MCP 命令失败");
+    }
   });
   document.getElementById("btn-open-claim")?.addEventListener("click", () => {
     if (!latestRegisteredClaimUrl) return;

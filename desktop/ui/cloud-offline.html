@@ -264,10 +264,9 @@
   </main>
   <script>
     const params = new URLSearchParams(window.location.search);
-    if (params.get("theme") === "dark") {
-      document.body.classList.add("dark");
-      document.documentElement.style.colorScheme = "dark";
-    }
+    const isDarkTheme = params.get("theme") === "dark";
+    document.body.classList.toggle("dark", isDarkTheme);
+    document.documentElement.style.colorScheme = isDarkTheme ? "dark" : "light";
     const remote = params.get("remote") || "https://agents-chat.com";
     const reason = params.get("reason") || "NETWORK_UNREACHABLE";
     const diagText = `${remote} (${reason})`;
@@ -284,6 +283,20 @@
     let paused = false;
     let retrying = false;
     let copyResetTimer = null;
+    let retryWatchdogTimer = null;
+
+    function resetRetryState(statusMsg) {
+      retrying = false;
+      clearTimeout(retryWatchdogTimer);
+      retryWatchdogTimer = null;
+      if (retryLink) {
+        retryLink.classList.remove("retrying");
+        retryLink.removeAttribute("aria-disabled");
+        retryLink.removeAttribute("aria-busy");
+      }
+      if (retryLabel) retryLabel.textContent = "重试连接远端";
+      if (autoStatus && statusMsg) autoStatus.textContent = statusMsg;
+    }
 
     function triggerRetry() {
       if (retrying) return;
@@ -296,6 +309,10 @@
       }
       if (retryLabel) retryLabel.textContent = "正在重连…";
       if (autoStatus) autoStatus.textContent = "正在重新连接 AgentsChat Cloud…";
+      clearTimeout(retryWatchdogTimer);
+      retryWatchdogTimer = setTimeout(() => {
+        resetRetryState("重连超时 · 请按 Enter / R 再次重试或切换本机 Server");
+      }, 12000);
       window.location.href = "agentschat-action://retry-cloud";
     }
 
@@ -337,13 +354,15 @@
           ta.remove();
         } catch {}
       }
-      if (copyDiagBtn && copied) {
-        copyDiagBtn.textContent = "✓ 已复制";
-        copyDiagBtn.classList.add("copied");
+      if (copyDiagBtn) {
+        copyDiagBtn.textContent = copied ? "✓ 已复制" : "复制失败";
+        copyDiagBtn.classList.toggle("copied", copied);
+        copyDiagBtn.setAttribute("aria-label", copied ? "已复制连接诊断信息" : "复制连接诊断信息失败");
         clearTimeout(copyResetTimer);
         copyResetTimer = setTimeout(() => {
           copyDiagBtn.textContent = "复制诊断";
           copyDiagBtn.classList.remove("copied");
+          copyDiagBtn.setAttribute("aria-label", "复制连接诊断信息");
         }, 1500);
       }
     }

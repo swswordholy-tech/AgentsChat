@@ -210,10 +210,9 @@
   </main>
   <script>
     const params = new URLSearchParams(window.location.search);
-    if (params.get("theme") === "dark") {
-      document.body.classList.add("dark");
-      document.documentElement.style.colorScheme = "dark";
-    }
+    const isDarkTheme = params.get("theme") === "dark";
+    document.body.classList.toggle("dark", isDarkTheme);
+    document.documentElement.style.colorScheme = isDarkTheme ? "dark" : "light";
     const rawPort = Number(params.get("port"));
     const port = Number.isInteger(rawPort) && rawPort >= 1024 && rawPort <= 65535 ? rawPort : 8787;
     const metaEl = document.getElementById("port-meta");
@@ -224,6 +223,20 @@
     const cloudLink = document.getElementById("btn-switch-cloud");
     const statusEl = document.getElementById("start-status");
     let starting = false;
+    let startWatchdogTimer = null;
+
+    function resetStartState(message) {
+      starting = false;
+      clearTimeout(startWatchdogTimer);
+      startWatchdogTimer = null;
+      if (startLink) {
+        startLink.classList.remove("starting");
+        startLink.removeAttribute("aria-disabled");
+        startLink.removeAttribute("aria-busy");
+      }
+      if (startLabel) startLabel.textContent = "启动本机 Server";
+      if (statusEl && message) statusEl.textContent = message;
+    }
 
     function triggerStart() {
       if (starting) return;
@@ -235,6 +248,10 @@
       }
       if (startLabel) startLabel.textContent = "正在启动…";
       if (statusEl) statusEl.textContent = `正在启动本机 Server (:${port})…`;
+      clearTimeout(startWatchdogTimer);
+      startWatchdogTimer = setTimeout(() => {
+        resetStartState("启动超时 · 请点击重试或切换到云端工作区");
+      }, 8000);
       window.location.href = "agentschat-action://start-local";
     }
 

@@ -676,6 +676,23 @@ export function resolveSmartReloadAction(params: {
 }
 
 /**
+ * Create a lightweight FIFO async task serializer so concurrent Local Mini-Server
+ * start/stop/restart/LAN transitions execute strictly one at a time without leaking
+ * orphaned listening sockets, while isolating errors so later tasks still run.
+ */
+export function createSerialTaskQueue(): <T>(task: () => Promise<T>) => Promise<T> {
+  let tail: Promise<unknown> = Promise.resolve();
+  return <T>(task: () => Promise<T>): Promise<T> => {
+    const run = tail.then(task, task);
+    tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  };
+}
+
+/**
  * Clamp and round Electron webContents zoom factor to a safe, comfortable range [0.75, 1.75].
  */
 export function clampDesktopZoomFactor(raw: unknown): number {

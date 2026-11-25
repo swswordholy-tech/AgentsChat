@@ -29,6 +29,7 @@ import {
   classifyCloudRailSection,
   computeCenteredWindowBounds,
   computeDownloadProgress,
+  createSerialTaskQueue,
   formatCopyableCloudUrl,
   formatDesktopDiagnostics,
   formatDesktopWindowTitle,
@@ -134,6 +135,7 @@ const desktopDataDir =
 const settingsStore = new DesktopSettingsStore(join(desktopDataDir, "settings.json"));
 let settings: DesktopSettings = settingsStore.load();
 let localServer: LocalMiniServer | null = null;
+const runLocalServerOp = createSerialTaskQueue();
 
 function isAllowedExternalUrl(rawUrl: string): boolean {
   try {
@@ -630,7 +632,7 @@ async function switchWorkspace(target: "cloud" | "local"): Promise<void> {
   if (target === "local") {
     localUnreadCount = 0;
     syncUnreadBadge();
-    const st = await ensureLocalServerStarted();
+    const st = await runLocalServerOp(() => ensureLocalServerStarted());
     if (st && localView && !localView.webContents.isDestroyed()) {
       const currentUrl = localView.webContents.getURL();
       if (!currentUrl.startsWith(st.httpUrl)) {
@@ -975,17 +977,7 @@ function setupApplicationMenu(): void {
           checked: settings.localServerEnabled !== false,
           accelerator: "CmdOrCtrl+Shift+L",
           click: () => {
-            void (async () => {
-              settings = settingsStore.save({ localServerEnabled: !(settings.localServerEnabled !== false) });
-              const nextStatus = await ensureLocalServerStarted();
-              if (nextStatus && localView && !localView.webContents.isDestroyed()) {
-                await localView.webContents.loadURL(nextStatus.httpUrl);
-              } else if (!nextStatus) {
-                await loadLocalStoppedPage();
-              }
-              setupApplicationMenu();
-              broadcastState();
-            })();
+            void setLocalServerEnabled(!(settings.localServerEnabled !== false));
           },
         },
         {
@@ -1208,17 +1200,7 @@ function rebuildTrayMenu(): void {
     {
       label: settings.localServerEnabled ? "Stop Local Server" : "Start Local Server",
       click: () => {
-        void (async () => {
-          settings = settingsStore.save({ localServerEnabled: !settings.localServerEnabled });
-          const nextStatus = await ensureLocalServerStarted();
-          if (nextStatus && localView && !localView.webContents.isDestroyed()) {
-            await localView.webContents.loadURL(nextStatus.httpUrl);
-          } else if (!nextStatus) {
-            await loadLocalStoppedPage();
-          }
-          setupApplicationMenu();
-          broadcastState();
-        })();
+        void setLocalServerEnabled(!settings.localServerEnabled);
       },
     },
     {
@@ -1245,23 +1227,40 @@ function rebuildTrayMenu(): void {
   tray.setContextMenu(menu);
 }
 
-async function setAllowLan(allowLan: boolean): Promise<LocalServerStatus | null> {
-  const changed = Boolean(allowLan) !== settings.allowLan;
-  settings = settingsStore.save({ allowLan: Boolean(allowLan) });
-  if (changed && localServer) {
-    await localServer.closeAll();
-    localServer = null;
-  }
-  const st = await ensureLocalServerStarted();
-  if (st && localView && !localView.webContents.isDestroyed()) {
-    const cur = localView.webContents.getURL();
-    if (!cur.startsWith(st.httpUrl)) {
-      await localView.webContents.loadURL(st.httpUrl);
+async function setLocalServerEnabled(enabled: boolean): Promise<LocalServerStatus | null> {
+  return runLocalServerOp(async () => {
+    settings = settingsStore.save({ localServerEnabled: Boolean(enabled) });
+    const nextStatus = await ensureLocalServerStarted();
+    if (nextStatus && localView && !localView.webContents.isDestroyed()) {
+      await localView.webContents.loadURL(nextStatus.httpUrl);
+    } else if (!nextStatus) {
+      await loadLocalStoppedPage();
     }
-  }
-  setupApplicationMenu();
-  broadcastState();
-  return st;
+    setupApplicationMenu();
+    broadcastState();
+    return nextStatus;
+  });
+}
+
+async function setAllowLan(allowLan: boolean): Promise<LocalServerStatus | null> {
+  return runLocalServerOp(async () => {
+    const changed = Boolean(allowLan) !== settings.allowLan;
+    settings = settingsStore.save({ allowLan: Boolean(allowLan) });
+    if (changed && localServer) {
+      await localServer.closeAll();
+      localServer = null;
+    }
+    const st = await ensureLocalServerStarted();
+    if (st && localView && !localView.webContents.isDestroyed()) {
+      const cur = localView.webContents.getURL();
+      if (!cur.startsWith(st.httpUrl)) {
+        await localView.webContents.loadURL(st.httpUrl);
+      }
+    }
+    setupApplicationMenu();
+    broadcastState();
+    return st;
+  });
 }
 
 async function createDesktopWindow(): Promise<void> {
@@ -1412,10 +1411,6 @@ async function createDesktopWindow(): Promise<void> {
   });
   cloudView.webContents.on("did-navigate", () => broadcastState());
   cloudView.webContents.on("did-navigate-in-page", () => broadcastState());
-  mainWindow.on("swipe", (_ev, direction) => {
-    if (direction === "right") navigateCloudHistory("back");
-    else if (direction === "left") navigateCloudHistory("forward");
-  });
   localView.webContents.on("dom-ready", () => {
     try { localView?.webContents.setZoomFactor(clampDesktopZoomFactor(settings.zoomFactor ?? 1)); } catch {}
     syncThemeToLocalView(settings.theme || "light");
@@ -1425,14 +1420,7 @@ async function createDesktopWindow(): Promise<void> {
     if (!isLocalStoppedPageUrl(currentUrl)) return;
     if (navUrl === "agentschat-action://start-local") {
       ev.preventDefault();
-      void (async () => {
-        settings = settingsStore.save({ localServerEnabled: true });
-        const nextStatus = await ensureLocalServerStarted();
-        if (nextStatus && localView && !localView.webContents.isDestroyed()) {
-          await localView.webContents.loadURL(nextStatus.httpUrl);
-        }
-        broadcastState();
-      })();
+      void setLocalServerEnabled(true);
     } else if (navUrl === "agentschat-action://switch-cloud") {
       ev.preventDefault();
       void switchWorkspace("cloud");
@@ -1625,33 +1613,27 @@ function registerIpcHandlers(): void {
   });
 
   ipcMain.handle("desktop:toggle-local-server", async (_ev, enabled: unknown) => {
-    settings = settingsStore.save({ localServerEnabled: Boolean(enabled) });
-    const st = await ensureLocalServerStarted();
-    if (st && localView && !localView.webContents.isDestroyed()) {
-      await localView.webContents.loadURL(st.httpUrl);
-    } else if (!st) {
-      await loadLocalStoppedPage();
-    }
-    setupApplicationMenu();
-    broadcastState();
+    await setLocalServerEnabled(Boolean(enabled));
     return getCombinedState();
   });
 
   ipcMain.handle("desktop:update-settings", async (_ev, patch: any) => {
-    const portOrHostChanged =
-      (patch?.localServerPort !== undefined && Number(patch.localServerPort) !== settings.localServerPort) ||
-      (patch?.allowLan !== undefined && Boolean(patch.allowLan) !== settings.allowLan);
-    settings = settingsStore.save(patch || {});
-    if (portOrHostChanged && localServer) {
-      await localServer.closeAll();
-      localServer = null;
-    }
-    const st = await ensureLocalServerStarted();
-    if (st && localView && !localView.webContents.isDestroyed()) {
-      await localView.webContents.loadURL(st.httpUrl);
-    }
-    setupApplicationMenu();
-    broadcastState();
+    await runLocalServerOp(async () => {
+      const portOrHostChanged =
+        (patch?.localServerPort !== undefined && Number(patch.localServerPort) !== settings.localServerPort) ||
+        (patch?.allowLan !== undefined && Boolean(patch.allowLan) !== settings.allowLan);
+      settings = settingsStore.save(patch || {});
+      if (portOrHostChanged && localServer) {
+        await localServer.closeAll();
+        localServer = null;
+      }
+      const st = await ensureLocalServerStarted();
+      if (st && localView && !localView.webContents.isDestroyed()) {
+        await localView.webContents.loadURL(st.httpUrl);
+      }
+      setupApplicationMenu();
+      broadcastState();
+    });
     return getCombinedState();
   });
 
@@ -1741,26 +1723,29 @@ function registerIpcHandlers(): void {
     if (patch?.minimizeToTray !== undefined) safePatch.minimizeToTray = Boolean(patch.minimizeToTray);
     if (patch?.launchAtLogin !== undefined) safePatch.launchAtLogin = Boolean(patch.launchAtLogin);
 
-    const restartNeeded =
-      (safePatch.localServerPort !== undefined && safePatch.localServerPort !== settings.localServerPort) ||
-      (safePatch.allowLan !== undefined && safePatch.allowLan !== settings.allowLan);
-    settings = settingsStore.save(safePatch);
-    if (safePatch.launchAtLogin !== undefined) {
-      applyLaunchAtLoginSetting();
-    }
-    if (restartNeeded && localServer) {
-      await localServer.closeAll();
-      localServer = null;
-    }
-    const nextStatus = await ensureLocalServerStarted();
-    if (nextStatus && localView && !localView.webContents.isDestroyed()) {
-      const currentUrl = localView.webContents.getURL();
-      if (!currentUrl.startsWith(nextStatus.httpUrl)) {
-        await localView.webContents.loadURL(nextStatus.httpUrl);
+    const nextStatus = await runLocalServerOp(async () => {
+      const restartNeeded =
+        (safePatch.localServerPort !== undefined && safePatch.localServerPort !== settings.localServerPort) ||
+        (safePatch.allowLan !== undefined && safePatch.allowLan !== settings.allowLan);
+      settings = settingsStore.save(safePatch);
+      if (safePatch.launchAtLogin !== undefined) {
+        applyLaunchAtLoginSetting();
       }
-    }
-    setupApplicationMenu();
-    broadcastState();
+      if (restartNeeded && localServer) {
+        await localServer.closeAll();
+        localServer = null;
+      }
+      const st = await ensureLocalServerStarted();
+      if (st && localView && !localView.webContents.isDestroyed()) {
+        const currentUrl = localView.webContents.getURL();
+        if (!currentUrl.startsWith(st.httpUrl)) {
+          await localView.webContents.loadURL(st.httpUrl);
+        }
+      }
+      setupApplicationMenu();
+      broadcastState();
+      return st;
+    });
     return { ok: true, settings, status: nextStatus };
   });
 

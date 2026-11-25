@@ -729,10 +729,11 @@
       btnCopyUrl.title = active === "cloud"
         ? `复制当前云端页面链接 (${modShift}C) · 右键在浏览器打开 (${modShift}O)`
         : `复制本机 MCP 接入命令 (${modShift}C)`;
-      btnCopyUrl.setAttribute(
-        "aria-label",
-        active === "cloud" ? "复制当前云端页面链接" : "复制本机 MCP 命令",
-      );
+      const baseCopyAriaLabel = active === "cloud" ? "复制当前云端页面链接" : "复制本机 MCP 命令";
+      btnCopyUrl.dataset.baseAriaLabel = baseCopyAriaLabel;
+      if (!btnCopyUrl.classList.contains("copied")) {
+        btnCopyUrl.setAttribute("aria-label", baseCopyAriaLabel);
+      }
       btnPower.classList.toggle("power-on", running);
       btnPower.setAttribute("aria-pressed", String(running));
       btnPower.title = running
@@ -858,7 +859,6 @@
       } catch {
         return;
       }
-      const prevAriaLabel = btnCopyUrl.getAttribute("aria-label") || "";
       btnCopyUrl.classList.add("copied");
       btnCopyUrl.setAttribute("aria-label", "已复制");
       iconCopy.toggleAttribute("hidden", true);
@@ -866,7 +866,10 @@
       clearTimeout(copyTimer);
       copyTimer = setTimeout(() => {
         btnCopyUrl.classList.remove("copied");
-        if (prevAriaLabel) btnCopyUrl.setAttribute("aria-label", prevAriaLabel);
+        const restoreLabel =
+          btnCopyUrl.dataset.baseAriaLabel ||
+          ((latestState?.settings?.activeWorkspace || "cloud") === "cloud" ? "复制当前云端页面链接" : "复制本机 MCP 命令");
+        btnCopyUrl.setAttribute("aria-label", restoreLabel);
         iconCopy.toggleAttribute("hidden", false);
         iconCheck.toggleAttribute("hidden", true);
       }, 1400);

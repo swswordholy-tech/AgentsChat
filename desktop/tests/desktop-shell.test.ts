@@ -13,6 +13,7 @@ import {
   compareSemver,
   computeCenteredWindowBounds,
   computeDownloadProgress,
+  createSerialTaskQueue,
   formatCopyableCloudUrl,
   formatDesktopDiagnostics,
   formatDesktopWindowTitle,
@@ -1143,14 +1144,14 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     const offlineHtml = readFileSync(join(import.meta.dir, "..", "ui", "cloud-offline.html"), "utf8");
     const offlineScript = offlineHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1] || "";
     expect(() => new Function(offlineScript)).not.toThrow();
-    expect(offlineHtml).toContain('document.documentElement.style.colorScheme = "dark"');
+    expect(offlineHtml).toContain('document.documentElement.style.colorScheme = isDarkTheme ? "dark" : "light"');
     expect(offlineHtml).toContain('retryLink.setAttribute("aria-busy", "true")');
     expect(offlineHtml).toContain("ev.isComposing || ev.keyCode === 229");
 
     const stoppedHtml = readFileSync(join(import.meta.dir, "..", "ui", "local-stopped.html"), "utf8");
     const stoppedScript = stoppedHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1] || "";
     expect(() => new Function(stoppedScript)).not.toThrow();
-    expect(stoppedHtml).toContain('document.documentElement.style.colorScheme = "dark"');
+    expect(stoppedHtml).toContain('document.documentElement.style.colorScheme = isDarkTheme ? "dark" : "light"');
     expect(stoppedHtml).toContain('startLink.setAttribute("aria-busy", "true")');
     expect(stoppedHtml).toContain("ev.isComposing || ev.keyCode === 229");
   });
@@ -1381,5 +1382,80 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     expect(localJs).toContain('showToast(msgRes.data?.error || "加载房间消息失败，请稍后重试")');
     expect(localJs).toContain("const mutatingMessageIds = new Set();");
     expect(localJs).toContain("const targetChannelId = m.channel_id || currentChannelId;");
+  });
+
+  test("Desktop 2.17 fixes duplicate swipe cancellation, serializes Local Server lifecycle, fixes rail copy aria-label stickiness, adds fallback watchdogs & hardens Local Hub IME/search/dialog/clipboard/motion", async () => {
+    // 1. Pure helper: createSerialTaskQueue runs overlapping async tasks strictly FIFO and isolates failures
+    const runSerial = createSerialTaskQueue();
+    const trace: string[] = [];
+    const p1 = runSerial(async () => {
+      trace.push("start-1");
+      await new Promise((r) => setTimeout(r, 15));
+      trace.push("end-1");
+      return "one";
+    });
+    const p2 = runSerial(async () => {
+      trace.push("start-2");
+      throw new Error("boom");
+    });
+    const p3 = runSerial(async () => {
+      trace.push("start-3");
+      return "three";
+    });
+    expect(await p1).toBe("one");
+    let p2Err = "";
+    try {
+      await p2;
+    } catch (err: any) {
+      p2Err = String(err?.message || "");
+    }
+    expect(p2Err).toBe("boom");
+    expect(await p3).toBe("three");
+    expect(trace).toEqual(["start-1", "end-1", "start-2", "start-3"]);
+
+    // 2. Main process: single swipe listener (no contradictory double-fire) + serialized Local Server transitions
+    const mainTs = readFileSync(join(import.meta.dir, "..", "src", "main.ts"), "utf8");
+    const swipeMatches = mainTs.match(/mainWindow\.on\("swipe"/g) || [];
+    expect(swipeMatches.length).toBe(1);
+    expect(mainTs).toContain("const runLocalServerOp = createSerialTaskQueue();");
+    expect(mainTs).toContain("async function setLocalServerEnabled(enabled: boolean)");
+    expect(mainTs).toContain("void setLocalServerEnabled(true);");
+    expect(mainTs).toContain("await setLocalServerEnabled(Boolean(enabled));");
+
+    // 3. Shell rail: baseAriaLabel prevents rapid double-click permanently sticking aria-label="已复制"
+    const shellHtml = readFileSync(join(import.meta.dir, "..", "ui", "shell.html"), "utf8");
+    const shellScript = shellHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1] || "";
+    expect(() => new Function(shellScript)).not.toThrow();
+    expect(shellHtml).toContain("btnCopyUrl.dataset.baseAriaLabel = baseCopyAriaLabel;");
+    expect(shellHtml).toContain("btnCopyUrl.dataset.baseAriaLabel ||");
+
+    // 4. Offline & Stopped fallback pages: Light/Dark colorScheme parity, watchdog recovery & valid JS syntax
+    const offlineHtml = readFileSync(join(import.meta.dir, "..", "ui", "cloud-offline.html"), "utf8");
+    const offlineScript = offlineHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1] || "";
+    expect(() => new Function(offlineScript)).not.toThrow();
+    expect(offlineHtml).toContain('document.documentElement.style.colorScheme = isDarkTheme ? "dark" : "light"');
+    expect(offlineHtml).toContain("function resetRetryState(");
+    expect(offlineHtml).toContain("retryWatchdogTimer = setTimeout(");
+    expect(offlineHtml).toContain('copied ? "✓ 已复制" : "复制失败"');
+
+    const stoppedHtml = readFileSync(join(import.meta.dir, "..", "ui", "local-stopped.html"), "utf8");
+    const stoppedScript = stoppedHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1] || "";
+    expect(() => new Function(stoppedScript)).not.toThrow();
+    expect(stoppedHtml).toContain('document.documentElement.style.colorScheme = isDarkTheme ? "dark" : "light"');
+    expect(stoppedHtml).toContain("function resetStartState(");
+    expect(stoppedHtml).toContain("startWatchdogTimer = setTimeout(");
+
+    // 5. Local Hub JS: IME-safe global keydown & snippet tabs, atomic search error state, dialog open/settled guards, reduced-motion scroll & unified safe clipboard
+    const localJs = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.js"), "utf8");
+    expect(localJs).not.toMatch(/\.(?:innerHTML|outerHTML)\s*=|insertAdjacentHTML|document\.write\s*\(/);
+    expect(() => new Function(localJs)).not.toThrow();
+    expect(localJs).toContain("function getScrollBehavior()");
+    expect(localJs).toContain("behavior: getScrollBehavior()");
+    expect(localJs).toContain("if (!localLbState.open || isImeComposing(ev)) return;");
+    expect(localJs).toContain("if (localLbState.open || isImeComposing(ev)) return;");
+    expect(localJs).toContain("if (!dlg || dlg.open) return Promise.resolve(null);");
+    expect(localJs).toContain("if (!dlg || dlg.open) return Promise.resolve(false);");
+    expect(localJs).toContain('if (!dlg || typeof dlg.showModal !== "function" || dlg.open) return;');
+    expect(localJs).not.toContain("else await navigator.clipboard?.writeText(");
   });
 });
