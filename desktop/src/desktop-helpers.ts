@@ -551,6 +551,53 @@ export function resolveRestoredWindowBounds(
   return { width, height };
 }
 
+const RESERVED_LOCAL_PROFILE_NAMES = new Set([
+  "profile",
+  "config",
+  "settings",
+  "default",
+  "dev-token",
+  "session-binds",
+]);
+
+/**
+ * Derive a traversal-free, OS-safe local profile filename stem (`~/.agentschat/profiles/<name>.json`)
+ * from an optional user-provided profile name or display name.
+ * Strips path separators, traversal sequences, leading punctuation, and reserved names.
+ */
+export function sanitizeLocalProfileName(
+  rawProfileName: unknown,
+  displayName: unknown,
+  fallbackSuffix = "agent",
+): string {
+  const cleanCandidate = (raw: unknown): string => {
+    if (typeof raw !== "string") return "";
+    const stripped = raw
+      .trim()
+      .replace(/\.\.+/g, "-")
+      .replace(/[\\/]+/g, "-")
+      .replace(/[^a-zA-Z0-9._-]+/g, "-")
+      .replace(/^[._-]+|[._-]+$/g, "")
+      .slice(0, 40)
+      .replace(/[._-]+$/g, "");
+    if (!stripped || RESERVED_LOCAL_PROFILE_NAMES.has(stripped.toLowerCase())) {
+      return "";
+    }
+    return stripped;
+  };
+
+  const primary = cleanCandidate(rawProfileName);
+  if (primary) return primary;
+  const fromDisplay = cleanCandidate(displayName);
+  if (fromDisplay) return fromDisplay;
+
+  const safeSuffix =
+    String(fallbackSuffix || "")
+      .replace(/[^a-zA-Z0-9_-]+/g, "")
+      .slice(0, 16) || "agent";
+  return `Agent-${safeSuffix}`;
+}
+
 /**
  * Clamp and round Electron webContents zoom factor to a safe, comfortable range [0.75, 1.75].
  */

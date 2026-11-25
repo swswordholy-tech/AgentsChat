@@ -9,6 +9,7 @@ import {
   nativeImage,
   nativeTheme,
   Notification,
+  powerMonitor,
   screen,
   shell,
   Tray,
@@ -42,6 +43,7 @@ import {
   resolveOfflineRetryUrl,
   resolveRestoredWindowBounds,
   resolveWorkspaceCopyAction,
+  sanitizeLocalProfileName,
   type CloudQuickRoute,
 } from "./desktop-helpers.js";
 import { GlobalIdentityAuthority, resolveHomeDir } from "./identity-authority.js";
@@ -1452,10 +1454,27 @@ async function createDesktopWindow(): Promise<void> {
   }
 
   const scheduleBoundsSave = () => {
-    if (isSmokeTest || !mainWindow || mainWindow.isDestroyed() || mainWindow.isMinimized()) return;
+    if (
+      isSmokeTest ||
+      !mainWindow ||
+      mainWindow.isDestroyed() ||
+      mainWindow.isMinimized() ||
+      mainWindow.isFullScreen() ||
+      mainWindow.isMaximized()
+    ) {
+      return;
+    }
     if (boundsSaveTimer) clearTimeout(boundsSaveTimer);
     boundsSaveTimer = setTimeout(() => {
-      if (!mainWindow || mainWindow.isDestroyed() || mainWindow.isMinimized()) return;
+      if (
+        !mainWindow ||
+        mainWindow.isDestroyed() ||
+        mainWindow.isMinimized() ||
+        mainWindow.isFullScreen() ||
+        mainWindow.isMaximized()
+      ) {
+        return;
+      }
       const b = mainWindow.getBounds();
       settings = settingsStore.save({ windowBounds: { width: b.width, height: b.height, x: b.x, y: b.y } });
     }, 400);
@@ -1554,6 +1573,7 @@ function registerIpcHandlers(): void {
     if (st && localView && !localView.webContents.isDestroyed()) {
       await localView.webContents.loadURL(st.httpUrl);
     }
+    setupApplicationMenu();
     broadcastState();
     return getCombinedState();
   });
@@ -1662,6 +1682,7 @@ function registerIpcHandlers(): void {
         await localView.webContents.loadURL(nextStatus.httpUrl);
       }
     }
+    setupApplicationMenu();
     broadcastState();
     return { ok: true, settings, status: nextStatus };
   });
@@ -1746,13 +1767,7 @@ function registerIpcHandlers(): void {
     }
     const displayName = String(req?.displayName || "").trim();
     const rawProfileName = String(req?.profileName || "").trim();
-    const safeProfileName =
-      rawProfileName ||
-      displayName
-        .replace(/[^a-zA-Z0-9._-]+/g, "-")
-        .replace(/^-+|-+$/g, "")
-        .slice(0, 40) ||
-      `Agent-${Date.now().toString(36)}`;
+    const safeProfileName = sanitizeLocalProfileName(rawProfileName, displayName, Date.now().toString(36));
     if (!displayName || displayName.length > 64) {
       return { ok: false, error: "Display name (1-64 chars) is required" };
     }
@@ -1949,6 +1964,30 @@ if (!gotSingleInstanceLock) {
         showMainWindow();
       }
     });
+
+    if (!isSmokeTest) {
+      let resumeTimer: ReturnType<typeof setTimeout> | null = null;
+      powerMonitor.on("resume", () => {
+        if (resumeTimer) clearTimeout(resumeTimer);
+        resumeTimer = setTimeout(() => {
+          resumeTimer = null;
+          if (cloudView && !cloudView.webContents.isDestroyed() && isCloudOfflinePageUrl(cloudView.webContents.getURL())) {
+            const targetUrl = resolveOfflineRetryUrl(lastCloudFailedUrl, settings.remoteServerUrl);
+            void cloudView.webContents.loadURL(targetUrl).catch(() => {});
+          }
+          const st = localServer?.getStatus();
+          if (st?.running && localView && !localView.webContents.isDestroyed()) {
+            const cur = localView.webContents.getURL();
+            if (cur.startsWith(st.httpUrl)) {
+              void localView.webContents
+                .executeJavaScript("window.dispatchEvent(new Event('online'))", true)
+                .catch(() => {});
+            }
+          }
+        }, 1200);
+        resumeTimer.unref?.();
+      });
+    }
   });
 
   app.on("will-quit", () => {

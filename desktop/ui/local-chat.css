@@ -1030,6 +1030,12 @@ body.dark .search-banner { color: #5ce695; }
 }
 .wx-avatar.clickable:hover { filter: brightness(1.06); }
 .wx-avatar.clickable:active { transform: scale(0.95); }
+.wx-avatar.clickable:focus-visible,
+.wx-sender-id.clickable:focus-visible,
+.member-pill:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 2px;
+}
 
 .wx-col {
   display: flex;

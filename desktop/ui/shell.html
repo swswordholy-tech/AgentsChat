@@ -254,6 +254,8 @@
 
     .lan-chip {
       -webkit-app-region: no-drag;
+      border: none;
+      cursor: pointer;
       font-size: 9px;
       font-weight: 700;
       letter-spacing: 0.04em;
@@ -261,7 +263,10 @@
       border-radius: 5px;
       background: var(--wechat-green-soft);
       color: #059e4e;
+      transition: filter 140ms var(--ease);
     }
+    .lan-chip:hover { filter: brightness(0.95); }
+    .lan-chip:focus-visible { outline: 2px solid var(--wechat-green); outline-offset: 1px; }
 
     .badge {
       -webkit-app-region: no-drag;
@@ -471,7 +476,7 @@
 
     <div class="footer-stack">
       <div class="rail-sep" aria-hidden="true"></div>
-      <span class="lan-chip" id="lan-chip" title="局域网接入已开启 (0.0.0.0)" hidden>LAN</span>
+      <button class="lan-chip" id="lan-chip" type="button" title="局域网接入已开启 (0.0.0.0) — 点击切换到本机" aria-label="局域网已开启，切换到本机 Server" hidden>LAN</button>
       <button class="zoom-chip" id="btn-zoom-reset" type="button" title="当前缩放比例 — 点击还原 100% (⌘0)" aria-label="还原 100% 缩放" hidden>100%</button>
       <button class="badge" id="local-port-badge" type="button" title="本机 Server 监听端口 — 点击切换到本机">:8787</button>
       <div class="history-row" id="cloud-history-row">
@@ -639,6 +644,9 @@
         iconMoon.toggleAttribute("hidden", isDark);
         iconSun.toggleAttribute("hidden", !isDark);
       }
+      if (btnShellTheme) {
+        btnShellTheme.setAttribute("aria-pressed", String(isDark));
+      }
       const active = state.settings?.activeWorkspace || "cloud";
       const section = state.cloudNav?.section || "lobby";
       const isCloudLobby = active === "cloud" && section !== "cloud-agents" && section !== "okr-board" && section !== "marketplace";
@@ -657,6 +665,17 @@
       btnCloudStudio?.setAttribute("aria-pressed", String(isCloudStudio));
       btnCloudOkr?.setAttribute("aria-pressed", String(isCloudOkr));
       btnCloudMarket?.setAttribute("aria-pressed", String(isCloudMarket));
+
+      const syncAriaCurrent = (el, activeFlag) => {
+        if (!el) return;
+        if (activeFlag) el.setAttribute("aria-current", "page");
+        else el.removeAttribute("aria-current");
+      };
+      syncAriaCurrent(btnCloud, isCloudLobby);
+      syncAriaCurrent(btnLocal, active === "local");
+      syncAriaCurrent(btnCloudStudio, isCloudStudio);
+      syncAriaCurrent(btnCloudOkr, isCloudOkr);
+      syncAriaCurrent(btnCloudMarket, isCloudMarket);
 
       const canGoBack = Boolean(active === "cloud" && state.cloudNav?.canGoBack);
       const canGoForward = Boolean(active === "cloud" && state.cloudNav?.canGoForward);
@@ -730,6 +749,7 @@
     });
     btnLocal.addEventListener("click", () => api?.switchWorkspace("local"));
     portBadge?.addEventListener("click", () => api?.switchWorkspace("local"));
+    lanChip?.addEventListener("click", () => api?.switchWorkspace("local"));
     btnZoomReset?.addEventListener("click", () => api?.resetZoom?.());
     btnCloudStudio?.addEventListener("click", () => api?.navigateCloudRoute?.("cloud-agents"));
     btnCloudOkr?.addEventListener("click", () => api?.navigateCloudRoute?.("okr-board"));
@@ -782,6 +802,7 @@
       if (powerToggling) return;
       powerToggling = true;
       btnPower.disabled = true;
+      btnPower.setAttribute("aria-busy", "true");
       btnPower.style.opacity = "0.55";
       try {
         const next = !(latestState?.settings?.localServerEnabled !== false);
@@ -789,6 +810,7 @@
       } finally {
         powerToggling = false;
         btnPower.disabled = false;
+        btnPower.removeAttribute("aria-busy");
         btnPower.style.opacity = "";
       }
     });

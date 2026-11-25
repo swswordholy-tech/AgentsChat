@@ -29,6 +29,7 @@ import {
   resolveOfflineRetryUrl,
   resolveRestoredWindowBounds,
   resolveWorkspaceCopyAction,
+  sanitizeLocalProfileName,
 } from "../src/desktop-helpers.js";
 import { GlobalIdentityAuthority } from "../src/identity-authority.js";
 import { LocalMiniServer } from "../src/local-server.js";
@@ -1149,5 +1150,50 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     expect(stoppedHtml).toContain('document.documentElement.style.colorScheme = "dark"');
     expect(stoppedHtml).toContain('startLink.setAttribute("aria-busy", "true")');
     expect(stoppedHtml).toContain("ev.isComposing || ev.keyCode === 229");
+  });
+
+  test("Desktop 2.13 adds sleep/wake recovery, fullscreen bounds guard, App Menu LAN sync, safe profile naming, interactive rail LAN/ARIA polish, online WS wakeup & Local Hub keyboard/history polish", () => {
+    // 1. Pure helper: sanitizeLocalProfileName strips traversal, separators, reserved names & handles CJK display names cleanly
+    expect(sanitizeLocalProfileName("My_Local_Claude", "Claude", "xyz")).toBe("My_Local_Claude");
+    expect(sanitizeLocalProfileName("../../etc/passwd", "Safe Bot", "xyz")).toBe("etc-passwd");
+    expect(sanitizeLocalProfileName("profile", "Code Reviewer", "xyz")).toBe("Code-Reviewer");
+    expect(sanitizeLocalProfileName("dev-token", "前端审查助手", "abc123")).toBe("Agent-abc123");
+    expect(sanitizeLocalProfileName("", "前端审查助手", "abc123")).toBe("Agent-abc123");
+    expect(sanitizeLocalProfileName("...___...", "  My Agent!!  ", "xyz")).toBe("My-Agent");
+    expect(sanitizeLocalProfileName("a".repeat(60), "", "xyz").length).toBeLessThanOrEqual(40);
+
+    // 2. Main process: powerMonitor resume recovery, fullscreen/maximized bounds guard, App Menu sync on settings save & sanitizeLocalProfileName
+    const mainTs = readFileSync(join(import.meta.dir, "..", "src", "main.ts"), "utf8");
+    expect(mainTs).toContain('powerMonitor.on("resume"');
+    expect(mainTs).toContain("mainWindow.isFullScreen()");
+    expect(mainTs).toContain("mainWindow.isMaximized()");
+    expect(mainTs).toContain("sanitizeLocalProfileName(rawProfileName, displayName");
+
+    // 3. Shell rail: clickable LAN button, aria-current="page", theme aria-pressed & power aria-busy
+    const shellHtml = readFileSync(join(import.meta.dir, "..", "ui", "shell.html"), "utf8");
+    const shellScript = shellHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1] || "";
+    expect(() => new Function(shellScript)).not.toThrow();
+    expect(shellHtml).toContain('<button class="lan-chip" id="lan-chip" type="button"');
+    expect(shellHtml).toContain('lanChip?.addEventListener("click", () => api?.switchWorkspace("local"))');
+    expect(shellHtml).toContain('el.setAttribute("aria-current", "page")');
+    expect(shellHtml).toContain('btnShellTheme.setAttribute("aria-pressed", String(isDark))');
+    expect(shellHtml).toContain('btnPower.setAttribute("aria-busy", "true")');
+
+    // 4. Local Hub: window online instant WS reconnect, loadOlderMessages busy/error states, keyboard-accessible avatars/sender handles & rich member aria-label
+    const localJs = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.js"), "utf8");
+    expect(localJs).not.toMatch(/\.(?:innerHTML|outerHTML)\s*=|insertAdjacentHTML|document\.write\s*\(/);
+    expect(() => new Function(localJs)).not.toThrow();
+    expect(localJs).toContain('window.addEventListener("online"');
+    expect(localJs).toContain("async function loadOlderMessages(triggerBtn)");
+    expect(localJs).toContain('triggerBtn.textContent = "加载中…"');
+    expect(localJs).toContain('showToast(res?.data?.error || "加载历史消息失败，请稍后重试")');
+    expect(localJs).toContain('av.setAttribute("role", "button")');
+    expect(localJs).toContain('idSpan.setAttribute("role", "button")');
+    expect(localJs).toContain('idSpan.setAttribute("aria-label", `复制 @${m.sender_id}`)');
+
+    const localCss = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.css"), "utf8");
+    expect(localCss).toContain(".wx-avatar.clickable:focus-visible");
+    expect(localCss).toContain(".wx-sender-id.clickable:focus-visible");
+    expect(localCss).toContain(".member-pill:focus-visible");
   });
 });

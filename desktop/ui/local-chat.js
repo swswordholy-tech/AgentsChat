@@ -864,6 +864,14 @@
     });
   }
 
+  window.addEventListener("online", () => {
+    if (!authToken) return;
+    if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+      wsReconnectDelayMs = 1000;
+      connectRealtimeWs();
+    }
+  });
+
   async function trySyncCloudSession(silent) {
     if (bridge && typeof bridge.getBootstrapSession === "function") {
       const boot = await bridge.getBootstrapSession();
@@ -1363,7 +1371,7 @@
     renderMessages();
   }
 
-  async function loadOlderMessages() {
+  async function loadOlderMessages(triggerBtn) {
     if (!authToken || loadingOlder || !hasMoreOlder || messages.length === 0 || activeSearchQuery) return;
     loadingOlder = true;
     const oldestTs = messages[0]?.timestamp;
@@ -1371,12 +1379,29 @@
       loadingOlder = false;
       return;
     }
+    if (triggerBtn) {
+      triggerBtn.disabled = true;
+      triggerBtn.textContent = "加载中…";
+      triggerBtn.setAttribute("aria-busy", "true");
+    }
     const prevHeight = elMessages.scrollHeight;
-    const res = await api(
-      `/api/channels/${encodeURIComponent(currentChannelId)}/messages?limit=50&before=${encodeURIComponent(oldestTs)}`,
-    );
-    loadingOlder = false;
-    if (!res.ok) return;
+    let res;
+    try {
+      res = await api(
+        `/api/channels/${encodeURIComponent(currentChannelId)}/messages?limit=50&before=${encodeURIComponent(oldestTs)}`,
+      );
+    } finally {
+      loadingOlder = false;
+    }
+    if (!res?.ok) {
+      if (triggerBtn && document.contains(triggerBtn)) {
+        triggerBtn.disabled = false;
+        triggerBtn.textContent = "查看更多消息";
+        triggerBtn.removeAttribute("aria-busy");
+      }
+      showToast(res?.data?.error || "加载历史消息失败，请稍后重试");
+      return;
+    }
     const older = Array.isArray(res.data?.messages) ? res.data.messages : [];
     hasMoreOlder = older.length >= 50;
     if (older.length > 0) {
@@ -1419,6 +1444,10 @@
       pill.appendChild(nameSpan);
       pill.appendChild(idSpan);
       pill.title = "点击插入 @提及 · 右键或 Option+点击复制 @ID";
+      pill.setAttribute(
+        "aria-label",
+        `${m.display_name || m.agent_id} (@${m.agent_id})，${m.online ? "在线" : "离线"}，点击插入提及`,
+      );
       const copyMemberId = async (ev) => {
         ev.preventDefault();
         const handle = `@${m.agent_id}`;
@@ -2458,7 +2487,7 @@
       btnMore.type = "button";
       btnMore.className = "btn btn-ghost btn-xs";
       btnMore.textContent = "查看更多消息";
-      btnMore.addEventListener("click", () => void loadOlderMessages());
+      btnMore.addEventListener("click", () => void loadOlderMessages(btnMore));
       loadMoreWrap.appendChild(btnMore);
       elMessages.appendChild(loadMoreWrap);
     }
@@ -2504,10 +2533,20 @@
       av.textContent = avatarInitials(m.sender_name, m.sender_id);
       if (!isSelf) {
         av.title = `点击插入 @${m.sender_id}`;
-        av.addEventListener("click", () => {
+        av.setAttribute("role", "button");
+        av.tabIndex = 0;
+        av.setAttribute("aria-label", `提及 @${m.sender_id}`);
+        const mentionFromAvatar = () => {
           insertTextAtCursor(elInput, `@${m.sender_id} `);
           saveLocalDraft(currentChannelId, elInput.value);
           syncComposerState();
+        };
+        av.addEventListener("click", mentionFromAvatar);
+        av.addEventListener("keydown", (ev) => {
+          if (ev.key === "Enter" || ev.key === " ") {
+            ev.preventDefault();
+            mentionFromAvatar();
+          }
         });
       }
       row.appendChild(av);
@@ -2524,9 +2563,19 @@
         idSpan.className = "wx-sender-id clickable";
         idSpan.textContent = `@${m.sender_id}`;
         idSpan.title = `点击复制 @${m.sender_id}`;
-        idSpan.addEventListener("click", async () => {
+        idSpan.setAttribute("role", "button");
+        idSpan.tabIndex = 0;
+        idSpan.setAttribute("aria-label", `复制 @${m.sender_id}`);
+        const copySenderHandle = async () => {
           await copyTextToClipboard(`@${m.sender_id}`);
           showToast(`已复制 @${m.sender_id}`);
+        };
+        idSpan.addEventListener("click", () => { void copySenderHandle(); });
+        idSpan.addEventListener("keydown", (ev) => {
+          if (ev.key === "Enter" || ev.key === " ") {
+            ev.preventDefault();
+            void copySenderHandle();
+          }
         });
         sender.appendChild(nameSpan);
         sender.appendChild(idSpan);
