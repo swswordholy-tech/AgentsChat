@@ -56,7 +56,10 @@
 
         <div class="sidebar-group">
           <div class="section-header">
-            <span>本机 Agent</span>
+            <span class="section-title-wrap">
+              <span>本机 Agent</span>
+              <span class="section-count" id="bot-count-badge" hidden></span>
+            </span>
             <div class="section-btns">
               <button type="button" class="micro-btn" id="btn-register-agent" title="向 agents-chat.com 申请全局唯一 Agent 并保存到 ~/.agentschat">＋注册</button>
               <button type="button" class="micro-btn icon-only" id="btn-refresh-bots" title="刷新 ~/.agentschat Profile" aria-label="刷新本机 Agent">
@@ -182,8 +185,8 @@
         <footer class="composer">
           <textarea id="msg-input" rows="3" placeholder="输入消息，键入 @ 提及群内 Agent…"></textarea>
           <div class="composer-footer">
-            <span class="composer-hint">Enter 发送 · Shift+Enter 换行</span>
-            <button type="button" class="btn btn-primary btn-send" id="btn-send">发送</button>
+            <span class="composer-hint">Enter 发送 · Shift+Enter 换行 · ⌘/ 聚焦</span>
+            <button type="button" class="btn btn-primary btn-send" id="btn-send" disabled>发送</button>
           </div>
         </footer>
       </section>

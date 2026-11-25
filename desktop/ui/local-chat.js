@@ -210,12 +210,14 @@
     renderChannelList();
   });
   const elBots = document.getElementById("discovered-bots");
+  const elBotCountBadge = document.getElementById("bot-count-badge");
   const elRoomTitle = document.getElementById("room-title");
   const elRoomTopic = document.getElementById("room-topic");
   const elMemberStrip = document.getElementById("member-strip");
   const elMessages = document.getElementById("messages-box");
   const elTyping = document.getElementById("typing-bar");
   const elInput = document.getElementById("msg-input");
+  const elBtnSend = document.getElementById("btn-send");
   const elToast = document.getElementById("toast");
   const elWsPill = document.getElementById("ws-pill");
   const elSearchInput = document.getElementById("search-input");
@@ -710,6 +712,10 @@
         renderMessages();
       } else if (frame.type === "agent_online" || frame.type === "agent_offline") {
         const online = frame.type === "agent_online";
+        if (frame.agent_id) {
+          knownBotOnlineById.set(frame.agent_id, online);
+          updateDiscoveredBotPresence(frame.agent_id, online);
+        }
         const found = currentMembers.find((m) => m.agent_id === frame.agent_id);
         if (found) {
           found.online = online;
@@ -897,20 +903,73 @@
     renderChannelList();
   }
 
+  const knownBotOnlineById = new Map();
+  let discoveredProfilesCache = [];
+
+  function renderBotCountBadge() {
+    if (!elBotCountBadge) return;
+    const total = discoveredProfilesCache.length;
+    if (total === 0) {
+      elBotCountBadge.hidden = true;
+      elBotCountBadge.textContent = "";
+      elBotCountBadge.classList.remove("has-online");
+      return;
+    }
+    const online = discoveredProfilesCache.filter((p) => Boolean(knownBotOnlineById.get(p.agent_id))).length;
+    elBotCountBadge.hidden = false;
+    elBotCountBadge.classList.toggle("has-online", online > 0);
+    elBotCountBadge.textContent = online > 0 ? `${online}/${total} 在线` : String(total);
+    elBotCountBadge.title = online > 0 ? `已检测到 ${total} 个本机 Agent，${online} 个在线` : `已检测到 ${total} 个本机 Agent`;
+  }
+
+  function updateDiscoveredBotPresence(agentId, online) {
+    if (!elBots || !agentId) return;
+    const rows = elBots.querySelectorAll(".bot-row");
+    for (const row of rows) {
+      if (row.dataset.agentId === agentId) {
+        const ind = row.querySelector(".bot-online-dot");
+        if (ind) {
+          ind.classList.toggle("online", Boolean(online));
+          ind.title = online ? "在线" : "离线";
+        }
+      }
+    }
+    renderBotCountBadge();
+  }
+
   async function loadDiscoveredBots() {
     const res = await api("/api/local/discovered-profiles");
     const profiles = Array.isArray(res.data?.profiles) ? res.data.profiles : [];
+    const principals = Array.isArray(res.data?.known_principals) ? res.data.known_principals : [];
+    for (const kp of principals) {
+      if (kp && typeof kp.id === "string") {
+        knownBotOnlineById.set(kp.id, Boolean(kp.online));
+      }
+    }
+    discoveredProfilesCache = profiles.slice().sort((a, b) => {
+      const ao = Boolean(knownBotOnlineById.get(a.agent_id));
+      const bo = Boolean(knownBotOnlineById.get(b.agent_id));
+      if (ao !== bo) return ao ? -1 : 1;
+      return String(a.display_name || a.agent_id || "").localeCompare(
+        String(b.display_name || b.agent_id || ""),
+        undefined,
+        { sensitivity: "base" },
+      );
+    });
+    renderBotCountBadge();
     elBots.replaceChildren();
-    if (profiles.length === 0) {
+    if (discoveredProfilesCache.length === 0) {
       const empty = document.createElement("div");
       empty.className = "bot-empty";
       empty.textContent = "未检测到 ~/.agentschat 下的本地 Profile，可点击上方「＋注册」快速创建。";
       elBots.appendChild(empty);
       return;
     }
-    profiles.forEach((p) => {
+    discoveredProfilesCache.forEach((p) => {
+      const isOnline = Boolean(knownBotOnlineById.get(p.agent_id));
       const row = document.createElement("div");
       row.className = "bot-row";
+      row.dataset.agentId = p.agent_id;
 
       const meta = document.createElement("div");
       meta.className = "bot-meta";
@@ -918,6 +977,10 @@
       dot.className = "bot-dot";
       dot.style.background = avatarBg(p.agent_id);
       dot.textContent = avatarInitials(p.display_name, p.agent_id);
+      const statusDot = document.createElement("span");
+      statusDot.className = "bot-online-dot" + (isOnline ? " online" : "");
+      statusDot.title = isOnline ? "在线" : "离线";
+      dot.appendChild(statusDot);
 
       const copy = document.createElement("div");
       copy.className = "bot-copy";
@@ -958,22 +1021,28 @@
       btnInvite.textContent = "入群";
       btnInvite.title = "验签并拉入当前群聊";
       btnInvite.addEventListener("click", async () => {
-        if (bridge?.activateDiscoveredProfile) {
-          await bridge.activateDiscoveredProfile(p.profile_name);
-        }
-        if (!authToken) {
-          showToast("请先登录或绑定您的账号后再拉 Agent 入群");
-          return;
-        }
-        const inv = await api(`/api/channels/${encodeURIComponent(currentChannelId)}/invite`, {
-          method: "POST",
-          body: JSON.stringify({ agent_id: p.agent_id }),
-        });
-        if (inv.ok) {
-          showToast(`已将 @${p.agent_id} 拉入 #${currentChannelId}`);
-          await selectChannel(currentChannelId);
-        } else {
-          showToast(inv.data?.error || "拉人失败");
+        if (btnInvite.disabled) return;
+        btnInvite.disabled = true;
+        try {
+          if (bridge?.activateDiscoveredProfile) {
+            await bridge.activateDiscoveredProfile(p.profile_name);
+          }
+          if (!authToken) {
+            showToast("请先登录或绑定您的账号后再拉 Agent 入群");
+            return;
+          }
+          const inv = await api(`/api/channels/${encodeURIComponent(currentChannelId)}/invite`, {
+            method: "POST",
+            body: JSON.stringify({ agent_id: p.agent_id }),
+          });
+          if (inv.ok) {
+            showToast(`已将 @${p.agent_id} 拉入 #${currentChannelId}`);
+            await selectChannel(currentChannelId);
+          } else {
+            showToast(inv.data?.error || "拉人失败");
+          }
+        } finally {
+          btnInvite.disabled = false;
         }
       });
 
@@ -983,21 +1052,27 @@
       btnDm.textContent = "私聊";
       btnDm.title = "打开与该本机 Agent 的 1v1 私聊";
       btnDm.addEventListener("click", async () => {
-        if (bridge?.activateDiscoveredProfile) {
-          await bridge.activateDiscoveredProfile(p.profile_name);
-        }
-        if (!authToken) {
-          showToast("请先登录或绑定您的账号后再发起私聊");
-          return;
-        }
-        const dmRes = await api("/api/channels", {
-          method: "POST",
-          body: JSON.stringify({ type: "direct", members: [p.agent_id] }),
-        });
-        if (dmRes.ok && dmRes.data?.channel) {
-          await selectChannel(dmRes.data.channel.id);
-        } else {
-          showToast(dmRes.data?.error || "打开私聊失败");
+        if (btnDm.disabled) return;
+        btnDm.disabled = true;
+        try {
+          if (bridge?.activateDiscoveredProfile) {
+            await bridge.activateDiscoveredProfile(p.profile_name);
+          }
+          if (!authToken) {
+            showToast("请先登录或绑定您的账号后再发起私聊");
+            return;
+          }
+          const dmRes = await api("/api/channels", {
+            method: "POST",
+            body: JSON.stringify({ type: "direct", members: [p.agent_id] }),
+          });
+          if (dmRes.ok && dmRes.data?.channel) {
+            await selectChannel(dmRes.data.channel.id);
+          } else {
+            showToast(dmRes.data?.error || "打开私聊失败");
+          }
+        } finally {
+          btnDm.disabled = false;
         }
       });
 
@@ -1023,6 +1098,48 @@
   }
 
   let channelLoadSeq = 0;
+
+  function autoResizeLocalInput() {
+    if (!elInput) return;
+    elInput.style.height = "auto";
+    const nextHeight = Math.min(180, Math.max(62, elInput.scrollHeight || 62));
+    elInput.style.height = `${nextHeight}px`;
+  }
+
+  function syncComposerState() {
+    autoResizeLocalInput();
+    if (elBtnSend && elInput) {
+      elBtnSend.disabled = !String(elInput.value || "").trim();
+    }
+  }
+
+  function renderMessagesSkeleton() {
+    if (!elMessages) return;
+    elMessages.replaceChildren();
+    const wrap = document.createElement("div");
+    wrap.className = "msg-skeleton-list";
+    wrap.setAttribute("role", "status");
+    wrap.setAttribute("aria-label", "正在加载房间消息");
+    const shapes = [
+      { self: false, width: "220px", height: "48px" },
+      { self: true, width: "168px", height: "42px" },
+      { self: false, width: "268px", height: "58px" },
+    ];
+    for (const s of shapes) {
+      const row = document.createElement("div");
+      row.className = "msg-skel-row" + (s.self ? " self" : "");
+      const av = document.createElement("div");
+      av.className = "msg-skel-avatar";
+      const bub = document.createElement("div");
+      bub.className = "msg-skel-bubble";
+      bub.style.width = s.width;
+      bub.style.height = s.height;
+      row.appendChild(av);
+      row.appendChild(bub);
+      wrap.appendChild(row);
+    }
+    elMessages.appendChild(wrap);
+  }
 
   function insertTextAtCursor(textarea, insertion) {
     if (!textarea) return;
@@ -1059,8 +1176,15 @@
       saveLocalDraft(prevChannelId, elInput.value);
     }
     currentChannelId = channelId;
+    try {
+      const nextHash = `#channel=${encodeURIComponent(channelId)}`;
+      if (window.location.hash !== nextHash) {
+        window.history.replaceState(null, "", nextHash);
+      }
+    } catch {}
     if (elInput && prevChannelId !== channelId) {
       elInput.value = getLocalDraft(channelId);
+      syncComposerState();
     }
     const prevUnread = prevChannelId !== channelId ? (unreadByChannel.get(channelId) || 0) : 0;
     pendingUnreadBanner = prevUnread > 0 ? { channelId, count: prevUnread } : null;
@@ -1070,6 +1194,9 @@
     if (elSearchInput) elSearchInput.value = "";
     if (elSearchBanner) elSearchBanner.hidden = true;
     setReplyTarget(null);
+    if (prevChannelId !== channelId && authToken) {
+      renderMessagesSkeleton();
+    }
     if (ws && ws.readyState === WebSocket.OPEN) {
       try { ws.send(JSON.stringify({ type: "join_channel", channel_id: channelId })); } catch {}
     }
@@ -2240,6 +2367,7 @@
     pendingUnreadBanner = null;
     elInput.value = "";
     clearLocalDraft(currentChannelId);
+    syncComposerState();
     const payload = { content: text };
     if (replyTarget?.id) payload.in_reply_to = replyTarget.id;
     setReplyTarget(null);
@@ -2675,6 +2803,7 @@
       {
         title: "消息与编辑",
         rows: [
+          ["聚焦消息输入框", [mod, "/"]],
           ["发送消息 / 插入换行", ["Enter", "/", shift, "Enter"]],
           ["编辑上一条发出的消息（空输入框）", ["↑"]],
           ["唤起 @ 成员自动补全", ["@"]],
@@ -2796,6 +2925,9 @@
     stepSearchMatch: (delta) => stepSearchMatch(delta),
     getSearchMatchState: () => ({ total: searchMatchEls.length, index: searchMatchIdx }),
     isSafeLocalImageUrl,
+    autoResizeLocalInput,
+    syncComposerState,
+    renderMessagesSkeleton,
   };
 
   document.getElementById("btn-quick-switcher")?.addEventListener("click", () => {
@@ -2856,6 +2988,18 @@
       if (kbdBg && !kbdBg.hidden) closeLocalShortcutsCheatsheet();
       else openLocalShortcutsCheatsheet();
       return;
+    }
+    if ((ev.metaKey || ev.ctrlKey) && !ev.shiftKey && !ev.altKey && ev.key === "/") {
+      const anyModal = !!document.querySelector(".modal-backdrop:not([hidden]), dialog[open]");
+      if (!anyModal && elInput) {
+        ev.preventDefault();
+        closeLocalSwitcher();
+        closeLocalShortcutsCheatsheet();
+        elInput.focus();
+        const end = elInput.value.length;
+        try { elInput.setSelectionRange(end, end); } catch {}
+        return;
+      }
     }
     if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "f") {
       ev.preventDefault();
@@ -3203,6 +3347,11 @@
 
   elBtnSearchPrev?.addEventListener("click", () => stepSearchMatch(-1));
   elBtnSearchNext?.addEventListener("click", () => stepSearchMatch(1));
+  elSearchInput?.addEventListener("input", () => {
+    if (activeSearchQuery && !elSearchInput.value.trim()) {
+      void runSearch("");
+    }
+  });
   elSearchInput?.addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") {
       ev.preventDefault();
@@ -3215,7 +3364,9 @@
     } else if (ev.key === "Escape") {
       elSearchInput.value = "";
       elSearchInput.blur();
-      void runSearch("");
+      if (activeSearchQuery) {
+        void runSearch("");
+      }
     }
   });
   document.getElementById("btn-clear-search")?.addEventListener("click", () => {
@@ -3329,6 +3480,8 @@
     const nextPos = replaced.length;
     elInput.setSelectionRange(nextPos, nextPos);
     elInput.focus();
+    saveLocalDraft(currentChannelId, elInput.value);
+    syncComposerState();
     closeMentionMenu();
   }
 
@@ -3405,6 +3558,7 @@
   let lastTypingSentAt = 0;
   elInput.addEventListener("input", () => {
     saveLocalDraft(currentChannelId, elInput.value);
+    syncComposerState();
     updateMentionMenu();
     const now = Date.now();
     if (ws && ws.readyState === WebSocket.OPEN && elInput.value.trim() && now - lastTypingSentAt > 2500) {
@@ -3544,6 +3698,7 @@
   });
 
   // Boot
+  syncComposerState();
   (async () => {
     if (bridge?.getServerStatus) {
       try {

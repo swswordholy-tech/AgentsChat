@@ -21,6 +21,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   buildCloudThemeSyncScript,
+  buildLocalChannelUrl,
   buildOfflineThemeSyncScript,
   checkLatestDesktopRelease,
   clampDesktopZoomFactor,
@@ -332,7 +333,7 @@ async function ensureLocalServerStarted(): Promise<LocalServerStatus | null> {
             });
             notif.on("click", () => {
               showMainWindow();
-              void switchWorkspace("local");
+              void openLocalChannel(msg.channel_id);
             });
             notif.show();
           }
@@ -513,6 +514,16 @@ function showMainWindow(): void {
   mainWindow.focus();
 }
 
+async function openLocalChannel(channelId?: string | null): Promise<void> {
+  await switchWorkspace("local");
+  const st = localServer?.getStatus();
+  if (!st || !localView || localView.webContents.isDestroyed()) return;
+  const targetUrl = buildLocalChannelUrl(st.httpUrl, channelId);
+  if (targetUrl) {
+    await localView.webContents.loadURL(targetUrl);
+  }
+}
+
 async function handleDeepLinkUrl(rawUrl: string): Promise<void> {
   const parsed = parseDeepLink(rawUrl);
   if (!parsed) return;
@@ -522,11 +533,7 @@ async function handleDeepLinkUrl(rawUrl: string): Promise<void> {
   }
   showMainWindow();
   if (parsed.workspace === "local") {
-    await switchWorkspace("local");
-    const st = localServer?.getStatus();
-    if (st && parsed.channelId && localView && !localView.webContents.isDestroyed()) {
-      await localView.webContents.loadURL(`${st.httpUrl}/#channel=${encodeURIComponent(parsed.channelId)}`);
-    }
+    await openLocalChannel(parsed.channelId);
     return;
   }
   await switchWorkspace("cloud");

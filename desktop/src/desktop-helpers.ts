@@ -168,6 +168,29 @@ export function resolveOfflineRetryUrl(failedUrl: unknown, remoteServerUrl: stri
   return formatCopyableCloudUrl(failedUrl, remoteServerUrl) || remoteServerUrl;
 }
 
+/**
+ * Safely construct a loopback Local Mini-Server channel deep-link URL
+ * (`http://127.0.0.1:<port>/#channel=<id>`) for OS Notification click routing
+ * and `agentschat://local/<channel>` deep links.
+ * Strictly requires an HTTP loopback origin and a valid, traversal-free channel ID.
+ */
+export function buildLocalChannelUrl(httpUrl: string, channelId: unknown): string | null {
+  if (typeof httpUrl !== "string" || typeof channelId !== "string") return null;
+  const cleanId = channelId.trim();
+  if (!cleanId || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(cleanId) || cleanId.includes("..")) {
+    return null;
+  }
+  try {
+    const parsed = new URL(httpUrl);
+    if (parsed.protocol !== "http:") return null;
+    if (parsed.hostname !== "127.0.0.1" && parsed.hostname !== "localhost") return null;
+    if (parsed.username || parsed.password) return null;
+    return `${parsed.origin}/#channel=${encodeURIComponent(cleanId)}`;
+  } catch {
+    return null;
+  }
+}
+
 export interface TrayTooltipState {
   cloudUnread?: number;
   localUnread?: number;

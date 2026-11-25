@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
   buildCloudThemeSyncScript,
+  buildLocalChannelUrl,
   buildOfflineThemeSyncScript,
   checkLatestDesktopRelease,
   clampDesktopZoomFactor,
@@ -630,5 +631,49 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     expect(mainTs).toContain("formatTrayTooltip(");
     expect(mainTs).toContain("Copy Local MCP Command");
     expect(mainTs).toContain("resolveOfflineRetryUrl(");
+  });
+
+  test("Desktop 2.5 adds Notification channel routing, Local Hub auto-resizing composer, live bot presence, channel-switch skeleton, live search clear & reduced motion", () => {
+    expect(buildLocalChannelUrl("http://127.0.0.1:8787", "dev-room")).toBe("http://127.0.0.1:8787/#channel=dev-room");
+    expect(buildLocalChannelUrl("http://localhost:9001/foo?x=1", "dm-alpha_1.2")).toBe(
+      "http://localhost:9001/#channel=dm-alpha_1.2",
+    );
+    // Rejects non-loopback, https, embedded credentials, traversal, or malformed channel IDs
+    expect(buildLocalChannelUrl("https://127.0.0.1:8787", "welcome")).toBeNull();
+    expect(buildLocalChannelUrl("http://evil.example:8787", "welcome")).toBeNull();
+    expect(buildLocalChannelUrl("http://user:pass@127.0.0.1:8787", "welcome")).toBeNull();
+    expect(buildLocalChannelUrl("http://127.0.0.1:8787", "../etc")).toBeNull();
+    expect(buildLocalChannelUrl("http://127.0.0.1:8787", "bad/channel")).toBeNull();
+    expect(buildLocalChannelUrl("http://127.0.0.1:8787", "")).toBeNull();
+    expect(buildLocalChannelUrl("http://127.0.0.1:8787", null)).toBeNull();
+
+    const mainTs = readFileSync(join(import.meta.dir, "..", "src", "main.ts"), "utf8");
+    expect(mainTs).toContain("buildLocalChannelUrl(");
+    expect(mainTs).toContain("void openLocalChannel(msg.channel_id);");
+    expect(mainTs).toContain("await openLocalChannel(parsed.channelId);");
+
+    const localJs = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.js"), "utf8");
+    expect(localJs).not.toMatch(/\.(?:innerHTML|outerHTML)\s*=|insertAdjacentHTML|document\.write\s*\(/);
+    expect(() => new Function(localJs)).not.toThrow();
+    expect(localJs).toContain("function autoResizeLocalInput()");
+    expect(localJs).toContain("function syncComposerState()");
+    expect(localJs).toContain("function renderMessagesSkeleton()");
+    expect(localJs).toContain("function updateDiscoveredBotPresence(");
+    expect(localJs).toContain("function renderBotCountBadge()");
+    expect(localJs).toContain("res.data?.known_principals");
+    expect(localJs).toContain("window.history.replaceState(null, \"\", nextHash)");
+    expect(localJs).toContain('if (activeSearchQuery && !elSearchInput.value.trim())');
+    expect(localJs).toContain('["聚焦消息输入框", [mod, "/"]]');
+
+    const localHtml = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.html"), "utf8");
+    expect(localHtml).toContain('id="bot-count-badge"');
+    expect(localHtml).toContain('id="btn-send" disabled');
+
+    const localCss = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.css"), "utf8");
+    expect(localCss).toContain(".bot-online-dot");
+    expect(localCss).toContain(".section-count.has-online");
+    expect(localCss).toContain(".msg-skeleton-list");
+    expect(localCss).toContain(".btn-send:disabled");
+    expect(localCss).toContain("@media (prefers-reduced-motion: reduce)");
   });
 });
