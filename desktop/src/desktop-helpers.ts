@@ -634,6 +634,17 @@ export function formatDesktopDiagnostics(info: DesktopDiagnosticsSnapshot): stri
 }
 
 /**
+ * Map Electron native swipe directions (macOS trackpad) and app-command triggers
+ * (Windows/Linux mouse Back/Forward buttons) to Cloud navigation history actions.
+ */
+export function resolveCloudHistoryCommand(trigger: string): "back" | "forward" | null {
+  const normalized = String(trigger || "").trim().toLowerCase();
+  if (normalized === "left" || normalized === "browser-backward") return "back";
+  if (normalized === "right" || normalized === "browser-forward") return "forward";
+  return null;
+}
+
+/**
  * Clamp and round Electron webContents zoom factor to a safe, comfortable range [0.75, 1.75].
  */
 export function clampDesktopZoomFactor(raw: unknown): number {

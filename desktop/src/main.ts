@@ -40,6 +40,7 @@ import {
   isTrustedCloudThemeOrigin,
   parseDeepLink,
   parseUnreadCountFromTitle,
+  resolveCloudHistoryCommand,
   resolveCloudQuickRoute,
   resolveOfflineRetryUrl,
   resolveRestoredWindowBounds,
@@ -1537,6 +1538,14 @@ async function createDesktopWindow(): Promise<void> {
     if (settings.activeWorkspace === "local") {
       clearLocalUnread();
     }
+  });
+  mainWindow.on("swipe", (_ev, direction) => {
+    const dir = resolveCloudHistoryCommand(direction);
+    if (dir) navigateCloudHistory(dir);
+  });
+  mainWindow.on("app-command", (_ev, cmd) => {
+    const dir = resolveCloudHistoryCommand(cmd);
+    if (dir) navigateCloudHistory(dir);
   });
 
   mainWindow.on("close", (ev) => {

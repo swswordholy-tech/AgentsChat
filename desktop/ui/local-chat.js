@@ -336,6 +336,9 @@
     const isDark = theme === "dark";
     document.documentElement.classList.toggle("dark", isDark);
     document.body.classList.toggle("dark", isDark);
+    document.documentElement.style.colorScheme = isDark ? "dark" : "light";
+    const themeBtn = document.getElementById("btn-toggle-theme");
+    themeBtn?.setAttribute("aria-pressed", String(isDark));
     try { localStorage.setItem("ac_desktop_theme", isDark ? "dark" : "light"); } catch {}
   }
 
@@ -3637,18 +3640,36 @@
   });
 
   // Event Bindings
+  async function withLocalActionBusy(btn, fn) {
+    if (btn && btn.disabled) return;
+    if (btn) {
+      btn.disabled = true;
+      btn.setAttribute("aria-busy", "true");
+    }
+    try {
+      await fn();
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.removeAttribute("aria-busy");
+      }
+    }
+  }
+
   const elBtnSyncCloud = document.getElementById("btn-sync-cloud");
   elBtnSyncCloud?.addEventListener("click", () => void trySyncCloudSession(false, elBtnSyncCloud));
-  document.getElementById("btn-manual-token").addEventListener("click", async () => {
+  const elBtnManualToken = document.getElementById("btn-manual-token");
+  elBtnManualToken?.addEventListener("click", () => void withLocalActionBusy(elBtnManualToken, async () => {
     const r = await openPromptDialog({
       title: "填入全局账号 JWT 或 Agent 密钥",
       hint: "本机 Server 会向 agents-chat.com 验证一次并缓存哈希，保证与云端身份完全一致。",
       placeholder1: "粘贴 eyJ... 或 ac_...",
     });
     if (r?.v1) await verifyAndSetToken(r.v1);
-  });
+  }));
 
-  document.getElementById("btn-new-group").addEventListener("click", async () => {
+  const elBtnNewGroup = document.getElementById("btn-new-group");
+  elBtnNewGroup?.addEventListener("click", () => void withLocalActionBusy(elBtnNewGroup, async () => {
     if (!authToken) return showToast("请先登录全局账号后再创建群聊");
     const r = await openPromptDialog({
       title: "新建本地群聊",
@@ -3668,9 +3689,10 @@
     } else {
       showToast(res.data?.error || "创建失败");
     }
-  });
+  }));
 
-  document.getElementById("btn-new-dm").addEventListener("click", async () => {
+  const elBtnNewDm = document.getElementById("btn-new-dm");
+  elBtnNewDm?.addEventListener("click", () => void withLocalActionBusy(elBtnNewDm, async () => {
     if (!authToken) return showToast("请先登录全局账号后再发起私聊");
     const r = await openPromptDialog({
       title: "发起本机 1v1 私聊",
@@ -3687,9 +3709,10 @@
     } else {
       showToast(res.data?.error || "创建私聊失败");
     }
-  });
+  }));
 
-  document.getElementById("btn-invite-member").addEventListener("click", async () => {
+  const elBtnInviteMember = document.getElementById("btn-invite-member");
+  elBtnInviteMember?.addEventListener("click", () => void withLocalActionBusy(elBtnInviteMember, async () => {
     if (!authToken) return showToast("请先登录全局账号");
     const r = await openPromptDialog({
       title: `邀请成员加入 #${currentChannelId}`,
@@ -3707,7 +3730,7 @@
     } else {
       showToast(res.data?.error || "邀请失败");
     }
-  });
+  }));
 
   let activeHarness = "claude";
   let activeConnectBaseUrl = originUrl;
@@ -3943,7 +3966,9 @@
     focusSearchMatch(base + (delta < 0 ? -1 : 1));
   }
 
+  let searchRequestSeq = 0;
   async function runSearch(query) {
+    const seq = ++searchRequestSeq;
     const q = String(query || "").trim();
     if (!q) {
       activeSearchQuery = "";
@@ -3958,9 +3983,11 @@
       showToast("请先登录全局账号后再搜索");
       return;
     }
+    const targetCh = currentChannelId;
     activeSearchQuery = q;
-    const params = new URLSearchParams({ q, channel_id: currentChannelId, limit: "50" });
+    const params = new URLSearchParams({ q, channel_id: targetCh, limit: "50" });
     const res = await api(`/api/search?${params.toString()}`);
+    if (seq !== searchRequestSeq || targetCh !== currentChannelId) return;
     if (!res.ok) {
       showToast(res.data?.error || "搜索失败");
       return;
@@ -3968,7 +3995,7 @@
     messages = Array.isArray(res.data?.messages) ? res.data.messages.slice().reverse() : [];
     if (elSearchBanner) {
       elSearchBanner.hidden = false;
-      elSearchBannerText.textContent = `在 #${currentChannelId} 中搜索 “${q}”：命中 ${messages.length} 条消息`;
+      elSearchBannerText.textContent = `在 #${targetCh} 中搜索 “${q}”：命中 ${messages.length} 条消息`;
     }
     renderMessages();
   }
@@ -3981,7 +4008,8 @@
     }
   });
   elSearchInput?.addEventListener("keydown", (ev) => {
-    if (ev.key === "Enter" && !isImeComposing(ev)) {
+    if (isImeComposing(ev)) return;
+    if (ev.key === "Enter") {
       ev.preventDefault();
       const val = elSearchInput.value.trim();
       if (val && val === activeSearchQuery && searchMatchEls.length > 0) {
@@ -3990,10 +4018,14 @@
         void runSearch(elSearchInput.value);
       }
     } else if (ev.key === "Escape") {
-      elSearchInput.value = "";
-      elSearchInput.blur();
-      if (activeSearchQuery) {
-        void runSearch("");
+      ev.preventDefault();
+      if (elSearchInput.value || activeSearchQuery) {
+        elSearchInput.value = "";
+        if (activeSearchQuery) {
+          void runSearch("");
+        }
+      } else {
+        elSearchInput.blur();
       }
     }
   });
@@ -4248,7 +4280,8 @@
     syncMentionActiveVisual(true);
   }
 
-  document.getElementById("btn-edit-topic")?.addEventListener("click", async () => {
+  const elBtnEditTopic = document.getElementById("btn-edit-topic");
+  elBtnEditTopic?.addEventListener("click", () => void withLocalActionBusy(elBtnEditTopic, async () => {
     if (!authToken) return showToast("请先登录全局账号后再编辑主题");
     const r = await openPromptDialog({
       title: `编辑 #${currentChannelId} 主题`,
@@ -4267,7 +4300,7 @@
     } else {
       showToast(res.data?.error || "主题更新失败");
     }
-  });
+  }));
 
   let lastTypingSentAt = 0;
   elInput.addEventListener("input", () => {
@@ -4368,27 +4401,32 @@
       showToast("当前房间暂无可导出的消息");
       return;
     }
-    const header = `# ${elRoomTitle.textContent || "#" + currentChannelId}\n\n> Exported from AgentsChat Desktop Local Server (${new Date().toISOString()})\n\n---\n\n`;
-    const body = messages
-      .map((m) => {
-        const ts = m.timestamp ? new Date(m.timestamp).toLocaleString() : "";
-        return `### ${m.sender_name || m.sender_id} (\`@${m.sender_id}\`) · ${ts}\n\n${m.content || ""}\n`;
-      })
-      .join("\n---\n\n");
-    const blob = new Blob([header + body], { type: "text/markdown;charset=utf-8" });
-    const dlUrl = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    const safeName = currentChannelId.replace(/[^a-zA-Z0-9._-]+/g, "-");
-    a.href = dlUrl;
-    a.download = `agentschat-${safeName}-${new Date().toISOString().slice(0, 10)}.md`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(dlUrl), 1000);
-    showToast(`已导出 ${messages.length} 条对话为 Markdown`);
+    try {
+      const header = `# ${elRoomTitle.textContent || "#" + currentChannelId}\n\n> Exported from AgentsChat Desktop Local Server (${new Date().toISOString()})\n\n---\n\n`;
+      const body = messages
+        .map((m) => {
+          const ts = m.timestamp ? new Date(m.timestamp).toLocaleString() : "";
+          return `### ${m.sender_name || m.sender_id} (\`@${m.sender_id}\`) · ${ts}\n\n${m.content || ""}\n`;
+        })
+        .join("\n---\n\n");
+      const blob = new Blob([header + body], { type: "text/markdown;charset=utf-8" });
+      const dlUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      const safeName = currentChannelId.replace(/[^a-zA-Z0-9._-]+/g, "-");
+      a.href = dlUrl;
+      a.download = `agentschat-${safeName}-${new Date().toISOString().slice(0, 10)}.md`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(dlUrl), 1000);
+      showToast(`已导出 ${messages.length} 条对话为 Markdown`);
+    } catch {
+      showToast("导出 Markdown 失败，请稍后重试");
+    }
   });
 
-  document.getElementById("btn-leave-channel")?.addEventListener("click", async () => {
+  const elBtnLeaveChannel = document.getElementById("btn-leave-channel");
+  elBtnLeaveChannel?.addEventListener("click", () => void withLocalActionBusy(elBtnLeaveChannel, async () => {
     if (!authToken || currentChannelId === "welcome") return;
     const leavingId = currentChannelId;
     const roomLabel = (elRoomTitle?.textContent || `#${leavingId}`).trim();
@@ -4407,7 +4445,7 @@
     } else {
       showToast(res.data?.error || "退出群聊失败");
     }
-  });
+  }));
 
   function readHashChannelId() {
     const m = window.location.hash.match(/^#channel=([a-zA-Z0-9._-]+)$/);

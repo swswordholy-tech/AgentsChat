@@ -425,7 +425,7 @@
     <div class="rail-load-bar" id="rail-load-bar" aria-hidden="true"></div>
     <button class="brand-avatar" id="btn-brand-home" type="button" title="AgentsChat Desktop — 返回云端大厅 (⌘1)" aria-label="返回云端大厅"><img src="../assets/icon.png" alt="AgentsChat" /></button>
 
-    <nav class="nav-group">
+    <nav class="nav-group" id="rail-nav-group" aria-label="主要导航">
       <button class="node-btn active" id="btn-cloud" type="button" title="AgentsChat Cloud (⌘1) — 云端多 Agent 协同、/loop 与 Bot 市场" aria-label="云端工作区">
         <svg class="node-svg" viewBox="0 0 24 24" aria-hidden="true">
           <path d="M17.5 19H7a4.5 4.5 0 0 1-.4-8.98A5.5 5.5 0 0 1 17.3 8.5 3.75 3.75 0 0 1 17.5 19Z" />
@@ -624,6 +624,7 @@
       if (isMac) rail.classList.add("mac");
       const isDark = state.settings?.theme === "dark";
       document.body.classList.toggle("dark", isDark);
+      document.documentElement.style.colorScheme = isDark ? "dark" : "light";
       const isPinned = state.settings?.alwaysOnTop === true;
       if (btnShellPin) {
         btnShellPin.classList.toggle("pinned", isPinned);
@@ -772,10 +773,28 @@
       api?.reloadActiveView?.();
     });
     btnCloudForward?.addEventListener("click", () => api?.cloudHistory?.("forward"));
+    const railNavGroup = document.getElementById("rail-nav-group");
+    railNavGroup?.addEventListener("keydown", (ev) => {
+      if (ev.isComposing || ev.keyCode === 229) return;
+      const buttons = Array.from(railNavGroup.querySelectorAll(".node-btn:not([hidden]):not(:disabled)"));
+      const idx = buttons.indexOf(document.activeElement);
+      if (idx < 0 || !buttons.length) return;
+      let nextIdx = -1;
+      if (ev.key === "ArrowDown") nextIdx = (idx + 1) % buttons.length;
+      else if (ev.key === "ArrowUp") nextIdx = (idx - 1 + buttons.length) % buttons.length;
+      else if (ev.key === "Home") nextIdx = 0;
+      else if (ev.key === "End") nextIdx = buttons.length - 1;
+      if (nextIdx >= 0) {
+        ev.preventDefault();
+        buttons[nextIdx].focus();
+      }
+    });
     btnShellTheme?.addEventListener("click", () => {
       const next = document.body.classList.contains("dark") ? "light" : "dark";
       const isDark = next === "dark";
       document.body.classList.toggle("dark", isDark);
+      document.documentElement.style.colorScheme = isDark ? "dark" : "light";
+      btnShellTheme.setAttribute("aria-pressed", String(isDark));
       iconMoon?.toggleAttribute("hidden", isDark);
       iconSun?.toggleAttribute("hidden", !isDark);
       api?.setTheme?.(next);
@@ -827,20 +846,27 @@
         return;
       }
       let copied = false;
-      if (isCloud && api?.copyCurrentCloudUrl) {
-        const copiedUrl = await api.copyCurrentCloudUrl();
-        copied = Boolean(copiedUrl);
+      try {
+        if (isCloud && api?.copyCurrentCloudUrl) {
+          const copiedUrl = await api.copyCurrentCloudUrl();
+          copied = Boolean(copiedUrl);
+        }
+        if (!copied) {
+          const url = latestState?.localServer?.httpUrl || "http://127.0.0.1:8787";
+          await api?.copyText(`npx -y agentschat-mcp@latest --url ${url}`);
+        }
+      } catch {
+        return;
       }
-      if (!copied) {
-        const url = latestState?.localServer?.httpUrl || "http://127.0.0.1:8787";
-        await api?.copyText(`npx -y agentschat-mcp@latest --url ${url}`);
-      }
+      const prevAriaLabel = btnCopyUrl.getAttribute("aria-label") || "";
       btnCopyUrl.classList.add("copied");
+      btnCopyUrl.setAttribute("aria-label", "已复制");
       iconCopy.toggleAttribute("hidden", true);
       iconCheck.toggleAttribute("hidden", false);
       clearTimeout(copyTimer);
       copyTimer = setTimeout(() => {
         btnCopyUrl.classList.remove("copied");
+        if (prevAriaLabel) btnCopyUrl.setAttribute("aria-label", prevAriaLabel);
         iconCopy.toggleAttribute("hidden", false);
         iconCheck.toggleAttribute("hidden", true);
       }, 1400);

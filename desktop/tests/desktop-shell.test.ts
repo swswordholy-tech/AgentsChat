@@ -26,6 +26,7 @@ import {
   parseDeepLink,
   parseDesktopReleaseTag,
   parseUnreadCountFromTitle,
+  resolveCloudHistoryCommand,
   resolveCloudQuickRoute,
   resolveOfflineRetryUrl,
   resolveRestoredWindowBounds,
@@ -1274,5 +1275,45 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     const localCss = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.css"), "utf8");
     expect(localCss).toContain(".local-sidebar-resizer:focus-visible::after");
     expect(localCss).toContain(".ch-filter-pill:focus-visible");
+  });
+
+  test("Desktop 2.15 adds native swipe/app-command Cloud history navigation, rail keyboard nav + colorScheme/aria-pressed sync, stale-search race guard, 2-step IME-safe Esc & withLocalActionBusy locks", () => {
+    // 1. Pure helper: resolveCloudHistoryCommand maps macOS swipe & Win/Linux mouse buttons cleanly
+    expect(resolveCloudHistoryCommand("left")).toBe("back");
+    expect(resolveCloudHistoryCommand("RIGHT")).toBe("forward");
+    expect(resolveCloudHistoryCommand("browser-backward")).toBe("back");
+    expect(resolveCloudHistoryCommand("browser-forward")).toBe("forward");
+    expect(resolveCloudHistoryCommand("up")).toBeNull();
+    expect(resolveCloudHistoryCommand("")).toBeNull();
+
+    // 2. Main process: macOS trackpad swipe & Windows/Linux app-command listeners
+    const mainTs = readFileSync(join(import.meta.dir, "..", "src", "main.ts"), "utf8");
+    expect(mainTs).toContain('mainWindow.on("swipe"');
+    expect(mainTs).toContain('mainWindow.on("app-command"');
+    expect(mainTs).toContain("resolveCloudHistoryCommand(direction)");
+    expect(mainTs).toContain("resolveCloudHistoryCommand(cmd)");
+
+    // 3. Shell rail: keyboard ArrowUp/ArrowDown/Home/End nav, colorScheme parity, optimistic theme aria-pressed & resilient copy
+    const shellHtml = readFileSync(join(import.meta.dir, "..", "ui", "shell.html"), "utf8");
+    const shellScript = shellHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1] || "";
+    expect(() => new Function(shellScript)).not.toThrow();
+    expect(shellHtml).toContain('id="rail-nav-group"');
+    expect(shellHtml).toContain('railNavGroup?.addEventListener("keydown"');
+    expect(shellHtml).toContain('document.documentElement.style.colorScheme = isDark ? "dark" : "light"');
+    expect(shellHtml).toContain('btnCopyUrl.setAttribute("aria-label", "已复制")');
+
+    // 4. Local Hub JS: colorScheme + theme aria-pressed, stale-search seq guard, 2-step IME-safe Esc, withLocalActionBusy locks & safe Markdown export
+    const localJs = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.js"), "utf8");
+    expect(localJs).not.toMatch(/\.(?:innerHTML|outerHTML)\s*=|insertAdjacentHTML|document\.write\s*\(/);
+    expect(() => new Function(localJs)).not.toThrow();
+    expect(localJs).toContain('document.documentElement.style.colorScheme = isDark ? "dark" : "light"');
+    expect(localJs).toContain('themeBtn?.setAttribute("aria-pressed", String(isDark))');
+    expect(localJs).toContain("let searchRequestSeq = 0;");
+    expect(localJs).toContain("if (seq !== searchRequestSeq || targetCh !== currentChannelId) return;");
+    expect(localJs).toContain("if (elSearchInput.value || activeSearchQuery)");
+    expect(localJs).toContain("async function withLocalActionBusy(btn, fn)");
+    expect(localJs).toContain("withLocalActionBusy(elBtnNewGroup");
+    expect(localJs).toContain("withLocalActionBusy(elBtnLeaveChannel");
+    expect(localJs).toContain('showToast("导出 Markdown 失败，请稍后重试")');
   });
 });
