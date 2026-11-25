@@ -158,24 +158,24 @@
 
       <!-- WeChat-Style Bottom Composer Panel -->
       <section class="composer-area">
-        <div class="mention-menu" id="mention-menu" hidden></div>
+        <div class="mention-menu" id="mention-menu" role="listbox" aria-label="选择要提及的群成员" hidden></div>
 
         <div class="reply-banner" id="reply-banner" hidden>
           <span id="reply-banner-text"></span>
-          <button type="button" class="header-icon-btn compact" id="btn-cancel-reply" title="取消引用" aria-label="取消引用">
+          <button type="button" class="header-icon-btn compact" id="btn-cancel-reply" title="取消引用 (Esc)" aria-label="取消引用">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg>
           </button>
         </div>
 
         <div class="composer-toolbar">
           <div class="toolbar-left">
-            <button type="button" class="tool-icon-btn" id="btn-quick-mention" title="插入 @ 提及本机 Agent">
+            <button type="button" class="tool-icon-btn" id="btn-quick-mention" title="插入 @ 提及本机 Agent" aria-label="插入 @ 提及本机 Agent">
               <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4" /><path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-3.92 7.94" /></svg>
             </button>
-            <button type="button" class="tool-icon-btn" id="btn-quick-connect" title="查看 MCP 接入命令与局域网地址">
+            <button type="button" class="tool-icon-btn" id="btn-quick-connect" title="查看 MCP 接入命令与局域网地址" aria-label="查看 MCP 接入命令与局域网地址">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22v-5" /><path d="M9 8V2" /><path d="M15 8V2" /><path d="M18 8v4a6 6 0 0 1-12 0V8Z" /></svg>
             </button>
-            <button type="button" class="tool-icon-btn" id="btn-quick-export" title="导出对话为 Markdown">
+            <button type="button" class="tool-icon-btn" id="btn-quick-export" title="导出对话为 Markdown" aria-label="导出对话为 Markdown">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><path d="M14 2v6h6" /><path d="M12 18v-6" /><path d="m9 15 3 3 3-3" /></svg>
             </button>
           </div>
@@ -183,7 +183,7 @@
         </div>
 
         <footer class="composer">
-          <textarea id="msg-input" rows="3" placeholder="输入消息，键入 @ 提及群内 Agent…"></textarea>
+          <textarea id="msg-input" rows="3" placeholder="输入消息，键入 @ 提及群内 Agent…" aria-autocomplete="list" aria-controls="mention-menu" aria-expanded="false"></textarea>
           <div class="composer-footer">
             <span class="composer-hint">Enter 发送 · Shift+Enter 换行 · ⌘/ 聚焦</span>
             <button type="button" class="btn btn-primary btn-send" id="btn-send" disabled>发送</button>

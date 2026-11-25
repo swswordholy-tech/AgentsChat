@@ -27,9 +27,11 @@ import {
   clampDesktopZoomFactor,
   classifyCloudRailSection,
   computeCenteredWindowBounds,
+  computeDownloadProgress,
   formatCopyableCloudUrl,
   formatDesktopWindowTitle,
   formatDownloadCompleteNotice,
+  formatLocalMcpCommand,
   formatTrayTooltip,
   isCloudOfflinePageUrl,
   isLocalStoppedPageUrl,
@@ -38,6 +40,7 @@ import {
   parseUnreadCountFromTitle,
   resolveCloudQuickRoute,
   resolveOfflineRetryUrl,
+  resolveWorkspaceCopyAction,
   type CloudQuickRoute,
 } from "./desktop-helpers.js";
 import { GlobalIdentityAuthority, resolveHomeDir } from "./identity-authority.js";
@@ -87,7 +90,12 @@ async function captureScreenshotToChat(): Promise<{ ok: boolean; pasted?: boolea
       return { ok: false, reason: "cancelled" };
     }
     showMainWindow();
-    if (settings.activeWorkspace === "cloud" && cloudView && !cloudView.webContents.isDestroyed()) {
+    if (
+      settings.activeWorkspace === "cloud" &&
+      cloudView &&
+      !cloudView.webContents.isDestroyed() &&
+      !isCloudOfflinePageUrl(cloudView.webContents.getURL())
+    ) {
       cloudView.webContents.focus();
       setTimeout(() => {
         if (cloudView && !cloudView.webContents.isDestroyed()) {
@@ -222,6 +230,27 @@ function copyCurrentCloudUrl(notify = true): string | null {
   return url;
 }
 
+function copyActiveWorkspaceLinkOrCommand(notify = true): string | null {
+  const st = localServer?.getStatus();
+  const action = resolveWorkspaceCopyAction({
+    activeWorkspace: settings.activeWorkspace,
+    cloudUrl: cloudView && !cloudView.webContents.isDestroyed() ? cloudView.webContents.getURL() : null,
+    remoteServerUrl: settings.remoteServerUrl,
+    localHttpUrl: st?.httpUrl,
+    localRunning: Boolean(st?.running),
+  });
+  if (!action) return null;
+  clipboard.writeText(action.text);
+  if (notify && Notification.isSupported()) {
+    new Notification({
+      title: action.title,
+      body: action.text,
+      silent: true,
+    }).show();
+  }
+  return action.text;
+}
+
 function openCurrentCloudUrlInBrowser(): boolean {
   const url = getCurrentSafeCloudUrl();
   if (!url) return false;
@@ -230,13 +259,26 @@ function openCurrentCloudUrlInBrowser(): boolean {
 }
 
 const downloadSessionsAttached = new WeakSet<Electron.Session>();
+let activeDownloadCount = 0;
 
 function attachDownloadFeedback(wc: Electron.WebContents): void {
   const ses = wc.session;
   if (!ses || downloadSessionsAttached.has(ses)) return;
   downloadSessionsAttached.add(ses);
   ses.on("will-download", (_ev, item) => {
+    activeDownloadCount += 1;
+    item.on("updated", (_updEv, state) => {
+      if (isSmokeTest || !mainWindow || mainWindow.isDestroyed()) return;
+      if (state === "progressing") {
+        const progress = computeDownloadProgress(item.getReceivedBytes(), item.getTotalBytes());
+        try { mainWindow.setProgressBar(progress); } catch {}
+      }
+    });
     item.once("done", (_doneEv, state) => {
+      activeDownloadCount = Math.max(0, activeDownloadCount - 1);
+      if (activeDownloadCount === 0 && mainWindow && !mainWindow.isDestroyed()) {
+        try { mainWindow.setProgressBar(-1); } catch {}
+      }
       if (isSmokeTest || state !== "completed") return;
       const savePath = item.getSavePath();
       if (!savePath || !Notification.isSupported()) return;
@@ -348,7 +390,7 @@ function attachNativeContextMenu(wc: Electron.WebContents): void {
             { type: "separator" },
             {
               label: "Copy Local MCP Command",
-              click: () => clipboard.writeText(`npx -y agentschat-mcp@latest --url ${st.httpUrl}`),
+              click: () => clipboard.writeText(formatLocalMcpCommand(st.httpUrl)),
             },
           );
         }
@@ -844,14 +886,42 @@ function setupApplicationMenu(): void {
           click: () => void navigateCloudHistory("forward"),
         },
         {
-          label: "Copy Current Page Link",
+          label: "Copy Current Link / Local MCP Command",
           accelerator: "CmdOrCtrl+Shift+C",
-          click: () => { copyCurrentCloudUrl(true); },
+          click: () => { copyActiveWorkspaceLinkOrCommand(true); },
         },
         {
           label: "Open Current Page in Browser",
           accelerator: "CmdOrCtrl+Shift+O",
           click: () => { openCurrentCloudUrlInBrowser(); },
+        },
+        { type: "separator" },
+        {
+          label: "Local Mini-Server Running",
+          type: "checkbox",
+          checked: settings.localServerEnabled !== false,
+          accelerator: "CmdOrCtrl+Shift+L",
+          click: () => {
+            void (async () => {
+              settings = settingsStore.save({ localServerEnabled: !(settings.localServerEnabled !== false) });
+              const nextStatus = await ensureLocalServerStarted();
+              if (nextStatus && localView && !localView.webContents.isDestroyed()) {
+                await localView.webContents.loadURL(nextStatus.httpUrl);
+              } else if (!nextStatus) {
+                await loadLocalStoppedPage();
+              }
+              setupApplicationMenu();
+              broadcastState();
+            })();
+          },
+        },
+        {
+          label: "Allow LAN Access (0.0.0.0)",
+          type: "checkbox",
+          checked: settings.allowLan === true,
+          click: () => {
+            void setAllowLan(!settings.allowLan);
+          },
         },
         { type: "separator" },
         {
@@ -1060,8 +1130,7 @@ function rebuildTrayMenu(): void {
       label: "Copy Local MCP Command",
       enabled: Boolean(st?.running),
       click: () => {
-        const url = st?.httpUrl || `http://127.0.0.1:${settings.localServerPort}`;
-        clipboard.writeText(`npx -y agentschat-mcp@latest --url ${url}`);
+        clipboard.writeText(formatLocalMcpCommand(st?.httpUrl || `http://127.0.0.1:${settings.localServerPort}`));
       },
     },
     {
@@ -1075,6 +1144,7 @@ function rebuildTrayMenu(): void {
           } else if (!nextStatus) {
             await loadLocalStoppedPage();
           }
+          setupApplicationMenu();
           broadcastState();
         })();
       },
@@ -1117,6 +1187,7 @@ async function setAllowLan(allowLan: boolean): Promise<LocalServerStatus | null>
       await localView.webContents.loadURL(st.httpUrl);
     }
   }
+  setupApplicationMenu();
   broadcastState();
   return st;
 }
@@ -1461,6 +1532,7 @@ function registerIpcHandlers(): void {
     } else if (!st) {
       await loadLocalStoppedPage();
     }
+    setupApplicationMenu();
     broadcastState();
     return getCombinedState();
   });

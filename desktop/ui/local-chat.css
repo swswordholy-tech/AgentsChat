@@ -1104,6 +1104,16 @@ body.dark .search-banner { color: #5ce695; }
   margin-top: 3px;
 }
 
+.wx-quote-pill.jumpable:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 2px;
+}
+
+.mention-opt:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: -2px;
+}
+
 /* WeChat-style Quote Pill beneath bubble */
 .wx-quote-pill {
   margin-top: 5px;

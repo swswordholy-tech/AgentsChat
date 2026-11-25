@@ -535,7 +535,7 @@
           <path d="M20 6 9 17l-5-5" />
         </svg>
       </button>
-      <button class="mini-btn" id="btn-power" type="button" title="启动 / 停止内置本机 Server" aria-label="开关本机 Server">
+      <button class="mini-btn" id="btn-power" type="button" title="启动 / 停止内置本机 Server" aria-label="开关本机 Server" aria-pressed="false">
         <svg viewBox="0 0 24 24" aria-hidden="true">
           <path d="M12 3v8" />
           <path d="M17.66 6.34a8 8 0 1 1-11.32 0" />
@@ -579,6 +579,8 @@
 
     let latestState = null;
     let copyTimer = null;
+    let localReloadSpinning = false;
+    let localReloadSpinTimer = null;
 
     function applyPlatformShortcuts(platform) {
       const isMac = platform === "darwin";
@@ -668,7 +670,8 @@
         btnCloudForward.hidden = active !== "cloud";
       }
       if (btnActiveReload) {
-        btnActiveReload.classList.toggle("spinning", isCloudLoading);
+        btnActiveReload.classList.toggle("spinning", isCloudLoading || localReloadSpinning);
+        btnActiveReload.setAttribute("aria-busy", String(isCloudLoading || localReloadSpinning));
       }
       if (railLoadBar) {
         railLoadBar.classList.toggle("active", isCloudLoading);
@@ -705,15 +708,16 @@
         : "本机 Server 已停止 — 点击切换到本机";
       btnCopyUrl.title = active === "cloud"
         ? `复制当前云端页面链接 (${modShift}C) · 右键在浏览器打开 (${modShift}O)`
-        : "复制本机 MCP 接入命令";
+        : `复制本机 MCP 接入命令 (${modShift}C)`;
       btnCopyUrl.setAttribute(
         "aria-label",
         active === "cloud" ? "复制当前云端页面链接" : "复制本机 MCP 命令",
       );
       btnPower.classList.toggle("power-on", running);
+      btnPower.setAttribute("aria-pressed", String(running));
       btnPower.title = running
-        ? `本机 Server 运行中 (${state.localServer.httpUrl}) — 点击停止`
-        : "本机 Server 已停止 — 点击启动";
+        ? `本机 Server 运行中 (${state.localServer.httpUrl}) — 点击停止 (${modShift}L)`
+        : `本机 Server 已停止 — 点击启动 (${modShift}L)`;
     }
 
     btnBrandHome?.addEventListener("click", () => {
@@ -731,7 +735,22 @@
     btnCloudOkr?.addEventListener("click", () => api?.navigateCloudRoute?.("okr-board"));
     btnCloudMarket?.addEventListener("click", () => api?.navigateCloudRoute?.("marketplace"));
     btnCloudBack?.addEventListener("click", () => api?.cloudHistory?.("back"));
-    btnActiveReload?.addEventListener("click", () => api?.reloadActiveView?.());
+    btnActiveReload?.addEventListener("click", () => {
+      const active = latestState?.settings?.activeWorkspace || "cloud";
+      if (active === "local") {
+        localReloadSpinning = true;
+        btnActiveReload.classList.add("spinning");
+        btnActiveReload.setAttribute("aria-busy", "true");
+        clearTimeout(localReloadSpinTimer);
+        localReloadSpinTimer = setTimeout(() => {
+          localReloadSpinning = false;
+          const isCloudLoading = Boolean((latestState?.settings?.activeWorkspace || "cloud") === "cloud" && latestState?.cloudNav?.isLoading);
+          btnActiveReload.classList.toggle("spinning", isCloudLoading);
+          btnActiveReload.setAttribute("aria-busy", String(isCloudLoading));
+        }, 450);
+      }
+      api?.reloadActiveView?.();
+    });
     btnCloudForward?.addEventListener("click", () => api?.cloudHistory?.("forward"));
     btnShellTheme?.addEventListener("click", () => {
       const next = document.body.classList.contains("dark") ? "light" : "dark";

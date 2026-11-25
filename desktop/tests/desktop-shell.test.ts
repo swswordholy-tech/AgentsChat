@@ -12,9 +12,11 @@ import {
   CLOUD_THEME_TOGGLE_SELECTOR,
   compareSemver,
   computeCenteredWindowBounds,
+  computeDownloadProgress,
   formatCopyableCloudUrl,
   formatDesktopWindowTitle,
   formatDownloadCompleteNotice,
+  formatLocalMcpCommand,
   formatTrayTooltip,
   formatZoomBadge,
   isCloudOfflinePageUrl,
@@ -25,6 +27,7 @@ import {
   parseUnreadCountFromTitle,
   resolveCloudQuickRoute,
   resolveOfflineRetryUrl,
+  resolveWorkspaceCopyAction,
 } from "../src/desktop-helpers.js";
 import { GlobalIdentityAuthority } from "../src/identity-authority.js";
 import { LocalMiniServer } from "../src/local-server.js";
@@ -952,5 +955,105 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     expect(localCss).toContain(".wx-md-check-box.done");
     expect(localCss).toContain(".wx-sender-time");
     expect(localCss).toContain(".micro-btn.spinning svg");
+  });
+
+  test("Desktop 2.11 adds OS download progress bar, workspace-aware Cmd+Shift+C, offline-safe screenshot guard, App Menu server/LAN toggles, rail ARIA/spin polish & Local @mention 2.0", () => {
+    // 1. Pure helpers: computeDownloadProgress, formatLocalMcpCommand & resolveWorkspaceCopyAction
+    expect(computeDownloadProgress(50, 100)).toBe(0.5);
+    expect(computeDownloadProgress(150, 100)).toBe(1);
+    expect(computeDownloadProgress(0, 100)).toBe(0);
+    expect(computeDownloadProgress(2048, 0)).toBe(2); // indeterminate progress when total unknown
+    expect(computeDownloadProgress(0, 0)).toBe(-1);
+    expect(computeDownloadProgress(-10, 100)).toBe(-1);
+    expect(computeDownloadProgress(Number.NaN, 100)).toBe(-1);
+
+    expect(formatLocalMcpCommand("http://127.0.0.1:9191/welcome")).toBe(
+      "npx -y agentschat-mcp@latest --url http://127.0.0.1:9191",
+    );
+    expect(formatLocalMcpCommand("http://user:pass@127.0.0.1:8787")).toBe(
+      "npx -y agentschat-mcp@latest --url http://127.0.0.1:8787",
+    );
+    expect(formatLocalMcpCommand("javascript:alert(1)")).toBe(
+      "npx -y agentschat-mcp@latest --url http://127.0.0.1:8787",
+    );
+    expect(formatLocalMcpCommand("")).toBe(
+      "npx -y agentschat-mcp@latest --url http://127.0.0.1:8787",
+    );
+
+    const cloudCopy = resolveWorkspaceCopyAction({
+      activeWorkspace: "cloud",
+      cloudUrl: "https://agents-chat.com/cloud-agents?tab=fleet",
+      remoteServerUrl: "https://agents-chat.com",
+      localHttpUrl: "http://127.0.0.1:8787",
+      localRunning: true,
+    });
+    expect(cloudCopy).toEqual({
+      kind: "cloud-url",
+      text: "https://agents-chat.com/cloud-agents?tab=fleet",
+      title: "已复制当前页面链接",
+    });
+
+    const localCopy = resolveWorkspaceCopyAction({
+      activeWorkspace: "local",
+      cloudUrl: "https://agents-chat.com/lobby",
+      remoteServerUrl: "https://agents-chat.com",
+      localHttpUrl: "http://127.0.0.1:9911",
+      localRunning: true,
+    });
+    expect(localCopy).toEqual({
+      kind: "local-mcp",
+      text: "npx -y agentschat-mcp@latest --url http://127.0.0.1:9911",
+      title: "已复制本机 MCP 接入命令",
+    });
+
+    expect(
+      resolveWorkspaceCopyAction({
+        activeWorkspace: "local",
+        cloudUrl: "https://agents-chat.com/lobby",
+        remoteServerUrl: "https://agents-chat.com",
+        localHttpUrl: "http://127.0.0.1:8787",
+        localRunning: false,
+      }),
+    ).toBeNull();
+
+    // 2. Main process wiring: download progress bar, workspace-aware copy, offline-safe screenshot & App Menu parity
+    const mainTs = readFileSync(join(import.meta.dir, "..", "src", "main.ts"), "utf8");
+    expect(mainTs).toContain("function copyActiveWorkspaceLinkOrCommand(notify = true)");
+    expect(mainTs).toContain("mainWindow.setProgressBar(progress)");
+    expect(mainTs).toContain("mainWindow.setProgressBar(-1)");
+    expect(mainTs).toContain("!isCloudOfflinePageUrl(cloudView.webContents.getURL())");
+    expect(mainTs).toContain('label: "Local Mini-Server Running"');
+    expect(mainTs).toContain('accelerator: "CmdOrCtrl+Shift+L"');
+
+    // 3. Shell rail: aria-pressed on power button, local reload spin pulse & aria-busy
+    const shellHtml = readFileSync(join(import.meta.dir, "..", "ui", "shell.html"), "utf8");
+    const shellScript = shellHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1] || "";
+    expect(() => new Function(shellScript)).not.toThrow();
+    expect(shellHtml).toContain('btnPower.setAttribute("aria-pressed", String(running));');
+    expect(shellHtml).toContain('btnActiveReload.setAttribute("aria-busy"');
+    expect(shellHtml).toContain("localReloadSpinning = true;");
+
+    // 4. Local Hub: @mention 2.0 (CJK/Unicode regex, online-first sort, ARIA listbox/combobox, Home/End, hover/scroll sync), global Esc reply cancel, Alt+Enter guard & keyboard quote jump
+    const localHtml = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.html"), "utf8");
+    expect(localHtml).toContain('id="mention-menu" role="listbox"');
+    expect(localHtml).toContain('aria-autocomplete="list" aria-controls="mention-menu" aria-expanded="false"');
+    expect(localHtml).toContain('id="btn-quick-mention" title="插入 @ 提及本机 Agent" aria-label="插入 @ 提及本机 Agent"');
+
+    const localJs = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.js"), "utf8");
+    expect(localJs).not.toMatch(/\.(?:innerHTML|outerHTML)\s*=|insertAdjacentHTML|document\.write\s*\(/);
+    expect(() => new Function(localJs)).not.toThrow();
+    expect(localJs).toContain("function syncMentionActiveVisual(scrollIntoView = false)");
+    expect(localJs).toContain("/(^|\\s)@([^\\s@]{0,40})$/");
+    expect(localJs).toContain('opt.setAttribute("role", "option")');
+    expect(localJs).toContain('elInput.setAttribute("aria-activedescendant", activeOpt.id)');
+    expect(localJs).toContain('if (ev.key === "Home")');
+    expect(localJs).toContain('if (ev.key === "End")');
+    expect(localJs).toContain('if (ev.key === "Enter" && !ev.shiftKey && !ev.altKey && !isImeComposing(ev))');
+    expect(localJs).toContain('quoteEl.setAttribute("role", "button")');
+    expect(localJs).toContain("if (ev.key === \"Escape\" && replyTarget)");
+
+    const localCss = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.css"), "utf8");
+    expect(localCss).toContain(".wx-quote-pill.jumpable:focus-visible");
+    expect(localCss).toContain(".mention-opt:focus-visible");
   });
 });

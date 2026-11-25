@@ -318,6 +318,77 @@ export function formatDownloadCompleteNotice(rawFilename: unknown): { title: str
 }
 
 /**
+ * Compute an Electron `BrowserWindow.setProgressBar` value from download byte counters.
+ * Returns `0..1` when total size is known, `2` (indeterminate) while receiving bytes
+ * without a known total, or `-1` (clear progress bar) when invalid/idle.
+ */
+export function computeDownloadProgress(receivedBytes: unknown, totalBytes: unknown): number {
+  const received = Number(receivedBytes);
+  const total = Number(totalBytes);
+  if (!Number.isFinite(received) || received < 0) return -1;
+  if (Number.isFinite(total) && total > 0) {
+    return Math.max(0, Math.min(1, received / total));
+  }
+  return received > 0 ? 2 : -1;
+}
+
+/**
+ * Build the safe Local Mini-Server MCP CLI command for a loopback HTTP base URL.
+ */
+export function formatLocalMcpCommand(httpUrl: unknown): string {
+  const fallback = "http://127.0.0.1:8787";
+  if (typeof httpUrl !== "string" || !httpUrl.trim()) {
+    return `npx -y agentschat-mcp@latest --url ${fallback}`;
+  }
+  try {
+    const parsed = new URL(httpUrl.trim());
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return `npx -y agentschat-mcp@latest --url ${fallback}`;
+    }
+    parsed.username = "";
+    parsed.password = "";
+    return `npx -y agentschat-mcp@latest --url ${parsed.origin}`;
+  } catch {
+    return `npx -y agentschat-mcp@latest --url ${fallback}`;
+  }
+}
+
+export interface WorkspaceCopyAction {
+  kind: "cloud-url" | "local-mcp";
+  text: string;
+  title: string;
+}
+
+/**
+ * Resolve what `Cmd/Ctrl+Shift+C` should copy based on the currently visible workspace:
+ * - Cloud workspace: copy the safe same-origin Cloud page URL.
+ * - Local workspace: copy the Local Mini-Server MCP command when running.
+ */
+export function resolveWorkspaceCopyAction(opts: {
+  activeWorkspace: "cloud" | "local";
+  cloudUrl: unknown;
+  remoteServerUrl: string;
+  localHttpUrl?: unknown;
+  localRunning: boolean;
+}): WorkspaceCopyAction | null {
+  if (opts.activeWorkspace === "local") {
+    if (!opts.localRunning) return null;
+    return {
+      kind: "local-mcp",
+      text: formatLocalMcpCommand(opts.localHttpUrl),
+      title: "已复制本机 MCP 接入命令",
+    };
+  }
+  const safeCloudUrl = formatCopyableCloudUrl(opts.cloudUrl, opts.remoteServerUrl);
+  if (!safeCloudUrl) return null;
+  return {
+    kind: "cloud-url",
+    text: safeCloudUrl,
+    title: "已复制当前页面链接",
+  };
+}
+
+/**
  * Build the safe IIFE injected into same-origin Cloud pages to sync theme
  * state from Desktop without triggering an echo loop in `cloud-preload.cjs`
  * and without clobbering SVG icon buttons.

@@ -2537,6 +2537,7 @@
       btnQuote.type = "button";
       btnQuote.className = "wx-act-btn";
       btnQuote.title = "引用回复";
+      btnQuote.setAttribute("aria-label", "引用回复");
       btnQuote.appendChild(createSvgIcon("reply"));
       btnQuote.addEventListener("click", () => setReplyTarget(m));
       actions.appendChild(btnQuote);
@@ -2545,6 +2546,7 @@
       btnCopyMsg.type = "button";
       btnCopyMsg.className = "wx-act-btn";
       btnCopyMsg.title = "复制消息内容";
+      btnCopyMsg.setAttribute("aria-label", "复制消息内容");
       btnCopyMsg.appendChild(createSvgIcon("copy"));
       btnCopyMsg.addEventListener("click", async () => {
         await copyTextToClipboard(String(m.content || ""));
@@ -2557,6 +2559,7 @@
         btnEdit.type = "button";
         btnEdit.className = "wx-act-btn";
         btnEdit.title = "编辑消息";
+        btnEdit.setAttribute("aria-label", "编辑消息");
         btnEdit.appendChild(createSvgIcon("edit"));
         btnEdit.addEventListener("click", () => { void editLocalMessage(m); });
 
@@ -2564,6 +2567,7 @@
         btnDel.type = "button";
         btnDel.className = "wx-act-btn danger";
         btnDel.title = "撤回消息";
+        btnDel.setAttribute("aria-label", "撤回消息");
         btnDel.appendChild(createSvgIcon("trash"));
         btnDel.addEventListener("click", () => { void deleteLocalMessage(m); });
 
@@ -2583,7 +2587,10 @@
           : `引用消息 #${String(m.in_reply_to).slice(0, 8)}`;
         if (quoted) {
           quoteEl.title = "点击定位到原消息";
-          quoteEl.addEventListener("click", () => {
+          quoteEl.setAttribute("role", "button");
+          quoteEl.tabIndex = 0;
+          quoteEl.setAttribute("aria-label", `定位到被引用消息：${quoted.sender_name || quoted.sender_id}`);
+          const jumpToQuoted = () => {
             const targetRow = Array.from(elMessages.querySelectorAll(".wx-msg")).find(
               (el) => el.dataset.msgId === quoted.id,
             );
@@ -2593,6 +2600,13 @@
             void targetRow.offsetWidth;
             targetRow.classList.add("wx-jump-flash");
             setTimeout(() => targetRow.classList.remove("wx-jump-flash"), 1200);
+          };
+          quoteEl.addEventListener("click", jumpToQuoted);
+          quoteEl.addEventListener("keydown", (ev) => {
+            if (ev.key === "Enter" || ev.key === " ") {
+              ev.preventDefault();
+              jumpToQuoted();
+            }
           });
         }
         col.appendChild(quoteEl);
@@ -3420,6 +3434,14 @@
     if (ev.key === "Escape" && activeSearchQuery) {
       ev.preventDefault();
       document.getElementById("btn-clear-search")?.click();
+      return;
+    }
+    if (ev.key === "Escape" && replyTarget) {
+      const anyModal = !!document.querySelector(".modal-backdrop:not([hidden]), dialog[open]");
+      if (!anyModal && (!elMentionMenu || elMentionMenu.hidden)) {
+        ev.preventDefault();
+        setReplyTarget(null);
+      }
     }
   });
 
@@ -3869,7 +3891,26 @@
     } catch {}
   });
 
-  // `@mention` Autocomplete Popover
+  // `@mention` Autocomplete Popover (Online-first, CJK display names, ARIA listbox & hover/scroll sync)
+  function syncMentionActiveVisual(scrollIntoView = false) {
+    if (!elMentionMenu) return;
+    const opts = Array.from(elMentionMenu.querySelectorAll(".mention-opt"));
+    let activeOpt = null;
+    opts.forEach((opt, i) => {
+      const isAct = i === mentionActiveIdx;
+      opt.classList.toggle("active", isAct);
+      opt.setAttribute("aria-selected", String(isAct));
+      if (isAct) activeOpt = opt;
+    });
+    if (elInput) {
+      if (activeOpt && activeOpt.id) elInput.setAttribute("aria-activedescendant", activeOpt.id);
+      else elInput.removeAttribute("aria-activedescendant");
+    }
+    if (scrollIntoView && activeOpt && typeof activeOpt.scrollIntoView === "function") {
+      try { activeOpt.scrollIntoView({ block: "nearest" }); } catch {}
+    }
+  }
+
   function closeMentionMenu() {
     mentionCandidates = [];
     mentionActiveIdx = 0;
@@ -3877,13 +3918,17 @@
       elMentionMenu.hidden = true;
       elMentionMenu.replaceChildren();
     }
+    if (elInput) {
+      elInput.setAttribute("aria-expanded", "false");
+      elInput.removeAttribute("aria-activedescendant");
+    }
   }
 
   function applyMentionSelection(agentId) {
     const pos = elInput.selectionStart ?? elInput.value.length;
     const before = elInput.value.slice(0, pos);
     const after = elInput.value.slice(pos);
-    const replaced = before.replace(/(^|\s)@([a-zA-Z0-9._-]*)$/, `$1@${agentId} `);
+    const replaced = before.replace(/(^|\s)@([^\s@]{0,40})$/, `$1@${agentId} `);
     elInput.value = replaced + after;
     const nextPos = replaced.length;
     elInput.setSelectionRange(nextPos, nextPos);
@@ -3897,26 +3942,37 @@
     if (!elMentionMenu) return;
     const pos = elInput.selectionStart ?? elInput.value.length;
     const before = elInput.value.slice(0, pos);
-    const match = before.match(/(^|\s)@([a-zA-Z0-9._-]*)$/);
+    const match = before.match(/(^|\s)@([^\s@]{0,40})$/);
     if (!match) {
       closeMentionMenu();
       return;
     }
     const q = (match[2] || "").toLowerCase();
-    mentionCandidates = currentMembers.filter(
-      (m) =>
-        m.agent_id !== currentPrincipal?.id &&
-        (m.agent_id.toLowerCase().includes(q) || (m.display_name || "").toLowerCase().includes(q)),
-    );
+    mentionCandidates = currentMembers
+      .filter(
+        (m) =>
+          m.agent_id !== currentPrincipal?.id &&
+          (m.agent_id.toLowerCase().includes(q) || (m.display_name || "").toLowerCase().includes(q)),
+      )
+      .sort((a, b) => {
+        const onlineDiff = Number(Boolean(b.online)) - Number(Boolean(a.online));
+        if (onlineDiff !== 0) return onlineDiff;
+        const nameA = String(a.display_name || a.agent_id || "");
+        const nameB = String(b.display_name || b.agent_id || "");
+        return nameA.localeCompare(nameB, undefined, { sensitivity: "base" });
+      });
     if (mentionCandidates.length === 0) {
       closeMentionMenu();
       return;
     }
-    mentionActiveIdx = Math.min(mentionActiveIdx, mentionCandidates.length - 1);
+    mentionActiveIdx = Math.max(0, Math.min(mentionActiveIdx, mentionCandidates.length - 1));
     elMentionMenu.replaceChildren();
     mentionCandidates.forEach((m, idx) => {
       const opt = document.createElement("button");
       opt.type = "button";
+      opt.id = `local-mention-opt-${idx}`;
+      opt.setAttribute("role", "option");
+      opt.setAttribute("aria-selected", String(idx === mentionActiveIdx));
       opt.className = "mention-opt" + (idx === mentionActiveIdx ? " active" : "");
 
       const left = document.createElement("span");
@@ -3933,6 +3989,12 @@
       idSpan.textContent = `@${m.agent_id}`;
       opt.appendChild(left);
       opt.appendChild(idSpan);
+      opt.addEventListener("mouseenter", () => {
+        if (mentionActiveIdx !== idx) {
+          mentionActiveIdx = idx;
+          syncMentionActiveVisual(false);
+        }
+      });
       opt.addEventListener("mousedown", (ev) => {
         ev.preventDefault();
         applyMentionSelection(m.agent_id);
@@ -3940,6 +4002,8 @@
       elMentionMenu.appendChild(opt);
     });
     elMentionMenu.hidden = false;
+    if (elInput) elInput.setAttribute("aria-expanded", "true");
+    syncMentionActiveVisual(true);
   }
 
   document.getElementById("btn-edit-topic")?.addEventListener("click", async () => {
@@ -3985,13 +4049,25 @@
       if (ev.key === "ArrowDown") {
         ev.preventDefault();
         mentionActiveIdx = (mentionActiveIdx + 1) % mentionCandidates.length;
-        updateMentionMenu();
+        syncMentionActiveVisual(true);
         return;
       }
       if (ev.key === "ArrowUp") {
         ev.preventDefault();
         mentionActiveIdx = (mentionActiveIdx - 1 + mentionCandidates.length) % mentionCandidates.length;
-        updateMentionMenu();
+        syncMentionActiveVisual(true);
+        return;
+      }
+      if (ev.key === "Home") {
+        ev.preventDefault();
+        mentionActiveIdx = 0;
+        syncMentionActiveVisual(true);
+        return;
+      }
+      if (ev.key === "End") {
+        ev.preventDefault();
+        mentionActiveIdx = mentionCandidates.length - 1;
+        syncMentionActiveVisual(true);
         return;
       }
       if (ev.key === "Enter" || ev.key === "Tab") {
@@ -4039,7 +4115,7 @@
         return;
       }
     }
-    if (ev.key === "Enter" && !ev.shiftKey && !isImeComposing(ev)) {
+    if (ev.key === "Enter" && !ev.shiftKey && !ev.altKey && !isImeComposing(ev)) {
       ev.preventDefault();
       sendChatText();
     }
