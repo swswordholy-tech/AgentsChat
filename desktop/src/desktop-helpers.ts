@@ -127,7 +127,37 @@ export function classifyCloudRailSection(rawUrl: unknown, remoteServerUrl: strin
  * on OKR Board that shares the `.theme-toggle` utility class).
  */
 export const CLOUD_THEME_TOGGLE_SELECTOR =
-  ".theme-toggle:not(#shortcutsBtn), .theme-btn, #themeToggleBtn, #agentThemeToggle, #approvalsThemeToggle, #analyticsThemeToggle, #landingThemeToggle, #lkThemeToggle, #docThemeToggle, #protocolThemeToggle";
+  ".theme-toggle:not(#shortcutsBtn), .theme-btn, #themeToggleBtn, #agentThemeToggle, #approvalsThemeToggle, #analyticsThemeToggle, #landingThemeToggle, #lkThemeToggle, #docThemeToggle, #protocolThemeToggle, #modThemeToggle";
+
+/**
+ * Format a safe, shareable http(s) URL for the currently viewed Cloud page.
+ * Strictly enforces same-origin with `remoteServerUrl`, strips any embedded
+ * credentials, and returns `null` for `file://`, `about:`, or foreign origins.
+ */
+export function formatCopyableCloudUrl(rawUrl: unknown, remoteServerUrl: string): string | null {
+  if (typeof rawUrl !== "string" || !rawUrl.trim()) return null;
+  try {
+    const parsed = new URL(rawUrl);
+    const expected = new URL(remoteServerUrl);
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return null;
+    if (parsed.origin !== expected.origin) return null;
+    parsed.username = "";
+    parsed.password = "";
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Format zoom factor into a compact rail badge string (e.g. `110%`), or `null`
+ * when at the default 100% scale so the rail stays clean.
+ */
+export function formatZoomBadge(zoomFactor: unknown): string | null {
+  const clamped = clampDesktopZoomFactor(zoomFactor);
+  const pct = Math.round(clamped * 100);
+  return pct === 100 ? null : `${pct}%`;
+}
 
 /**
  * Verify that an IPC theme signal from Cloud WebContentsView comes from the

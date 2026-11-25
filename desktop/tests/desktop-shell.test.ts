@@ -10,6 +10,8 @@ import {
   classifyCloudRailSection,
   CLOUD_THEME_TOGGLE_SELECTOR,
   compareSemver,
+  formatCopyableCloudUrl,
+  formatZoomBadge,
   isCloudOfflinePageUrl,
   isTrustedCloudThemeOrigin,
   parseDeepLink,
@@ -529,5 +531,47 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     expect(cloudPreloadCode).not.toContain("contextBridge");
     expect(cloudPreloadCode).not.toContain("exposeInMainWorld");
     expect(cloudPreloadCode).toContain("desktop:cloud-theme-observed");
+  });
+
+  test("Desktop 2.3 rail wires zoom reset chip, active reload, context-aware copy URL & safe same-origin link helpers", () => {
+    const remote = "https://agents-chat.com/lobby";
+    expect(formatCopyableCloudUrl("https://agents-chat.com/lobby?channel=abc", remote)).toBe(
+      "https://agents-chat.com/lobby?channel=abc",
+    );
+    expect(formatCopyableCloudUrl("https://user:pass@agents-chat.com/marketplace?bot=codex", remote)).toBe(
+      "https://agents-chat.com/marketplace?bot=codex",
+    );
+    expect(formatCopyableCloudUrl("file:///Users/test/cloud-offline.html", remote)).toBeNull();
+    expect(formatCopyableCloudUrl("https://evil.example/phish", remote)).toBeNull();
+    expect(formatCopyableCloudUrl("javascript:alert(1)", remote)).toBeNull();
+    expect(formatCopyableCloudUrl("", remote)).toBeNull();
+
+    expect(formatZoomBadge(1)).toBeNull();
+    expect(formatZoomBadge(1.001)).toBeNull();
+    expect(formatZoomBadge(1.1)).toBe("110%");
+    expect(formatZoomBadge(0.85)).toBe("85%");
+    expect(formatZoomBadge(5)).toBe("175%");
+    expect(formatZoomBadge(0.2)).toBe("75%");
+
+    expect(CLOUD_THEME_TOGGLE_SELECTOR).toContain("#modThemeToggle");
+
+    const shellHtml = readFileSync(join(import.meta.dir, "..", "ui", "shell.html"), "utf8");
+    expect(shellHtml).toContain('id="btn-zoom-reset"');
+    expect(shellHtml).toContain('id="btn-active-reload"');
+    expect(shellHtml).toContain("copyCurrentCloudUrl");
+    expect(shellHtml).toContain("resetZoom");
+    expect(shellHtml).toContain("reloadActiveView");
+
+    const preloadJs = readFileSync(join(import.meta.dir, "..", "ui", "preload.cjs"), "utf8");
+    expect(preloadJs).toContain("desktop:reload-active");
+    expect(preloadJs).toContain("desktop:reset-zoom");
+    expect(preloadJs).toContain("desktop:copy-cloud-url");
+
+    const mainTs = readFileSync(join(import.meta.dir, "..", "src", "main.ts"), "utf8");
+    expect(mainTs).toContain("CmdOrCtrl+6");
+    expect(mainTs).toContain("CmdOrCtrl+Shift+C");
+    expect(mainTs).toContain("CmdOrCtrl+Shift+O");
+    expect(mainTs).toContain("Copy Page Link");
+    expect(mainTs).toContain("Open Page in Browser");
   });
 });

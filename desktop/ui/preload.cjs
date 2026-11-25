@@ -12,6 +12,9 @@ contextBridge.exposeInMainWorld("agentschatShell", {
   captureScreenshot: () => ipcRenderer.invoke("desktop:capture-screenshot"),
   navigateCloudRoute: (route) => ipcRenderer.invoke("desktop:navigate-cloud-route", route),
   cloudHistory: (direction) => ipcRenderer.invoke("desktop:cloud-history", direction),
+  reloadActiveView: () => ipcRenderer.invoke("desktop:reload-active"),
+  resetZoom: () => ipcRenderer.invoke("desktop:reset-zoom"),
+  copyCurrentCloudUrl: () => ipcRenderer.invoke("desktop:copy-cloud-url"),
   onStateChanged: (cb) => {
     const handler = (_ev, state) => cb(state);
     ipcRenderer.on("desktop:state-changed", handler);

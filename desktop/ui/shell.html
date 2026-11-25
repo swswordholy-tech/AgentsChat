@@ -250,13 +250,45 @@
 
     .badge {
       -webkit-app-region: no-drag;
+      border: none;
+      background: transparent;
+      padding: 2px 5px;
+      border-radius: 5px;
+      cursor: pointer;
       font-size: 10px;
       font-weight: 600;
       color: var(--ink-muted);
       font-family: "SF Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
       font-variant-numeric: tabular-nums;
+      transition: background-color 140ms var(--ease), color 140ms var(--ease);
     }
+    .badge:hover {
+      background: var(--btn-hover);
+      color: var(--ink-primary);
+    }
+    .badge:focus-visible { outline: 2px solid var(--wechat-green); outline-offset: 1px; }
     .badge.live { color: #059e4e; }
+
+    .zoom-chip {
+      -webkit-app-region: no-drag;
+      border: 1px solid var(--sep);
+      background: var(--btn-active);
+      color: var(--ink-secondary);
+      padding: 1px 6px;
+      border-radius: 999px;
+      cursor: pointer;
+      font-size: 9.5px;
+      font-weight: 600;
+      font-family: "SF Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-variant-numeric: tabular-nums;
+      line-height: 15px;
+      transition: background-color 140ms var(--ease), color 140ms var(--ease), border-color 140ms var(--ease);
+    }
+    .zoom-chip:hover {
+      border-color: var(--wechat-green);
+      color: var(--wechat-green);
+    }
+    .zoom-chip:focus-visible { outline: 2px solid var(--wechat-green); outline-offset: 1px; }
 
     .mini-btn {
       -webkit-app-region: no-drag;
@@ -305,12 +337,12 @@
       display: flex;
       align-items: center;
       justify-content: center;
-      gap: 4px;
+      gap: 2px;
     }
     .history-btn {
-      width: 24px;
-      height: 24px;
-      border-radius: 7px;
+      width: 20px;
+      height: 22px;
+      border-radius: 6px;
       border: none;
       background: transparent;
       color: var(--ink-secondary);
@@ -320,6 +352,13 @@
       justify-content: center;
       padding: 0;
       transition: background-color 140ms var(--ease), color 140ms var(--ease), opacity 140ms var(--ease);
+    }
+    .history-btn.spinning svg {
+      animation: railSpin 0.85s linear infinite;
+    }
+    @keyframes railSpin {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
     }
     .history-btn:hover:not(:disabled) {
       background: var(--btn-hover);
@@ -402,11 +441,18 @@
     <div class="footer-stack">
       <div class="rail-sep" aria-hidden="true"></div>
       <span class="lan-chip" id="lan-chip" title="局域网接入已开启 (0.0.0.0)" hidden>LAN</span>
-      <span class="badge" id="local-port-badge" title="本机 Server 监听端口">:8787</span>
-      <div class="history-row" id="cloud-history-row" hidden>
+      <button class="zoom-chip" id="btn-zoom-reset" type="button" title="当前缩放比例 — 点击还原 100% (⌘0)" aria-label="还原 100% 缩放" hidden>100%</button>
+      <button class="badge" id="local-port-badge" type="button" title="本机 Server 监听端口 — 点击切换到本机">:8787</button>
+      <div class="history-row" id="cloud-history-row">
         <button class="history-btn" id="btn-cloud-back" type="button" title="返回上一页 (⌘[)" aria-label="返回上一页" disabled>
           <svg viewBox="0 0 24 24" aria-hidden="true">
             <path d="m15 18-6-6 6-6" />
+          </svg>
+        </button>
+        <button class="history-btn" id="btn-active-reload" type="button" title="刷新当前页面 (⌘R)" aria-label="刷新当前页面">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+            <path d="M21 3v6h-6" />
           </svg>
         </button>
         <button class="history-btn" id="btn-cloud-forward" type="button" title="前进下一页 (⌘])" aria-label="前进下一页" disabled>
@@ -462,7 +508,9 @@
     const btnCloudMarket = document.getElementById("btn-cloud-market");
     const cloudHistoryRow = document.getElementById("cloud-history-row");
     const btnCloudBack = document.getElementById("btn-cloud-back");
+    const btnActiveReload = document.getElementById("btn-active-reload");
     const btnCloudForward = document.getElementById("btn-cloud-forward");
+    const btnZoomReset = document.getElementById("btn-zoom-reset");
     const localDot = document.getElementById("local-dot");
     const localUnreadBadge = document.getElementById("local-unread-badge");
     const lanChip = document.getElementById("lan-chip");
@@ -510,13 +558,30 @@
 
       const canGoBack = Boolean(active === "cloud" && state.cloudNav?.canGoBack);
       const canGoForward = Boolean(active === "cloud" && state.cloudNav?.canGoForward);
-      if (cloudHistoryRow) {
-        cloudHistoryRow.hidden = !(canGoBack || canGoForward);
+      const isCloudLoading = Boolean(active === "cloud" && state.cloudNav?.isLoading);
+      if (btnCloudBack) {
+        btnCloudBack.disabled = !canGoBack;
+        btnCloudBack.hidden = active !== "cloud";
       }
-      if (btnCloudBack) btnCloudBack.disabled = !canGoBack;
-      if (btnCloudForward) btnCloudForward.disabled = !canGoForward;
+      if (btnCloudForward) {
+        btnCloudForward.disabled = !canGoForward;
+        btnCloudForward.hidden = active !== "cloud";
+      }
+      if (btnActiveReload) {
+        btnActiveReload.classList.toggle("spinning", isCloudLoading);
+      }
       if (railLoadBar) {
-        railLoadBar.classList.toggle("active", Boolean(active === "cloud" && state.cloudNav?.isLoading));
+        railLoadBar.classList.toggle("active", isCloudLoading);
+      }
+
+      const zoomPct = Math.round(Number(state.settings?.zoomFactor ?? 1) * 100);
+      if (btnZoomReset) {
+        const showZoom = Number.isFinite(zoomPct) && zoomPct > 0 && zoomPct !== 100;
+        btnZoomReset.hidden = !showZoom;
+        if (showZoom) {
+          btnZoomReset.textContent = `${zoomPct}%`;
+          btnZoomReset.title = `当前缩放 ${zoomPct}% — 点击还原 100% (⌘0)`;
+        }
       }
 
       const running = Boolean(state.localServer?.running);
@@ -530,8 +595,21 @@
       localUnreadBadge.hidden = unread <= 0;
       localUnreadBadge.textContent = unread > 99 ? "99+" : String(unread);
       lanChip.hidden = !(running && state.settings?.allowLan);
+      const localOnlineCount = Array.isArray(state.localServer?.connectedAgents)
+        ? state.localServer.connectedAgents.length
+        : 0;
       portBadge.textContent = running ? ":" + state.localServer.port : "OFF";
       portBadge.classList.toggle("live", running);
+      portBadge.title = running
+        ? `本机 Server 运行中 (${state.localServer.httpUrl} · ${localOnlineCount} 个 Agent 在线) — 点击切换到本机`
+        : "本机 Server 已停止 — 点击切换到本机";
+      btnCopyUrl.title = active === "cloud"
+        ? "复制当前云端页面链接 (⌘⇧C)"
+        : "复制本机 MCP 接入命令";
+      btnCopyUrl.setAttribute(
+        "aria-label",
+        active === "cloud" ? "复制当前云端页面链接" : "复制本机 MCP 命令",
+      );
       btnPower.classList.toggle("power-on", running);
       btnPower.title = running
         ? `本机 Server 运行中 (${state.localServer.httpUrl}) — 点击停止`
@@ -547,10 +625,13 @@
       else api?.switchWorkspace("cloud");
     });
     btnLocal.addEventListener("click", () => api?.switchWorkspace("local"));
+    portBadge?.addEventListener("click", () => api?.switchWorkspace("local"));
+    btnZoomReset?.addEventListener("click", () => api?.resetZoom?.());
     btnCloudStudio?.addEventListener("click", () => api?.navigateCloudRoute?.("cloud-agents"));
     btnCloudOkr?.addEventListener("click", () => api?.navigateCloudRoute?.("okr-board"));
     btnCloudMarket?.addEventListener("click", () => api?.navigateCloudRoute?.("marketplace"));
     btnCloudBack?.addEventListener("click", () => api?.cloudHistory?.("back"));
+    btnActiveReload?.addEventListener("click", () => api?.reloadActiveView?.());
     btnCloudForward?.addEventListener("click", () => api?.cloudHistory?.("forward"));
     btnShellTheme?.addEventListener("click", () => {
       const next = document.body.classList.contains("dark") ? "light" : "dark";
@@ -568,8 +649,16 @@
       api?.toggleLocalServer(next);
     });
     btnCopyUrl.addEventListener("click", async () => {
-      const url = latestState?.localServer?.httpUrl || "http://127.0.0.1:8787";
-      await api?.copyText(`npx -y agentschat-mcp@latest --url ${url}`);
+      const isCloud = (latestState?.settings?.activeWorkspace || "cloud") === "cloud";
+      let copied = false;
+      if (isCloud && api?.copyCurrentCloudUrl) {
+        const copiedUrl = await api.copyCurrentCloudUrl();
+        copied = Boolean(copiedUrl);
+      }
+      if (!copied) {
+        const url = latestState?.localServer?.httpUrl || "http://127.0.0.1:8787";
+        await api?.copyText(`npx -y agentschat-mcp@latest --url ${url}`);
+      }
       btnCopyUrl.classList.add("copied");
       iconCopy.toggleAttribute("hidden", true);
       iconCheck.toggleAttribute("hidden", false);

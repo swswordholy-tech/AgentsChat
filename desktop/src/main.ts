@@ -25,6 +25,7 @@ import {
   checkLatestDesktopRelease,
   clampDesktopZoomFactor,
   classifyCloudRailSection,
+  formatCopyableCloudUrl,
   isCloudOfflinePageUrl,
   isTrustedCloudThemeOrigin,
   parseDeepLink,
@@ -165,6 +166,41 @@ function applyDesktopZoom(nextFactor: number): void {
   broadcastState();
 }
 
+function reloadActiveView(): boolean {
+  const target = settings.activeWorkspace === "local" ? localView : cloudView;
+  if (target && !target.webContents.isDestroyed()) {
+    target.webContents.reload();
+    return true;
+  }
+  return false;
+}
+
+function getCurrentSafeCloudUrl(): string | null {
+  if (!cloudView || cloudView.webContents.isDestroyed()) return null;
+  return formatCopyableCloudUrl(cloudView.webContents.getURL(), settings.remoteServerUrl);
+}
+
+function copyCurrentCloudUrl(notify = true): string | null {
+  const url = getCurrentSafeCloudUrl();
+  if (!url) return null;
+  clipboard.writeText(url);
+  if (notify && Notification.isSupported()) {
+    new Notification({
+      title: "已复制当前页面链接",
+      body: url,
+      silent: true,
+    }).show();
+  }
+  return url;
+}
+
+function openCurrentCloudUrlInBrowser(): boolean {
+  const url = getCurrentSafeCloudUrl();
+  if (!url) return false;
+  void shell.openExternal(url);
+  return true;
+}
+
 function attachNativeContextMenu(wc: Electron.WebContents): void {
   wc.on("context-menu", (_ev, params) => {
     const items: Electron.MenuItemConstructorOptions[] = [];
@@ -223,12 +259,23 @@ function attachNativeContextMenu(wc: Electron.WebContents): void {
     if (items.length === 0) {
       const canBack = wc.navigationHistory?.canGoBack?.() ?? false;
       const canFwd = wc.navigationHistory?.canGoForward?.() ?? false;
-      if (canBack || canFwd) {
+      const safePageUrl = formatCopyableCloudUrl(wc.getURL(), settings.remoteServerUrl);
+      items.push(
+        { label: "Back", enabled: canBack, click: () => wc.navigationHistory.goBack() },
+        { label: "Forward", enabled: canFwd, click: () => wc.navigationHistory.goForward() },
+        { label: "Reload", click: () => wc.reload() },
+      );
+      if (safePageUrl) {
         items.push(
-          { label: "Back", enabled: canBack, click: () => wc.navigationHistory.goBack() },
-          { label: "Forward", enabled: canFwd, click: () => wc.navigationHistory.goForward() },
           { type: "separator" },
-          { label: "Reload", click: () => wc.reload() },
+          {
+            label: "Copy Page Link",
+            click: () => clipboard.writeText(safePageUrl),
+          },
+          {
+            label: "Open Page in Browser",
+            click: () => void shell.openExternal(safePageUrl),
+          },
         );
       }
     }
@@ -539,12 +586,6 @@ function applyLaunchAtLoginSetting(): void {
 
 function setupApplicationMenu(): void {
   const isMac = process.platform === "darwin";
-  const reloadActiveView = () => {
-    const target = settings.activeWorkspace === "local" ? localView : cloudView;
-    if (target && !target.webContents.isDestroyed()) {
-      target.webContents.reload();
-    }
-  };
   const toggleActiveDevTools = () => {
     const target = settings.activeWorkspace === "local" ? localView : cloudView;
     if (target && !target.webContents.isDestroyed()) {
@@ -622,6 +663,11 @@ function setupApplicationMenu(): void {
           accelerator: "CmdOrCtrl+5",
           click: () => void navigateCloudQuickRoute("marketplace"),
         },
+        {
+          label: "Dashboard",
+          accelerator: "CmdOrCtrl+6",
+          click: () => void navigateCloudQuickRoute("dashboard"),
+        },
         { type: "separator" },
         {
           label: "Back",
@@ -632,6 +678,16 @@ function setupApplicationMenu(): void {
           label: "Forward",
           accelerator: "CmdOrCtrl+]",
           click: () => void navigateCloudHistory("forward"),
+        },
+        {
+          label: "Copy Current Page Link",
+          accelerator: "CmdOrCtrl+Shift+C",
+          click: () => { copyCurrentCloudUrl(true); },
+        },
+        {
+          label: "Open Current Page in Browser",
+          accelerator: "CmdOrCtrl+Shift+O",
+          click: () => { openCurrentCloudUrlInBrowser(); },
         },
         { type: "separator" },
         {
@@ -1106,6 +1162,25 @@ function registerIpcHandlers(): void {
       return navigateCloudHistory(direction);
     }
     return false;
+  });
+
+  ipcMain.handle("desktop:reload-active", (ev) => {
+    const isShell = Boolean(mainWindow && !mainWindow.isDestroyed() && ev.sender === mainWindow.webContents);
+    if (!isShell) return false;
+    return reloadActiveView();
+  });
+
+  ipcMain.handle("desktop:reset-zoom", (ev) => {
+    const isShell = Boolean(mainWindow && !mainWindow.isDestroyed() && ev.sender === mainWindow.webContents);
+    if (!isShell) return false;
+    applyDesktopZoom(1);
+    return true;
+  });
+
+  ipcMain.handle("desktop:copy-cloud-url", (ev) => {
+    const isShell = Boolean(mainWindow && !mainWindow.isDestroyed() && ev.sender === mainWindow.webContents);
+    if (!isShell) return null;
+    return copyCurrentCloudUrl(false);
   });
 
   ipcMain.handle("desktop:open-cloud-path", async (_ev, targetPath: unknown) => {
