@@ -64,9 +64,24 @@
       align-items: center;
       padding: 16px 0 16px;
       gap: 8px;
+      overflow-y: auto;
+      scrollbar-width: none;
       -webkit-app-region: drag;
     }
+    .rail::-webkit-scrollbar { display: none; }
     .rail.mac { padding-top: 48px; }
+
+    @media (max-height: 670px) {
+      .rail { padding: 10px 0 10px; gap: 4px; }
+      .rail.mac { padding-top: 40px; }
+      .brand-avatar { width: 38px; height: 38px; margin-bottom: 2px; }
+      .brand-avatar img { width: 38px; height: 38px; }
+      .nav-group { gap: 3px; }
+      .node-btn { height: 42px; }
+      .node-btn.quick-node { height: 38px; }
+      .footer-stack { gap: 3px; }
+      .mini-btn { width: 32px; height: 30px; }
+    }
 
     .rail-load-bar {
       position: absolute;
@@ -527,10 +542,33 @@
     let latestState = null;
     let copyTimer = null;
 
+    function applyPlatformShortcuts(platform) {
+      const isMac = platform === "darwin";
+      const mod = isMac ? "⌘" : "Ctrl+";
+      const modShift = isMac ? "⌘⇧" : "Ctrl+Shift+";
+      if (btnBrandHome) btnBrandHome.title = `AgentsChat Desktop — 返回云端大厅 (${mod}1)`;
+      if (btnCloud) btnCloud.title = `AgentsChat Cloud (${mod}1) — 云端多 Agent 协同、/loop 与 Bot 市场`;
+      if (btnLocal) btnLocal.title = `本机 Server (${mod}2) — 本机低延迟多 Agent 群聊与私聊`;
+      if (btnCloudStudio) btnCloudStudio.title = `Cloud Studio 算力工坊 (${mod}3)`;
+      if (btnCloudOkr) btnCloudOkr.title = `OKR 协同看板 (${mod}4)`;
+      if (btnCloudMarket) btnCloudMarket.title = `Bot 租赁市场 (${mod}5)`;
+      if (btnCloudBack) btnCloudBack.title = `返回上一页 (${mod}[)`;
+      if (btnActiveReload) btnActiveReload.title = `刷新当前页面 (${mod}R)`;
+      if (btnCloudForward) btnCloudForward.title = `前进下一页 (${mod}])`;
+      if (btnShellTheme) btnShellTheme.title = `切换浅色 / 深色模式 (${modShift}D)`;
+      if (btnShellScreenshot) {
+        btnShellScreenshot.hidden = !isMac;
+        btnShellScreenshot.title = `框选截图并直接粘贴到聊天框 (${modShift}X)`;
+      }
+      return { mod, modShift };
+    }
+
     function render(state) {
       if (!state) return;
       latestState = state;
-      if (state.platform === "darwin") rail.classList.add("mac");
+      const isMac = state.platform === "darwin";
+      const { mod, modShift } = applyPlatformShortcuts(state.platform);
+      if (isMac) rail.classList.add("mac");
       const isDark = state.settings?.theme === "dark";
       document.body.classList.toggle("dark", isDark);
       if (iconMoon && iconSun) {
@@ -580,7 +618,7 @@
         btnZoomReset.hidden = !showZoom;
         if (showZoom) {
           btnZoomReset.textContent = `${zoomPct}%`;
-          btnZoomReset.title = `当前缩放 ${zoomPct}% — 点击还原 100% (⌘0)`;
+          btnZoomReset.title = `当前缩放 ${zoomPct}% — 点击还原 100% (${mod}0)`;
         }
       }
 
@@ -604,7 +642,7 @@
         ? `本机 Server 运行中 (${state.localServer.httpUrl} · ${localOnlineCount} 个 Agent 在线) — 点击切换到本机`
         : "本机 Server 已停止 — 点击切换到本机";
       btnCopyUrl.title = active === "cloud"
-        ? "复制当前云端页面链接 (⌘⇧C)"
+        ? `复制当前云端页面链接 (${modShift}C) · 右键在浏览器打开 (${modShift}O)`
         : "复制本机 MCP 接入命令";
       btnCopyUrl.setAttribute(
         "aria-label",
@@ -648,8 +686,18 @@
       const next = !(latestState?.settings?.localServerEnabled !== false);
       api?.toggleLocalServer(next);
     });
-    btnCopyUrl.addEventListener("click", async () => {
+    btnCopyUrl.addEventListener("contextmenu", (ev) => {
       const isCloud = (latestState?.settings?.activeWorkspace || "cloud") === "cloud";
+      if (!isCloud || !api?.openCurrentCloudInBrowser) return;
+      ev.preventDefault();
+      api.openCurrentCloudInBrowser();
+    });
+    btnCopyUrl.addEventListener("click", async (ev) => {
+      const isCloud = (latestState?.settings?.activeWorkspace || "cloud") === "cloud";
+      if (ev.shiftKey && isCloud && api?.openCurrentCloudInBrowser) {
+        api.openCurrentCloudInBrowser();
+        return;
+      }
       let copied = false;
       if (isCloud && api?.copyCurrentCloudUrl) {
         const copiedUrl = await api.copyCurrentCloudUrl();

@@ -12,6 +12,7 @@ import {
   CLOUD_THEME_TOGGLE_SELECTOR,
   compareSemver,
   formatCopyableCloudUrl,
+  formatDesktopWindowTitle,
   formatTrayTooltip,
   formatZoomBadge,
   isCloudOfflinePageUrl,
@@ -675,5 +676,47 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     expect(localCss).toContain(".msg-skeleton-list");
     expect(localCss).toContain(".btn-send:disabled");
     expect(localCss).toContain("@media (prefers-reduced-motion: reduce)");
+  });
+
+  test("Desktop 2.6 adds live contextual window title, tray tooltip parity, auto-focus on switch, compact low-height rail & cross-platform shortcuts", () => {
+    expect(
+      formatDesktopWindowTitle({ activeWorkspace: "cloud", cloudSection: "lobby", cloudUnread: 0, localUnread: 0 }),
+    ).toBe("AgentsChat");
+    expect(
+      formatDesktopWindowTitle({ activeWorkspace: "cloud", cloudSection: "cloud-agents", cloudUnread: 2, localUnread: 1 }),
+    ).toBe("(3) AgentsChat · Cloud Studio");
+    expect(
+      formatDesktopWindowTitle({ activeWorkspace: "cloud", cloudSection: "okr-board", cloudUnread: 0, localUnread: 0 }),
+    ).toBe("AgentsChat · OKR Board");
+    expect(
+      formatDesktopWindowTitle({ activeWorkspace: "cloud", cloudSection: "marketplace", cloudUnread: 0, localUnread: 0 }),
+    ).toBe("AgentsChat · Bot Market");
+    expect(
+      formatDesktopWindowTitle({ activeWorkspace: "cloud", cloudSection: "dashboard", cloudUnread: 1, localUnread: 0 }),
+    ).toBe("(1) AgentsChat · Dashboard");
+    expect(
+      formatDesktopWindowTitle({ activeWorkspace: "local", localRunning: true, localPort: 8787, cloudUnread: 0, localUnread: 0 }),
+    ).toBe("AgentsChat · Local :8787");
+    expect(
+      formatDesktopWindowTitle({ activeWorkspace: "local", localRunning: false, cloudUnread: 4, localUnread: 0 }),
+    ).toBe("(4) AgentsChat · Local");
+
+    const shellHtml = readFileSync(join(import.meta.dir, "..", "ui", "shell.html"), "utf8");
+    const shellScript = shellHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1] || "";
+    expect(shellScript.length).toBeGreaterThan(0);
+    expect(() => new Function(shellScript)).not.toThrow();
+    expect(shellHtml).toContain("@media (max-height: 670px)");
+    expect(shellHtml).toContain("function applyPlatformShortcuts(platform)");
+    expect(shellHtml).toContain("btnShellScreenshot.hidden = !isMac;");
+    expect(shellHtml).toContain("openCurrentCloudInBrowser");
+
+    const preloadJs = readFileSync(join(import.meta.dir, "..", "ui", "preload.cjs"), "utf8");
+    expect(preloadJs).toContain("desktop:open-cloud-browser");
+
+    const mainTs = readFileSync(join(import.meta.dir, "..", "src", "main.ts"), "utf8");
+    expect(mainTs).toContain("formatDesktopWindowTitle(");
+    expect(mainTs).toContain("activeView.webContents.focus()");
+    expect(mainTs).toContain("Dashboard (⌘6)");
+    expect(mainTs).toContain("desktop:open-cloud-browser");
   });
 });

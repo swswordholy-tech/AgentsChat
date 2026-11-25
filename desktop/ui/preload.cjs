@@ -15,6 +15,7 @@ contextBridge.exposeInMainWorld("agentschatShell", {
   reloadActiveView: () => ipcRenderer.invoke("desktop:reload-active"),
   resetZoom: () => ipcRenderer.invoke("desktop:reset-zoom"),
   copyCurrentCloudUrl: () => ipcRenderer.invoke("desktop:copy-cloud-url"),
+  openCurrentCloudInBrowser: () => ipcRenderer.invoke("desktop:open-cloud-browser"),
   onStateChanged: (cb) => {
     const handler = (_ev, state) => cb(state);
     ipcRenderer.on("desktop:state-changed", handler);

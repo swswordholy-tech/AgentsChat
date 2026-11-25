@@ -27,6 +27,7 @@ import {
   clampDesktopZoomFactor,
   classifyCloudRailSection,
   formatCopyableCloudUrl,
+  formatDesktopWindowTitle,
   formatTrayTooltip,
   isCloudOfflinePageUrl,
   isTrustedCloudThemeOrigin,
@@ -143,17 +144,35 @@ function isOAuthPopupUrl(rawUrl: string, remoteOrigin: string): boolean {
 
 function syncUnreadBadge(): void {
   const totalUnread = Math.max(0, localUnreadCount + cloudUnreadCount);
+  const st = localServer?.getStatus();
   try {
     if (typeof app.setBadgeCount === "function") {
       app.setBadgeCount(totalUnread);
     }
   } catch {}
   if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.setTitle(totalUnread > 0 ? `(${totalUnread}) AgentsChat` : "AgentsChat");
+    mainWindow.setTitle(
+      formatDesktopWindowTitle({
+        activeWorkspace: settings.activeWorkspace,
+        cloudSection: getCloudNavState().section,
+        cloudUnread: cloudUnreadCount,
+        localUnread: localUnreadCount,
+        localRunning: Boolean(st?.running),
+        localPort: st?.port,
+      }),
+    );
   }
   if (tray) {
     try {
-      tray.setToolTip(totalUnread > 0 ? `AgentsChat (${totalUnread} unread)` : "AgentsChat");
+      tray.setToolTip(
+        formatTrayTooltip({
+          cloudUnread: cloudUnreadCount,
+          localUnread: localUnreadCount,
+          localRunning: Boolean(st?.running),
+          localPort: st?.port,
+          localOnlineCount: st?.connectedAgents?.length || 0,
+        }),
+      );
     } catch {}
   }
 }
@@ -281,6 +300,17 @@ function attachNativeContextMenu(wc: Electron.WebContents): void {
             click: () => void shell.openExternal(safePageUrl),
           },
         );
+      } else if (localView && !localView.webContents.isDestroyed() && wc === localView.webContents) {
+        const st = localServer?.getStatus();
+        if (st?.running) {
+          items.push(
+            { type: "separator" },
+            {
+              label: "Copy Local MCP Command",
+              click: () => clipboard.writeText(`npx -y agentschat-mcp@latest --url ${st.httpUrl}`),
+            },
+          );
+        }
       }
     }
 
@@ -415,6 +445,16 @@ function broadcastState(): void {
   const snapshot = getCombinedState();
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send("desktop:state-changed", snapshot);
+    mainWindow.setTitle(
+      formatDesktopWindowTitle({
+        activeWorkspace: settings.activeWorkspace,
+        cloudSection: snapshot.cloudNav.section,
+        cloudUnread: cloudUnreadCount,
+        localUnread: localUnreadCount,
+        localRunning: Boolean(snapshot.localServer?.running),
+        localPort: snapshot.localServer?.port,
+      }),
+    );
   }
   rebuildTrayMenu();
 }
@@ -471,6 +511,12 @@ async function switchWorkspace(target: "cloud" | "local"): Promise<void> {
     }
   }
   layoutViews();
+  if (!isSmokeTest) {
+    const activeView = target === "local" ? localView : cloudView;
+    if (activeView && !activeView.webContents.isDestroyed()) {
+      try { activeView.webContents.focus(); } catch {}
+    }
+  }
   broadcastState();
 }
 
@@ -834,6 +880,13 @@ function rebuildTrayMenu(): void {
       click: () => {
         showMainWindow();
         void navigateCloudQuickRoute("marketplace");
+      },
+    },
+    {
+      label: "  Dashboard (⌘6)",
+      click: () => {
+        showMainWindow();
+        void navigateCloudQuickRoute("dashboard");
       },
     },
     {
@@ -1242,6 +1295,12 @@ function registerIpcHandlers(): void {
     const isShell = Boolean(mainWindow && !mainWindow.isDestroyed() && ev.sender === mainWindow.webContents);
     if (!isShell) return null;
     return copyCurrentCloudUrl(false);
+  });
+
+  ipcMain.handle("desktop:open-cloud-browser", (ev) => {
+    const isShell = Boolean(mainWindow && !mainWindow.isDestroyed() && ev.sender === mainWindow.webContents);
+    if (!isShell) return false;
+    return openCurrentCloudUrlInBrowser();
   });
 
   ipcMain.handle("desktop:open-cloud-path", async (_ev, targetPath: unknown) => {

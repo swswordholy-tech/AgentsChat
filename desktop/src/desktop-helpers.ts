@@ -216,6 +216,45 @@ export function formatTrayTooltip(state: TrayTooltipState): string {
   return online > 0 ? `${head} · Local :${port} (${online} online)` : `${head} · Local :${port}`;
 }
 
+export interface DesktopWindowTitleState {
+  activeWorkspace: "cloud" | "local";
+  cloudSection?: CloudQuickRoute;
+  cloudUnread?: number;
+  localUnread?: number;
+  localRunning?: boolean;
+  localPort?: number;
+}
+
+const CLOUD_SECTION_TITLES: Record<CloudQuickRoute, string> = {
+  lobby: "AgentsChat",
+  "cloud-agents": "AgentsChat · Cloud Studio",
+  "okr-board": "AgentsChat · OKR Board",
+  marketplace: "AgentsChat · Bot Market",
+  dashboard: "AgentsChat · Dashboard",
+};
+
+/**
+ * Format a concise, live native window title showing unread count and active
+ * Cloud section or Local Mini-Server port.
+ */
+export function formatDesktopWindowTitle(state: DesktopWindowTitleState): string {
+  const cloud = Math.max(0, Math.floor(Number(state.cloudUnread) || 0));
+  const local = Math.max(0, Math.floor(Number(state.localUnread) || 0));
+  const totalUnread = cloud + local;
+  const prefix = totalUnread > 0 ? `(${totalUnread}) ` : "";
+  if (state.activeWorkspace === "local") {
+    if (state.localRunning) {
+      const port = Number.isFinite(Number(state.localPort)) && Number(state.localPort) > 0 ? Number(state.localPort) : 8787;
+      return `${prefix}AgentsChat · Local :${port}`;
+    }
+    return `${prefix}AgentsChat · Local`;
+  }
+  const section = state.cloudSection && Object.prototype.hasOwnProperty.call(CLOUD_SECTION_TITLES, state.cloudSection)
+    ? state.cloudSection
+    : "lobby";
+  return `${prefix}${CLOUD_SECTION_TITLES[section]}`;
+}
+
 /**
  * Verify that an IPC theme signal from Cloud WebContentsView comes from the
  * configured AgentsChat remote origin (http/https only).
