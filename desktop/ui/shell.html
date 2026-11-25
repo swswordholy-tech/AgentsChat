@@ -339,6 +339,14 @@
       color: #059e4e;
       background: var(--wechat-green-soft);
     }
+    .mini-btn.pinned {
+      color: var(--wechat-green);
+      background: var(--wechat-green-soft);
+    }
+    .mini-btn.pinned:hover {
+      color: var(--wechat-green-hover);
+      background: var(--wechat-green-soft);
+    }
     .mini-btn.power-on {
       color: var(--wechat-green);
     }
@@ -483,6 +491,12 @@
           <path d="M20 4 8.12 15.88M14.47 14.48 20 20M8.12 8.12 12 12" />
         </svg>
       </button>
+      <button class="mini-btn" id="btn-shell-pin" type="button" title="置顶窗口 (⌘⇧T)" aria-label="切换窗口置顶" aria-pressed="false">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M12 17v5" />
+          <path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1Z" />
+        </svg>
+      </button>
       <button class="mini-btn" id="btn-shell-theme" type="button" title="切换浅色 / 深色模式 (⌘⇧D)" aria-label="切换浅色深色模式">
         <svg id="icon-moon" viewBox="0 0 24 24" aria-hidden="true">
           <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z" />
@@ -534,6 +548,7 @@
     const iconCopy = document.getElementById("icon-copy");
     const iconCheck = document.getElementById("icon-check");
     const btnShellTheme = document.getElementById("btn-shell-theme");
+    const btnShellPin = document.getElementById("btn-shell-pin");
     const btnShellScreenshot = document.getElementById("btn-shell-screenshot");
     const iconMoon = document.getElementById("icon-moon");
     const iconSun = document.getElementById("icon-sun");
@@ -556,6 +571,10 @@
       if (btnActiveReload) btnActiveReload.title = `刷新当前页面 (${mod}R)`;
       if (btnCloudForward) btnCloudForward.title = `前进下一页 (${mod}])`;
       if (btnShellTheme) btnShellTheme.title = `切换浅色 / 深色模式 (${modShift}D)`;
+      if (btnShellPin) {
+        const pinned = Boolean(latestState?.settings?.alwaysOnTop);
+        btnShellPin.title = pinned ? `取消窗口置顶 (${modShift}T)` : `置顶窗口 (${modShift}T)`;
+      }
       if (btnShellScreenshot) {
         btnShellScreenshot.hidden = !isMac;
         btnShellScreenshot.title = `框选截图并直接粘贴到聊天框 (${modShift}X)`;
@@ -571,6 +590,12 @@
       if (isMac) rail.classList.add("mac");
       const isDark = state.settings?.theme === "dark";
       document.body.classList.toggle("dark", isDark);
+      const isPinned = state.settings?.alwaysOnTop === true;
+      if (btnShellPin) {
+        btnShellPin.classList.toggle("pinned", isPinned);
+        btnShellPin.setAttribute("aria-pressed", String(isPinned));
+        btnShellPin.title = isPinned ? `取消窗口置顶 (${modShift}T)` : `置顶窗口 (${modShift}T)`;
+      }
       if (iconMoon && iconSun) {
         iconMoon.toggleAttribute("hidden", isDark);
         iconSun.toggleAttribute("hidden", !isDark);
@@ -681,6 +706,12 @@
     });
     btnShellScreenshot?.addEventListener("click", () => {
       api?.captureScreenshot?.();
+    });
+    btnShellPin?.addEventListener("click", () => {
+      const next = !(latestState?.settings?.alwaysOnTop === true);
+      btnShellPin.classList.toggle("pinned", next);
+      btnShellPin.setAttribute("aria-pressed", String(next));
+      api?.setAlwaysOnTop?.(next);
     });
     btnPower.addEventListener("click", () => {
       const next = !(latestState?.settings?.localServerEnabled !== false);

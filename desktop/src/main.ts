@@ -640,6 +640,20 @@ function applyLaunchAtLoginSetting(): void {
   } catch {}
 }
 
+function applyAlwaysOnTop(enabled: boolean): boolean {
+  const next = Boolean(enabled);
+  settings = settingsStore.save({ alwaysOnTop: next });
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    try {
+      if (next) mainWindow.setAlwaysOnTop(true, "floating");
+      else mainWindow.setAlwaysOnTop(false);
+    } catch {}
+  }
+  setupApplicationMenu();
+  broadcastState();
+  return next;
+}
+
 function setupApplicationMenu(): void {
   const isMac = process.platform === "darwin";
   const toggleActiveDevTools = () => {
@@ -790,6 +804,14 @@ function setupApplicationMenu(): void {
       submenu: [
         { role: "minimize" },
         { role: "close" },
+        { type: "separator" },
+        {
+          label: "Keep Window on Top",
+          type: "checkbox",
+          checked: settings.alwaysOnTop === true,
+          accelerator: "CmdOrCtrl+Shift+T",
+          click: () => applyAlwaysOnTop(!(settings.alwaysOnTop === true)),
+        },
         ...(isMac ? [{ type: "separator" as const }, { role: "front" as const }] : []),
       ],
     },
@@ -848,6 +870,15 @@ function rebuildTrayMenu(): void {
     {
       label: "Capture Screenshot to Chat (⌘⇧X)",
       click: () => void captureScreenshotToChat(),
+    },
+    {
+      label: "Keep Window on Top",
+      type: "checkbox",
+      checked: settings.alwaysOnTop === true,
+      click: () => {
+        showMainWindow();
+        applyAlwaysOnTop(!(settings.alwaysOnTop === true));
+      },
     },
     { type: "separator" },
     {
@@ -1012,6 +1043,12 @@ async function createDesktopWindow(): Promise<void> {
       sandbox: true,
     },
   });
+
+  if (settings.alwaysOnTop === true) {
+    try {
+      mainWindow.setAlwaysOnTop(true, "floating");
+    } catch {}
+  }
 
   await mainWindow.loadFile(join(UI_DIR, "shell.html"));
 
@@ -1218,6 +1255,13 @@ function registerIpcHandlers(): void {
     if (!isShell && !isLocal) return { ok: false };
     applyDesktopTheme(nextTheme);
     return { ok: true, theme: nextTheme };
+  });
+
+  ipcMain.handle("desktop:set-always-on-top", (ev, enabled: unknown) => {
+    const isShell = Boolean(mainWindow && !mainWindow.isDestroyed() && ev.sender === mainWindow.webContents);
+    if (!isShell) return { ok: false };
+    const pinned = applyAlwaysOnTop(Boolean(enabled));
+    return { ok: true, alwaysOnTop: pinned };
   });
 
   ipcMain.on("desktop:cloud-theme-observed", (ev, rawTheme: unknown) => {

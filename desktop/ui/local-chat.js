@@ -434,13 +434,19 @@
       i2.style.display = "none";
     }
     const activeField = useMulti ? ta : i1;
+    const prevFocus = document.activeElement;
     return new Promise((resolve) => {
       const form = document.getElementById("dialog-form");
       const cancelBtn = document.getElementById("dialog-cancel");
       const onFieldKey = (ev) => {
-        if (useMulti && ev.key === "Enter" && (ev.metaKey || ev.ctrlKey)) {
+        if (useMulti && ev.key === "Enter" && (ev.metaKey || ev.ctrlKey) && !ev.isComposing) {
           ev.preventDefault();
           onSubmit(ev);
+        }
+      };
+      const restoreFocus = () => {
+        if (prevFocus && typeof prevFocus.focus === "function" && document.contains(prevFocus)) {
+          try { prevFocus.focus(); } catch {}
         }
       };
       const onDialogCancel = (ev) => {
@@ -449,6 +455,7 @@
       };
       const onDialogClose = () => {
         cleanup();
+        restoreFocus();
         resolve(null);
       };
       const cleanup = () => {
@@ -462,11 +469,13 @@
         ev.preventDefault();
         cleanup();
         dlg.close();
+        restoreFocus();
         resolve({ v1: activeField.value.trim(), v2: i2.value.trim() });
       };
       const onCancel = () => {
         cleanup();
         dlg.close();
+        restoreFocus();
         resolve(null);
       };
       form.addEventListener("submit", onSubmit);
@@ -510,6 +519,7 @@
       confirmBtn.classList.toggle("btn-primary", !danger);
     }
     if (cancelBtn) cancelBtn.textContent = cancelText;
+    const prevFocus = document.activeElement;
     return new Promise((resolve) => {
       const form = document.getElementById("dialog-form");
       let settled = false;
@@ -521,8 +531,15 @@
         }
         if (cancelBtn) cancelBtn.textContent = "取消";
       };
+      const onFormKey = (ev) => {
+        if (ev.key === "Enter" && !ev.isComposing && cancelBtn && document.activeElement === cancelBtn) {
+          ev.preventDefault();
+          finish(false);
+        }
+      };
       const cleanup = () => {
         form.removeEventListener("submit", onSubmit);
+        form.removeEventListener("keydown", onFormKey);
         cancelBtn?.removeEventListener("click", onCancel);
         dlg.removeEventListener("cancel", onDialogCancel);
         dlg.removeEventListener("close", onDialogClose);
@@ -533,6 +550,9 @@
         settled = true;
         cleanup();
         if (dlg.open) dlg.close();
+        if (prevFocus && typeof prevFocus.focus === "function" && document.contains(prevFocus)) {
+          try { prevFocus.focus(); } catch {}
+        }
         resolve(accepted);
       };
       const onSubmit = (ev) => {
@@ -546,6 +566,7 @@
       };
       const onDialogClose = () => finish(false);
       form.addEventListener("submit", onSubmit);
+      form.addEventListener("keydown", onFormKey);
       cancelBtn?.addEventListener("click", onCancel);
       dlg.addEventListener("cancel", onDialogCancel);
       dlg.addEventListener("close", onDialogClose);
@@ -1098,6 +1119,7 @@
   }
 
   let channelLoadSeq = 0;
+  let isSendingChat = false;
 
   function autoResizeLocalInput() {
     if (!elInput) return;
@@ -1109,7 +1131,8 @@
   function syncComposerState() {
     autoResizeLocalInput();
     if (elBtnSend && elInput) {
-      elBtnSend.disabled = !String(elInput.value || "").trim();
+      elBtnSend.disabled = isSendingChat || !String(elInput.value || "").trim();
+      elBtnSend.textContent = isSendingChat ? "发送中…" : "发送";
     }
   }
 
@@ -2358,30 +2381,57 @@
   }
 
   async function sendChatText(rawText) {
+    if (isSendingChat) return;
     const text = String(rawText ?? elInput.value).trim();
     if (!text) return;
     if (!authToken) {
       showToast("请先同步或填入全局账号凭证");
       return;
     }
+    const targetChannel = currentChannelId;
+    const savedReply = replyTarget ? { ...replyTarget } : null;
+    isSendingChat = true;
     pendingUnreadBanner = null;
     elInput.value = "";
-    clearLocalDraft(currentChannelId);
+    clearLocalDraft(targetChannel);
+    setReplyTarget(null);
     syncComposerState();
     const payload = { content: text };
-    if (replyTarget?.id) payload.in_reply_to = replyTarget.id;
-    setReplyTarget(null);
-    const res = await api(`/api/channels/${encodeURIComponent(currentChannelId)}/messages`, {
-      method: "POST",
-      body: JSON.stringify(payload),
-    });
-    if (!res.ok) {
-      showToast(res.data?.error || "发送失败");
-      return;
-    }
-    if (res.data?.message && !messages.some((m) => m.id === res.data.message.id)) {
-      messages.push(res.data.message);
-      renderMessages();
+    if (savedReply?.id) payload.in_reply_to = savedReply.id;
+
+    const restoreFailedDraft = () => {
+      saveLocalDraft(targetChannel, text);
+      if (currentChannelId === targetChannel && elInput && !String(elInput.value || "").trim()) {
+        elInput.value = text;
+        if (savedReply && !replyTarget) setReplyTarget(savedReply);
+        elInput.focus();
+      }
+    };
+
+    try {
+      const res = await api(`/api/channels/${encodeURIComponent(targetChannel)}/messages`, {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) {
+        restoreFailedDraft();
+        showToast(res.data?.error || "发送失败，已保留原消息内容");
+        return;
+      }
+      if (
+        currentChannelId === targetChannel &&
+        res.data?.message &&
+        !messages.some((m) => m.id === res.data.message.id)
+      ) {
+        messages.push(res.data.message);
+        renderMessages();
+      }
+    } catch {
+      restoreFailedDraft();
+      showToast("发送失败，请重试（原消息已保留）");
+    } finally {
+      isSendingChat = false;
+      syncComposerState();
     }
   }
 
@@ -2670,7 +2720,9 @@
 
     const foot = document.createElement("div");
     foot.className = "local-switcher-foot";
-    for (const tip of ["↑↓ 选择", "↵ 执行", "⌥↑↓ 切换频道", "⌘F 搜消息"]) {
+    const switcherMod = isMacPlatform() ? "⌘" : "Ctrl+";
+    const switcherAlt = isMacPlatform() ? "⌥" : "Alt+";
+    for (const tip of ["↑↓ 选择", "↵ 执行", `${switcherAlt}↑↓ 切换频道`, `${switcherMod}F 搜消息`]) {
       const sp = document.createElement("span");
       sp.textContent = tip;
       foot.appendChild(sp);
@@ -2683,7 +2735,9 @@
     document.body.appendChild(switcherBg);
 
     switcherBg.addEventListener("click", (ev) => {
-      if (ev.target === switcherBg) closeLocalSwitcher();
+      const downTarget = _localDialogDownTarget;
+      _localDialogDownTarget = null;
+      if (ev.target === switcherBg && (!downTarget || downTarget === switcherBg)) closeLocalSwitcher();
     });
     switcherInput.addEventListener("input", () => {
       switcherIdx = 0;
@@ -2749,11 +2803,35 @@
     }
   }
 
+  function isMacPlatform() {
+    if (bridge?.platform) return bridge.platform === "darwin";
+    return /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent || "");
+  }
+
+  function applyLocalPlatformShortcuts() {
+    const isMac = isMacPlatform();
+    const mod = isMac ? "⌘" : "Ctrl+";
+    const modShift = isMac ? "⌘⇧" : "Ctrl+Shift+";
+    if (elSearchInput) elSearchInput.placeholder = `搜索本房间消息 (${mod}F)`;
+    const btnQs = document.getElementById("btn-quick-switcher");
+    if (btnQs) {
+      btnQs.textContent = isMac ? "⌘K" : "Ctrl+K";
+      btnQs.title = `快速跳转房间与指令面板 (${mod}K)`;
+      btnQs.setAttribute("aria-label", `快速切换与指令面板 (${mod}K)`);
+    }
+    const hint = document.querySelector(".composer-hint");
+    if (hint) hint.textContent = `Enter 发送 · Shift+Enter 换行 · ${mod}/ 聚焦`;
+    const btnPrev = document.getElementById("btn-search-prev");
+    const btnNext = document.getElementById("btn-search-next");
+    if (btnPrev) btnPrev.title = `上一处匹配 (Shift+Enter / ${modShift}G)`;
+    if (btnNext) btnNext.title = `下一处匹配 (Enter / ${mod}G)`;
+  }
+
   function openLocalShortcutsCheatsheet() {
     closeLocalSwitcher();
     closeChannelContextMenu();
     kbdPrevFocus = document.activeElement;
-    const isMac = /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent || "");
+    const isMac = isMacPlatform();
     const mod = isMac ? "⌘" : "Ctrl";
     const alt = isMac ? "⌥" : "Alt";
     const shift = isMac ? "⇧" : "Shift";
@@ -2766,7 +2844,9 @@
       kbdBg.setAttribute("aria-modal", "true");
       kbdBg.setAttribute("aria-label", "快捷键一览");
       kbdBg.addEventListener("click", (ev) => {
-        if (ev.target === kbdBg) closeLocalShortcutsCheatsheet();
+        const downTarget = _localDialogDownTarget;
+        _localDialogDownTarget = null;
+        if (ev.target === kbdBg && (!downTarget || downTarget === kbdBg)) closeLocalShortcutsCheatsheet();
       });
       document.body.appendChild(kbdBg);
     }
@@ -2796,6 +2876,7 @@
           ["搜索当前房间消息", [mod, "F"]],
           ["跳转下一处 / 上一处搜索匹配", [mod, "G", "/", shift, "Enter"]],
           ["切换上 / 下一个会话", [alt, "↑", "/", "↓"]],
+          ["跳转上 / 下一个未读会话", [alt, shift, "↑", "/", "↓"]],
           ["切换浅色 / 深色模式", ["T"]],
           ["打开快捷键一览", ["?"]],
         ],
@@ -2812,9 +2893,10 @@
         ],
       },
       {
-        title: "桌面客户端（macOS）",
+        title: isMac ? "桌面客户端（macOS）" : "桌面客户端",
         rows: [
-          ["全局截屏并自动粘贴到聊天", ["⌘", "⇧", "X"]],
+          ...(isMac ? [["全局截屏并自动粘贴到聊天", ["⌘", "⇧", "X"]]] : []),
+          ["切换窗口置顶", [mod, shift, "T"]],
           ["界面放大 / 缩小 / 还原默认", [mod, "+", "/", "−", "/", "0"]],
         ],
       },
@@ -3047,14 +3129,30 @@
       }
     }
     if (ev.altKey && !ev.metaKey && !ev.ctrlKey && (ev.key === "ArrowUp" || ev.key === "ArrowDown")) {
-      if (channels.length > 1) {
+      if (channels.length > 0) {
         ev.preventDefault();
         const curIdx = channels.findIndex((c) => c.id === currentChannelId);
         const base = curIdx >= 0 ? curIdx : 0;
         const delta = ev.key === "ArrowDown" ? 1 : -1;
-        const nextCh = channels[(base + delta + channels.length) % channels.length];
-        if (nextCh && nextCh.id !== currentChannelId) {
-          void selectChannel(nextCh.id);
+        if (ev.shiftKey) {
+          let found = null;
+          for (let step = 1; step <= channels.length; step++) {
+            const candidate = channels[(base + delta * step + channels.length * step) % channels.length];
+            if (candidate && candidate.id !== currentChannelId && (unreadCounts.get(candidate.id) || 0) > 0) {
+              found = candidate;
+              break;
+            }
+          }
+          if (found) {
+            void selectChannel(found.id);
+          } else {
+            showToast("当前没有未读会话");
+          }
+        } else if (channels.length > 1) {
+          const nextCh = channels[(base + delta + channels.length) % channels.length];
+          if (nextCh && nextCh.id !== currentChannelId) {
+            void selectChannel(nextCh.id);
+          }
         }
       }
       return;
@@ -3698,6 +3796,7 @@
   });
 
   // Boot
+  applyLocalPlatformShortcuts();
   syncComposerState();
   (async () => {
     if (bridge?.getServerStatus) {

@@ -13,6 +13,7 @@ export const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   allowLan: false,
   minimizeToTray: true,
   launchAtLogin: false,
+  alwaysOnTop: false,
   zoomFactor: 1,
 };
 
@@ -58,6 +59,7 @@ export function sanitizeDesktopSettings(raw: Partial<DesktopSettings> | null | u
     allowLan: s.allowLan === true,
     minimizeToTray: s.minimizeToTray !== false,
     launchAtLogin: s.launchAtLogin === true,
+    alwaysOnTop: s.alwaysOnTop === true,
     zoomFactor: s.zoomFactor !== undefined ? clampDesktopZoomFactor(s.zoomFactor) : 1,
     ...(windowBounds ? { windowBounds } : {}),
   };

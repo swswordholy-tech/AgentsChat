@@ -719,4 +719,51 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     expect(mainTs).toContain("Dashboard (⌘6)");
     expect(mainTs).toContain("desktop:open-cloud-browser");
   });
+
+  test("Desktop 2.7 adds persistent Always-on-Top pin, lossless Local Hub send with retry-restore, IME/Cancel/focus dialog guards, drag-safe overlays, platform shortcuts & Alt+Shift unread jump", () => {
+    // 1. Settings sanitization & persistence for alwaysOnTop
+    expect(DEFAULT_DESKTOP_SETTINGS.alwaysOnTop).toBe(false);
+    expect(sanitizeDesktopSettings({}).alwaysOnTop).toBe(false);
+    expect(sanitizeDesktopSettings({ alwaysOnTop: true }).alwaysOnTop).toBe(true);
+    expect(sanitizeDesktopSettings({ alwaysOnTop: "yes" as any }).alwaysOnTop).toBe(false);
+    const store = new DesktopSettingsStore(join(tempDir, "settings-pin.json"));
+    expect(store.load().alwaysOnTop).toBe(false);
+    expect(store.save({ alwaysOnTop: true }).alwaysOnTop).toBe(true);
+    expect(store.load().alwaysOnTop).toBe(true);
+
+    // 2. Shell, preload & main process Always-on-Top wiring + strict shell-only IPC check
+    const mainTs = readFileSync(join(import.meta.dir, "..", "src", "main.ts"), "utf8");
+    expect(mainTs).toContain("function applyAlwaysOnTop(enabled: boolean)");
+    expect(mainTs).toContain('setAlwaysOnTop(true, "floating")');
+    expect(mainTs).toContain('accelerator: "CmdOrCtrl+Shift+T"');
+    expect(mainTs).toContain('label: "Keep Window on Top"');
+    expect(mainTs).toContain('ipcMain.handle("desktop:set-always-on-top"');
+
+    const preloadJs = readFileSync(join(import.meta.dir, "..", "ui", "preload.cjs"), "utf8");
+    expect(preloadJs).toContain('setAlwaysOnTop: (enabled) => ipcRenderer.invoke("desktop:set-always-on-top"');
+
+    const shellHtml = readFileSync(join(import.meta.dir, "..", "ui", "shell.html"), "utf8");
+    const shellScript = shellHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1] || "";
+    expect(() => new Function(shellScript)).not.toThrow();
+    expect(shellHtml).toContain('id="btn-shell-pin"');
+    expect(shellHtml).toContain(".mini-btn.pinned");
+    expect(shellHtml).toContain("api?.setAlwaysOnTop?.(next)");
+    expect(shellHtml).toContain("取消窗口置顶");
+
+    // 3. Local Hub lossless messaging, IME/Cancel/Focus dialogs, drag-safe overlays, platform shortcuts & Alt+Shift unread jump
+    const localJs = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.js"), "utf8");
+    expect(() => new Function(localJs)).not.toThrow();
+    expect(localJs).toContain("let isSendingChat = false;");
+    expect(localJs).toContain("if (isSendingChat) return;");
+    expect(localJs).toContain("const restoreFailedDraft = () =>");
+    expect(localJs).toContain("saveLocalDraft(targetChannel, text);");
+    expect(localJs).toContain("if (savedReply && !replyTarget) setReplyTarget(savedReply);");
+    expect(localJs).toContain("(ev.metaKey || ev.ctrlKey) && !ev.isComposing");
+    expect(localJs).toContain("document.activeElement === cancelBtn");
+    expect(localJs).toContain("if (ev.target === switcherBg && (!downTarget || downTarget === switcherBg))");
+    expect(localJs).toContain("if (ev.target === kbdBg && (!downTarget || downTarget === kbdBg))");
+    expect(localJs).toContain("function applyLocalPlatformShortcuts()");
+    expect(localJs).toContain("当前没有未读会话");
+    expect(localJs).toContain("切换窗口置顶");
+  });
 });
