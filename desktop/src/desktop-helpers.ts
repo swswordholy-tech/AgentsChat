@@ -482,6 +482,75 @@ export function computeCenteredWindowBounds(
   return { x, y, width, height };
 }
 
+export interface SavedWindowBounds {
+  x?: number;
+  y?: number;
+  width?: number;
+  height?: number;
+}
+
+/**
+ * Resolve restored window bounds safely against the matching display's workArea.
+ * Clamps oversized windows (e.g. saved on an external 4K display, restored after
+ * undocking to a smaller laptop panel) so the window fits completely inside the
+ * visible workArea, and omits off-screen x/y coordinates cleanly.
+ */
+export function resolveRestoredWindowBounds(
+  saved: SavedWindowBounds | null | undefined,
+  workArea: RectBounds | null | undefined,
+  defaultWidth = 1320,
+  defaultHeight = 860,
+  minWidth = 880,
+  minHeight = 560,
+): { width: number; height: number; x?: number; y?: number } {
+  const rawW = Number(saved?.width);
+  const rawH = Number(saved?.height);
+  const baseW = Number.isFinite(rawW) && rawW > 0 ? Math.round(rawW) : defaultWidth;
+  const baseH = Number.isFinite(rawH) && rawH > 0 ? Math.round(rawH) : defaultHeight;
+
+  if (
+    !workArea ||
+    !Number.isFinite(workArea.width) ||
+    !Number.isFinite(workArea.height) ||
+    workArea.width <= 0 ||
+    workArea.height <= 0
+  ) {
+    return {
+      width: Math.max(minWidth, baseW),
+      height: Math.max(minHeight, baseH),
+    };
+  }
+
+  const waX = Number.isFinite(workArea.x) ? Math.round(workArea.x) : 0;
+  const waY = Number.isFinite(workArea.y) ? Math.round(workArea.y) : 0;
+  const waW = Math.max(320, Math.round(workArea.width));
+  const waH = Math.max(240, Math.round(workArea.height));
+
+  const clampedMinW = Math.min(minWidth, waW);
+  const clampedMinH = Math.min(minHeight, waH);
+  const width = Math.min(waW, Math.max(clampedMinW, baseW));
+  const height = Math.min(waH, Math.max(clampedMinH, baseH));
+
+  const rawX = saved?.x;
+  const rawY = saved?.y;
+  if (typeof rawX === "number" && Number.isFinite(rawX) && typeof rawY === "number" && Number.isFinite(rawY)) {
+    const sx = Math.round(rawX);
+    const sy = Math.round(rawY);
+    const intersects =
+      sx < waX + waW - 80 &&
+      sx + baseW > waX + 80 &&
+      sy < waY + waH - 60 &&
+      sy + baseH > waY + 40;
+    if (intersects) {
+      const x = Math.min(waX + waW - width, Math.max(waX, sx));
+      const y = Math.min(waY + waH - height, Math.max(waY, sy));
+      return { width, height, x, y };
+    }
+  }
+
+  return { width, height };
+}
+
 /**
  * Clamp and round Electron webContents zoom factor to a safe, comfortable range [0.75, 1.75].
  */

@@ -415,6 +415,20 @@ body.dark .section-count.has-online {
 }
 .channel-item:hover { background: var(--bg-sidebar-hover); }
 .channel-item.active { background: var(--bg-sidebar-active); }
+.channel-item:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: -2px;
+}
+.bot-id.copyable:focus-visible,
+.icon-btn:focus-visible,
+.local-switcher-item:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 2px;
+}
+.icon-btn:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
 
 .ch-avatar {
   position: relative;

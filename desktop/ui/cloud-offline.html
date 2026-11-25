@@ -264,7 +264,10 @@
   </main>
   <script>
     const params = new URLSearchParams(window.location.search);
-    if (params.get("theme") === "dark") document.body.classList.add("dark");
+    if (params.get("theme") === "dark") {
+      document.body.classList.add("dark");
+      document.documentElement.style.colorScheme = "dark";
+    }
     const remote = params.get("remote") || "https://agents-chat.com";
     const reason = params.get("reason") || "NETWORK_UNREACHABLE";
     const diagText = `${remote} (${reason})`;
@@ -289,6 +292,7 @@
       if (retryLink) {
         retryLink.classList.add("retrying");
         retryLink.setAttribute("aria-disabled", "true");
+        retryLink.setAttribute("aria-busy", "true");
       }
       if (retryLabel) retryLabel.textContent = "正在重连…";
       if (autoStatus) autoStatus.textContent = "正在重新连接 AgentsChat Cloud…";
@@ -367,7 +371,7 @@
     });
 
     document.addEventListener("keydown", (ev) => {
-      if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+      if (ev.isComposing || ev.keyCode === 229 || ev.metaKey || ev.ctrlKey || ev.altKey) return;
       if (ev.key === "Enter") {
         if (document.activeElement === copyDiagBtn || document.activeElement === toggleBtn || document.activeElement === localLink) {
           return;

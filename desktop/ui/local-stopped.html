@@ -210,7 +210,10 @@
   </main>
   <script>
     const params = new URLSearchParams(window.location.search);
-    if (params.get("theme") === "dark") document.body.classList.add("dark");
+    if (params.get("theme") === "dark") {
+      document.body.classList.add("dark");
+      document.documentElement.style.colorScheme = "dark";
+    }
     const rawPort = Number(params.get("port"));
     const port = Number.isInteger(rawPort) && rawPort >= 1024 && rawPort <= 65535 ? rawPort : 8787;
     const metaEl = document.getElementById("port-meta");
@@ -228,6 +231,7 @@
       if (startLink) {
         startLink.classList.add("starting");
         startLink.setAttribute("aria-disabled", "true");
+        startLink.setAttribute("aria-busy", "true");
       }
       if (startLabel) startLabel.textContent = "正在启动…";
       if (statusEl) statusEl.textContent = `正在启动本机 Server (:${port})…`;
@@ -240,7 +244,7 @@
     });
 
     document.addEventListener("keydown", (ev) => {
-      if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+      if (ev.isComposing || ev.keyCode === 229 || ev.metaKey || ev.ctrlKey || ev.altKey) return;
       if (ev.key === "Enter") {
         if (document.activeElement === cloudLink) return;
         ev.preventDefault();

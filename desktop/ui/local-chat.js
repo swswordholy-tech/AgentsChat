@@ -505,7 +505,11 @@
       const form = document.getElementById("dialog-form");
       const cancelBtn = document.getElementById("dialog-cancel");
       const onFieldKey = (ev) => {
-        if (useMulti && ev.key === "Enter" && (ev.metaKey || ev.ctrlKey) && !ev.isComposing) {
+        if (ev.key === "Enter" && isImeComposing(ev)) {
+          ev.preventDefault();
+          return;
+        }
+        if (useMulti && ev.key === "Enter" && (ev.metaKey || ev.ctrlKey) && !isImeComposing(ev)) {
           ev.preventDefault();
           onSubmit(ev);
         }
@@ -598,7 +602,7 @@
         if (cancelBtn) cancelBtn.textContent = "取消";
       };
       const onFormKey = (ev) => {
-        if (ev.key === "Enter" && !ev.isComposing && cancelBtn && document.activeElement === cancelBtn) {
+        if (ev.key === "Enter" && !isImeComposing(ev) && cancelBtn && document.activeElement === cancelBtn) {
           ev.preventDefault();
           finish(false);
         }
@@ -936,11 +940,22 @@
     ordered.forEach(({ ch, pinned }) => {
       const btn = document.createElement("button");
       btn.type = "button";
+      const isCurrent = ch.id === currentChannelId;
       btn.className =
         "channel-item" +
-        (ch.id === currentChannelId ? " active" : "") +
+        (isCurrent ? " active" : "") +
         (pinned ? " pinned" : "");
       btn.dataset.channelId = ch.id;
+      if (isCurrent) btn.setAttribute("aria-current", "page");
+
+      const displayLabel = ch.type === "direct" ? (ch.name || ch.id) : `#${ch.name || ch.id}`;
+      const unread = unreadByChannel.get(ch.id) || 0;
+      const draftText = !isCurrent ? getLocalDraft(ch.id) : "";
+      const ariaParts = [displayLabel];
+      if (pinned) ariaParts.push("已置顶");
+      if (unread > 0 && !isCurrent) ariaParts.push(`${unread} 条未读`);
+      if (draftText) ariaParts.push("有草稿");
+      btn.setAttribute("aria-label", ariaParts.join("，"));
 
       const av = document.createElement("div");
       av.className = "ch-avatar";
@@ -950,8 +965,7 @@
       } else {
         av.appendChild(createSvgIcon(ch.visibility === "private" ? "lock" : "hash"));
       }
-      const unread = unreadByChannel.get(ch.id) || 0;
-      if (unread > 0 && ch.id !== currentChannelId) {
+      if (unread > 0 && !isCurrent) {
         const badge = document.createElement("span");
         badge.className = "ch-unread";
         badge.textContent = unread > 99 ? "99+" : String(unread);
@@ -964,7 +978,7 @@
       top.className = "ch-top";
       const name = document.createElement("span");
       name.className = "ch-name";
-      name.textContent = ch.type === "direct" ? (ch.name || ch.id) : `#${ch.name || ch.id}`;
+      name.textContent = displayLabel;
       top.appendChild(name);
       if (pinned) {
         const pin = document.createElement("span");
@@ -981,7 +995,6 @@
       }
       const sub = document.createElement("div");
       sub.className = "ch-sub";
-      const draftText = ch.id !== currentChannelId ? getLocalDraft(ch.id) : "";
       if (draftText) {
         const tag = document.createElement("span");
         tag.className = "ch-draft-prefix";
@@ -1100,6 +1113,7 @@
       idEl.textContent = `@${p.agent_id}`;
       idEl.setAttribute("role", "button");
       idEl.setAttribute("tabindex", "0");
+      idEl.setAttribute("aria-label", `复制 @${p.agent_id}`);
       idEl.title = "点击复制 @ID";
       const copyBotHandle = async (ev) => {
         ev.stopPropagation();
@@ -1131,6 +1145,8 @@
       btnInvite.addEventListener("click", async () => {
         if (btnInvite.disabled) return;
         btnInvite.disabled = true;
+        btnInvite.textContent = "处理中…";
+        btnInvite.setAttribute("aria-busy", "true");
         try {
           if (bridge?.activateDiscoveredProfile) {
             await bridge.activateDiscoveredProfile(p.profile_name);
@@ -1151,6 +1167,8 @@
           }
         } finally {
           btnInvite.disabled = false;
+          btnInvite.textContent = "入群";
+          btnInvite.removeAttribute("aria-busy");
         }
       });
 
@@ -1162,6 +1180,8 @@
       btnDm.addEventListener("click", async () => {
         if (btnDm.disabled) return;
         btnDm.disabled = true;
+        btnDm.textContent = "打开中…";
+        btnDm.setAttribute("aria-busy", "true");
         try {
           if (bridge?.activateDiscoveredProfile) {
             await bridge.activateDiscoveredProfile(p.profile_name);
@@ -1181,6 +1201,8 @@
           }
         } finally {
           btnDm.disabled = false;
+          btnDm.textContent = "私聊";
+          btnDm.removeAttribute("aria-busy");
         }
       });
 
@@ -1193,6 +1215,7 @@
         const cmd = `npx -y agentschat-mcp@latest --profile ${p.profile_name} --url ${originUrl}`;
         if (bridge?.copyText) await bridge.copyText(cmd);
         else await navigator.clipboard?.writeText(cmd);
+        flashCopyButton(btnCmd, "MCP");
         showToast(`已复制 ${p.profile_name} 本机 MCP 命令`);
       });
 
@@ -2778,7 +2801,7 @@
       {
         icon: "🔍",
         label: "搜索当前房间消息",
-        meta: "⌘F",
+        meta: isMacPlatform() ? "⌘F" : "Ctrl+F",
         kw: "search find 搜索",
         run: () => {
           elSearchInput?.focus();
@@ -2871,14 +2894,35 @@
     return entries;
   }
 
+  function syncLocalSwitcherActive(scrollIntoView = false) {
+    if (!switcherList) return;
+    const nodes = Array.from(switcherList.querySelectorAll(".local-switcher-item"));
+    let activeNode = null;
+    nodes.forEach((n, i) => {
+      const isAct = i === switcherIdx;
+      n.classList.toggle("active", isAct);
+      n.setAttribute("aria-selected", String(isAct));
+      if (isAct) activeNode = n;
+    });
+    if (switcherInput) {
+      if (activeNode && activeNode.id) switcherInput.setAttribute("aria-activedescendant", activeNode.id);
+      else switcherInput.removeAttribute("aria-activedescendant");
+    }
+    if (scrollIntoView && activeNode && typeof activeNode.scrollIntoView === "function") {
+      try { activeNode.scrollIntoView({ block: "nearest" }); } catch {}
+    }
+  }
+
   function renderLocalSwitcherList() {
     if (!switcherList) return;
     switcherItems = buildLocalSwitcherEntries(switcherInput ? switcherInput.value : "");
     if (switcherIdx >= switcherItems.length) switcherIdx = Math.max(0, switcherItems.length - 1);
     switcherList.replaceChildren();
     if (switcherItems.length === 0) {
+      if (switcherInput) switcherInput.removeAttribute("aria-activedescendant");
       const empty = document.createElement("div");
       empty.className = "local-switcher-empty";
+      empty.setAttribute("role", "status");
       empty.textContent = "没有匹配的本地房间或快捷指令";
       switcherList.appendChild(empty);
       return;
@@ -2889,14 +2933,19 @@
         lastSec = item.section;
         const sec = document.createElement("div");
         sec.className = "local-switcher-sec";
+        sec.setAttribute("role", "presentation");
         sec.textContent = lastSec;
         switcherList.appendChild(sec);
       }
       const btn = document.createElement("button");
       btn.type = "button";
+      btn.id = `local-switcher-opt-${idx}`;
+      btn.setAttribute("role", "option");
+      btn.setAttribute("aria-selected", String(idx === switcherIdx));
       btn.className = "local-switcher-item" + (idx === switcherIdx ? " active" : "");
       const ic = document.createElement("span");
       ic.className = "local-switcher-icon";
+      ic.setAttribute("aria-hidden", "true");
       ic.textContent = item.icon;
       const lbl = document.createElement("span");
       lbl.className = "local-switcher-label";
@@ -2916,10 +2965,10 @@
         btn.appendChild(badge);
       }
       btn.addEventListener("mouseenter", () => {
-        switcherIdx = idx;
-        switcherList.querySelectorAll(".local-switcher-item").forEach((n, i) => {
-          n.classList.toggle("active", i === idx);
-        });
+        if (switcherIdx !== idx) {
+          switcherIdx = idx;
+          syncLocalSwitcherActive(false);
+        }
       });
       btn.addEventListener("click", () => {
         closeLocalSwitcher();
@@ -2927,8 +2976,7 @@
       });
       switcherList.appendChild(btn);
     });
-    const activeNode = switcherList.querySelector(".local-switcher-item.active");
-    activeNode?.scrollIntoView?.({ block: "nearest" });
+    syncLocalSwitcherActive(true);
   }
 
   function ensureLocalSwitcher() {
@@ -2964,6 +3012,11 @@
     switcherInput.className = "local-switcher-input";
     switcherInput.placeholder = "快速跳转本地房间、私聊或执行快捷指令…";
     switcherInput.autocomplete = "off";
+    switcherInput.setAttribute("role", "combobox");
+    switcherInput.setAttribute("aria-autocomplete", "list");
+    switcherInput.setAttribute("aria-controls", "local-switcher-list");
+    switcherInput.setAttribute("aria-expanded", "false");
+    switcherInput.setAttribute("aria-label", "搜索本地房间或快捷指令");
 
     const escPill = document.createElement("span");
     escPill.className = "local-switcher-esc";
@@ -2974,13 +3027,16 @@
     head.appendChild(escPill);
 
     switcherList = document.createElement("div");
+    switcherList.id = "local-switcher-list";
     switcherList.className = "local-switcher-list";
+    switcherList.setAttribute("role", "listbox");
+    switcherList.setAttribute("aria-label", "房间与快捷指令");
 
     const foot = document.createElement("div");
     foot.className = "local-switcher-foot";
     const switcherMod = isMacPlatform() ? "⌘" : "Ctrl+";
     const switcherAlt = isMacPlatform() ? "⌥" : "Alt+";
-    for (const tip of ["↑↓ 选择", "↵ 执行", `${switcherAlt}↑↓ 切换频道`, `${switcherMod}F 搜消息`]) {
+    for (const tip of ["↑↓ / Home / End 选择", "↵ 执行", `${switcherAlt}↑↓ 切换频道`, `${switcherMod}F 搜消息`]) {
       const sp = document.createElement("span");
       sp.textContent = tip;
       foot.appendChild(sp);
@@ -3007,13 +3063,25 @@
         ev.preventDefault();
         if (switcherItems.length) {
           switcherIdx = (switcherIdx + 1) % switcherItems.length;
-          renderLocalSwitcherList();
+          syncLocalSwitcherActive(true);
         }
       } else if (ev.key === "ArrowUp") {
         ev.preventDefault();
         if (switcherItems.length) {
           switcherIdx = (switcherIdx - 1 + switcherItems.length) % switcherItems.length;
-          renderLocalSwitcherList();
+          syncLocalSwitcherActive(true);
+        }
+      } else if (ev.key === "Home") {
+        if (switcherItems.length) {
+          ev.preventDefault();
+          switcherIdx = 0;
+          syncLocalSwitcherActive(true);
+        }
+      } else if (ev.key === "End") {
+        if (switcherItems.length) {
+          ev.preventDefault();
+          switcherIdx = switcherItems.length - 1;
+          syncLocalSwitcherActive(true);
         }
       } else if (ev.key === "Enter") {
         ev.preventDefault();
@@ -3035,6 +3103,7 @@
     switcherInput.value = "";
     switcherIdx = 0;
     switcherBg.hidden = false;
+    switcherInput.setAttribute("aria-expanded", "true");
     renderLocalSwitcherList();
     switcherInput.focus();
   }
@@ -3042,6 +3111,10 @@
   function closeLocalSwitcher() {
     if (!switcherBg || switcherBg.hidden) return;
     switcherBg.hidden = true;
+    if (switcherInput) {
+      switcherInput.setAttribute("aria-expanded", "false");
+      switcherInput.removeAttribute("aria-activedescendant");
+    }
     if (switcherPrevFocus && typeof switcherPrevFocus.focus === "function") {
       try {
         switcherPrevFocus.focus();
@@ -3155,6 +3228,9 @@
       {
         title: isMac ? "桌面客户端（macOS）" : "桌面客户端",
         rows: [
+          ["快捷切换工作区（Cloud / 本地 / Studio / OKR）", [mod, "1", "–", "6"]],
+          ["复制当前页面链接 / 本机 MCP 命令", [mod, shift, "C"]],
+          ["启动 / 停止内置本机 Server", [mod, shift, "L"]],
           ...(isMac ? [["全局截屏并自动粘贴到聊天", ["⌘", "⇧", "X"]]] : []),
           ["切换窗口置顶", [mod, shift, "T"]],
           ["静音 / 恢复桌面通知", [mod, shift, "M"]],
@@ -3603,14 +3679,30 @@
     document.getElementById("connect-dialog").close();
   });
 
-  document.getElementById("btn-toggle-lan").addEventListener("click", async () => {
-    if (!bridge?.toggleAllowLan || !bridge?.getServerStatus) return;
-    const cur = await bridge.getServerStatus();
-    const next = !Boolean(cur?.allowLan);
-    const res = await bridge.toggleAllowLan(next);
-    if (res?.ok) {
-      showToast(next ? "已开放局域网接入 (0.0.0.0)" : "已切回仅本机回环 (127.0.0.1)");
-      await refreshConnectModal();
+  const btnToggleLan = document.getElementById("btn-toggle-lan");
+  btnToggleLan?.addEventListener("click", async () => {
+    if (!bridge?.toggleAllowLan || !bridge?.getServerStatus || btnToggleLan.disabled) return;
+    const prevLabel = btnToggleLan.textContent;
+    btnToggleLan.disabled = true;
+    btnToggleLan.textContent = "切换中…";
+    btnToggleLan.setAttribute("aria-busy", "true");
+    try {
+      const cur = await bridge.getServerStatus();
+      const next = !Boolean(cur?.allowLan);
+      const res = await bridge.toggleAllowLan(next);
+      if (res?.ok) {
+        showToast(next ? "已开放局域网接入 (0.0.0.0)" : "已切回仅本机回环 (127.0.0.1)");
+        await refreshConnectModal();
+      } else {
+        btnToggleLan.textContent = prevLabel;
+        showToast("局域网设置切换失败，请稍后重试");
+      }
+    } catch {
+      btnToggleLan.textContent = prevLabel;
+      showToast("局域网设置切换失败，请稍后重试");
+    } finally {
+      btnToggleLan.disabled = false;
+      btnToggleLan.removeAttribute("aria-busy");
     }
   });
 
@@ -3812,9 +3904,10 @@
   document.getElementById("btn-close-settings")?.addEventListener("click", () => {
     document.getElementById("settings-dialog").close();
   });
+  let savingLocalSettings = false;
   document.getElementById("settings-form")?.addEventListener("submit", async (ev) => {
     ev.preventDefault();
-    if (!bridge?.updateLocalSettings) return;
+    if (!bridge?.updateLocalSettings || savingLocalSettings) return;
     const portInput = document.getElementById("setting-port");
     const port = Number(portInput?.value);
     if (!Number.isInteger(port) || port < 1024 || port > 65535) {
@@ -3826,12 +3919,30 @@
     const allowLan = document.getElementById("setting-allow-lan").checked;
     const minimizeToTray = document.getElementById("setting-minimize-tray").checked;
     const launchAtLogin = document.getElementById("setting-launch-login").checked;
-    document.getElementById("settings-dialog").close();
-    const res = await bridge.updateLocalSettings({ localServerPort: port, allowLan, minimizeToTray, launchAtLogin });
-    if (res?.ok) {
-      showToast(`设置已保存（${res.status?.httpUrl || ""}）`);
-    } else {
+    const saveBtn = document.getElementById("btn-save-settings");
+    savingLocalSettings = true;
+    if (saveBtn) {
+      saveBtn.disabled = true;
+      saveBtn.textContent = "保存中…";
+      saveBtn.setAttribute("aria-busy", "true");
+    }
+    try {
+      const res = await bridge.updateLocalSettings({ localServerPort: port, allowLan, minimizeToTray, launchAtLogin });
+      if (res?.ok) {
+        document.getElementById("settings-dialog").close();
+        showToast(`设置已保存（${res.status?.httpUrl || ""}）`);
+      } else {
+        showToast("保存设置失败，请稍后重试");
+      }
+    } catch {
       showToast("保存设置失败，请稍后重试");
+    } finally {
+      savingLocalSettings = false;
+      if (saveBtn) {
+        saveBtn.disabled = false;
+        saveBtn.textContent = "保存并生效";
+        saveBtn.removeAttribute("aria-busy");
+      }
     }
   });
 

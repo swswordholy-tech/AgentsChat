@@ -40,6 +40,7 @@ import {
   parseUnreadCountFromTitle,
   resolveCloudQuickRoute,
   resolveOfflineRetryUrl,
+  resolveRestoredWindowBounds,
   resolveWorkspaceCopyAction,
   type CloudQuickRoute,
 } from "./desktop-helpers.js";
@@ -1196,30 +1197,33 @@ async function createDesktopWindow(): Promise<void> {
   const isMac = process.platform === "darwin";
   const windowIconPath = join(ASSETS_DIR, "icon.png");
 
-  // Restore saved bounds only if the saved position is still visible on a connected display
-  let initialWidth = settings.windowBounds?.width || 1320;
-  let initialHeight = settings.windowBounds?.height || 860;
-  let initialPos: { x?: number; y?: number } = {};
-  if (settings.windowBounds?.x !== undefined && settings.windowBounds?.y !== undefined) {
-    try {
-      const targetRect = {
-        x: settings.windowBounds.x,
-        y: settings.windowBounds.y,
-        width: initialWidth,
-        height: initialHeight,
-      };
-      const disp = screen.getDisplayMatching(targetRect);
-      const wa = disp.workArea;
-      const intersects =
-        targetRect.x < wa.x + wa.width - 80 &&
-        targetRect.x + targetRect.width > wa.x + 80 &&
-        targetRect.y < wa.y + wa.height - 60 &&
-        targetRect.y + targetRect.height > wa.y + 40;
-      if (intersects) {
-        initialPos = { x: targetRect.x, y: targetRect.y };
-      }
-    } catch {}
+  // Restore saved bounds safely, clamping into the connected display's workArea
+  let restoredBounds: { width: number; height: number; x?: number; y?: number } = {
+    width: settings.windowBounds?.width || 1320,
+    height: settings.windowBounds?.height || 860,
+  };
+  try {
+    const saved = settings.windowBounds;
+    const probeRect = {
+      x: saved?.x ?? 0,
+      y: saved?.y ?? 0,
+      width: saved?.width || 1320,
+      height: saved?.height || 860,
+    };
+    const disp =
+      saved?.x !== undefined && saved?.y !== undefined
+        ? screen.getDisplayMatching(probeRect)
+        : screen.getPrimaryDisplay();
+    restoredBounds = resolveRestoredWindowBounds(saved, disp?.workArea, 1320, 860, 880, 560);
+  } catch {
+    restoredBounds = resolveRestoredWindowBounds(settings.windowBounds, null, 1320, 860, 880, 560);
   }
+  const initialWidth = restoredBounds.width;
+  const initialHeight = restoredBounds.height;
+  const initialPos: { x?: number; y?: number } =
+    restoredBounds.x !== undefined && restoredBounds.y !== undefined
+      ? { x: restoredBounds.x, y: restoredBounds.y }
+      : {};
 
   try {
     nativeTheme.themeSource = settings.theme === "dark" ? "dark" : "light";

@@ -51,7 +51,7 @@
               <button type="button" class="ch-filter-pill" id="ch-filter-unread" role="tab" aria-selected="false">未读</button>
             </div>
           </div>
-          <div class="channel-list" id="channel-list"></div>
+          <div class="channel-list" id="channel-list" role="navigation" aria-label="本地会话列表"></div>
         </div>
 
         <div class="sidebar-group">
@@ -146,10 +146,10 @@
         </div>
       </div>
 
-      <div class="member-strip" id="member-strip"></div>
+      <div class="member-strip" id="member-strip" role="region" aria-label="房间成员"></div>
 
       <div class="messages-wrap">
-        <div class="messages-scroll" id="messages-box"></div>
+        <div class="messages-scroll" id="messages-box" aria-label="消息记录"></div>
         <button type="button" class="scroll-bottom-pill" id="btn-scroll-bottom" hidden>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14" /><path d="m19 12-7 7-7-7" /></svg>
           <span id="scroll-bottom-text">回到底部</span>
@@ -269,7 +269,7 @@
       </div>
       <div class="dialog-actions">
         <button type="button" class="btn btn-ghost" id="btn-close-settings">取消</button>
-        <button type="submit" class="btn btn-primary">保存并生效</button>
+        <button type="submit" class="btn btn-primary" id="btn-save-settings">保存并生效</button>
       </div>
     </form>
   </dialog>

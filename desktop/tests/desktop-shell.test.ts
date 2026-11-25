@@ -27,6 +27,7 @@ import {
   parseUnreadCountFromTitle,
   resolveCloudQuickRoute,
   resolveOfflineRetryUrl,
+  resolveRestoredWindowBounds,
   resolveWorkspaceCopyAction,
 } from "../src/desktop-helpers.js";
 import { GlobalIdentityAuthority } from "../src/identity-authority.js";
@@ -764,7 +765,7 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     expect(localJs).toContain("const restoreFailedDraft = () =>");
     expect(localJs).toContain("saveLocalDraft(targetChannel, text);");
     expect(localJs).toContain("if (savedReply && !replyTarget) setReplyTarget(savedReply);");
-    expect(localJs).toContain("(ev.metaKey || ev.ctrlKey) && !ev.isComposing");
+    expect(localJs).toContain("(ev.metaKey || ev.ctrlKey) && !isImeComposing(ev)");
     expect(localJs).toContain("document.activeElement === cancelBtn");
     expect(localJs).toContain("if (ev.target === switcherBg && (!downTarget || downTarget === switcherBg))");
     expect(localJs).toContain("if (ev.target === kbdBg && (!downTarget || downTarget === kbdBg))");
@@ -1055,5 +1056,98 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     const localCss = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.css"), "utf8");
     expect(localCss).toContain(".wx-quote-pill.jumpable:focus-visible");
     expect(localCss).toContain(".mention-opt:focus-visible");
+  });
+
+  test("Desktop 2.12 hardens multi-monitor window restoration, upgrades Cmd+K Quick Switcher 2.0 (in-place sync/Home/End/ARIA), updates shortcuts cheatsheet, adds busy/copy locks on bot/LAN/settings controls & IME/colorScheme guards on fallback pages", () => {
+    // 1. Pure helper: resolveRestoredWindowBounds clamps oversized 4K bounds into smaller laptop display & keeps position inside workArea
+    expect(
+      resolveRestoredWindowBounds(
+        { x: 100, y: 80, width: 2200, height: 1400 },
+        { x: 0, y: 25, width: 1440, height: 875 },
+      ),
+    ).toEqual({ width: 1440, height: 875, x: 0, y: 25 });
+
+    // Preserves valid bounds comfortably inside display
+    expect(
+      resolveRestoredWindowBounds(
+        { x: 120, y: 60, width: 1280, height: 800 },
+        { x: 0, y: 25, width: 1920, height: 1055 },
+      ),
+    ).toEqual({ width: 1280, height: 800, x: 120, y: 60 });
+
+    // Clamps partially overhanging coordinates back into visible workArea
+    expect(
+      resolveRestoredWindowBounds(
+        { x: 1400, y: 500, width: 1000, height: 700 },
+        { x: 0, y: 25, width: 1920, height: 1055 },
+      ),
+    ).toEqual({ width: 1000, height: 700, x: 920, y: 380 });
+
+    // Drops off-screen coordinates cleanly while returning clamped size
+    expect(
+      resolveRestoredWindowBounds(
+        { x: 4000, y: 3000, width: 1320, height: 860 },
+        { x: 0, y: 25, width: 1920, height: 1055 },
+      ),
+    ).toEqual({ width: 1320, height: 860 });
+
+    // Handles null/missing saved bounds gracefully
+    expect(resolveRestoredWindowBounds(null, { x: 0, y: 0, width: 1280, height: 720 })).toEqual({
+      width: 1280,
+      height: 720,
+    });
+
+    // 2. Main process wiring uses resolveRestoredWindowBounds
+    const mainTs = readFileSync(join(import.meta.dir, "..", "src", "main.ts"), "utf8");
+    expect(mainTs).toContain("resolveRestoredWindowBounds(");
+
+    // 3. Local Hub HTML landmarks & settings submit button ID
+    const localHtml = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.html"), "utf8");
+    expect(localHtml).toContain('id="channel-list" role="navigation" aria-label="本地会话列表"');
+    expect(localHtml).toContain('id="member-strip" role="region" aria-label="房间成员"');
+    expect(localHtml).toContain('id="messages-box" aria-label="消息记录"');
+    expect(localHtml).toContain('id="btn-save-settings"');
+
+    // 4. Local Hub JS: Cmd+K Quick Switcher 2.0, Shortcuts Cheatsheet parity, channel ARIA, bot busy/copy locks, LAN/settings re-entrancy locks & IME guards
+    const localJs = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.js"), "utf8");
+    expect(localJs).not.toMatch(/\.(?:innerHTML|outerHTML)\s*=|insertAdjacentHTML|document\.write\s*\(/);
+    expect(() => new Function(localJs)).not.toThrow();
+    expect(localJs).toContain("function syncLocalSwitcherActive(scrollIntoView = false)");
+    expect(localJs).toContain('switcherInput.setAttribute("role", "combobox")');
+    expect(localJs).toContain('switcherList.setAttribute("role", "listbox")');
+    expect(localJs).toContain('switcherInput.setAttribute("aria-activedescendant", activeNode.id)');
+    expect(localJs).toContain('else if (ev.key === "Home")');
+    expect(localJs).toContain('else if (ev.key === "End")');
+    expect(localJs).toContain('if (isCurrent) btn.setAttribute("aria-current", "page")');
+    expect(localJs).toContain('btnInvite.textContent = "处理中…"');
+    expect(localJs).toContain('btnDm.textContent = "打开中…"');
+    expect(localJs).toContain('flashCopyButton(btnCmd, "MCP")');
+    expect(localJs).toContain('btnToggleLan.textContent = "切换中…"');
+    expect(localJs).toContain("let savingLocalSettings = false;");
+    expect(localJs).toContain('saveBtn.textContent = "保存中…"');
+    expect(localJs).toContain("复制当前页面链接 / 本机 MCP 命令");
+    expect(localJs).toContain("启动 / 停止内置本机 Server");
+    expect(localJs).toContain("快捷切换工作区（Cloud / 本地 / Studio / OKR）");
+
+    // 5. Local Hub CSS focus-visible & disabled wait affordances
+    const localCss = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.css"), "utf8");
+    expect(localCss).toContain(".channel-item:focus-visible");
+    expect(localCss).toContain(".local-switcher-item:focus-visible");
+    expect(localCss).toContain(".icon-btn:disabled");
+
+    // 6. Fallback pages (cloud-offline.html & local-stopped.html): colorScheme dark sync, aria-busy & IME keydown guard
+    const offlineHtml = readFileSync(join(import.meta.dir, "..", "ui", "cloud-offline.html"), "utf8");
+    const offlineScript = offlineHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1] || "";
+    expect(() => new Function(offlineScript)).not.toThrow();
+    expect(offlineHtml).toContain('document.documentElement.style.colorScheme = "dark"');
+    expect(offlineHtml).toContain('retryLink.setAttribute("aria-busy", "true")');
+    expect(offlineHtml).toContain("ev.isComposing || ev.keyCode === 229");
+
+    const stoppedHtml = readFileSync(join(import.meta.dir, "..", "ui", "local-stopped.html"), "utf8");
+    const stoppedScript = stoppedHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1] || "";
+    expect(() => new Function(stoppedScript)).not.toThrow();
+    expect(stoppedHtml).toContain('document.documentElement.style.colorScheme = "dark"');
+    expect(stoppedHtml).toContain('startLink.setAttribute("aria-busy", "true")');
+    expect(stoppedHtml).toContain("ev.isComposing || ev.keyCode === 229");
   });
 });
