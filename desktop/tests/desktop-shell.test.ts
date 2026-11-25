@@ -11,6 +11,7 @@ import {
   classifyCloudRailSection,
   CLOUD_THEME_TOGGLE_SELECTOR,
   compareSemver,
+  computeCenteredWindowBounds,
   formatCopyableCloudUrl,
   formatDesktopWindowTitle,
   formatTrayTooltip,
@@ -820,5 +821,75 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     expect(localCss).toContain(".wx-md-quote");
     expect(localCss).toContain(".wx-md-heading");
     expect(localCss).toContain(".wx-sender-id.clickable:hover");
+  });
+
+  test("Desktop 2.9 fixes Alt+Shift unread jump crash, hardens Lightbox pan/Esc/focus, adds IME/dialog/tablist/context-menu a11y, offline diag copy & Reset Window Size & Center", () => {
+    // 1. Pure centered window geometry helper (standard, small display, secondary monitor offset)
+    expect(computeCenteredWindowBounds({ x: 0, y: 25, width: 1920, height: 1055 })).toEqual({
+      x: 300,
+      y: 123,
+      width: 1320,
+      height: 860,
+    });
+    // Small 1280x720 display clamps cleanly without overflowing workArea
+    expect(computeCenteredWindowBounds({ x: 0, y: 0, width: 1280, height: 720 })).toEqual({
+      x: 0,
+      y: 0,
+      width: 1280,
+      height: 720,
+    });
+    // Secondary display at negative X offset centers inside that display
+    expect(computeCenteredWindowBounds({ x: -1920, y: 0, width: 1920, height: 1080 })).toEqual({
+      x: -1620,
+      y: 110,
+      width: 1320,
+      height: 860,
+    });
+
+    // 2. Main process: Reset Window Size & Center, macOS-gated screenshot shortcut/tray/menu, cross-platform tray hints, silent DND screenshot notice
+    const mainTs = readFileSync(join(import.meta.dir, "..", "src", "main.ts"), "utf8");
+    expect(mainTs).toContain("function resetWindowSizeAndCenter(): boolean");
+    expect(mainTs).toContain('label: "Reset Window Size & Center"');
+    expect(mainTs).toContain('accelerator: "CmdOrCtrl+Shift+0"');
+    expect(mainTs).toContain('isMac ? "  Dashboard (⌘6)" : "  Dashboard (Ctrl+6)"');
+    expect(mainTs).toContain('if (process.platform === "darwin")');
+    expect(mainTs).toContain("silent: settings.notificationsMuted === true");
+
+    // 3. Offline fallback page: 1-click diagnostic copy, double-click-safe triggerRetry, P pause shortcut & focus-visible styles
+    const offlineHtml = readFileSync(join(import.meta.dir, "..", "ui", "cloud-offline.html"), "utf8");
+    const offlineScript = offlineHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1] || "";
+    expect(() => new Function(offlineScript)).not.toThrow();
+    expect(offlineHtml).toContain('id="btn-copy-diag"');
+    expect(offlineHtml).toContain("async function copyDiagnosticText()");
+    expect(offlineHtml).toContain("function toggleAutoRetry()");
+    expect(offlineHtml).toContain('retryLink.classList.add("retrying")');
+    expect(offlineHtml).toContain('else if (ev.key === "p" || ev.key === "P")');
+
+    // 4. Local Hub: no unreadCounts crash, pinned-first Alt+Up/Down & Alt+Shift+Up/Down, capture-phase Lightbox + pan guard + focus restore, IME guards, accessible dialogs/tablist/context-menu
+    const localJs = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.js"), "utf8");
+    expect(localJs).not.toMatch(/\.(?:innerHTML|outerHTML)\s*=|insertAdjacentHTML|document\.write\s*\(/);
+    expect(() => new Function(localJs)).not.toThrow();
+    expect(localJs).not.toContain("unreadCounts");
+    expect(localJs).toContain("function getOrderedChannels()");
+    expect(localJs).toContain("unreadByChannel.get(candidate.id)");
+    expect(localJs).toContain("function isImeComposing(ev)");
+    expect(localJs).toContain("function openNativeDialog(dlg)");
+    expect(localJs).toContain("function mountContextMenu(menu, clientX, clientY)");
+    expect(localJs).toContain("function selectHarnessTab(btn, shouldFocus = false)");
+    expect(localJs).toContain("function flashCopyButton(btn, defaultLabel)");
+    expect(localJs).toContain("localLbState.stageDownTarget");
+    expect(localJs).toContain("localLbState.justDragged");
+    expect(localJs).toContain("localLbState.prevFocus");
+    expect(localJs).toContain("!Number.isInteger(port) || port < 1024 || port > 65535");
+    expect(localJs).toContain("重置窗口大小并居中");
+
+    const localHtml = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.html"), "utf8");
+    expect(localHtml).toContain('data-harness="claude" role="tab" aria-selected="true" tabindex="0"');
+    expect(localHtml).toContain('data-harness="codex" role="tab" aria-selected="false" tabindex="-1"');
+
+    const localCss = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.css"), "utf8");
+    expect(localCss).toContain(".tab-btn:focus-visible");
+    expect(localCss).toContain(".local-ctx-item:focus-visible:not(:disabled)");
+    expect(localCss).toContain(".local-lb-close:focus-visible");
   });
 });

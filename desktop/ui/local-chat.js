@@ -41,6 +41,21 @@
   let sidebarUnreadOnly = false;
   let pendingUnreadBanner = null;
   let ctxMenuEl = null;
+  let ctxMenuPrevFocus = null;
+
+  function isImeComposing(ev) {
+    return Boolean(ev && (ev.isComposing || ev.keyCode === 229));
+  }
+
+  function getOrderedChannels() {
+    return channels
+      .map((ch, index) => ({ ch, index, pinned: isChannelPinned(ch?.id) }))
+      .filter(({ ch }) => Boolean(ch && ch.id))
+      .sort((a, b) => {
+        if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+        return a.index - b.index;
+      });
+  }
 
   function persistPinnedChannels() {
     try {
@@ -85,14 +100,62 @@
     }
     document.title = total > 0 ? `(${total > 99 ? "99+" : total}) AgentsChat Local Server` : "AgentsChat Local Server";
   }
-  function closeChannelContextMenu() {
+  function closeChannelContextMenu(restoreFocus = false) {
     if (ctxMenuEl) {
       ctxMenuEl.remove();
       ctxMenuEl = null;
     }
+    const prev = ctxMenuPrevFocus;
+    ctxMenuPrevFocus = null;
+    if (restoreFocus && prev && typeof prev.focus === "function" && document.contains(prev)) {
+      try { prev.focus(); } catch {}
+    }
   }
+
+  function mountContextMenu(menu, clientX, clientY) {
+    ctxMenuPrevFocus = document.activeElement;
+    document.body.appendChild(menu);
+    const rect = menu.getBoundingClientRect();
+    const x = Math.min(Math.max(8, clientX), Math.max(8, window.innerWidth - rect.width - 8));
+    const y = Math.min(Math.max(8, clientY), Math.max(8, window.innerHeight - rect.height - 8));
+    menu.style.left = `${x}px`;
+    menu.style.top = `${y}px`;
+    ctxMenuEl = menu;
+
+    const getEnabledItems = () =>
+      Array.from(menu.querySelectorAll('[role="menuitem"]:not(:disabled)'));
+
+    menu.addEventListener("keydown", (ev) => {
+      const items = getEnabledItems();
+      if (!items.length) return;
+      const curIdx = items.indexOf(document.activeElement);
+      if (ev.key === "ArrowDown") {
+        ev.preventDefault();
+        items[(curIdx + 1 + items.length) % items.length]?.focus();
+      } else if (ev.key === "ArrowUp") {
+        ev.preventDefault();
+        items[(curIdx <= 0 ? items.length - 1 : curIdx - 1)]?.focus();
+      } else if (ev.key === "Home") {
+        ev.preventDefault();
+        items[0]?.focus();
+      } else if (ev.key === "End") {
+        ev.preventDefault();
+        items[items.length - 1]?.focus();
+      } else if (ev.key === "Escape") {
+        ev.preventDefault();
+        ev.stopPropagation();
+        closeChannelContextMenu(true);
+      }
+    });
+
+    const first = getEnabledItems()[0];
+    if (first && typeof first.focus === "function") {
+      try { first.focus({ preventScroll: true }); } catch { try { first.focus(); } catch {} }
+    }
+  }
+
   function openChannelContextMenu(ch, clientX, clientY) {
-    closeChannelContextMenu();
+    closeChannelContextMenu(false);
     if (!ch || !ch.id) return;
     const menu = document.createElement("div");
     menu.id = "local-ctx-menu";
@@ -111,7 +174,7 @@
       item.textContent = label;
       item.addEventListener("click", (ev) => {
         ev.stopPropagation();
-        closeChannelContextMenu();
+        closeChannelContextMenu(false);
         onClick();
       });
       menu.appendChild(item);
@@ -134,19 +197,13 @@
       showToast(`已复制频道 ID: ${ch.id}`);
     });
 
-    document.body.appendChild(menu);
-    const rect = menu.getBoundingClientRect();
-    const x = Math.min(Math.max(8, clientX), Math.max(8, window.innerWidth - rect.width - 8));
-    const y = Math.min(Math.max(8, clientY), Math.max(8, window.innerHeight - rect.height - 8));
-    menu.style.left = `${x}px`;
-    menu.style.top = `${y}px`;
-    ctxMenuEl = menu;
+    mountContextMenu(menu, clientX, clientY);
   }
   document.addEventListener("click", (ev) => {
-    if (ctxMenuEl && !ctxMenuEl.contains(ev.target)) closeChannelContextMenu();
+    if (ctxMenuEl && !ctxMenuEl.contains(ev.target)) closeChannelContextMenu(false);
   });
-  window.addEventListener("blur", closeChannelContextMenu);
-  window.addEventListener("resize", closeChannelContextMenu);
+  window.addEventListener("blur", () => closeChannelContextMenu(false));
+  window.addEventListener("resize", () => closeChannelContextMenu(false));
   const draftsByChannel = (() => {
     const map = new Map();
     try {
@@ -580,6 +637,34 @@
     _localDialogDownTarget = ev.target;
   }, true);
 
+  function openNativeDialog(dlg) {
+    if (!dlg || typeof dlg.showModal !== "function") return;
+    const prevFocus = document.activeElement;
+    if (dlg.dataset.focusRestoreBound !== "1") {
+      dlg.dataset.focusRestoreBound = "1";
+      dlg.addEventListener("close", () => {
+        const prev = dlg._prevFocus;
+        dlg._prevFocus = null;
+        if (prev && typeof prev.focus === "function" && document.contains(prev)) {
+          try { prev.focus(); } catch {}
+        }
+      });
+    }
+    dlg._prevFocus = prevFocus;
+    dlg.showModal();
+  }
+
+  function flashCopyButton(btn, defaultLabel) {
+    if (!btn) return;
+    const baseLabel = btn.dataset.defaultLabel || defaultLabel || btn.textContent || "复制";
+    btn.dataset.defaultLabel = baseLabel;
+    btn.textContent = "✓ 已复制";
+    clearTimeout(btn._copyFlashTimer);
+    btn._copyFlashTimer = setTimeout(() => {
+      btn.textContent = baseLabel;
+    }, 1400);
+  }
+
   function bindDialogBackdropClose(dlg) {
     if (!dlg || dlg.dataset.backdropBound === "1") return;
     dlg.dataset.backdropBound = "1";
@@ -814,17 +899,10 @@
   function renderChannelList() {
     updateUnreadFilterUI();
     elChannelList.replaceChildren();
-    const ordered = channels
-      .map((ch, index) => ({ ch, index, pinned: isChannelPinned(ch?.id) }))
-      .filter(({ ch }) => {
-        if (!ch || !ch.id) return false;
-        if (!sidebarUnreadOnly) return true;
-        return ch.id !== currentChannelId && (unreadByChannel.get(ch.id) || 0) > 0;
-      })
-      .sort((a, b) => {
-        if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
-        return a.index - b.index;
-      });
+    const ordered = getOrderedChannels().filter(({ ch }) => {
+      if (!sidebarUnreadOnly) return true;
+      return ch.id !== currentChannelId && (unreadByChannel.get(ch.id) || 0) > 0;
+    });
 
     if (ordered.length === 0 && sidebarUnreadOnly) {
       const empty = document.createElement("div");
@@ -1378,6 +1456,9 @@
     tx: 0,
     ty: 0,
     dragging: false,
+    justDragged: false,
+    stageDownTarget: null,
+    prevFocus: null,
     dragStartX: 0,
     dragStartY: 0,
     originTx: 0,
@@ -1585,9 +1666,16 @@
     if (!localLbState.open) return;
     localLbState.open = false;
     localLbState.dragging = false;
+    localLbState.justDragged = false;
+    localLbState.stageDownTarget = null;
     if (localLbDom) {
       localLbDom.root.classList.remove("open");
       localLbDom.img.src = "";
+    }
+    const prev = localLbState.prevFocus;
+    localLbState.prevFocus = null;
+    if (prev && typeof prev.focus === "function" && document.contains(prev)) {
+      try { prev.focus(); } catch {}
     }
   }
 
@@ -1691,7 +1779,19 @@
     toolbar.append(zoomOutBtn, pctBtn, zoomInBtn, oneBtn, mkSep(), rotLeftBtn, rotRightBtn, mkSep(), copyBtn, dlBtn);
     dock.append(strip, toolbar);
 
-    stage.addEventListener("click", (e) => { if (e.target === stage) closeLocalImageLightbox(); });
+    stage.addEventListener("mousedown", (e) => {
+      localLbState.stageDownTarget = e.target;
+      localLbState.justDragged = false;
+    });
+    stage.addEventListener("click", (e) => {
+      const downTarget = localLbState.stageDownTarget;
+      localLbState.stageDownTarget = null;
+      if (localLbState.justDragged) {
+        localLbState.justDragged = false;
+        return;
+      }
+      if (e.target === stage && downTarget === stage) closeLocalImageLightbox();
+    });
     stage.addEventListener("wheel", (e) => {
       e.preventDefault();
       const dy = e.ctrlKey ? Math.max(-80, Math.min(80, e.deltaY)) : Math.max(-140, Math.min(140, e.deltaY));
@@ -1710,6 +1810,7 @@
       if (localLbState.scale <= 1.01) return;
       e.preventDefault();
       localLbState.dragging = true;
+      localLbState.justDragged = false;
       localLbState.dragStartX = e.clientX;
       localLbState.dragStartY = e.clientY;
       localLbState.originTx = localLbState.tx;
@@ -1718,9 +1819,12 @@
     });
     document.addEventListener("mousemove", (e) => {
       if (!localLbState.dragging || !localLbState.open) return;
+      const dx = e.clientX - localLbState.dragStartX;
+      const dy = e.clientY - localLbState.dragStartY;
+      if (Math.hypot(dx, dy) > 4) localLbState.justDragged = true;
       const cl = lbClampPan(
-        localLbState.originTx + (e.clientX - localLbState.dragStartX),
-        localLbState.originTy + (e.clientY - localLbState.dragStartY),
+        localLbState.originTx + dx,
+        localLbState.originTy + dy,
         localLbState.scale,
       );
       localLbState.tx = cl.tx;
@@ -1731,6 +1835,9 @@
       if (!localLbState.dragging) return;
       localLbState.dragging = false;
       if (localLbDom) localLbDom.img.classList.remove("dragging");
+      if (localLbState.justDragged) {
+        setTimeout(() => { localLbState.justDragged = false; }, 0);
+      }
     });
 
     root.append(topbar, stage, prevBtn, nextBtn, dock);
@@ -1758,11 +1865,17 @@
       items.push({ src: src.trim(), alt: "" });
       activeIdx = items.length - 1;
     }
+    localLbState.prevFocus = document.activeElement;
     localLbState.items = items;
     localLbState.index = activeIdx;
     localLbState.open = true;
+    localLbState.justDragged = false;
+    localLbState.stageDownTarget = null;
     lbUpdateView();
     dom.root.classList.add("open");
+    if (dom.closeBtn && typeof dom.closeBtn.focus === "function") {
+      try { dom.closeBtn.focus({ preventScroll: true }); } catch { try { dom.closeBtn.focus(); } catch {} }
+    }
     return true;
   }
 
@@ -2120,7 +2233,7 @@
   }
 
   function openMessageContextMenu(m, isSelf, clientX, clientY) {
-    closeChannelContextMenu();
+    closeChannelContextMenu(false);
     if (!m) return;
     const menu = document.createElement("div");
     menu.id = "local-ctx-menu";
@@ -2135,7 +2248,7 @@
       item.textContent = label;
       item.addEventListener("click", (ev) => {
         ev.stopPropagation();
-        closeChannelContextMenu();
+        closeChannelContextMenu(false);
         onClick();
       });
       menu.appendChild(item);
@@ -2155,13 +2268,7 @@
       addItem("🗑️ 撤回消息", () => { void deleteLocalMessage(m); }, true);
     }
 
-    document.body.appendChild(menu);
-    const rect = menu.getBoundingClientRect();
-    const x = Math.min(Math.max(8, clientX), Math.max(8, window.innerWidth - rect.width - 8));
-    const y = Math.min(Math.max(8, clientY), Math.max(8, window.innerHeight - rect.height - 8));
-    menu.style.left = `${x}px`;
-    menu.style.top = `${y}px`;
-    ctxMenuEl = menu;
+    mountContextMenu(menu, clientX, clientY);
   }
 
   elMessages?.addEventListener("contextmenu", (ev) => {
@@ -2798,6 +2905,7 @@
       renderLocalSwitcherList();
     });
     switcherInput.addEventListener("keydown", (ev) => {
+      if (isImeComposing(ev)) return;
       if (ev.key === "ArrowDown") {
         ev.preventDefault();
         if (switcherItems.length) {
@@ -2953,6 +3061,7 @@
           ...(isMac ? [["全局截屏并自动粘贴到聊天", ["⌘", "⇧", "X"]]] : []),
           ["切换窗口置顶", [mod, shift, "T"]],
           ["静音 / 恢复桌面通知", [mod, shift, "M"]],
+          ["重置窗口大小并居中", [mod, shift, "0"]],
           ["界面放大 / 缩小 / 还原默认", [mod, "+", "/", "−", "/", "0"]],
         ],
       },
@@ -3072,44 +3181,51 @@
     openLocalSwitcher();
   });
 
-  // Global shortcuts: Lightbox, Cmd/Ctrl+K command palette, Cmd/Ctrl+F search room, Cmd/Ctrl+G match stepper, ? shortcuts modal, Alt+Up/Down switch channel, Esc close/clear
+  // Capture-phase Lightbox shortcuts (prevents Escape from cancelling underlying composer replyTarget)
   window.addEventListener("keydown", (ev) => {
-    if (localLbState.open) {
-      if (ev.key === "Escape") { ev.preventDefault(); closeLocalImageLightbox(); return; }
-      if (ev.key === "ArrowLeft") { ev.preventDefault(); lbStep(-1); return; }
-      if (ev.key === "ArrowRight") { ev.preventDefault(); lbStep(1); return; }
-      if (ev.key === "+" || ev.key === "=") { ev.preventDefault(); lbSetScaleAt(localLbState.scale + 0.25, null, null, false); return; }
-      if (ev.key === "-" || ev.key === "_") { ev.preventDefault(); lbSetScaleAt(localLbState.scale - 0.25, null, null, false); return; }
-      if (ev.key === "0") { ev.preventDefault(); lbResetTransform(); return; }
-      if (ev.key === "1") {
-        ev.preventDefault();
-        if (localLbState.scale > 1.05) {
-          localLbState.scale = 1; localLbState.tx = 0; localLbState.ty = 0; lbApplyTransform(false);
-        } else {
-          lbSetScaleAt(2.5, null, null, false);
-        }
-        return;
-      }
-      if (ev.key === "r" || ev.key === "R") {
-        ev.preventDefault();
-        localLbState.rotate = (localLbState.rotate + (ev.shiftKey ? 270 : 90)) % 360;
-        const cl = lbClampPan(localLbState.tx, localLbState.ty, localLbState.scale);
-        localLbState.tx = cl.tx; localLbState.ty = cl.ty;
-        lbApplyTransform(false);
-        return;
-      }
-      if ((ev.key === "c" || ev.key === "C") && !ev.altKey) {
-        ev.preventDefault();
-        void lbCopyImage();
-        return;
-      }
-      if ((ev.key === "d" || ev.key === "D") && !ev.metaKey && !ev.ctrlKey && !ev.altKey) {
-        ev.preventDefault();
-        lbDownloadImage();
-        return;
+    if (!localLbState.open) return;
+    if (ev.key === "Escape") { ev.preventDefault(); ev.stopPropagation(); closeLocalImageLightbox(); return; }
+    if (ev.key === "ArrowLeft") { ev.preventDefault(); ev.stopPropagation(); lbStep(-1); return; }
+    if (ev.key === "ArrowRight") { ev.preventDefault(); ev.stopPropagation(); lbStep(1); return; }
+    if (ev.key === "+" || ev.key === "=") { ev.preventDefault(); ev.stopPropagation(); lbSetScaleAt(localLbState.scale + 0.25, null, null, false); return; }
+    if (ev.key === "-" || ev.key === "_") { ev.preventDefault(); ev.stopPropagation(); lbSetScaleAt(localLbState.scale - 0.25, null, null, false); return; }
+    if (ev.key === "0") { ev.preventDefault(); ev.stopPropagation(); lbResetTransform(); return; }
+    if (ev.key === "1") {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (localLbState.scale > 1.05) {
+        localLbState.scale = 1; localLbState.tx = 0; localLbState.ty = 0; lbApplyTransform(false);
+      } else {
+        lbSetScaleAt(2.5, null, null, false);
       }
       return;
     }
+    if (ev.key === "r" || ev.key === "R") {
+      ev.preventDefault();
+      ev.stopPropagation();
+      localLbState.rotate = (localLbState.rotate + (ev.shiftKey ? 270 : 90)) % 360;
+      const cl = lbClampPan(localLbState.tx, localLbState.ty, localLbState.scale);
+      localLbState.tx = cl.tx; localLbState.ty = cl.ty;
+      lbApplyTransform(false);
+      return;
+    }
+    if ((ev.key === "c" || ev.key === "C") && !ev.altKey) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      void lbCopyImage();
+      return;
+    }
+    if ((ev.key === "d" || ev.key === "D") && !ev.metaKey && !ev.ctrlKey && !ev.altKey) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      lbDownloadImage();
+      return;
+    }
+  }, true);
+
+  // Global shortcuts: Cmd/Ctrl+K command palette, Cmd/Ctrl+F search room, Cmd/Ctrl+G match stepper, ? shortcuts modal, Alt+Up/Down switch channel, Esc close/clear
+  window.addEventListener("keydown", (ev) => {
+    if (localLbState.open) return;
     if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "g" && activeSearchQuery && searchMatchEls.length > 0) {
       ev.preventDefault();
       stepSearchMatch(ev.shiftKey ? -1 : 1);
@@ -3149,7 +3265,7 @@
     }
     if (ev.key === "Escape" && ctxMenuEl) {
       ev.preventDefault();
-      closeChannelContextMenu();
+      closeChannelContextMenu(true);
       return;
     }
     if (ev.key === "Escape" && kbdBg && !kbdBg.hidden) {
@@ -3185,16 +3301,21 @@
       }
     }
     if (ev.altKey && !ev.metaKey && !ev.ctrlKey && (ev.key === "ArrowUp" || ev.key === "ArrowDown")) {
-      if (channels.length > 0) {
+      const anyModal = !!document.querySelector(".modal-backdrop:not([hidden]), dialog[open]");
+      if (anyModal || ctxMenuEl || (switcherBg && !switcherBg.hidden) || (kbdBg && !kbdBg.hidden)) {
+        return;
+      }
+      const ordered = getOrderedChannels().map((entry) => entry.ch);
+      if (ordered.length > 0) {
         ev.preventDefault();
-        const curIdx = channels.findIndex((c) => c.id === currentChannelId);
+        const curIdx = ordered.findIndex((c) => c.id === currentChannelId);
         const base = curIdx >= 0 ? curIdx : 0;
         const delta = ev.key === "ArrowDown" ? 1 : -1;
         if (ev.shiftKey) {
           let found = null;
-          for (let step = 1; step <= channels.length; step++) {
-            const candidate = channels[(base + delta * step + channels.length * step) % channels.length];
-            if (candidate && candidate.id !== currentChannelId && (unreadCounts.get(candidate.id) || 0) > 0) {
+          for (let step = 1; step <= ordered.length; step++) {
+            const candidate = ordered[(base + delta * step + ordered.length * step) % ordered.length];
+            if (candidate && candidate.id !== currentChannelId && (unreadByChannel.get(candidate.id) || 0) > 0) {
               found = candidate;
               break;
             }
@@ -3204,8 +3325,8 @@
           } else {
             showToast("当前没有未读会话");
           }
-        } else if (channels.length > 1) {
-          const nextCh = channels[(base + delta + channels.length) % channels.length];
+        } else if (ordered.length > 1) {
+          const nextCh = ordered[(base + delta + ordered.length) % ordered.length];
           if (nextCh && nextCh.id !== currentChannelId) {
             void selectChannel(nextCh.id);
           }
@@ -3370,7 +3491,7 @@
   document.getElementById("btn-copy-mcp").addEventListener("click", async () => {
     const dlg = document.getElementById("connect-dialog");
     await refreshConnectModal();
-    dlg.showModal();
+    openNativeDialog(dlg);
   });
 
   document.getElementById("btn-close-connect").addEventListener("click", () => {
@@ -3388,23 +3509,51 @@
     }
   });
 
-  document.getElementById("snippet-tabs").addEventListener("click", (ev) => {
-    const btn = ev.target.closest(".tab-btn");
+  function selectHarnessTab(btn, shouldFocus = false) {
     if (!btn) return;
     activeHarness = btn.dataset.harness || "claude";
     for (const el of document.querySelectorAll("#snippet-tabs .tab-btn")) {
-      el.classList.toggle("active", el === btn);
+      const selected = el === btn;
+      el.classList.toggle("active", selected);
+      el.setAttribute("aria-selected", String(selected));
+      el.setAttribute("tabindex", selected ? "0" : "-1");
+    }
+    if (shouldFocus && typeof btn.focus === "function") {
+      try { btn.focus(); } catch {}
     }
     document.getElementById("mcp-snippet-box").textContent = buildHarnessSnippet(
       activeHarness,
       activeConnectBaseUrl,
     );
+  }
+
+  const elSnippetTabs = document.getElementById("snippet-tabs");
+  elSnippetTabs?.addEventListener("click", (ev) => {
+    const btn = ev.target.closest(".tab-btn");
+    if (!btn) return;
+    selectHarnessTab(btn, false);
+  });
+  elSnippetTabs?.addEventListener("keydown", (ev) => {
+    const tabs = Array.from(elSnippetTabs.querySelectorAll(".tab-btn"));
+    if (!tabs.length) return;
+    const curIdx = tabs.indexOf(document.activeElement);
+    if (curIdx < 0) return;
+    let nextIdx = -1;
+    if (ev.key === "ArrowRight") nextIdx = (curIdx + 1) % tabs.length;
+    else if (ev.key === "ArrowLeft") nextIdx = (curIdx - 1 + tabs.length) % tabs.length;
+    else if (ev.key === "Home") nextIdx = 0;
+    else if (ev.key === "End") nextIdx = tabs.length - 1;
+    if (nextIdx >= 0) {
+      ev.preventDefault();
+      selectHarnessTab(tabs[nextIdx], true);
+    }
   });
 
-  document.getElementById("btn-copy-snippet").addEventListener("click", async () => {
+  document.getElementById("btn-copy-snippet").addEventListener("click", async (ev) => {
     const txt = document.getElementById("mcp-snippet-box").textContent || "";
     if (bridge?.copyText) await bridge.copyText(txt);
     else await navigator.clipboard?.writeText(txt);
+    flashCopyButton(ev.currentTarget, "复制配置命令");
     showToast("已复制 MCP 接入配置");
   });
 
@@ -3507,7 +3656,7 @@
     }
   });
   elSearchInput?.addEventListener("keydown", (ev) => {
-    if (ev.key === "Enter") {
+    if (ev.key === "Enter" && !isImeComposing(ev)) {
       ev.preventDefault();
       const val = elSearchInput.value.trim();
       if (val && val === activeSearchQuery && searchMatchEls.length > 0) {
@@ -3541,7 +3690,7 @@
     document.getElementById("setting-allow-lan").checked = Boolean(st.settings?.allowLan);
     document.getElementById("setting-minimize-tray").checked = st.settings?.minimizeToTray !== false;
     document.getElementById("setting-launch-login").checked = Boolean(st.settings?.launchAtLogin);
-    document.getElementById("settings-dialog").showModal();
+    openNativeDialog(document.getElementById("settings-dialog"));
   });
   document.getElementById("btn-close-settings")?.addEventListener("click", () => {
     document.getElementById("settings-dialog").close();
@@ -3549,7 +3698,14 @@
   document.getElementById("settings-form")?.addEventListener("submit", async (ev) => {
     ev.preventDefault();
     if (!bridge?.updateLocalSettings) return;
-    const port = Number(document.getElementById("setting-port").value);
+    const portInput = document.getElementById("setting-port");
+    const port = Number(portInput?.value);
+    if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+      showToast("监听端口须为 1024 - 65535 之间的整数");
+      portInput?.focus();
+      portInput?.select?.();
+      return;
+    }
     const allowLan = document.getElementById("setting-allow-lan").checked;
     const minimizeToTray = document.getElementById("setting-minimize-tray").checked;
     const launchAtLogin = document.getElementById("setting-launch-login").checked;
@@ -3557,6 +3713,8 @@
     const res = await bridge.updateLocalSettings({ localServerPort: port, allowLan, minimizeToTray, launchAtLogin });
     if (res?.ok) {
       showToast(`设置已保存（${res.status?.httpUrl || ""}）`);
+    } else {
+      showToast("保存设置失败，请稍后重试");
     }
   });
 
@@ -3589,17 +3747,18 @@
     document.getElementById("registered-mcp-cmd").textContent = latestRegisteredCmd;
     const claimBtn = document.getElementById("btn-open-claim");
     claimBtn.hidden = !latestRegisteredClaimUrl;
-    document.getElementById("registered-dialog").showModal();
+    openNativeDialog(document.getElementById("registered-dialog"));
     await loadDiscoveredBots();
     await selectChannel(currentChannelId);
   });
   document.getElementById("btn-close-registered")?.addEventListener("click", () => {
     document.getElementById("registered-dialog").close();
   });
-  document.getElementById("btn-copy-registered-cmd")?.addEventListener("click", async () => {
+  document.getElementById("btn-copy-registered-cmd")?.addEventListener("click", async (ev) => {
     if (!latestRegisteredCmd) return;
     if (bridge?.copyText) await bridge.copyText(latestRegisteredCmd);
     else await navigator.clipboard?.writeText(latestRegisteredCmd);
+    flashCopyButton(ev.currentTarget, "复制本机 MCP 命令");
     showToast("已复制新 Agent 本机 MCP 启动命令");
   });
   document.getElementById("btn-open-claim")?.addEventListener("click", () => {
@@ -3726,6 +3885,7 @@
 
   document.getElementById("btn-send").addEventListener("click", () => sendChatText());
   elInput.addEventListener("keydown", (ev) => {
+    if (isImeComposing(ev)) return;
     if (mentionCandidates.length > 0 && elMentionMenu && !elMentionMenu.hidden) {
       if (ev.key === "ArrowDown") {
         ev.preventDefault();
@@ -3768,7 +3928,7 @@
       setReplyTarget(null);
       return;
     }
-    if ((ev.metaKey || ev.ctrlKey) && !ev.altKey && !ev.shiftKey && !ev.isComposing) {
+    if ((ev.metaKey || ev.ctrlKey) && !ev.altKey && !ev.shiftKey && !isImeComposing(ev)) {
       const k = ev.key.toLowerCase();
       if (k === "b" || k === "i" || k === "e") {
         ev.preventDefault();
@@ -3784,7 +3944,7 @@
         return;
       }
     }
-    if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) {
+    if (ev.key === "Enter" && !ev.shiftKey && !isImeComposing(ev)) {
       ev.preventDefault();
       sendChatText();
     }

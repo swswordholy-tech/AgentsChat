@@ -351,6 +351,37 @@ export function parseUnreadCountFromTitle(title: unknown): number {
   return Math.min(999, n);
 }
 
+export interface RectBounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * Compute centered window bounds within a display's workArea, clamping width
+ * and height so the window never overflows smaller displays.
+ */
+export function computeCenteredWindowBounds(
+  workArea: RectBounds,
+  targetWidth = 1320,
+  targetHeight = 860,
+  minWidth = 880,
+  minHeight = 560,
+): RectBounds {
+  const waX = Number.isFinite(workArea.x) ? Math.round(workArea.x) : 0;
+  const waY = Number.isFinite(workArea.y) ? Math.round(workArea.y) : 0;
+  const waW = Math.max(320, Math.round(Number.isFinite(workArea.width) ? workArea.width : targetWidth));
+  const waH = Math.max(240, Math.round(Number.isFinite(workArea.height) ? workArea.height : targetHeight));
+  const clampedMinW = Math.min(minWidth, waW);
+  const clampedMinH = Math.min(minHeight, waH);
+  const width = Math.min(waW, Math.max(clampedMinW, Math.round(targetWidth)));
+  const height = Math.min(waH, Math.max(clampedMinH, Math.round(targetHeight)));
+  const x = waX + Math.round((waW - width) / 2);
+  const y = waY + Math.round((waH - height) / 2);
+  return { x, y, width, height };
+}
+
 /**
  * Clamp and round Electron webContents zoom factor to a safe, comfortable range [0.75, 1.75].
  */

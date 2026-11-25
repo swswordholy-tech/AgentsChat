@@ -26,6 +26,7 @@ import {
   checkLatestDesktopRelease,
   clampDesktopZoomFactor,
   classifyCloudRailSection,
+  computeCenteredWindowBounds,
   formatCopyableCloudUrl,
   formatDesktopWindowTitle,
   formatTrayTooltip,
@@ -98,6 +99,7 @@ async function captureScreenshotToChat(): Promise<{ ok: boolean; pasted?: boolea
       new Notification({
         title: "截图已复制到剪贴板",
         body: "切换到云端聊天室按 ⌘V 即可直接粘贴发送",
+        silent: settings.notificationsMuted === true,
       }).show();
     }
     return { ok: true, pasted: false };
@@ -664,6 +666,26 @@ function applyNotificationsMuted(muted: boolean): boolean {
   return next;
 }
 
+function resetWindowSizeAndCenter(): boolean {
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
+  try {
+    if (mainWindow.isFullScreen()) mainWindow.setFullScreen(false);
+    if (mainWindow.isMaximized()) mainWindow.unmaximize();
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    const curBounds = mainWindow.getBounds();
+    const disp = screen.getDisplayMatching(curBounds);
+    const nextBounds = computeCenteredWindowBounds(disp.workArea, 1320, 860, 880, 560);
+    mainWindow.setBounds(nextBounds, true);
+    mainWindow.show();
+    mainWindow.focus();
+    layoutViews();
+    settings = settingsStore.save({ windowBounds: nextBounds });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function setupApplicationMenu(): void {
   const isMac = process.platform === "darwin";
   const toggleActiveDevTools = () => {
@@ -782,11 +804,15 @@ function setupApplicationMenu(): void {
           accelerator: "CmdOrCtrl+Shift+M",
           click: () => applyNotificationsMuted(!(settings.notificationsMuted === true)),
         },
-        {
-          label: "Capture Screenshot to Chat",
-          accelerator: "CmdOrCtrl+Shift+X",
-          click: () => void captureScreenshotToChat(),
-        },
+        ...(isMac
+          ? [
+              {
+                label: "Capture Screenshot to Chat",
+                accelerator: "CmdOrCtrl+Shift+X",
+                click: () => void captureScreenshotToChat(),
+              },
+            ]
+          : []),
         { type: "separator" },
         {
           label: "Zoom In",
@@ -829,6 +855,11 @@ function setupApplicationMenu(): void {
           accelerator: "CmdOrCtrl+Shift+T",
           click: () => applyAlwaysOnTop(!(settings.alwaysOnTop === true)),
         },
+        {
+          label: "Reset Window Size & Center",
+          accelerator: "CmdOrCtrl+Shift+0",
+          click: () => { resetWindowSizeAndCenter(); },
+        },
         ...(isMac ? [{ type: "separator" as const }, { role: "front" as const }] : []),
       ],
     },
@@ -868,6 +899,7 @@ function setupApplicationMenu(): void {
 
 function rebuildTrayMenu(): void {
   if (!tray) return;
+  const isMac = process.platform === "darwin";
   const st = localServer?.getStatus();
   const totalUnread = cloudUnreadCount + localUnreadCount;
   tray.setToolTip(
@@ -885,10 +917,14 @@ function rebuildTrayMenu(): void {
       label: totalUnread > 0 ? `Open AgentsChat (${totalUnread} unread)` : "Open AgentsChat",
       click: () => showMainWindow(),
     },
-    {
-      label: "Capture Screenshot to Chat (⌘⇧X)",
-      click: () => void captureScreenshotToChat(),
-    },
+    ...(isMac
+      ? [
+          {
+            label: "Capture Screenshot to Chat (⌘⇧X)",
+            click: () => void captureScreenshotToChat(),
+          },
+        ]
+      : []),
     {
       label: "Keep Window on Top",
       type: "checkbox",
@@ -919,28 +955,28 @@ function rebuildTrayMenu(): void {
       },
     },
     {
-      label: "  Cloud Studio (⌘3)",
+      label: isMac ? "  Cloud Studio (⌘3)" : "  Cloud Studio (Ctrl+3)",
       click: () => {
         showMainWindow();
         void navigateCloudQuickRoute("cloud-agents");
       },
     },
     {
-      label: "  OKR Board (⌘4)",
+      label: isMac ? "  OKR Board (⌘4)" : "  OKR Board (Ctrl+4)",
       click: () => {
         showMainWindow();
         void navigateCloudQuickRoute("okr-board");
       },
     },
     {
-      label: "  Bot Market (⌘5)",
+      label: isMac ? "  Bot Market (⌘5)" : "  Bot Market (Ctrl+5)",
       click: () => {
         showMainWindow();
         void navigateCloudQuickRoute("marketplace");
       },
     },
     {
-      label: "  Dashboard (⌘6)",
+      label: isMac ? "  Dashboard (⌘6)" : "  Dashboard (Ctrl+6)",
       click: () => {
         showMainWindow();
         void navigateCloudQuickRoute("dashboard");
@@ -1604,11 +1640,13 @@ if (!gotSingleInstanceLock) {
       } catch {}
       applyLaunchAtLoginSetting();
       setupApplicationMenu();
-      try {
-        globalShortcut.register("CmdOrCtrl+Shift+X", () => {
-          void captureScreenshotToChat();
-        });
-      } catch {}
+      if (process.platform === "darwin") {
+        try {
+          globalShortcut.register("CmdOrCtrl+Shift+X", () => {
+            void captureScreenshotToChat();
+          });
+        } catch {}
+      }
       try {
         const trayIconPath = join(UI_DIR, "tray-icon.png");
         const trayImg = existsSync(trayIconPath)

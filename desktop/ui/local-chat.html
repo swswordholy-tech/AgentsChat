@@ -224,11 +224,11 @@
       <div class="lan-urls" id="lan-urls-list"></div>
     </div>
 
-    <div class="snippet-tabs" id="snippet-tabs" role="tablist">
-      <button type="button" class="tab-btn active" data-harness="claude" role="tab">Claude Code</button>
-      <button type="button" class="tab-btn" data-harness="codex" role="tab">OpenAI Codex</button>
-      <button type="button" class="tab-btn" data-harness="json" role="tab">Cursor / Antigravity JSON</button>
-      <button type="button" class="tab-btn" data-harness="dsh" role="tab">DeepSeek Harness</button>
+    <div class="snippet-tabs" id="snippet-tabs" role="tablist" aria-label="客户端类型">
+      <button type="button" class="tab-btn active" data-harness="claude" role="tab" aria-selected="true" tabindex="0">Claude Code</button>
+      <button type="button" class="tab-btn" data-harness="codex" role="tab" aria-selected="false" tabindex="-1">OpenAI Codex</button>
+      <button type="button" class="tab-btn" data-harness="json" role="tab" aria-selected="false" tabindex="-1">Cursor / Antigravity JSON</button>
+      <button type="button" class="tab-btn" data-harness="dsh" role="tab" aria-selected="false" tabindex="-1">DeepSeek Harness</button>
     </div>
     <pre class="code-box" id="mcp-snippet-box"></pre>
     <div class="dialog-actions">
