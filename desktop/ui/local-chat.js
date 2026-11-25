@@ -395,6 +395,14 @@
     const i1 = document.getElementById("dialog-input-1");
     const ta = document.getElementById("dialog-textarea");
     const i2 = document.getElementById("dialog-input-2");
+    const confirmBtn = document.getElementById("dialog-confirm");
+    const cancelBtn = document.getElementById("dialog-cancel");
+    if (confirmBtn) {
+      confirmBtn.textContent = "确认";
+      confirmBtn.classList.remove("btn-danger");
+      confirmBtn.classList.add("btn-primary");
+    }
+    if (cancelBtn) cancelBtn.textContent = "取消";
     const useMulti = Boolean(multiline && ta);
     document.getElementById("dialog-title").textContent = title;
     document.getElementById("dialog-hint").textContent = hint || "";
@@ -470,13 +478,96 @@
     });
   }
 
+  function openConfirmDialog({ title, hint, confirmText = "确认", cancelText = "取消", danger = false }) {
+    const dlg = document.getElementById("prompt-dialog");
+    const i1 = document.getElementById("dialog-input-1");
+    const ta = document.getElementById("dialog-textarea");
+    const i2 = document.getElementById("dialog-input-2");
+    const confirmBtn = document.getElementById("dialog-confirm");
+    const cancelBtn = document.getElementById("dialog-cancel");
+    if (!dlg) return Promise.resolve(false);
+    document.getElementById("dialog-title").textContent = title || "确认操作";
+    document.getElementById("dialog-hint").textContent = hint || "";
+    if (i1) {
+      i1.hidden = true;
+      i1.style.display = "none";
+      i1.value = "";
+    }
+    if (ta) {
+      ta.hidden = true;
+      ta.style.display = "none";
+      ta.value = "";
+    }
+    if (i2) {
+      i2.style.display = "none";
+      i2.value = "";
+    }
+    if (confirmBtn) {
+      confirmBtn.textContent = confirmText;
+      confirmBtn.classList.toggle("btn-danger", Boolean(danger));
+      confirmBtn.classList.toggle("btn-primary", !danger);
+    }
+    if (cancelBtn) cancelBtn.textContent = cancelText;
+    return new Promise((resolve) => {
+      const form = document.getElementById("dialog-form");
+      let settled = false;
+      const restore = () => {
+        if (confirmBtn) {
+          confirmBtn.textContent = "确认";
+          confirmBtn.classList.remove("btn-danger");
+          confirmBtn.classList.add("btn-primary");
+        }
+        if (cancelBtn) cancelBtn.textContent = "取消";
+      };
+      const cleanup = () => {
+        form.removeEventListener("submit", onSubmit);
+        cancelBtn?.removeEventListener("click", onCancel);
+        dlg.removeEventListener("cancel", onDialogCancel);
+        dlg.removeEventListener("close", onDialogClose);
+        restore();
+      };
+      const finish = (accepted) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (dlg.open) dlg.close();
+        resolve(accepted);
+      };
+      const onSubmit = (ev) => {
+        ev.preventDefault();
+        finish(true);
+      };
+      const onCancel = () => finish(false);
+      const onDialogCancel = (ev) => {
+        ev.preventDefault();
+        finish(false);
+      };
+      const onDialogClose = () => finish(false);
+      form.addEventListener("submit", onSubmit);
+      cancelBtn?.addEventListener("click", onCancel);
+      dlg.addEventListener("cancel", onDialogCancel);
+      dlg.addEventListener("close", onDialogClose);
+      dlg.showModal();
+      (danger && cancelBtn ? cancelBtn : confirmBtn || cancelBtn)?.focus();
+    });
+  }
+
+  let _localDialogDownTarget = null;
+  document.addEventListener("mousedown", (ev) => {
+    _localDialogDownTarget = ev.target;
+  }, true);
+
   function bindDialogBackdropClose(dlg) {
     if (!dlg || dlg.dataset.backdropBound === "1") return;
     dlg.dataset.backdropBound = "1";
     dlg.addEventListener("click", (ev) => {
+      const downTarget = _localDialogDownTarget;
+      _localDialogDownTarget = null;
       if (ev.target !== dlg) return;
+      if (downTarget && downTarget !== dlg) return;
       if (ev.detail === 0 && ev.clientX === 0 && ev.clientY === 0) return;
       const rect = dlg.getBoundingClientRect();
+      if (!rect || rect.width === 0 || rect.height === 0) return;
       const inside =
         ev.clientX >= rect.left &&
         ev.clientX <= rect.right &&
@@ -507,17 +598,44 @@
 
   function setWsPillState(state) {
     if (!elWsPill) return;
-    elWsPill.classList.remove("live", "reconnecting");
+    elWsPill.classList.remove("live", "reconnecting", "clickable");
     if (state === "live") {
       elWsPill.classList.add("live");
       elWsPill.textContent = "实时已连";
+      elWsPill.title = "本机 WebSocket 实时通道已连接";
+      elWsPill.removeAttribute("role");
+      elWsPill.removeAttribute("tabindex");
     } else if (state === "reconnecting") {
-      elWsPill.classList.add("reconnecting");
+      elWsPill.classList.add("reconnecting", "clickable");
       elWsPill.textContent = "重连中…";
+      elWsPill.title = "点击立即重试连接本机实时通道";
+      elWsPill.setAttribute("role", "button");
+      elWsPill.setAttribute("tabindex", "0");
     } else {
+      elWsPill.classList.add("clickable");
       elWsPill.textContent = "离线";
+      elWsPill.title = "本机实时通道离线 — 点击立即重连";
+      elWsPill.setAttribute("role", "button");
+      elWsPill.setAttribute("tabindex", "0");
     }
   }
+
+  function triggerManualWsReconnect() {
+    if (!elWsPill || elWsPill.classList.contains("live")) return;
+    if (!authToken) {
+      showToast("请先同步或填入全局账号凭证");
+      return;
+    }
+    showToast("正在重新连接本机实时通道…");
+    connectRealtimeWs();
+  }
+  elWsPill?.addEventListener("click", triggerManualWsReconnect);
+  elWsPill?.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" || ev.key === " ") {
+      ev.preventDefault();
+      triggerManualWsReconnect();
+    }
+  });
 
   function setReplyTarget(msg) {
     replyTarget = msg || null;
@@ -1778,6 +1896,18 @@
 
   async function deleteLocalMessage(m) {
     if (!m || !m.id || m.sender_id !== currentPrincipal?.id) return;
+    const rawPreview = String(m.content || "").replace(/\s+/g, " ").trim();
+    const snippet = rawPreview.length > 56 ? rawPreview.slice(0, 55) + "…" : rawPreview;
+    const confirmed = await openConfirmDialog({
+      title: "撤回这条消息？",
+      hint: snippet
+        ? `“${snippet}” 将从当前本地房间移除，此操作无法撤销。`
+        : "此消息将从当前本地房间移除，此操作无法撤销。",
+      confirmText: "确认撤回",
+      cancelText: "保留消息",
+      danger: true,
+    });
+    if (!confirmed) return;
     const res = await api(
       `/api/channels/${encodeURIComponent(currentChannelId)}/messages/${encodeURIComponent(m.id)}`,
       { method: "DELETE" },
@@ -1975,8 +2105,8 @@
       if (!isSelf) {
         av.title = `点击插入 @${m.sender_id}`;
         av.addEventListener("click", () => {
-          elInput.value = (elInput.value ? elInput.value + " " : "") + `@${m.sender_id} `;
-          elInput.focus();
+          insertTextAtCursor(elInput, `@${m.sender_id} `);
+          saveLocalDraft(currentChannelId, elInput.value);
         });
       }
       row.appendChild(av);
@@ -2160,9 +2290,8 @@
 
   // Composer toolbar quick shortcuts
   document.getElementById("btn-quick-mention")?.addEventListener("click", () => {
-    const val = elInput.value;
-    elInput.value = val + (val && !val.endsWith(" ") ? " @" : "@");
-    elInput.focus();
+    insertTextAtCursor(elInput, "@");
+    saveLocalDraft(currentChannelId, elInput.value);
     updateMentionMenu();
   });
   document.getElementById("btn-quick-connect")?.addEventListener("click", () => {
@@ -2539,6 +2668,7 @@
           ["搜索当前房间消息", [mod, "F"]],
           ["跳转下一处 / 上一处搜索匹配", [mod, "G", "/", shift, "Enter"]],
           ["切换上 / 下一个会话", [alt, "↑", "/", "↓"]],
+          ["切换浅色 / 深色模式", ["T"]],
           ["打开快捷键一览", ["?"]],
         ],
       },
@@ -2750,7 +2880,7 @@
       closeLocalSwitcher();
       return;
     }
-    if (ev.key === "?" && !ev.metaKey && !ev.ctrlKey && !ev.altKey) {
+    if ((ev.key === "?" || ev.key === "t" || ev.key === "T") && !ev.metaKey && !ev.ctrlKey && !ev.altKey) {
       const active = document.activeElement;
       const tag = active ? String(active.tagName || "").toUpperCase() : "";
       const editable = !!(
@@ -2759,10 +2889,17 @@
       );
       const anyModal = !!document.querySelector(".modal-backdrop:not([hidden]), dialog[open]");
       if (!editable && !anyModal && (!switcherBg || switcherBg.hidden)) {
-        ev.preventDefault();
-        if (kbdBg && !kbdBg.hidden) closeLocalShortcutsCheatsheet();
-        else openLocalShortcutsCheatsheet();
-        return;
+        if (ev.key === "?") {
+          ev.preventDefault();
+          if (kbdBg && !kbdBg.hidden) closeLocalShortcutsCheatsheet();
+          else openLocalShortcutsCheatsheet();
+          return;
+        }
+        if (!kbdBg || kbdBg.hidden) {
+          ev.preventDefault();
+          document.getElementById("btn-toggle-theme")?.click();
+          return;
+        }
       }
     }
     if (ev.altKey && !ev.metaKey && !ev.ctrlKey && (ev.key === "ArrowUp" || ev.key === "ArrowDown")) {
@@ -3357,6 +3494,15 @@
   document.getElementById("btn-leave-channel")?.addEventListener("click", async () => {
     if (!authToken || currentChannelId === "welcome") return;
     const leavingId = currentChannelId;
+    const roomLabel = (elRoomTitle?.textContent || `#${leavingId}`).trim();
+    const confirmed = await openConfirmDialog({
+      title: `退出群聊 ${roomLabel}？`,
+      hint: "退出后你将不再收到此本地群聊的新消息；已保存的本地消息记录与本机 Agent 身份仍会保留。",
+      confirmText: "确认退出",
+      cancelText: "留在群聊",
+      danger: true,
+    });
+    if (!confirmed) return;
     const res = await api(`/api/channels/${encodeURIComponent(leavingId)}/leave`, { method: "POST" });
     if (res.ok) {
       showToast(`已退出 #${leavingId}`);

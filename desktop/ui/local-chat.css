@@ -727,6 +727,14 @@ body.dark .ws-pill.live { color: #38d97c; }
   color: var(--warn);
 }
 .ws-pill.reconnecting::before { background: var(--warn); }
+.ws-pill.clickable {
+  cursor: pointer;
+  transition: background-color 140ms var(--ease), color 140ms var(--ease);
+}
+.ws-pill.clickable:hover {
+  background: var(--bg-sidebar-hover);
+  color: var(--ink-0);
+}
 
 .header-actions {
   display: flex;
@@ -1357,6 +1365,11 @@ body.dark .mention-opt:hover { color: #5ce695; }
   color: #ffffff;
 }
 .btn-primary:hover { background: var(--green-hover); }
+.btn-danger {
+  background: var(--danger);
+  color: #ffffff;
+}
+.btn-danger:hover { background: #e03e3e; }
 .btn-ghost {
   background: var(--bg-surface);
   border-color: var(--border-strong);

@@ -26,11 +26,13 @@ import {
   clampDesktopZoomFactor,
   classifyCloudRailSection,
   formatCopyableCloudUrl,
+  formatTrayTooltip,
   isCloudOfflinePageUrl,
   isTrustedCloudThemeOrigin,
   parseDeepLink,
   parseUnreadCountFromTitle,
   resolveCloudQuickRoute,
+  resolveOfflineRetryUrl,
   type CloudQuickRoute,
 } from "./desktop-helpers.js";
 import { GlobalIdentityAuthority, resolveHomeDir } from "./identity-authority.js";
@@ -55,6 +57,7 @@ let isQuitting = false;
 let localUnreadCount = 0;
 let cloudUnreadCount = 0;
 let cloudLoading = false;
+let lastCloudFailedUrl: string | null = null;
 let pendingDeepLinkUrl: string | null = null;
 let screenshotInFlight = false;
 
@@ -774,9 +777,19 @@ function setupApplicationMenu(): void {
 function rebuildTrayMenu(): void {
   if (!tray) return;
   const st = localServer?.getStatus();
+  const totalUnread = cloudUnreadCount + localUnreadCount;
+  tray.setToolTip(
+    formatTrayTooltip({
+      cloudUnread: cloudUnreadCount,
+      localUnread: localUnreadCount,
+      localRunning: Boolean(st?.running),
+      localPort: st?.port,
+      localOnlineCount: st?.connectedAgents?.length || 0,
+    }),
+  );
   const menu = Menu.buildFromTemplate([
     {
-      label: "Open AgentsChat",
+      label: totalUnread > 0 ? `Open AgentsChat (${totalUnread} unread)` : "Open AgentsChat",
       click: () => showMainWindow(),
     },
     {
@@ -785,7 +798,9 @@ function rebuildTrayMenu(): void {
     },
     { type: "separator" },
     {
-      label: "Cloud Workspace (agents-chat.com)",
+      label: cloudUnreadCount > 0
+        ? `Cloud Workspace (${cloudUnreadCount} unread)`
+        : "Cloud Workspace (agents-chat.com)",
       type: "radio",
       checked: settings.activeWorkspace === "cloud",
       click: () => {
@@ -794,8 +809,29 @@ function rebuildTrayMenu(): void {
       },
     },
     {
+      label: "  Cloud Studio (⌘3)",
+      click: () => {
+        showMainWindow();
+        void navigateCloudQuickRoute("cloud-agents");
+      },
+    },
+    {
+      label: "  OKR Board (⌘4)",
+      click: () => {
+        showMainWindow();
+        void navigateCloudQuickRoute("okr-board");
+      },
+    },
+    {
+      label: "  Bot Market (⌘5)",
+      click: () => {
+        showMainWindow();
+        void navigateCloudQuickRoute("marketplace");
+      },
+    },
+    {
       label: st
-        ? `Local Server (${st.httpUrl} · ${st.connectedAgents.length} online)`
+        ? `Local Server (${st.httpUrl} · ${st.connectedAgents.length} online${localUnreadCount > 0 ? ` · ${localUnreadCount} unread` : ""})`
         : "Local Server (Stopped)",
       type: "radio",
       checked: settings.activeWorkspace === "local",
@@ -805,6 +841,14 @@ function rebuildTrayMenu(): void {
       },
     },
     { type: "separator" },
+    {
+      label: "Copy Local MCP Command",
+      enabled: Boolean(st?.running),
+      click: () => {
+        const url = st?.httpUrl || `http://127.0.0.1:${settings.localServerPort}`;
+        clipboard.writeText(`npx -y agentschat-mcp@latest --url ${url}`);
+      },
+    },
     {
       label: settings.localServerEnabled ? "Stop Local Server" : "Start Local Server",
       click: () => {
@@ -1022,13 +1066,22 @@ async function createDesktopWindow(): Promise<void> {
     }
     if (!isMainFrame || errorCode === -3 || isSmokeTest) return;
     if (validatedURL && validatedURL.includes("cloud-offline.html")) return;
+    const retryUrl = resolveOfflineRetryUrl(validatedURL, settings.remoteServerUrl);
+    lastCloudFailedUrl = retryUrl;
     void cloudView?.webContents.loadFile(join(UI_DIR, "cloud-offline.html"), {
       query: {
-        remote: settings.remoteServerUrl,
+        remote: retryUrl,
         reason: errorDescription || `ERR_${errorCode}`,
         theme: settings.theme || "light",
       },
     });
+  });
+
+  cloudView.webContents.on("did-finish-load", () => {
+    const cur = cloudView?.webContents.getURL() || "";
+    if (!isCloudOfflinePageUrl(cur)) {
+      lastCloudFailedUrl = null;
+    }
   });
 
   cloudView.webContents.on("will-navigate", (ev, navUrl) => {
@@ -1036,7 +1089,8 @@ async function createDesktopWindow(): Promise<void> {
     if (!currentUrl.startsWith("file://") || !currentUrl.includes("cloud-offline.html")) return;
     if (navUrl === "agentschat-action://retry-cloud") {
       ev.preventDefault();
-      void cloudView?.webContents.loadURL(settings.remoteServerUrl);
+      const targetUrl = resolveOfflineRetryUrl(lastCloudFailedUrl, settings.remoteServerUrl);
+      void cloudView?.webContents.loadURL(targetUrl);
     } else if (navUrl === "agentschat-action://switch-local") {
       ev.preventDefault();
       void switchWorkspace("local");

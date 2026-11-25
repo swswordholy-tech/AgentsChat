@@ -11,6 +11,7 @@ import {
   CLOUD_THEME_TOGGLE_SELECTOR,
   compareSemver,
   formatCopyableCloudUrl,
+  formatTrayTooltip,
   formatZoomBadge,
   isCloudOfflinePageUrl,
   isTrustedCloudThemeOrigin,
@@ -18,6 +19,7 @@ import {
   parseDesktopReleaseTag,
   parseUnreadCountFromTitle,
   resolveCloudQuickRoute,
+  resolveOfflineRetryUrl,
 } from "../src/desktop-helpers.js";
 import { GlobalIdentityAuthority } from "../src/identity-authority.js";
 import { LocalMiniServer } from "../src/local-server.js";
@@ -573,5 +575,60 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     expect(mainTs).toContain("CmdOrCtrl+Shift+O");
     expect(mainTs).toContain("Copy Page Link");
     expect(mainTs).toContain("Open Page in Browser");
+  });
+
+  test("Desktop 2.4 adds live tray tooltip & quick jumps, smart offline auto-reconnect, Local Hub confirmations, drag-safe backdrop close & T shortcut", () => {
+    const remote = "https://agents-chat.com/lobby";
+    expect(resolveOfflineRetryUrl("https://agents-chat.com/cloud-agents?tab=billing", remote)).toBe(
+      "https://agents-chat.com/cloud-agents?tab=billing",
+    );
+    expect(resolveOfflineRetryUrl("https://u:p@agents-chat.com/okr-board", remote)).toBe(
+      "https://agents-chat.com/okr-board",
+    );
+    expect(resolveOfflineRetryUrl("https://evil.example/steal", remote)).toBe(remote);
+    expect(resolveOfflineRetryUrl("file:///tmp/cloud-offline.html", remote)).toBe(remote);
+    expect(resolveOfflineRetryUrl(null, remote)).toBe(remote);
+
+    expect(
+      formatTrayTooltip({ cloudUnread: 2, localUnread: 3, localRunning: true, localPort: 8787, localOnlineCount: 4 }),
+    ).toBe("AgentsChat Desktop (5 unread) · Local :8787 (4 online)");
+    expect(
+      formatTrayTooltip({ cloudUnread: 0, localUnread: 0, localRunning: true, localPort: 9001, localOnlineCount: 0 }),
+    ).toBe("AgentsChat Desktop · Local :9001");
+    expect(
+      formatTrayTooltip({ cloudUnread: -2, localUnread: Number.NaN, localRunning: false }),
+    ).toBe("AgentsChat Desktop · Local Stopped");
+
+    const offlineHtml = readFileSync(join(import.meta.dir, "..", "ui", "cloud-offline.html"), "utf8");
+    const offlineScript = offlineHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1] || "";
+    expect(offlineScript.length).toBeGreaterThan(0);
+    expect(() => new Function(offlineScript)).not.toThrow();
+    expect(offlineHtml).toContain('window.addEventListener("online"');
+    expect(offlineHtml).toContain('id="btn-toggle-auto"');
+    expect(offlineHtml).toContain("agentschat-action://retry-cloud");
+
+    const localJs = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.js"), "utf8");
+    expect(() => new Function(localJs)).not.toThrow();
+    expect(localJs).toContain("function openConfirmDialog(");
+    expect(localJs).toContain('title: "撤回这条消息？"');
+    expect(localJs).toContain('title: `退出群聊 ${roomLabel}？`');
+    expect(localJs).toContain("if (downTarget && downTarget !== dlg) return;");
+    expect(localJs).toContain("function triggerManualWsReconnect()");
+    expect(localJs).toContain('insertTextAtCursor(elInput, "@")');
+    expect(localJs).toContain('ev.key === "t" || ev.key === "T"');
+    expect(localJs).toContain('["切换浅色 / 深色模式", ["T"]]');
+
+    const localHtml = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.html"), "utf8");
+    expect(localHtml).toContain('title="切换浅色 / 深色模式 (T)"');
+
+    const localCss = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.css"), "utf8");
+    expect(localCss).toContain(".ws-pill.clickable");
+    expect(localCss).toContain(".btn-danger");
+
+    const mainTs = readFileSync(join(import.meta.dir, "..", "src", "main.ts"), "utf8");
+    expect(mainTs).toContain("tray.setToolTip(");
+    expect(mainTs).toContain("formatTrayTooltip(");
+    expect(mainTs).toContain("Copy Local MCP Command");
+    expect(mainTs).toContain("resolveOfflineRetryUrl(");
   });
 });

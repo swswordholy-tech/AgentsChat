@@ -160,6 +160,40 @@ export function formatZoomBadge(zoomFactor: unknown): string | null {
 }
 
 /**
+ * Resolve the safest retry URL for `cloud-offline.html`: preserves the exact
+ * same-origin Cloud sub-page that failed (stripping any credentials), and falls
+ * back to `remoteServerUrl` for foreign, `file://`, or malformed URLs.
+ */
+export function resolveOfflineRetryUrl(failedUrl: unknown, remoteServerUrl: string): string {
+  return formatCopyableCloudUrl(failedUrl, remoteServerUrl) || remoteServerUrl;
+}
+
+export interface TrayTooltipState {
+  cloudUnread?: number;
+  localUnread?: number;
+  localRunning: boolean;
+  localPort?: number;
+  localOnlineCount?: number;
+}
+
+/**
+ * Format a compact, live tray tooltip summarizing unread notifications and
+ * embedded Local Mini-Server status.
+ */
+export function formatTrayTooltip(state: TrayTooltipState): string {
+  const cloud = Math.max(0, Math.floor(Number(state.cloudUnread) || 0));
+  const local = Math.max(0, Math.floor(Number(state.localUnread) || 0));
+  const totalUnread = cloud + local;
+  const head = totalUnread > 0 ? `AgentsChat Desktop (${totalUnread} unread)` : "AgentsChat Desktop";
+  if (!state.localRunning) {
+    return `${head} · Local Stopped`;
+  }
+  const port = Number.isFinite(Number(state.localPort)) && Number(state.localPort) > 0 ? Number(state.localPort) : 8787;
+  const online = Math.max(0, Math.floor(Number(state.localOnlineCount) || 0));
+  return online > 0 ? `${head} · Local :${port} (${online} online)` : `${head} · Local :${port}`;
+}
+
+/**
  * Verify that an IPC theme signal from Cloud WebContentsView comes from the
  * configured AgentsChat remote origin (http/https only).
  */
