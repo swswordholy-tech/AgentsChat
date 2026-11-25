@@ -197,6 +197,7 @@ export interface TrayTooltipState {
   localRunning: boolean;
   localPort?: number;
   localOnlineCount?: number;
+  notificationsMuted?: boolean;
 }
 
 /**
@@ -208,12 +209,15 @@ export function formatTrayTooltip(state: TrayTooltipState): string {
   const local = Math.max(0, Math.floor(Number(state.localUnread) || 0));
   const totalUnread = cloud + local;
   const head = totalUnread > 0 ? `AgentsChat Desktop (${totalUnread} unread)` : "AgentsChat Desktop";
+  const muteSuffix = state.notificationsMuted === true ? " · Muted" : "";
   if (!state.localRunning) {
-    return `${head} · Local Stopped`;
+    return `${head} · Local Stopped${muteSuffix}`;
   }
   const port = Number.isFinite(Number(state.localPort)) && Number(state.localPort) > 0 ? Number(state.localPort) : 8787;
   const online = Math.max(0, Math.floor(Number(state.localOnlineCount) || 0));
-  return online > 0 ? `${head} · Local :${port} (${online} online)` : `${head} · Local :${port}`;
+  return online > 0
+    ? `${head} · Local :${port} (${online} online)${muteSuffix}`
+    : `${head} · Local :${port}${muteSuffix}`;
 }
 
 export interface DesktopWindowTitleState {

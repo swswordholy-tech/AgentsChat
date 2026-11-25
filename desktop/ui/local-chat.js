@@ -1768,7 +1768,7 @@
 
   function appendInlineRichText(parent, text) {
     const tokenRe =
-      /!\[([^\]\n]{0,120})\]\(([^)\s\n]+)\)|(`[^`\n]+`)|(\*\*[^*\n]+?\*\*)|(\*[^*\n]+?\*)|(https?:\/\/[^\s<>"'`]+)|((?:^|(?<=[\s(\[，。、]))@[a-zA-Z0-9][a-zA-Z0-9._-]{1,62})/g;
+      /!\[([^\]\n]{0,120})\]\(([^)\s\n]+)\)|\[([^\]\n]{1,120})\]\((https?:\/\/[^)\s\n]+)\)|(`[^`\n]+`)|(\*\*[^*\n]+?\*\*)|(\*[^*\n]+?\*)|(https?:\/\/[^\s<>"'`]+)|((?:^|(?<=[\s(\[，。、]))@[a-zA-Z0-9][a-zA-Z0-9._-]{1,62})/g;
     let last = 0;
     let m;
     while ((m = tokenRe.exec(text)) !== null) {
@@ -1792,31 +1792,47 @@
         } else {
           parent.appendChild(document.createTextNode(m[0]));
         }
-      } else if (m[3]) {
-        const code = document.createElement("code");
-        code.className = "inline-code";
-        code.textContent = m[3].slice(1, -1);
-        parent.appendChild(code);
-      } else if (m[4]) {
-        const strong = document.createElement("strong");
-        strong.textContent = m[4].slice(2, -2);
-        parent.appendChild(strong);
-      } else if (m[5]) {
-        const em = document.createElement("em");
-        em.textContent = m[5].slice(1, -1);
-        parent.appendChild(em);
-      } else if (m[6]) {
+      } else if (m[4] !== undefined) {
         const a = document.createElement("a");
         a.className = "msg-link";
-        a.href = m[6];
+        a.href = m[4];
         a.target = "_blank";
         a.rel = "noopener noreferrer";
-        a.textContent = m[6];
+        a.title = m[4];
+        a.textContent = m[3];
         parent.appendChild(a);
+      } else if (m[5]) {
+        const code = document.createElement("code");
+        code.className = "inline-code";
+        code.textContent = m[5].slice(1, -1);
+        parent.appendChild(code);
+      } else if (m[6]) {
+        const strong = document.createElement("strong");
+        strong.textContent = m[6].slice(2, -2);
+        parent.appendChild(strong);
       } else if (m[7]) {
+        const em = document.createElement("em");
+        em.textContent = m[7].slice(1, -1);
+        parent.appendChild(em);
+      } else if (m[8]) {
+        const a = document.createElement("a");
+        a.className = "msg-link";
+        a.href = m[8];
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        a.textContent = m[8];
+        parent.appendChild(a);
+      } else if (m[9]) {
+        const handle = m[9];
         const chip = document.createElement("span");
-        chip.className = "mention-chip" + (isMentionMe(m[7]) ? " mention-me" : "");
-        chip.textContent = m[7];
+        chip.className = "mention-chip clickable" + (isMentionMe(handle) ? " mention-me" : "");
+        chip.textContent = handle;
+        chip.title = `点击插入 ${handle}`;
+        chip.addEventListener("click", () => {
+          insertTextAtCursor(elInput, `${handle} `);
+          saveLocalDraft(currentChannelId, elInput.value);
+          syncComposerState();
+        });
         parent.appendChild(chip);
       }
       last = m.index + m[0].length;
@@ -1904,6 +1920,38 @@
         wrap.appendChild(table);
         container.appendChild(wrap);
         while (i < lines.length && !lines[i].trim()) i += 1;
+        continue;
+      }
+      const trimmedLine = lines[i].trim();
+      const headingMatch = trimmedLine.match(/^(#{1,3})\s+(.+)$/);
+      if (headingMatch) {
+        flushProse(true);
+        const hEl = document.createElement("div");
+        hEl.className = `wx-md-heading h${headingMatch[1].length}`;
+        appendInlineRichText(hEl, headingMatch[2]);
+        container.appendChild(hEl);
+        i += 1;
+        continue;
+      }
+      if (/^(?:-{3,}|\*{3,}|_{3,})$/.test(trimmedLine)) {
+        flushProse(true);
+        const hr = document.createElement("hr");
+        hr.className = "wx-md-hr";
+        container.appendChild(hr);
+        i += 1;
+        continue;
+      }
+      if (/^>\s?/.test(trimmedLine)) {
+        flushProse(true);
+        const quoteLines = [];
+        while (i < lines.length && /^>\s?/.test(lines[i].trim())) {
+          quoteLines.push(lines[i].trim().replace(/^>\s?/, ""));
+          i += 1;
+        }
+        const bq = document.createElement("blockquote");
+        bq.className = "wx-md-quote";
+        appendInlineRichText(bq, quoteLines.join("\n"));
+        container.appendChild(bq);
         continue;
       }
       proseBuf.push(lines[i]);
@@ -2257,6 +2305,7 @@
         av.addEventListener("click", () => {
           insertTextAtCursor(elInput, `@${m.sender_id} `);
           saveLocalDraft(currentChannelId, elInput.value);
+          syncComposerState();
         });
       }
       row.appendChild(av);
@@ -2270,8 +2319,13 @@
         const nameSpan = document.createElement("span");
         nameSpan.textContent = m.sender_name || m.sender_id;
         const idSpan = document.createElement("span");
-        idSpan.className = "wx-sender-id";
+        idSpan.className = "wx-sender-id clickable";
         idSpan.textContent = `@${m.sender_id}`;
+        idSpan.title = `点击复制 @${m.sender_id}`;
+        idSpan.addEventListener("click", async () => {
+          await copyTextToClipboard(`@${m.sender_id}`);
+          showToast(`已复制 @${m.sender_id}`);
+        });
         sender.appendChild(nameSpan);
         sender.appendChild(idSpan);
         col.appendChild(sender);
@@ -2886,6 +2940,7 @@
         rows: [
           ["聚焦消息输入框", [mod, "/"]],
           ["发送消息 / 插入换行", ["Enter", "/", shift, "Enter"]],
+          ["粗体 / 斜体 / 行内代码", [mod, "B", "/", "I", "/", "E"]],
           ["编辑上一条发出的消息（空输入框）", ["↑"]],
           ["唤起 @ 成员自动补全", ["@"]],
           ["看图缩放 / 1:1 / 旋转 / 复制", ["+", "−", "1", "R", "C"]],
@@ -2897,6 +2952,7 @@
         rows: [
           ...(isMac ? [["全局截屏并自动粘贴到聊天", ["⌘", "⇧", "X"]]] : []),
           ["切换窗口置顶", [mod, shift, "T"]],
+          ["静音 / 恢复桌面通知", [mod, shift, "M"]],
           ["界面放大 / 缩小 / 还原默认", [mod, "+", "/", "−", "/", "0"]],
         ],
       },
@@ -3711,6 +3767,22 @@
       ev.preventDefault();
       setReplyTarget(null);
       return;
+    }
+    if ((ev.metaKey || ev.ctrlKey) && !ev.altKey && !ev.shiftKey && !ev.isComposing) {
+      const k = ev.key.toLowerCase();
+      if (k === "b" || k === "i" || k === "e") {
+        ev.preventDefault();
+        const wrap = k === "b" ? "**" : k === "i" ? "*" : "`";
+        const start = elInput.selectionStart ?? elInput.value.length;
+        const end = elInput.selectionEnd ?? start;
+        const sel = elInput.value.slice(start, end);
+        elInput.value = elInput.value.slice(0, start) + wrap + sel + wrap + elInput.value.slice(end);
+        elInput.focus();
+        elInput.setSelectionRange(start + wrap.length, start + wrap.length + sel.length);
+        saveLocalDraft(currentChannelId, elInput.value);
+        syncComposerState();
+        return;
+      }
     }
     if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) {
       ev.preventDefault();

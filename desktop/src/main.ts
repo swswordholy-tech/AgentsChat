@@ -171,6 +171,7 @@ function syncUnreadBadge(): void {
           localRunning: Boolean(st?.running),
           localPort: st?.port,
           localOnlineCount: st?.connectedAgents?.length || 0,
+          notificationsMuted: settings.notificationsMuted === true,
         }),
       );
     } catch {}
@@ -356,7 +357,7 @@ async function ensureLocalServerStarted(): Promise<LocalServerStatus | null> {
         if (!winFocusedOnLocal && msg.sender_type === "agent") {
           localUnreadCount += 1;
           syncUnreadBadge();
-          if (Notification.isSupported()) {
+          if (settings.notificationsMuted !== true && Notification.isSupported()) {
             const notif = new Notification({
               title: `${msg.sender_name || msg.sender_id} · #${channelName} (Local)`,
               body: msg.content.slice(0, 140),
@@ -654,6 +655,15 @@ function applyAlwaysOnTop(enabled: boolean): boolean {
   return next;
 }
 
+function applyNotificationsMuted(muted: boolean): boolean {
+  const next = Boolean(muted);
+  settings = settingsStore.save({ notificationsMuted: next });
+  setupApplicationMenu();
+  syncUnreadBadge();
+  broadcastState();
+  return next;
+}
+
 function setupApplicationMenu(): void {
   const isMac = process.platform === "darwin";
   const toggleActiveDevTools = () => {
@@ -766,6 +776,13 @@ function setupApplicationMenu(): void {
           click: () => applyDesktopTheme(settings.theme === "dark" ? "light" : "dark"),
         },
         {
+          label: "Mute Local Notifications",
+          type: "checkbox",
+          checked: settings.notificationsMuted === true,
+          accelerator: "CmdOrCtrl+Shift+M",
+          click: () => applyNotificationsMuted(!(settings.notificationsMuted === true)),
+        },
+        {
           label: "Capture Screenshot to Chat",
           accelerator: "CmdOrCtrl+Shift+X",
           click: () => void captureScreenshotToChat(),
@@ -860,6 +877,7 @@ function rebuildTrayMenu(): void {
       localRunning: Boolean(st?.running),
       localPort: st?.port,
       localOnlineCount: st?.connectedAgents?.length || 0,
+      notificationsMuted: settings.notificationsMuted === true,
     }),
   );
   const menu = Menu.buildFromTemplate([
@@ -878,6 +896,14 @@ function rebuildTrayMenu(): void {
       click: () => {
         showMainWindow();
         applyAlwaysOnTop(!(settings.alwaysOnTop === true));
+      },
+    },
+    {
+      label: "Mute Local Notifications",
+      type: "checkbox",
+      checked: settings.notificationsMuted === true,
+      click: () => {
+        applyNotificationsMuted(!(settings.notificationsMuted === true));
       },
     },
     { type: "separator" },
@@ -1262,6 +1288,13 @@ function registerIpcHandlers(): void {
     if (!isShell) return { ok: false };
     const pinned = applyAlwaysOnTop(Boolean(enabled));
     return { ok: true, alwaysOnTop: pinned };
+  });
+
+  ipcMain.handle("desktop:set-notifications-muted", (ev, muted: unknown) => {
+    const isShell = Boolean(mainWindow && !mainWindow.isDestroyed() && ev.sender === mainWindow.webContents);
+    if (!isShell) return { ok: false };
+    const nextMuted = applyNotificationsMuted(Boolean(muted));
+    return { ok: true, notificationsMuted: nextMuted };
   });
 
   ipcMain.on("desktop:cloud-theme-observed", (ev, rawTheme: unknown) => {

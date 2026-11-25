@@ -72,6 +72,7 @@ export interface DesktopSettings {
   minimizeToTray: boolean;
   launchAtLogin: boolean;
   alwaysOnTop?: boolean;
+  notificationsMuted?: boolean;
   zoomFactor?: number;
   windowBounds?: DesktopWindowBounds;
 }

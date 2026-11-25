@@ -766,4 +766,59 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     expect(localJs).toContain("当前没有未读会话");
     expect(localJs).toContain("切换窗口置顶");
   });
+
+  test("Desktop 2.8 adds persistent Do-Not-Disturb notification mute, Local Hub Markdown links/headings/blockquotes/rules, interactive @chips, sender @ID copy & Cmd+B/I/E formatting", () => {
+    // 1. Settings persistence & sanitization for notificationsMuted + Tray tooltip Muted state
+    expect(DEFAULT_DESKTOP_SETTINGS.notificationsMuted).toBe(false);
+    expect(sanitizeDesktopSettings({}).notificationsMuted).toBe(false);
+    expect(sanitizeDesktopSettings({ notificationsMuted: true }).notificationsMuted).toBe(true);
+    expect(sanitizeDesktopSettings({ notificationsMuted: 1 as any }).notificationsMuted).toBe(false);
+    const store = new DesktopSettingsStore(join(tempDir, "settings-mute.json"));
+    expect(store.load().notificationsMuted).toBe(false);
+    expect(store.save({ notificationsMuted: true }).notificationsMuted).toBe(true);
+    expect(store.load().notificationsMuted).toBe(true);
+
+    expect(
+      formatTrayTooltip({ localRunning: true, localPort: 8787, localOnlineCount: 2, notificationsMuted: true }),
+    ).toBe("AgentsChat Desktop · Local :8787 (2 online) · Muted");
+    expect(
+      formatTrayTooltip({ localRunning: false, cloudUnread: 3, notificationsMuted: true }),
+    ).toBe("AgentsChat Desktop (3 unread) · Local Stopped · Muted");
+
+    // 2. Main process, preload & shell rail Do-Not-Disturb mute wiring
+    const mainTs = readFileSync(join(import.meta.dir, "..", "src", "main.ts"), "utf8");
+    expect(mainTs).toContain("function applyNotificationsMuted(muted: boolean)");
+    expect(mainTs).toContain("if (settings.notificationsMuted !== true && Notification.isSupported())");
+    expect(mainTs).toContain('accelerator: "CmdOrCtrl+Shift+M"');
+    expect(mainTs).toContain('label: "Mute Local Notifications"');
+    expect(mainTs).toContain('ipcMain.handle("desktop:set-notifications-muted"');
+
+    const preloadJs = readFileSync(join(import.meta.dir, "..", "ui", "preload.cjs"), "utf8");
+    expect(preloadJs).toContain('setNotificationsMuted: (muted) => ipcRenderer.invoke("desktop:set-notifications-muted"');
+
+    const shellHtml = readFileSync(join(import.meta.dir, "..", "ui", "shell.html"), "utf8");
+    const shellScript = shellHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1] || "";
+    expect(() => new Function(shellScript)).not.toThrow();
+    expect(shellHtml).toContain('id="btn-shell-mute"');
+    expect(shellHtml).toContain(".mini-btn.muted");
+    expect(shellHtml).toContain("api?.setNotificationsMuted?.(next)");
+    expect(shellHtml).toContain("恢复本机通知提醒");
+
+    // 3. Local Hub safe Markdown links, headings/blockquotes/hr, interactive @mention & sender @id copy, avatar syncComposerState & Cmd+B/I/E
+    const localJs = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.js"), "utf8");
+    expect(() => new Function(localJs)).not.toThrow();
+    expect(localJs).toContain("\\[([^\\]\\n]{1,120})\\]\\((https?:\\/\\/[^)\\s\\n]+)\\)");
+    expect(localJs).toContain("wx-md-heading");
+    expect(localJs).toContain("wx-md-quote");
+    expect(localJs).toContain("wx-md-hr");
+    expect(localJs).toContain("mention-chip clickable");
+    expect(localJs).toContain("wx-sender-id clickable");
+    expect(localJs).toContain('if (k === "b" || k === "i" || k === "e")');
+    expect(localJs).toContain("静音 / 恢复桌面通知");
+
+    const localCss = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.css"), "utf8");
+    expect(localCss).toContain(".wx-md-quote");
+    expect(localCss).toContain(".wx-md-heading");
+    expect(localCss).toContain(".wx-sender-id.clickable:hover");
+  });
 });

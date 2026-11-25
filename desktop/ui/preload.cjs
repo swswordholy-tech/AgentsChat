@@ -7,6 +7,7 @@ contextBridge.exposeInMainWorld("agentschatShell", {
   switchWorkspace: (workspace) => ipcRenderer.invoke("desktop:switch-workspace", workspace),
   setTheme: (theme) => ipcRenderer.invoke("desktop:set-theme", theme),
   setAlwaysOnTop: (enabled) => ipcRenderer.invoke("desktop:set-always-on-top", Boolean(enabled)),
+  setNotificationsMuted: (muted) => ipcRenderer.invoke("desktop:set-notifications-muted", Boolean(muted)),
   toggleLocalServer: (enabled) => ipcRenderer.invoke("desktop:toggle-local-server", enabled),
   updateSettings: (patch) => ipcRenderer.invoke("desktop:update-settings", patch),
   copyText: (text) => ipcRenderer.invoke("desktop:copy-text", text),

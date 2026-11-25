@@ -2535,6 +2535,52 @@ body.dark .wx-inline-img {
   opacity: 0.78;
 }
 
+/* Rich Markdown headings, blockquotes, rules & interactive handles (Desktop 2.8) */
+.wx-md-heading {
+  font-weight: 700;
+  color: inherit;
+  margin: 6px 0 4px;
+  line-height: 1.35;
+}
+.wx-md-heading.h1 { font-size: 16px; }
+.wx-md-heading.h2 { font-size: 15px; }
+.wx-md-heading.h3 { font-size: 14px; }
+.wx-md-quote {
+  margin: 6px 0;
+  padding: 6px 10px;
+  border-left: 3px solid var(--green);
+  border-radius: 0 6px 6px 0;
+  background: rgba(7, 193, 96, 0.08);
+  color: var(--ink-1);
+  white-space: pre-wrap;
+}
+body.dark .wx-md-quote {
+  background: rgba(7, 193, 96, 0.14);
+  color: #cbd5e1;
+}
+.wx-msg.self .wx-md-quote {
+  border-left-color: rgba(0, 0, 0, 0.28);
+  background: rgba(0, 0, 0, 0.06);
+  color: inherit;
+}
+.wx-md-hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 8px 0;
+}
+.mention-chip.clickable,
+.wx-sender-id.clickable {
+  cursor: pointer;
+}
+.mention-chip.clickable:hover {
+  filter: brightness(0.95);
+  text-decoration: underline;
+}
+.wx-sender-id.clickable:hover {
+  color: var(--green);
+  text-decoration: underline;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.01ms !important;
