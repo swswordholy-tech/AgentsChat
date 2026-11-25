@@ -437,10 +437,15 @@
         ev.preventDefault();
         onCancel();
       };
+      const onDialogClose = () => {
+        cleanup();
+        resolve(null);
+      };
       const cleanup = () => {
         form.removeEventListener("submit", onSubmit);
         cancelBtn.removeEventListener("click", onCancel);
         dlg.removeEventListener("cancel", onDialogCancel);
+        dlg.removeEventListener("close", onDialogClose);
         activeField.removeEventListener("keydown", onFieldKey);
       };
       const onSubmit = (ev) => {
@@ -457,10 +462,32 @@
       form.addEventListener("submit", onSubmit);
       cancelBtn.addEventListener("click", onCancel);
       dlg.addEventListener("cancel", onDialogCancel);
+      dlg.addEventListener("close", onDialogClose);
       activeField.addEventListener("keydown", onFieldKey);
       dlg.showModal();
       activeField.focus();
       if (value1 && !useMulti) activeField.select();
+    });
+  }
+
+  function bindDialogBackdropClose(dlg) {
+    if (!dlg || dlg.dataset.backdropBound === "1") return;
+    dlg.dataset.backdropBound = "1";
+    dlg.addEventListener("click", (ev) => {
+      if (ev.target !== dlg) return;
+      if (ev.detail === 0 && ev.clientX === 0 && ev.clientY === 0) return;
+      const rect = dlg.getBoundingClientRect();
+      const inside =
+        ev.clientX >= rect.left &&
+        ev.clientX <= rect.right &&
+        ev.clientY >= rect.top &&
+        ev.clientY <= rect.bottom;
+      if (!inside) {
+        const cancelEv = new Event("cancel", { cancelable: true });
+        if (dlg.dispatchEvent(cancelEv)) {
+          dlg.close("cancel");
+        }
+      }
     });
   }
 
@@ -780,8 +807,25 @@
       nameEl.className = "bot-name";
       nameEl.textContent = p.display_name;
       const idEl = document.createElement("div");
-      idEl.className = "bot-id";
+      idEl.className = "bot-id copyable";
       idEl.textContent = `@${p.agent_id}`;
+      idEl.setAttribute("role", "button");
+      idEl.setAttribute("tabindex", "0");
+      idEl.title = "点击复制 @ID";
+      const copyBotHandle = async (ev) => {
+        ev.stopPropagation();
+        const handle = `@${p.agent_id}`;
+        if (bridge?.copyText) await bridge.copyText(handle);
+        else await navigator.clipboard?.writeText(handle);
+        showToast(`已复制 ${handle}`);
+      };
+      idEl.addEventListener("click", copyBotHandle);
+      idEl.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter" || ev.key === " ") {
+          ev.preventDefault();
+          void copyBotHandle(ev);
+        }
+      });
       copy.appendChild(nameEl);
       copy.appendChild(idEl);
       meta.appendChild(dot);
@@ -860,7 +904,38 @@
     });
   }
 
+  let channelLoadSeq = 0;
+
+  function insertTextAtCursor(textarea, insertion) {
+    if (!textarea) return;
+    const val = textarea.value || "";
+    const start = typeof textarea.selectionStart === "number" ? textarea.selectionStart : val.length;
+    const end = typeof textarea.selectionEnd === "number" ? textarea.selectionEnd : val.length;
+    const before = val.slice(0, start);
+    const after = val.slice(end);
+    const needsLeadSpace = before.length > 0 && !/\s$/.test(before);
+    const piece = (needsLeadSpace ? " " : "") + insertion;
+    textarea.value = before + piece + after;
+    const caret = before.length + piece.length;
+    textarea.focus();
+    try { textarea.setSelectionRange(caret, caret); } catch {}
+    textarea.dispatchEvent(new Event("input"));
+  }
+
+  function markAllLocalChannelsRead() {
+    if (unreadByChannel.size === 0) {
+      showToast("本机全部会话均已读");
+      return;
+    }
+    unreadByChannel.clear();
+    pendingUnreadBanner = null;
+    updateUnreadFilterUI();
+    renderChannelList();
+    showToast("已将本机全部未读标为已读");
+  }
+
   async function selectChannel(channelId) {
+    const seq = ++channelLoadSeq;
     const prevChannelId = currentChannelId;
     if (prevChannelId && prevChannelId !== channelId && elInput) {
       saveLocalDraft(prevChannelId, elInput.value);
@@ -881,6 +956,7 @@
       try { ws.send(JSON.stringify({ type: "join_channel", channel_id: channelId })); } catch {}
     }
     await loadChannels();
+    if (seq !== channelLoadSeq || currentChannelId !== channelId) return;
     const ch = channels.find((c) => c.id === channelId);
     const baseTitle = ch ? (ch.type === "direct" ? ch.name : `#${ch.name}`) : `#${channelId}`;
     const countSuffix = ch && ch.type !== "direct" && ch.member_count ? ` (${ch.member_count})` : "";
@@ -901,6 +977,7 @@
       api(`/api/channels/${encodeURIComponent(channelId)}/members`),
       api(`/api/channels/${encodeURIComponent(channelId)}/messages?limit=50`),
     ]);
+    if (seq !== channelLoadSeq || currentChannelId !== channelId) return;
     currentMembers = Array.isArray(memRes.data?.members) ? memRes.data.members : [];
     messages = Array.isArray(msgRes.data?.messages) ? msgRes.data.messages : [];
     hasMoreOlder = messages.length >= 50;
@@ -936,7 +1013,23 @@
 
   function renderMembers() {
     elMemberStrip.replaceChildren();
-    currentMembers.forEach((m) => {
+    if (!currentMembers.length) return;
+    const sorted = [...currentMembers].sort((a, b) => {
+      if (Boolean(a.online) !== Boolean(b.online)) return a.online ? -1 : 1;
+      return String(a.display_name || a.agent_id || "").localeCompare(
+        String(b.display_name || b.agent_id || ""),
+        undefined,
+        { sensitivity: "base" },
+      );
+    });
+    const onlineCount = sorted.filter((m) => m.online).length;
+    const summary = document.createElement("span");
+    summary.className = "member-online-summary";
+    summary.textContent = `${onlineCount}/${sorted.length} 在线`;
+    summary.title = `当前频道共 ${sorted.length} 位成员，${onlineCount} 位在线`;
+    elMemberStrip.appendChild(summary);
+
+    sorted.forEach((m) => {
       const pill = document.createElement("button");
       pill.type = "button";
       pill.className = "member-pill" + (m.online ? " online" : "");
@@ -947,11 +1040,22 @@
       idSpan.textContent = `@${m.agent_id}`;
       pill.appendChild(nameSpan);
       pill.appendChild(idSpan);
-      pill.title = "点击插入 @提及";
-      pill.addEventListener("click", () => {
-        elInput.value = (elInput.value ? elInput.value + " " : "") + `@${m.agent_id} `;
-        elInput.focus();
+      pill.title = "点击插入 @提及 · 右键或 Option+点击复制 @ID";
+      const copyMemberId = async (ev) => {
+        ev.preventDefault();
+        const handle = `@${m.agent_id}`;
+        if (bridge?.copyText) await bridge.copyText(handle);
+        else await navigator.clipboard?.writeText(handle);
+        showToast(`已复制 ${handle}`);
+      };
+      pill.addEventListener("click", (ev) => {
+        if (ev.altKey) {
+          void copyMemberId(ev);
+          return;
+        }
+        insertTextAtCursor(elInput, `@${m.agent_id} `);
       });
+      pill.addEventListener("contextmenu", copyMemberId);
       elMemberStrip.appendChild(pill);
     });
   }
@@ -2159,6 +2263,13 @@
         run: () => document.getElementById("btn-go-marketplace")?.click(),
       },
       {
+        icon: "✅",
+        label: "全部本机未读标为已读",
+        meta: unreadByChannel.size > 0 ? `${Array.from(unreadByChannel.values()).reduce((a, b) => a + b, 0)} 条` : "",
+        kw: "read unread clear mark all 已读 未读 清除",
+        run: () => markAllLocalChannelsRead(),
+      },
+      {
         icon: "📄",
         label: "导出当前对话为 Markdown",
         meta: "",
@@ -2646,7 +2757,7 @@
         active &&
         (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || active.isContentEditable)
       );
-      const anyModal = !!document.querySelector(".modal-backdrop:not([hidden])");
+      const anyModal = !!document.querySelector(".modal-backdrop:not([hidden]), dialog[open]");
       if (!editable && !anyModal && (!switcherBg || switcherBg.hidden)) {
         ev.preventDefault();
         if (kbdBg && !kbdBg.hidden) closeLocalShortcutsCheatsheet();
@@ -3281,6 +3392,10 @@
       })();
     });
   }
+
+  ["prompt-dialog", "connect-dialog", "settings-dialog", "registered-dialog"].forEach((id) => {
+    bindDialogBackdropClose(document.getElementById(id));
+  });
 
   // Boot
   (async () => {

@@ -518,6 +518,19 @@ body.resizing-sidebar {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.bot-id.copyable {
+  cursor: pointer;
+  border-radius: 4px;
+  padding: 0 3px;
+  margin-left: -3px;
+  display: inline-block;
+  max-width: 100%;
+  transition: background-color 120ms var(--ease), color 120ms var(--ease);
+}
+.bot-id.copyable:hover {
+  background: var(--green-soft);
+  color: var(--green);
+}
 .bot-actions {
   position: absolute;
   right: 10px;
@@ -808,6 +821,19 @@ body.dark .search-banner { color: #5ce695; }
   flex-shrink: 0;
 }
 .member-strip:empty { display: none; }
+.member-online-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: var(--green-soft);
+  color: var(--green);
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
 .member-pill {
   display: inline-flex;
   align-items: center;

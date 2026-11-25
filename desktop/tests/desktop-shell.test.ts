@@ -368,6 +368,15 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     expect(js).toContain('openLocalImageLightbox');
     expect(js).toContain('lbClampPan');
 
+    // Local Hub 2.2: online-first member strip, cursor-aware @mention, bot @ID copy, channel race guard, mark-all-read & dialog backdrop close
+    expect(js).toContain('channelLoadSeq');
+    expect(js).toContain('insertTextAtCursor');
+    expect(js).toContain('markAllLocalChannelsRead');
+    expect(js).toContain('bindDialogBackdropClose');
+    expect(js).toContain('member-online-summary');
+    expect(js).toContain('bot-id copyable');
+    expect(js).toContain('dialog[open]');
+
     expect(css).toContain('.ac-table-wrap');
     expect(css).toContain('.unread-divider');
     expect(css).toContain('.local-ctx-menu');
@@ -377,6 +386,8 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     expect(css).toContain('mark.search-hit.current');
     expect(css).toContain('.wx-inline-img');
     expect(css).toContain('.local-lb-backdrop');
+    expect(css).toContain('.member-online-summary');
+    expect(css).toContain('.bot-id.copyable');
   });
 
   test("Desktop Command Rail 2.0 allowlists Cloud quick routes, classifies active sections, and wires shell rail controls", () => {
