@@ -44,6 +44,7 @@ import {
   resolveCloudQuickRoute,
   resolveOfflineRetryUrl,
   resolveRestoredWindowBounds,
+  resolveSmartReloadAction,
   resolveWorkspaceCopyAction,
   sanitizeLocalProfileName,
   type CloudQuickRoute,
@@ -207,11 +208,30 @@ function applyDesktopZoom(nextFactor: number): void {
   broadcastState();
 }
 
-function reloadActiveView(): boolean {
-  const target = settings.activeWorkspace === "local" ? localView : cloudView;
-  if (target && !target.webContents.isDestroyed()) {
-    target.webContents.reload();
+function reloadWebContentsSmart(wc: Electron.WebContents, workspace: "cloud" | "local"): boolean {
+  if (!wc || wc.isDestroyed()) return false;
+  const st = localServer?.getStatus();
+  const action = resolveSmartReloadAction({
+    workspace,
+    currentUrl: wc.getURL() || "",
+    lastCloudFailedUrl,
+    remoteServerUrl: settings.remoteServerUrl,
+    localRunning: Boolean(st?.running),
+    localHttpUrl: st?.httpUrl ?? null,
+  });
+  if (action.kind === "loadUrl") {
+    void wc.loadURL(action.url);
     return true;
+  }
+  wc.reload();
+  return true;
+}
+
+function reloadActiveView(): boolean {
+  const workspace = settings.activeWorkspace === "local" ? "local" : "cloud";
+  const target = workspace === "local" ? localView : cloudView;
+  if (target && !target.webContents.isDestroyed()) {
+    return reloadWebContentsSmart(target.webContents, workspace);
   }
   return false;
 }
@@ -371,10 +391,12 @@ function attachNativeContextMenu(wc: Electron.WebContents): void {
       const canBack = wc.navigationHistory?.canGoBack?.() ?? false;
       const canFwd = wc.navigationHistory?.canGoForward?.() ?? false;
       const safePageUrl = formatCopyableCloudUrl(wc.getURL(), settings.remoteServerUrl);
+      const targetWorkspace: "cloud" | "local" =
+        localView && !localView.webContents.isDestroyed() && wc === localView.webContents ? "local" : "cloud";
       items.push(
         { label: "Back", enabled: canBack, click: () => wc.navigationHistory.goBack() },
         { label: "Forward", enabled: canFwd, click: () => wc.navigationHistory.goForward() },
-        { label: "Reload", click: () => wc.reload() },
+        { label: "Reload", click: () => { reloadWebContentsSmart(wc, targetWorkspace); } },
       );
       if (safePageUrl) {
         items.push(

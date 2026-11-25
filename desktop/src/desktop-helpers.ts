@@ -644,6 +644,37 @@ export function resolveCloudHistoryCommand(trigger: string): "back" | "forward" 
   return null;
 }
 
+export type SmartReloadAction = { kind: "reload" } | { kind: "loadUrl"; url: string };
+
+/**
+ * Determine whether Reload (Cmd+R / rail reload / context menu Reload) should reload
+ * the current document or recover from a static offline/stopped fallback page.
+ */
+export function resolveSmartReloadAction(params: {
+  workspace: "cloud" | "local";
+  currentUrl: string;
+  lastCloudFailedUrl?: string | null;
+  remoteServerUrl: string;
+  localRunning?: boolean;
+  localHttpUrl?: string | null;
+}): SmartReloadAction {
+  if (params.workspace === "cloud" && isCloudOfflinePageUrl(params.currentUrl)) {
+    return {
+      kind: "loadUrl",
+      url: resolveOfflineRetryUrl(params.lastCloudFailedUrl, params.remoteServerUrl),
+    };
+  }
+  if (
+    params.workspace === "local" &&
+    isLocalStoppedPageUrl(params.currentUrl) &&
+    params.localRunning &&
+    params.localHttpUrl
+  ) {
+    return { kind: "loadUrl", url: params.localHttpUrl };
+  }
+  return { kind: "reload" };
+}
+
 /**
  * Clamp and round Electron webContents zoom factor to a safe, comfortable range [0.75, 1.75].
  */

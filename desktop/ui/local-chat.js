@@ -771,6 +771,7 @@
   }
   elWsPill?.addEventListener("click", triggerManualWsReconnect);
   elWsPill?.addEventListener("keydown", (ev) => {
+    if (isImeComposing(ev)) return;
     if (ev.key === "Enter" || ev.key === " ") {
       ev.preventDefault();
       triggerManualWsReconnect();
@@ -889,6 +890,10 @@
       wsReconnectDelayMs = 1000;
       connectRealtimeWs();
     }
+  });
+  window.addEventListener("offline", () => {
+    if (!authToken) return;
+    setWsPillState("offline");
   });
 
   let syncingCloudSession = false;
@@ -1108,6 +1113,7 @@
 
   async function loadDiscoveredBots() {
     const res = await api("/api/local/discovered-profiles");
+    if (!res.ok) return;
     const profiles = Array.isArray(res.data?.profiles) ? res.data.profiles : [];
     const principals = Array.isArray(res.data?.known_principals) ? res.data.known_principals : [];
     for (const kp of principals) {
@@ -1375,6 +1381,10 @@
     if (elSearchInput) elSearchInput.value = "";
     if (elSearchBanner) elSearchBanner.hidden = true;
     setReplyTarget(null);
+    if (prevChannelId !== channelId) {
+      clearTimeout(connectRealtimeWs._typingTimer);
+      if (elTyping) elTyping.textContent = "";
+    }
     if (prevChannelId !== channelId && authToken) {
       renderMessagesSkeleton();
     }
@@ -1404,6 +1414,9 @@
       api(`/api/channels/${encodeURIComponent(channelId)}/messages?limit=50`),
     ]);
     if (seq !== channelLoadSeq || currentChannelId !== channelId) return;
+    if (!msgRes.ok) {
+      showToast(msgRes.data?.error || "加载房间消息失败，请稍后重试");
+    }
     currentMembers = Array.isArray(memRes.data?.members) ? memRes.data.members : [];
     messages = Array.isArray(msgRes.data?.messages) ? msgRes.data.messages : [];
     hasMoreOlder = messages.length >= 50;
@@ -2345,8 +2358,11 @@
     return Math.abs(t2 - t1) >= 5 * 60 * 1000;
   }
 
+  const mutatingMessageIds = new Set();
+
   async function editLocalMessage(m) {
-    if (!m || !m.id || m.sender_id !== currentPrincipal?.id) return;
+    if (!m || !m.id || m.sender_id !== currentPrincipal?.id || mutatingMessageIds.has(m.id)) return;
+    const targetChannelId = m.channel_id || currentChannelId;
     const r = await openPromptDialog({
       title: "✏️ 编辑消息",
       hint: "支持多行 Markdown 与代码块，⌘/Ctrl + Enter 快捷保存并实时同步给所有成员。",
@@ -2355,22 +2371,28 @@
       multiline: true,
     });
     if (!r?.v1 || r.v1 === m.content) return;
-    const res = await api(
-      `/api/channels/${encodeURIComponent(currentChannelId)}/messages/${encodeURIComponent(m.id)}`,
-      { method: "PATCH", body: JSON.stringify({ content: r.v1 }) },
-    );
-    if (res.ok && res.data?.message) {
-      m.content = res.data.message.content;
-      m.edited_at = res.data.message.edited_at;
-      renderMessages();
-      showToast("消息已更新");
-    } else {
-      showToast(res.data?.error || "编辑失败");
+    mutatingMessageIds.add(m.id);
+    try {
+      const res = await api(
+        `/api/channels/${encodeURIComponent(targetChannelId)}/messages/${encodeURIComponent(m.id)}`,
+        { method: "PATCH", body: JSON.stringify({ content: r.v1 }) },
+      );
+      if (res.ok && res.data?.message) {
+        m.content = res.data.message.content;
+        m.edited_at = res.data.message.edited_at;
+        if (currentChannelId === targetChannelId) renderMessages();
+        showToast("消息已更新");
+      } else {
+        showToast(res.data?.error || "编辑失败");
+      }
+    } finally {
+      mutatingMessageIds.delete(m.id);
     }
   }
 
   async function deleteLocalMessage(m) {
-    if (!m || !m.id || m.sender_id !== currentPrincipal?.id) return;
+    if (!m || !m.id || m.sender_id !== currentPrincipal?.id || mutatingMessageIds.has(m.id)) return;
+    const targetChannelId = m.channel_id || currentChannelId;
     const rawPreview = String(m.content || "").replace(/\s+/g, " ").trim();
     const snippet = rawPreview.length > 56 ? rawPreview.slice(0, 55) + "…" : rawPreview;
     const confirmed = await openConfirmDialog({
@@ -2383,16 +2405,23 @@
       danger: true,
     });
     if (!confirmed) return;
-    const res = await api(
-      `/api/channels/${encodeURIComponent(currentChannelId)}/messages/${encodeURIComponent(m.id)}`,
-      { method: "DELETE" },
-    );
-    if (res.ok) {
-      messages = messages.filter((itemMsg) => itemMsg.id !== m.id);
-      renderMessages();
-      showToast("消息已撤回");
-    } else {
-      showToast(res.data?.error || "撤回失败");
+    mutatingMessageIds.add(m.id);
+    try {
+      const res = await api(
+        `/api/channels/${encodeURIComponent(targetChannelId)}/messages/${encodeURIComponent(m.id)}`,
+        { method: "DELETE" },
+      );
+      if (res.ok) {
+        if (currentChannelId === targetChannelId) {
+          messages = messages.filter((itemMsg) => itemMsg.id !== m.id);
+          renderMessages();
+        }
+        showToast("消息已撤回");
+      } else {
+        showToast(res.data?.error || "撤回失败");
+      }
+    } finally {
+      mutatingMessageIds.delete(m.id);
     }
   }
 

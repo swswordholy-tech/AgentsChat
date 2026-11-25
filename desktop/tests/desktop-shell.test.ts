@@ -30,6 +30,7 @@ import {
   resolveCloudQuickRoute,
   resolveOfflineRetryUrl,
   resolveRestoredWindowBounds,
+  resolveSmartReloadAction,
   resolveWorkspaceCopyAction,
   sanitizeLocalProfileName,
 } from "../src/desktop-helpers.js";
@@ -1315,5 +1316,70 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     expect(localJs).toContain("withLocalActionBusy(elBtnNewGroup");
     expect(localJs).toContain("withLocalActionBusy(elBtnLeaveChannel");
     expect(localJs).toContain('showToast("导出 Markdown 失败，请稍后重试")');
+  });
+
+  test("Desktop 2.16 fixes offline/stopped smart reload recovery, adds dialog aria-labelledby, clears stale typing on room switch, surfaces load errors, adds offline WS detection & hardens message edit/delete", () => {
+    // 1. Pure helper: resolveSmartReloadAction recovers cloud-offline & local-stopped instead of endlessly reloading static fallback pages
+    expect(
+      resolveSmartReloadAction({
+        workspace: "cloud",
+        currentUrl: "file:///app/out/ui/cloud-offline.html?theme=dark",
+        lastCloudFailedUrl: "https://agents-chat.com/lobby?channel=dev",
+        remoteServerUrl: "https://agents-chat.com",
+      }),
+    ).toEqual({ kind: "loadUrl", url: "https://agents-chat.com/lobby?channel=dev" });
+
+    expect(
+      resolveSmartReloadAction({
+        workspace: "cloud",
+        currentUrl: "https://agents-chat.com/lobby",
+        lastCloudFailedUrl: "https://agents-chat.com/okr-board",
+        remoteServerUrl: "https://agents-chat.com",
+      }),
+    ).toEqual({ kind: "reload" });
+
+    expect(
+      resolveSmartReloadAction({
+        workspace: "local",
+        currentUrl: "file:///app/out/ui/local-stopped.html?port=8787",
+        remoteServerUrl: "https://agents-chat.com",
+        localRunning: true,
+        localHttpUrl: "http://127.0.0.1:8787",
+      }),
+    ).toEqual({ kind: "loadUrl", url: "http://127.0.0.1:8787" });
+
+    expect(
+      resolveSmartReloadAction({
+        workspace: "local",
+        currentUrl: "file:///app/out/ui/local-stopped.html?port=8787",
+        remoteServerUrl: "https://agents-chat.com",
+        localRunning: false,
+        localHttpUrl: null,
+      }),
+    ).toEqual({ kind: "reload" });
+
+    // 2. Main process: reloadWebContentsSmart wired into both reloadActiveView & native context menu Reload
+    const mainTs = readFileSync(join(import.meta.dir, "..", "src", "main.ts"), "utf8");
+    expect(mainTs).toContain("function reloadWebContentsSmart(");
+    expect(mainTs).toContain("resolveSmartReloadAction({");
+    expect(mainTs).toContain("return reloadWebContentsSmart(target.webContents, workspace);");
+    expect(mainTs).toContain("reloadWebContentsSmart(wc, targetWorkspace)");
+
+    // 3. Local Hub HTML: all 4 native <dialog> modals wire aria-labelledby to their titles
+    const localHtml = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.html"), "utf8");
+    expect(localHtml).toContain('<dialog id="prompt-dialog" class="modal-dialog" aria-labelledby="dialog-title">');
+    expect(localHtml).toContain('<dialog id="connect-dialog" class="modal-dialog modal-wide" aria-labelledby="connect-dialog-title">');
+    expect(localHtml).toContain('<dialog id="settings-dialog" class="modal-dialog" aria-labelledby="settings-dialog-title">');
+    expect(localHtml).toContain('<dialog id="registered-dialog" class="modal-dialog modal-wide" aria-labelledby="registered-dialog-title">');
+
+    // 4. Local Hub JS: offline WS pill update, clear stale typing, msgRes/bots error guards, edit/delete targetChannelId capture & per-message mutation lock
+    const localJs = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.js"), "utf8");
+    expect(localJs).not.toMatch(/\.(?:innerHTML|outerHTML)\s*=|insertAdjacentHTML|document\.write\s*\(/);
+    expect(() => new Function(localJs)).not.toThrow();
+    expect(localJs).toContain('window.addEventListener("offline"');
+    expect(localJs).toContain("clearTimeout(connectRealtimeWs._typingTimer);");
+    expect(localJs).toContain('showToast(msgRes.data?.error || "加载房间消息失败，请稍后重试")');
+    expect(localJs).toContain("const mutatingMessageIds = new Set();");
+    expect(localJs).toContain("const targetChannelId = m.channel_id || currentChannelId;");
   });
 });

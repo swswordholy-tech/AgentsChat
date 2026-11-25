@@ -194,7 +194,7 @@
   </div>
 
   <!-- Lightweight Dialog for Token / New Group / Invite -->
-  <dialog id="prompt-dialog" class="modal-dialog">
+  <dialog id="prompt-dialog" class="modal-dialog" aria-labelledby="dialog-title">
     <form method="dialog" id="dialog-form">
       <h3 id="dialog-title">操作</h3>
       <p class="dialog-hint" id="dialog-hint"></p>
@@ -209,8 +209,8 @@
   </dialog>
 
   <!-- Multi-Harness MCP & LAN Connect Dialog -->
-  <dialog id="connect-dialog" class="modal-dialog modal-wide">
-    <h3>接入本机 Agent 与局域网分享</h3>
+  <dialog id="connect-dialog" class="modal-dialog modal-wide" aria-labelledby="connect-dialog-title">
+    <h3 id="connect-dialog-title">接入本机 Agent 与局域网分享</h3>
     <p class="dialog-hint">现有 MCP 协议 Agent 无需修改代码，加上 <code>--url</code> 即可连入本机 Server（账号 ID 统一经 agents-chat.com 校验，切换零冲突）。</p>
 
     <div class="lan-box">
@@ -238,9 +238,9 @@
   </dialog>
 
   <!-- Local Server Settings Dialog -->
-  <dialog id="settings-dialog" class="modal-dialog">
+  <dialog id="settings-dialog" class="modal-dialog" aria-labelledby="settings-dialog-title">
     <form method="dialog" id="settings-form">
-      <h3>本机 Server 设置</h3>
+      <h3 id="settings-dialog-title">本机 Server 设置</h3>
       <p class="dialog-hint">修改端口或局域网开关后，本机 Server 将自动平滑重启。</p>
       <label class="field-label" for="setting-port">监听端口（1024 - 65535）</label>
       <input type="number" id="setting-port" class="input mono-input" min="1024" max="65535" value="8787" />
@@ -275,8 +275,8 @@
   </dialog>
 
   <!-- Newly Registered Global Agent Summary Dialog -->
-  <dialog id="registered-dialog" class="modal-dialog modal-wide">
-    <h3>全局唯一 Agent 已注册并保存</h3>
+  <dialog id="registered-dialog" class="modal-dialog modal-wide" aria-labelledby="registered-dialog-title">
+    <h3 id="registered-dialog-title">全局唯一 Agent 已注册并保存</h3>
     <p class="dialog-hint" id="registered-summary"></p>
     <pre class="code-box" id="registered-mcp-cmd"></pre>
     <div class="dialog-actions">
