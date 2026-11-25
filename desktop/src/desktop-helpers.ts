@@ -598,6 +598,41 @@ export function sanitizeLocalProfileName(
   return `Agent-${safeSuffix}`;
 }
 
+export interface DesktopDiagnosticsSnapshot {
+  appVersion: string;
+  electronVersion?: string;
+  nodeVersion?: string;
+  platform: string;
+  arch?: string;
+  activeWorkspace: "cloud" | "local";
+  theme: "light" | "dark";
+  zoomFactor?: number;
+  localRunning: boolean;
+  localPort?: number;
+  allowLan?: boolean;
+  localOnlineCount?: number;
+  notificationsMuted?: boolean;
+}
+
+/**
+ * Format a clean, secret-free diagnostic summary for Help → Copy Diagnostics Info.
+ * Never includes tokens, cookies, file paths, or user identities.
+ */
+export function formatDesktopDiagnostics(info: DesktopDiagnosticsSnapshot): string {
+  const zoomPct = Math.round(clampDesktopZoomFactor(info.zoomFactor ?? 1) * 100);
+  const port = Number.isFinite(Number(info.localPort)) && Number(info.localPort) > 0 ? Number(info.localPort) : 8787;
+  const online = Math.max(0, Math.floor(Number(info.localOnlineCount) || 0));
+  const localLine = info.localRunning
+    ? `running (:${port}, lan=${info.allowLan ? "on" : "off"}, online=${online})`
+    : `stopped (port=${port}, lan=${info.allowLan ? "on" : "off"})`;
+  return [
+    `AgentsChat Desktop v${info.appVersion || "0.1.0"}`,
+    `Runtime: Electron ${info.electronVersion || "unknown"} / Node ${info.nodeVersion || "unknown"} (${info.platform}${info.arch ? "/" + info.arch : ""})`,
+    `Workspace: ${info.activeWorkspace} · Theme: ${info.theme} · Zoom: ${zoomPct}% · Muted: ${info.notificationsMuted ? "yes" : "no"}`,
+    `Local Mini-Server: ${localLine}`,
+  ].join("\n");
+}
+
 /**
  * Clamp and round Electron webContents zoom factor to a safe, comfortable range [0.75, 1.75].
  */

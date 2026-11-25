@@ -46,9 +46,9 @@
         <div class="sidebar-group">
           <div class="section-header">
             <span>会话列表</span>
-            <div class="ch-filter-pills" role="tablist" aria-label="会话筛选">
-              <button type="button" class="ch-filter-pill active" id="ch-filter-all" role="tab" aria-selected="true">全部</button>
-              <button type="button" class="ch-filter-pill" id="ch-filter-unread" role="tab" aria-selected="false">未读</button>
+            <div class="ch-filter-pills" id="ch-filter-tabs" role="tablist" aria-label="会话筛选">
+              <button type="button" class="ch-filter-pill active" id="ch-filter-all" role="tab" aria-selected="true" tabindex="0">全部</button>
+              <button type="button" class="ch-filter-pill" id="ch-filter-unread" role="tab" aria-selected="false" tabindex="-1">未读</button>
             </div>
           </div>
           <div class="channel-list" id="channel-list" role="navigation" aria-label="本地会话列表"></div>
@@ -93,7 +93,7 @@
           <svg class="bridge-arrow" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6" /></svg>
         </button>
       </footer>
-      <div class="local-sidebar-resizer" id="local-sidebar-resizer" role="separator" aria-orientation="vertical" aria-label="调整侧边栏宽度" title="拖拽调整侧边栏宽度 · 双击还原默认"></div>
+      <div class="local-sidebar-resizer" id="local-sidebar-resizer" role="separator" tabindex="0" aria-orientation="vertical" aria-valuemin="220" aria-valuemax="420" aria-valuenow="276" aria-label="调整侧边栏宽度" title="拖拽或按左右方向键调整侧边栏宽度 · 双击或按 0 还原默认"></div>
     </aside>
 
     <!-- Right Column: WeChat-Style Clean Chat Workspace -->

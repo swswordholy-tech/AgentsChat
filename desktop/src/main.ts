@@ -30,6 +30,7 @@ import {
   computeCenteredWindowBounds,
   computeDownloadProgress,
   formatCopyableCloudUrl,
+  formatDesktopDiagnostics,
   formatDesktopWindowTitle,
   formatDownloadCompleteNotice,
   formatLocalMcpCommand,
@@ -699,44 +700,90 @@ async function handleDeepLinkUrl(rawUrl: string): Promise<void> {
   }
 }
 
-async function promptCheckForUpdates(): Promise<void> {
-  const currentVersion = app.getVersion() || "0.1.0";
-  const result = await checkLatestDesktopRelease(currentVersion);
-  if (!result.checked) {
-    await dialog.showMessageBox({
-      type: "info",
-      title: "Check for Updates",
-      message: `Current version: v${currentVersion}`,
-      detail: result.error
-        ? `Could not reach GitHub Releases (${result.error}).`
-        : "Unable to check for updates right now.",
-      buttons: ["Open Releases Page", "Close"],
-      defaultId: 1,
-    }).then(({ response }) => {
-      if (response === 0) void shell.openExternal(result.releaseUrl);
-    });
-    return;
+let checkingForUpdates = false;
+
+async function showDesktopMessageBox(options: Electron.MessageBoxOptions): Promise<Electron.MessageBoxReturnValue> {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    return dialog.showMessageBox(mainWindow, options);
   }
-  if (result.hasUpdate && result.latestVersion) {
-    const { response } = await dialog.showMessageBox({
-      type: "info",
-      title: "AgentsChat Desktop Update Available",
-      message: `AgentsChat Desktop v${result.latestVersion} is available!`,
-      detail: `You are currently running v${currentVersion}. Download the latest macOS / Windows installer from GitHub Releases.`,
-      buttons: ["Download Update", "Later"],
-      defaultId: 0,
-    });
-    if (response === 0) {
-      void shell.openExternal(result.releaseUrl);
-    }
-    return;
-  }
-  await dialog.showMessageBox({
-    type: "info",
-    title: "Up to Date",
-    message: `AgentsChat Desktop v${currentVersion} is up to date.`,
-    buttons: ["OK"],
+  return dialog.showMessageBox(options);
+}
+
+function copyDesktopDiagnostics(): string {
+  const st = localServer?.getStatus();
+  const text = formatDesktopDiagnostics({
+    appVersion: app.getVersion() || "0.1.0",
+    electronVersion: process.versions.electron,
+    nodeVersion: process.versions.node,
+    platform: process.platform,
+    arch: process.arch,
+    activeWorkspace: settings.activeWorkspace,
+    theme: settings.theme === "dark" ? "dark" : "light",
+    zoomFactor: settings.zoomFactor ?? 1,
+    localRunning: Boolean(st?.running),
+    localPort: st?.port ?? settings.localServerPort,
+    allowLan: settings.allowLan === true,
+    localOnlineCount: st?.connectedAgents?.length || 0,
+    notificationsMuted: settings.notificationsMuted === true,
   });
+  clipboard.writeText(text);
+  if (!isSmokeTest && Notification.isSupported()) {
+    new Notification({
+      title: "已复制桌面端诊断信息",
+      body: `v${app.getVersion() || "0.1.0"} · Electron ${process.versions.electron || ""}`,
+      silent: true,
+    }).show();
+  }
+  return text;
+}
+
+async function promptCheckForUpdates(): Promise<void> {
+  if (checkingForUpdates) return;
+  checkingForUpdates = true;
+  try {
+    const currentVersion = app.getVersion() || "0.1.0";
+    const result = await checkLatestDesktopRelease(currentVersion);
+    if (!result.checked) {
+      const { response } = await showDesktopMessageBox({
+        type: "info",
+        title: "Check for Updates",
+        message: `Current version: v${currentVersion}`,
+        detail: result.error
+          ? `Could not reach GitHub Releases (${result.error}).`
+          : "Unable to check for updates right now.",
+        buttons: ["Open Releases Page", "Close"],
+        defaultId: 1,
+        cancelId: 1,
+      });
+      if (response === 0) void shell.openExternal(result.releaseUrl);
+      return;
+    }
+    if (result.hasUpdate && result.latestVersion) {
+      const { response } = await showDesktopMessageBox({
+        type: "info",
+        title: "AgentsChat Desktop Update Available",
+        message: `AgentsChat Desktop v${result.latestVersion} is available!`,
+        detail: `You are currently running v${currentVersion}. Download the latest macOS / Windows installer from GitHub Releases.`,
+        buttons: ["Download Update", "Later"],
+        defaultId: 0,
+        cancelId: 1,
+      });
+      if (response === 0) {
+        void shell.openExternal(result.releaseUrl);
+      }
+      return;
+    }
+    await showDesktopMessageBox({
+      type: "info",
+      title: "Up to Date",
+      message: `AgentsChat Desktop v${currentVersion} is up to date.`,
+      buttons: ["OK"],
+      defaultId: 0,
+      cancelId: 0,
+    });
+  } finally {
+    checkingForUpdates = false;
+  }
 }
 
 function applyLaunchAtLoginSetting(): void {
@@ -1006,6 +1053,10 @@ function setupApplicationMenu(): void {
           click: () => void promptCheckForUpdates(),
         },
         {
+          label: "Copy Diagnostics Info",
+          click: () => { copyDesktopDiagnostics(); },
+        },
+        {
           label: "Open Local Data Folder",
           click: () => void shell.openPath(desktopDataDir),
         },
@@ -1014,12 +1065,7 @@ function setupApplicationMenu(): void {
           label: "Bot Market (Rent / Monetize Bots)",
           click: () => {
             showMainWindow();
-            void switchWorkspace("cloud").then(() => {
-              if (cloudView && !cloudView.webContents.isDestroyed()) {
-                const targetUrl = new URL("/marketplace", settings.remoteServerUrl).toString();
-                void cloudView.webContents.loadURL(targetUrl);
-              }
-            });
+            void navigateCloudQuickRoute("marketplace");
           },
         },
         {

@@ -92,10 +92,12 @@
     if (elChFilterAll) {
       elChFilterAll.classList.toggle("active", !sidebarUnreadOnly);
       elChFilterAll.setAttribute("aria-selected", String(!sidebarUnreadOnly));
+      elChFilterAll.tabIndex = sidebarUnreadOnly ? -1 : 0;
     }
     if (elChFilterUnread) {
       elChFilterUnread.classList.toggle("active", sidebarUnreadOnly);
       elChFilterUnread.setAttribute("aria-selected", String(sidebarUnreadOnly));
+      elChFilterUnread.tabIndex = sidebarUnreadOnly ? 0 : -1;
       elChFilterUnread.textContent = total > 0 ? `未读 ${total > 99 ? "99+" : total}` : "未读";
     }
     document.title = total > 0 ? `(${total > 99 ? "99+" : total}) AgentsChat Local Server` : "AgentsChat Local Server";
@@ -254,17 +256,31 @@
   const elAuthName = document.getElementById("auth-name");
   const elAuthId = document.getElementById("auth-id-text");
   const elChannelList = document.getElementById("channel-list");
+  const elChFilterTabs = document.getElementById("ch-filter-tabs");
   const elChFilterAll = document.getElementById("ch-filter-all");
   const elChFilterUnread = document.getElementById("ch-filter-unread");
-  elChFilterAll?.addEventListener("click", () => {
-    sidebarUnreadOnly = false;
+  function selectLocalChannelFilter(unreadOnly, shouldFocus = false) {
+    sidebarUnreadOnly = Boolean(unreadOnly);
     updateUnreadFilterUI();
     renderChannelList();
-  });
-  elChFilterUnread?.addEventListener("click", () => {
-    sidebarUnreadOnly = true;
-    updateUnreadFilterUI();
-    renderChannelList();
+    if (shouldFocus) {
+      (sidebarUnreadOnly ? elChFilterUnread : elChFilterAll)?.focus();
+    }
+  }
+  elChFilterAll?.addEventListener("click", () => selectLocalChannelFilter(false, false));
+  elChFilterUnread?.addEventListener("click", () => selectLocalChannelFilter(true, false));
+  elChFilterTabs?.addEventListener("keydown", (ev) => {
+    if (isImeComposing(ev)) return;
+    if (ev.key === "ArrowLeft" || ev.key === "ArrowRight") {
+      ev.preventDefault();
+      selectLocalChannelFilter(!sidebarUnreadOnly, true);
+    } else if (ev.key === "Home") {
+      ev.preventDefault();
+      selectLocalChannelFilter(false, true);
+    } else if (ev.key === "End") {
+      ev.preventDefault();
+      selectLocalChannelFilter(true, true);
+    }
   });
   const elBots = document.getElementById("discovered-bots");
   const elBotCountBadge = document.getElementById("bot-count-badge");
@@ -872,27 +888,48 @@
     }
   });
 
-  async function trySyncCloudSession(silent) {
-    if (bridge && typeof bridge.getBootstrapSession === "function") {
-      const boot = await bridge.getBootstrapSession();
-      if (boot && boot.token && boot.principal) {
-        authToken = boot.token;
-        sessionStorage.setItem("ac_local_token", authToken);
-        currentPrincipal = boot.principal;
-        renderIdentity();
-        connectRealtimeWs();
-        await refreshAll();
-        if (!silent) showToast("已同步远端全局账号：" + currentPrincipal.id);
-        return true;
-      }
-      if (!silent) {
-        showToast("正在切到 Cloud 登录全局账号…");
-        bridge.switchToCloud("/login");
-      }
-      return false;
+  let syncingCloudSession = false;
+  async function trySyncCloudSession(silent, triggerBtn = null) {
+    if (syncingCloudSession) return false;
+    syncingCloudSession = true;
+    const origLabel = triggerBtn ? triggerBtn.textContent : "";
+    if (triggerBtn) {
+      triggerBtn.disabled = true;
+      triggerBtn.setAttribute("aria-busy", "true");
+      triggerBtn.textContent = "同步中…";
     }
-    if (!silent) showToast("请在桌面客户端中使用一键同步，或点击“填入凭证”");
-    return false;
+    try {
+      if (bridge && typeof bridge.getBootstrapSession === "function") {
+        const boot = await bridge.getBootstrapSession();
+        if (boot && boot.token && boot.principal) {
+          authToken = boot.token;
+          sessionStorage.setItem("ac_local_token", authToken);
+          currentPrincipal = boot.principal;
+          renderIdentity();
+          connectRealtimeWs();
+          await refreshAll();
+          if (!silent) showToast("已同步远端全局账号：" + currentPrincipal.id);
+          return true;
+        }
+        if (!silent) {
+          showToast("正在切到 Cloud 登录全局账号…");
+          bridge.switchToCloud("/login");
+        }
+        return false;
+      }
+      if (!silent) showToast("请在桌面客户端中使用一键同步，或点击“填入凭证”");
+      return false;
+    } catch {
+      if (!silent) showToast("同步云端账号失败，请稍后重试");
+      return false;
+    } finally {
+      syncingCloudSession = false;
+      if (triggerBtn) {
+        triggerBtn.disabled = false;
+        triggerBtn.removeAttribute("aria-busy");
+        triggerBtn.textContent = origLabel;
+      }
+    }
   }
 
   async function verifyAndSetToken(candidate) {
@@ -2428,7 +2465,7 @@
       btnSync.type = "button";
       btnSync.className = "btn btn-primary";
       btnSync.textContent = "从 Cloud 一键同步身份";
-      btnSync.addEventListener("click", () => trySyncCloudSession(false));
+      btnSync.addEventListener("click", () => void trySyncCloudSession(false, btnSync));
       acts.appendChild(btnSync);
       card.appendChild(iconWrap);
       card.appendChild(h3);
@@ -2772,9 +2809,14 @@
 
   // Click local URL pill to copy
   elServerPill?.addEventListener("click", async () => {
-    if (bridge?.copyText) await bridge.copyText(originUrl);
-    else await navigator.clipboard?.writeText(originUrl);
-    showToast("已复制本机地址：" + originUrl);
+    try {
+      if (bridge?.copyText) await bridge.copyText(originUrl);
+      else await navigator.clipboard?.writeText(originUrl);
+      flashCopyButton(elServerPill, originUrl.replace(/^https?:\/\//, ""));
+      showToast("已复制本机地址：" + originUrl);
+    } catch {
+      showToast("复制本机地址失败");
+    }
   });
 
   // Light / Dark theme toggle (synced across left rail + chat pane + persisted in Desktop settings)
@@ -3324,12 +3366,16 @@
     closeBtn.focus();
   }
 
-  // WeChat macOS 4.0 Resizable Sidebar Split-Pane (220px–420px, double-click resets to 276px)
+  // WeChat macOS 4.0 Resizable Sidebar Split-Pane (220px–420px, double-click or Enter/0 resets to 276px)
   const LOCAL_SB_W_KEY = "ac_local_sidebar_width";
   const LOCAL_SB_DEFAULT_W = 276;
+  const elSidebarResizer = document.getElementById("local-sidebar-resizer");
+  let currentLocalSidebarW = LOCAL_SB_DEFAULT_W;
   function applyLocalSidebarWidth(px, persist) {
     const clamped = Math.max(220, Math.min(420, Math.round(Number(px) || LOCAL_SB_DEFAULT_W)));
+    currentLocalSidebarW = clamped;
     document.documentElement.style.setProperty("--local-sb-w", `${clamped}px`);
+    elSidebarResizer?.setAttribute("aria-valuenow", String(clamped));
     if (persist) {
       try {
         localStorage.setItem(LOCAL_SB_W_KEY, String(clamped));
@@ -3343,7 +3389,6 @@
       applyLocalSidebarWidth(savedW, false);
     }
   } catch {}
-  const elSidebarResizer = document.getElementById("local-sidebar-resizer");
   if (elSidebarResizer) {
     let dragging = false;
     elSidebarResizer.addEventListener("pointerdown", (ev) => {
@@ -3375,6 +3420,27 @@
     elSidebarResizer.addEventListener("dblclick", () => {
       applyLocalSidebarWidth(LOCAL_SB_DEFAULT_W, true);
       showToast("已还原侧边栏默认宽度");
+    });
+    elSidebarResizer.addEventListener("keydown", (ev) => {
+      if (isImeComposing(ev)) return;
+      const step = ev.shiftKey ? 40 : 16;
+      if (ev.key === "ArrowLeft") {
+        ev.preventDefault();
+        applyLocalSidebarWidth(currentLocalSidebarW - step, true);
+      } else if (ev.key === "ArrowRight") {
+        ev.preventDefault();
+        applyLocalSidebarWidth(currentLocalSidebarW + step, true);
+      } else if (ev.key === "Home") {
+        ev.preventDefault();
+        applyLocalSidebarWidth(220, true);
+      } else if (ev.key === "End") {
+        ev.preventDefault();
+        applyLocalSidebarWidth(420, true);
+      } else if (ev.key === "Enter" || ev.key === "0") {
+        ev.preventDefault();
+        applyLocalSidebarWidth(LOCAL_SB_DEFAULT_W, true);
+        showToast("已还原侧边栏默认宽度");
+      }
     });
   }
 
@@ -3571,7 +3637,8 @@
   });
 
   // Event Bindings
-  document.getElementById("btn-sync-cloud").addEventListener("click", () => trySyncCloudSession(false));
+  const elBtnSyncCloud = document.getElementById("btn-sync-cloud");
+  elBtnSyncCloud?.addEventListener("click", () => void trySyncCloudSession(false, elBtnSyncCloud));
   document.getElementById("btn-manual-token").addEventListener("click", async () => {
     const r = await openPromptDialog({
       title: "填入全局账号 JWT 或 Agent 密钥",
@@ -4002,8 +4069,9 @@
   }
   let latestRegisteredClaimUrl = null;
   let latestRegisteredCmd = "";
+  let registeringLocalAgent = false;
   btnRegisterAgent?.addEventListener("click", async () => {
-    if (!bridge?.registerLocalAgent) return;
+    if (!bridge?.registerLocalAgent || registeringLocalAgent) return;
     const r = await openPromptDialog({
       title: "注册全局唯一本机 Agent",
       hint: "将向 agents-chat.com 申请全局唯一 agent_id 与密钥并保存到 ~/.agentschat/profiles/，本地与远端切换零冲突。",
@@ -4011,22 +4079,36 @@
       placeholder2: "可选：Profile 文件名（如：My_Claude）",
     });
     if (!r?.v1) return;
-    showToast("正在向 agents-chat.com 申请全局身份…");
-    const res = await bridge.registerLocalAgent({ displayName: r.v1, profileName: r.v2 });
-    if (!res?.ok) {
-      showToast(res?.error || "注册失败");
-      return;
+    registeringLocalAgent = true;
+    const origLabel = btnRegisterAgent.textContent || "注册新 Agent";
+    btnRegisterAgent.disabled = true;
+    btnRegisterAgent.setAttribute("aria-busy", "true");
+    btnRegisterAgent.textContent = "注册中…";
+    try {
+      showToast("正在向 agents-chat.com 申请全局身份…");
+      const res = await bridge.registerLocalAgent({ displayName: r.v1, profileName: r.v2 });
+      if (!res?.ok) {
+        showToast(res?.error || "注册失败");
+        return;
+      }
+      latestRegisteredClaimUrl = res.claim_url || null;
+      latestRegisteredCmd = res.mcp_command || "";
+      document.getElementById("registered-summary").textContent =
+        `已保存 ~/.agentschat/profiles/${res.profile_name}.json（全局 ID：@${res.agent_id}）并自动加入 #welcome。`;
+      document.getElementById("registered-mcp-cmd").textContent = latestRegisteredCmd;
+      const claimBtn = document.getElementById("btn-open-claim");
+      claimBtn.hidden = !latestRegisteredClaimUrl;
+      openNativeDialog(document.getElementById("registered-dialog"));
+      await loadDiscoveredBots();
+      await selectChannel(currentChannelId);
+    } catch {
+      showToast("注册本机 Agent 失败，请稍后重试");
+    } finally {
+      registeringLocalAgent = false;
+      btnRegisterAgent.disabled = false;
+      btnRegisterAgent.removeAttribute("aria-busy");
+      btnRegisterAgent.textContent = origLabel;
     }
-    latestRegisteredClaimUrl = res.claim_url || null;
-    latestRegisteredCmd = res.mcp_command || "";
-    document.getElementById("registered-summary").textContent =
-      `已保存 ~/.agentschat/profiles/${res.profile_name}.json（全局 ID：@${res.agent_id}）并自动加入 #welcome。`;
-    document.getElementById("registered-mcp-cmd").textContent = latestRegisteredCmd;
-    const claimBtn = document.getElementById("btn-open-claim");
-    claimBtn.hidden = !latestRegisteredClaimUrl;
-    openNativeDialog(document.getElementById("registered-dialog"));
-    await loadDiscoveredBots();
-    await selectChannel(currentChannelId);
   });
   document.getElementById("btn-close-registered")?.addEventListener("click", () => {
     document.getElementById("registered-dialog").close();

@@ -14,6 +14,7 @@ import {
   computeCenteredWindowBounds,
   computeDownloadProgress,
   formatCopyableCloudUrl,
+  formatDesktopDiagnostics,
   formatDesktopWindowTitle,
   formatDownloadCompleteNotice,
   formatLocalMcpCommand,
@@ -1195,5 +1196,83 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     expect(localCss).toContain(".wx-avatar.clickable:focus-visible");
     expect(localCss).toContain(".wx-sender-id.clickable:focus-visible");
     expect(localCss).toContain(".member-pill:focus-visible");
+  });
+
+  test("Desktop 2.14 adds Copy Diagnostics Info, parented update dialogs with re-entrancy guard, WAI-ARIA keyboard Window Splitter, roving channel filter tabs, copy flash & sync/register busy locks", () => {
+    // 1. Pure helper: formatDesktopDiagnostics outputs clean secret-free runtime summary for both running and stopped Local Mini-Server
+    const runningDiag = formatDesktopDiagnostics({
+      appVersion: "0.2.14",
+      electronVersion: "35.0.0",
+      nodeVersion: "22.14.0",
+      platform: "darwin",
+      arch: "arm64",
+      activeWorkspace: "local",
+      theme: "dark",
+      zoomFactor: 1.1,
+      localRunning: true,
+      localPort: 8787,
+      allowLan: true,
+      localOnlineCount: 3,
+      notificationsMuted: false,
+    });
+    expect(runningDiag).toContain("AgentsChat Desktop v0.2.14");
+    expect(runningDiag).toContain("Electron 35.0.0 / Node 22.14.0 (darwin/arm64)");
+    expect(runningDiag).toContain("Workspace: local · Theme: dark · Zoom: 110% · Muted: no");
+    expect(runningDiag).toContain("Local Mini-Server: running (:8787, lan=on, online=3)");
+
+    const stoppedDiag = formatDesktopDiagnostics({
+      appVersion: "",
+      platform: "win32",
+      activeWorkspace: "cloud",
+      theme: "light",
+      zoomFactor: 99,
+      localRunning: false,
+      localPort: 0,
+      allowLan: false,
+      notificationsMuted: true,
+    });
+    expect(stoppedDiag).toContain("AgentsChat Desktop v0.1.0");
+    expect(stoppedDiag).toContain("Zoom: 175% · Muted: yes");
+    expect(stoppedDiag).toContain("Local Mini-Server: stopped (port=8787, lan=off)");
+
+    // 2. Main process: parented update dialog, re-entrancy lock, Help → Copy Diagnostics Info & simplified Bot Market route
+    const mainTs = readFileSync(join(import.meta.dir, "..", "src", "main.ts"), "utf8");
+    expect(mainTs).toContain("let checkingForUpdates = false;");
+    expect(mainTs).toContain("async function showDesktopMessageBox(");
+    expect(mainTs).toContain("dialog.showMessageBox(mainWindow, options)");
+    expect(mainTs).toContain("cancelId: 1");
+    expect(mainTs).toContain("function copyDesktopDiagnostics(): string");
+    expect(mainTs).toContain('label: "Copy Diagnostics Info"');
+
+    // 3. Local Hub HTML: roving filter tablist & WAI-ARIA Window Splitter attributes
+    const localHtml = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.html"), "utf8");
+    expect(localHtml).toContain('id="ch-filter-tabs" role="tablist"');
+    expect(localHtml).toContain('id="ch-filter-all" role="tab" aria-selected="true" tabindex="0"');
+    expect(localHtml).toContain('id="ch-filter-unread" role="tab" aria-selected="false" tabindex="-1"');
+    expect(localHtml).toContain('tabindex="0"');
+    expect(localHtml).toContain('aria-valuemin="220"');
+    expect(localHtml).toContain('aria-valuemax="420"');
+    expect(localHtml).toContain('aria-valuenow="276"');
+
+    // 4. Local Hub JS: zero HTML sinks, valid JS syntax, roving tablist keyboard nav, keyboard splitter resize, server pill flash copy & sync/register busy locks
+    const localJs = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.js"), "utf8");
+    expect(localJs).not.toMatch(/\.(?:innerHTML|outerHTML)\s*=|insertAdjacentHTML|document\.write\s*\(/);
+    expect(() => new Function(localJs)).not.toThrow();
+    expect(localJs).toContain("function selectLocalChannelFilter(unreadOnly, shouldFocus = false)");
+    expect(localJs).toContain('elChFilterTabs?.addEventListener("keydown"');
+    expect(localJs).toContain("elChFilterAll.tabIndex = sidebarUnreadOnly ? -1 : 0;");
+    expect(localJs).toContain('elSidebarResizer?.setAttribute("aria-valuenow", String(clamped))');
+    expect(localJs).toContain('elSidebarResizer.addEventListener("keydown"');
+    expect(localJs).toContain('const step = ev.shiftKey ? 40 : 16;');
+    expect(localJs).toContain('flashCopyButton(elServerPill, originUrl.replace(/^https?:\\/\\//, ""))');
+    expect(localJs).toContain("let syncingCloudSession = false;");
+    expect(localJs).toContain('triggerBtn.textContent = "同步中…"');
+    expect(localJs).toContain("let registeringLocalAgent = false;");
+    expect(localJs).toContain('btnRegisterAgent.textContent = "注册中…"');
+
+    // 5. Local Hub CSS: keyboard focus-visible rings on sidebar resizer & filter pills
+    const localCss = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.css"), "utf8");
+    expect(localCss).toContain(".local-sidebar-resizer:focus-visible::after");
+    expect(localCss).toContain(".ch-filter-pill:focus-visible");
   });
 });
