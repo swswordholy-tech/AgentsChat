@@ -38,6 +38,7 @@ import {
   formatDownloadCompleteNotice,
   formatLocalMcpCommand,
   formatTrayTooltip,
+  isAllowedLocalViewNavigation,
   isCloudOfflinePageUrl,
   isLocalStoppedPageUrl,
   isOAuthPopupUrl,
@@ -52,6 +53,7 @@ import {
   resolveSmartReloadAction,
   resolveWorkspaceCopyAction,
   sanitizeLocalProfileName,
+  shouldGrantWebPermission,
   type CloudQuickRoute,
 } from "./desktop-helpers.js";
 import { GlobalIdentityAuthority, resolveHomeDir } from "./identity-authority.js";
@@ -275,6 +277,35 @@ function openCurrentCloudUrlInBrowser(): boolean {
   if (!url) return false;
   void shell.openExternal(url);
   return true;
+}
+
+const permissionSessionsAttached = new WeakSet<Electron.Session>();
+
+function attachSessionPermissionGuards(wc: Electron.WebContents, workspace: "cloud" | "local"): void {
+  const ses = wc.session;
+  if (!ses || permissionSessionsAttached.has(ses)) return;
+  permissionSessionsAttached.add(ses);
+  ses.setPermissionRequestHandler((webContents, permission, callback, details) => {
+    const origin = (details as { requestingUrl?: string } | undefined)?.requestingUrl || webContents.getURL();
+    callback(
+      shouldGrantWebPermission({
+        workspace,
+        permission,
+        requestingOrigin: origin,
+        remoteServerUrl: settings.remoteServerUrl,
+        notificationsMuted: settings.notificationsMuted === true,
+      }),
+    );
+  });
+  ses.setPermissionCheckHandler((_webContents, permission, requestingOrigin) =>
+    shouldGrantWebPermission({
+      workspace,
+      permission,
+      requestingOrigin,
+      remoteServerUrl: settings.remoteServerUrl,
+      notificationsMuted: settings.notificationsMuted === true,
+    }),
+  );
 }
 
 const downloadSessionsAttached = new WeakSet<Electron.Session>();
@@ -546,6 +577,7 @@ function getSettingsWindowState() {
   return {
     ...getCombinedState(),
     settingsFilePath,
+    appVersion: app.getVersion() || "0.1.0",
   };
 }
 
@@ -627,9 +659,11 @@ function broadcastState(): void {
     settingsWindow.webContents.send("desktop:settings-state-changed", {
       ...snapshot,
       settingsFilePath,
+      appVersion: app.getVersion() || "0.1.0",
     });
   }
   rebuildTrayMenu();
+  rebuildDockMenu();
 }
 
 function layoutViews(): void {
@@ -1395,6 +1429,92 @@ function rebuildTrayMenu(): void {
   tray.setContextMenu(menu);
 }
 
+function rebuildDockMenu(): void {
+  if (process.platform !== "darwin" || !app.dock || isSmokeTest) return;
+  const showLocal = settings.showLocalWorkspace === true;
+  const st = showLocal ? localServer?.getStatus() : null;
+  const dockMenu = Menu.buildFromTemplate([
+    {
+      label: "AgentsChat Cloud (Lobby)",
+      click: () => {
+        showMainWindow();
+        void navigateCloudQuickRoute("lobby");
+      },
+    },
+    {
+      label: "Cloud Studio (算力工坊)",
+      click: () => {
+        showMainWindow();
+        void navigateCloudQuickRoute("cloud-agents");
+      },
+    },
+    {
+      label: "OKR Board",
+      click: () => {
+        showMainWindow();
+        void navigateCloudQuickRoute("okr-board");
+      },
+    },
+    {
+      label: "Bot Market",
+      click: () => {
+        showMainWindow();
+        void navigateCloudQuickRoute("marketplace");
+      },
+    },
+    {
+      label: "Dashboard",
+      click: () => {
+        showMainWindow();
+        void navigateCloudQuickRoute("dashboard");
+      },
+    },
+    ...(showLocal
+      ? [
+          { type: "separator" as const },
+          {
+            label: st?.running ? `Local Server (:${st.port})` : "Local Server (Stopped)",
+            click: () => {
+              showMainWindow();
+              void switchWorkspace("local");
+            },
+          },
+        ]
+      : []),
+    { type: "separator" },
+    {
+      label: "Capture Screenshot to Chat (⌘⇧X)",
+      click: () => void captureScreenshotToChat(),
+    },
+    {
+      label: "Keep Window on Top",
+      type: "checkbox",
+      checked: settings.alwaysOnTop === true,
+      click: () => {
+        showMainWindow();
+        applyAlwaysOnTop(!(settings.alwaysOnTop === true));
+      },
+    },
+    {
+      label: "Mute Notifications",
+      type: "checkbox",
+      checked: settings.notificationsMuted === true,
+      click: () => applyNotificationsMuted(!(settings.notificationsMuted === true)),
+    },
+    { type: "separator" },
+    {
+      label: "Settings… (⌘,)",
+      click: () => {
+        showMainWindow();
+        void openDesktopSettingsWindow();
+      },
+    },
+  ]);
+  try {
+    app.dock.setMenu(dockMenu);
+  } catch {}
+}
+
 async function setShowLocalWorkspace(enabled: boolean): Promise<LocalServerStatus | null> {
   return runLocalServerOp(async () => {
     const nextEnabled = Boolean(enabled);
@@ -1637,6 +1757,8 @@ async function createDesktopWindow(): Promise<void> {
   attachBeforeInputShortcuts(localView.webContents, "local");
 
   const initialZoom = clampDesktopZoomFactor(settings.zoomFactor ?? 1);
+  attachSessionPermissionGuards(cloudView.webContents, "cloud");
+  attachSessionPermissionGuards(localView.webContents, "local");
   attachNativeContextMenu(cloudView.webContents);
   attachNativeContextMenu(localView.webContents);
   attachDownloadFeedback(cloudView.webContents);
@@ -1663,13 +1785,24 @@ async function createDesktopWindow(): Promise<void> {
   });
   localView.webContents.on("will-navigate", (ev, navUrl) => {
     const currentUrl = localView?.webContents.getURL() || "";
-    if (!isLocalStoppedPageUrl(currentUrl)) return;
-    if (navUrl === "agentschat-action://start-local") {
+    if (isLocalStoppedPageUrl(currentUrl)) {
+      if (navUrl === "agentschat-action://start-local") {
+        ev.preventDefault();
+        void setLocalServerEnabled(true);
+        return;
+      }
+      if (navUrl === "agentschat-action://switch-cloud") {
+        ev.preventDefault();
+        void switchWorkspace("cloud");
+        return;
+      }
+    }
+    const localHttpUrl = localServer?.getStatus()?.httpUrl;
+    if (!isAllowedLocalViewNavigation(navUrl, localHttpUrl)) {
       ev.preventDefault();
-      void setLocalServerEnabled(true);
-    } else if (navUrl === "agentschat-action://switch-cloud") {
-      ev.preventDefault();
-      void switchWorkspace("cloud");
+      if (isAllowedExternalUrl(navUrl)) {
+        void shell.openExternal(navUrl);
+      }
     }
   });
   cloudView.webContents.on("render-process-gone", (_ev, details) => {

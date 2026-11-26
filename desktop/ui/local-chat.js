@@ -896,6 +896,8 @@
     });
   }
 
+  window.addEventListener("dragover", (ev) => ev.preventDefault());
+  window.addEventListener("drop", (ev) => ev.preventDefault());
   window.addEventListener("online", () => {
     if (!authToken) return;
     if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
@@ -1767,11 +1769,11 @@
           return;
         }
       }
-      await copyTextToClipboard(cur.src);
-      showToast("已复制图片链接");
+      const ok = await copyTextToClipboard(cur.src);
+      showToast(ok ? "已复制图片链接" : "复制失败");
     } catch {
-      await copyTextToClipboard(cur.src);
-      showToast("已复制图片链接");
+      const ok = await copyTextToClipboard(cur.src);
+      showToast(ok ? "已复制图片链接" : "复制失败");
     }
   }
 

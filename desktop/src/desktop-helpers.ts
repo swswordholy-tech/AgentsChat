@@ -399,6 +399,66 @@ export function resolveBeforeInputShortcut(input: BeforeInputKeySample): "reload
   return null;
 }
 
+const ALLOWED_WEB_PERMISSIONS = new Set([
+  "media",
+  "audioCapture",
+  "clipboard-read",
+  "clipboard-sanitized-write",
+  "fullscreen",
+  "notifications",
+]);
+
+export interface WebPermissionCheckParams {
+  workspace: "cloud" | "local";
+  permission: string;
+  requestingOrigin: unknown;
+  remoteServerUrl: string;
+  notificationsMuted?: boolean;
+}
+
+/**
+ * Strict, least-privilege Electron permission policy for Cloud and Local sessions:
+ * - Denies untrusted / foreign origins.
+ * - Allowlists only voice/media, clipboard, fullscreen, and notifications.
+ * - Enforces Desktop Do-Not-Disturb (`notificationsMuted`) for Web notifications too.
+ */
+export function shouldGrantWebPermission(params: WebPermissionCheckParams): boolean {
+  const perm = String(params.permission || "");
+  if (!ALLOWED_WEB_PERMISSIONS.has(perm)) return false;
+  if (perm === "notifications" && params.notificationsMuted === true) return false;
+  if (typeof params.requestingOrigin !== "string" || !params.requestingOrigin.trim()) return false;
+  try {
+    const req = new URL(params.requestingOrigin);
+    if (params.workspace === "cloud") {
+      const expected = new URL(params.remoteServerUrl);
+      return (req.protocol === "https:" || req.protocol === "http:") && req.origin === expected.origin;
+    }
+    return req.protocol === "http:" && (req.hostname === "127.0.0.1" || req.hostname === "localhost");
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Guard `localView` main-frame navigations so accidental file drops or untrusted
+ * URLs can never replace the embedded Local Mini-Server UI.
+ */
+export function isAllowedLocalViewNavigation(targetUrl: unknown, localHttpUrl: string | null | undefined): boolean {
+  if (typeof targetUrl !== "string" || !targetUrl.trim()) return false;
+  if (targetUrl === "agentschat-action://start-local" || targetUrl === "agentschat-action://switch-cloud") {
+    return true;
+  }
+  if (isLocalStoppedPageUrl(targetUrl)) return true;
+  if (!localHttpUrl) return false;
+  try {
+    const target = new URL(targetUrl);
+    const local = new URL(localHttpUrl);
+    return target.protocol === "http:" && target.origin === local.origin;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Build the safe Local Mini-Server MCP CLI command for a loopback HTTP base URL.
  */

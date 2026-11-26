@@ -23,6 +23,7 @@ import {
   formatLocalMcpCommand,
   formatTrayTooltip,
   formatZoomBadge,
+  isAllowedLocalViewNavigation,
   isCloudOfflinePageUrl,
   isLocalStoppedPageUrl,
   isOAuthPopupUrl,
@@ -38,6 +39,7 @@ import {
   resolveSmartReloadAction,
   resolveWorkspaceCopyAction,
   sanitizeLocalProfileName,
+  shouldGrantWebPermission,
 } from "../src/desktop-helpers.js";
 import { GlobalIdentityAuthority } from "../src/identity-authority.js";
 import { LocalMiniServer } from "../src/local-server.js";
@@ -1678,5 +1680,97 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     const localJs = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.js"), "utf8");
     expect(() => new Function(localJs)).not.toThrow();
     expect(localJs).toContain('menu.addEventListener("keydown", (ev) => {\n      if (isImeComposing(ev)) return;');
+  });
+
+  test("Desktop 2.21 adds least-privilege Electron permission & DND notification guards, macOS Dock quick menu, localView navigation containment, fallback drag-drop guards, Preferences version badge & truthful Lightbox copy toast", () => {
+    const remote = "https://agents-chat.com";
+    // 1. Pure helper: shouldGrantWebPermission enforces trusted origin, allowlisted perms & DND notification mute
+    expect(
+      shouldGrantWebPermission({
+        workspace: "cloud",
+        permission: "media",
+        requestingOrigin: "https://agents-chat.com/lobby",
+        remoteServerUrl: remote,
+      }),
+    ).toBe(true);
+    expect(
+      shouldGrantWebPermission({
+        workspace: "cloud",
+        permission: "notifications",
+        requestingOrigin: "https://agents-chat.com/lobby",
+        remoteServerUrl: remote,
+        notificationsMuted: false,
+      }),
+    ).toBe(true);
+    expect(
+      shouldGrantWebPermission({
+        workspace: "cloud",
+        permission: "notifications",
+        requestingOrigin: "https://agents-chat.com/lobby",
+        remoteServerUrl: remote,
+        notificationsMuted: true,
+      }),
+    ).toBe(false);
+    expect(
+      shouldGrantWebPermission({
+        workspace: "cloud",
+        permission: "geolocation",
+        requestingOrigin: "https://agents-chat.com/lobby",
+        remoteServerUrl: remote,
+      }),
+    ).toBe(false);
+    expect(
+      shouldGrantWebPermission({
+        workspace: "cloud",
+        permission: "media",
+        requestingOrigin: "https://evil.example/phish",
+        remoteServerUrl: remote,
+      }),
+    ).toBe(false);
+    expect(
+      shouldGrantWebPermission({
+        workspace: "local",
+        permission: "clipboard-read",
+        requestingOrigin: "http://127.0.0.1:8787/",
+        remoteServerUrl: remote,
+      }),
+    ).toBe(true);
+    expect(
+      shouldGrantWebPermission({
+        workspace: "local",
+        permission: "usb",
+        requestingOrigin: "http://127.0.0.1:8787/",
+        remoteServerUrl: remote,
+      }),
+    ).toBe(false);
+
+    // 2. Pure helper: isAllowedLocalViewNavigation blocks file:// drops & foreign URLs
+    expect(isAllowedLocalViewNavigation("http://127.0.0.1:8787/#channel=dev", "http://127.0.0.1:8787")).toBe(true);
+    expect(isAllowedLocalViewNavigation("agentschat-action://start-local", null)).toBe(true);
+    expect(isAllowedLocalViewNavigation("file:///app/ui/local-stopped.html?theme=dark", null)).toBe(true);
+    expect(isAllowedLocalViewNavigation("file:///Users/victim/secret.png", "http://127.0.0.1:8787")).toBe(false);
+    expect(isAllowedLocalViewNavigation("https://evil.example/", "http://127.0.0.1:8787")).toBe(false);
+
+    // 3. Main process wiring: permission guards, macOS Dock menu, localView containment & Preferences appVersion
+    const mainTs = readFileSync(join(import.meta.dir, "..", "src", "main.ts"), "utf8");
+    expect(mainTs).toContain("function attachSessionPermissionGuards(");
+    expect(mainTs).toContain("ses.setPermissionRequestHandler(");
+    expect(mainTs).toContain("ses.setPermissionCheckHandler(");
+    expect(mainTs).toContain("function rebuildDockMenu()");
+    expect(mainTs).toContain("app.dock.setMenu(dockMenu);");
+    expect(mainTs).toContain("if (!isAllowedLocalViewNavigation(navUrl, localHttpUrl))");
+    expect(mainTs).toContain('appVersion: app.getVersion() || "0.1.0"');
+
+    // 4. Fallback pages, Preferences & Local Hub: drag-drop guards, version badge & truthful Lightbox copy toast
+    const offlineHtml = readFileSync(join(import.meta.dir, "..", "ui", "cloud-offline.html"), "utf8");
+    expect(offlineHtml).toContain('window.addEventListener("drop", (ev) => ev.preventDefault());');
+    const stoppedHtml = readFileSync(join(import.meta.dir, "..", "ui", "local-stopped.html"), "utf8");
+    expect(stoppedHtml).toContain('window.addEventListener("drop", (ev) => ev.preventDefault());');
+    const settingsHtml = readFileSync(join(import.meta.dir, "..", "ui", "settings.html"), "utf8");
+    expect(settingsHtml).toContain("state.appVersion");
+    const localJs = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.js"), "utf8");
+    expect(() => new Function(localJs)).not.toThrow();
+    expect(localJs).toContain('showToast(ok ? "已复制图片链接" : "复制失败");');
+    expect(localJs).toContain('window.addEventListener("drop", (ev) => ev.preventDefault());');
   });
 });

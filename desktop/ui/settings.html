@@ -609,8 +609,9 @@
       if (prefMuteNotifications) prefMuteNotifications.checked = s.notificationsMuted === true;
 
       if (configPathLabel && typeof state.settingsFilePath === "string" && state.settingsFilePath) {
-        configPathLabel.textContent = state.settingsFilePath;
-        configPathLabel.title = state.settingsFilePath;
+        const verPrefix = typeof state.appVersion === "string" && state.appVersion ? `v${state.appVersion} · ` : "";
+        configPathLabel.textContent = `${verPrefix}${state.settingsFilePath}`;
+        configPathLabel.title = `${verPrefix}${state.settingsFilePath}`;
       }
       syncPortApplyButton();
     }

@@ -259,6 +259,8 @@
       ev.preventDefault();
       triggerStart();
     });
+    window.addEventListener("dragover", (ev) => ev.preventDefault());
+    window.addEventListener("drop", (ev) => ev.preventDefault());
 
     document.addEventListener("keydown", (ev) => {
       if (ev.isComposing || ev.keyCode === 229 || ev.metaKey || ev.ctrlKey || ev.altKey) return;
