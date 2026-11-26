@@ -281,7 +281,8 @@ export class Bridge {
         }
         e.error = this.redact(error instanceof Error ? error.message : "Bridge operation failed").slice(0, 240);
         e.status = e.status === "sending" ? "uncertain" : "failed";
-        this.save(); this.log(cleanBridgeLog(`Message ${JSON.stringify(e.message.id)} ${e.status}; inspect private state before retrying`));
+        const reason = e.error.trim() || "Bridge operation failed";
+        this.save(); this.log(cleanBridgeLog(`Message ${JSON.stringify(e.message.id)} ${e.status} (${reason}); inspect private state before retrying`));
       } finally { this.activity(e.message.channel_id, false); }
     }
   }

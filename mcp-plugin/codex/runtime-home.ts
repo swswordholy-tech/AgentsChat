@@ -1,9 +1,82 @@
-import { existsSync, mkdirSync, readdirSync, accessSync, constants, lstatSync, readlinkSync, realpathSync, symlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, accessSync, constants, lstatSync, readlinkSync, realpathSync, symlinkSync, linkSync, statSync, type Stats } from "node:fs";
 import { assertDirectoryAncestors, type CodexHomeMode } from "./config.ts";
 import { homedir } from "node:os";
 import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 const RUNTIME_CTRL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+
+export interface RuntimeHomeLinkDeps {
+  platform?: NodeJS.Platform;
+  symlinkSync?: (target: Parameters<typeof symlinkSync>[0], path: Parameters<typeof symlinkSync>[1], type?: Parameters<typeof symlinkSync>[2]) => void;
+  linkSync?: (existingPath: Parameters<typeof linkSync>[0], newPath: Parameters<typeof linkSync>[1]) => void;
+}
+
+function normalizeOrigin(origin: string, platform: NodeJS.Platform): string {
+  if (platform !== "win32") return origin;
+  return origin.replace(/^\\\\\?\\(?=[A-Za-z]:\\)/, "").replace(/[\\/]+$/, "").toLowerCase();
+}
+
+function normalizeLinkTarget(baseDir: string, linkValue: string, platform: NodeJS.Platform): string {
+  if (platform !== "win32") return resolve(baseDir, linkValue);
+  const stripped = linkValue.replace(/^\\\\\?\\(?=[A-Za-z]:\\)/, "");
+  return resolve(baseDir, stripped).replace(/[\\/]+$/, "").toLowerCase();
+}
+
+function sameResolvedLink(baseDir: string, linkValue: string, origin: string, platform: NodeJS.Platform): boolean {
+  return normalizeLinkTarget(baseDir, linkValue, platform) === normalizeOrigin(origin, platform);
+}
+
+function sameHardLinkFile(targetPath: string, originPath: string): boolean {
+  try {
+    const targetStat = lstatSync(targetPath, { bigint: true });
+    if (targetStat.isSymbolicLink() || !targetStat.isFile()) return false;
+    const originStat = statSync(originPath, { bigint: true });
+    if (!originStat.isFile()) return false;
+    return targetStat.dev === originStat.dev && targetStat.ino === originStat.ino && targetStat.ino > 0n && targetStat.nlink >= 2n;
+  } catch {
+    return false;
+  }
+}
+
+function isExpectedRuntimeLink(current: Stats, home: string, target: string, origin: string, isDir: boolean, platform: NodeJS.Platform): boolean {
+  if (current.isSymbolicLink()) return sameResolvedLink(home, readlinkSync(target), origin, platform);
+  // POSIX keeps strict symlink-only guarantees; Windows falls back to same-volume hard links for unprivileged file linking.
+  if (platform === "win32" && !isDir && current.isFile()) return sameHardLinkFile(target, origin);
+  return false;
+}
+
+function createRuntimeLink(origin: string, target: string, name: string, isDir: boolean, deps: Required<RuntimeHomeLinkDeps>): void {
+  if (deps.platform !== "win32") {
+    deps.symlinkSync(origin, target);
+    return;
+  }
+  if (isDir) {
+    try {
+      deps.symlinkSync(origin, target, "junction");
+      return;
+    } catch (e: any) {
+      if (e?.code === "EPERM" || e?.code === "EACCES") {
+        throw new Error(`Windows could not create a directory junction for Codex ${name}; check permissions or use --codex-home-mode isolated`);
+      }
+      throw e;
+    }
+  }
+  try {
+    deps.symlinkSync(origin, target, "file");
+    return;
+  } catch (e: any) {
+    if (e?.code !== "EPERM" && e?.code !== "EACCES") throw e;
+  }
+  const linkSource = lstatSync(origin).isSymbolicLink() ? realpathSync(origin) : origin;
+  try {
+    deps.linkSync(linkSource, target);
+  } catch (linkErr: any) {
+    if (linkErr?.code === "EXDEV" || linkErr?.code === "EPERM" || linkErr?.code === "EACCES") {
+      throw new Error(`Windows could not link Codex ${name} without symlink privilege or same-drive hard link; enable Windows Developer Mode, keep state_root on the same drive as CODEX_HOME, or use --codex-home-mode isolated`);
+    }
+    throw linkErr;
+  }
+}
 
 function executablePath(bin: string): string | undefined {
   if (!bin || RUNTIME_CTRL_RE.test(bin)) return undefined;
@@ -36,14 +109,14 @@ function prepareHomeDirectory(stateDir: string, home: string) {
 }
 
 /** Inspect metadata only; never follow a runtime-state link into another home. */
-function assertIndependentTree(home: string, allowedAuthOrigin?: string, codexExecutable?: string) {
+function assertIndependentTree(home: string, allowedAuthOrigin?: string, codexExecutable?: string, platform: NodeJS.Platform = process.platform) {
   if (lstatSync(home).isSymbolicLink()) throw new Error("Independent Codex home must not be a symlink");
   const inspect = (dir: string, depth = 0) => {
     if (depth > 32) throw new Error("Independent Codex home directory depth exceeds 32");
     for (const name of readdirSync(dir)) {
       const path = join(dir, name), info = lstatSync(path);
       if (info.isSymbolicLink()) {
-        if (dir === home && name === "auth.json" && allowedAuthOrigin && resolve(home, readlinkSync(path)) === allowedAuthOrigin) continue;
+        if (dir === home && name === "auth.json" && allowedAuthOrigin && sameResolvedLink(home, readlinkSync(path), allowedAuthOrigin, platform)) continue;
         // Official Codex creates these executable aliases and SIGKILL can leave
         // them behind. Permit only the known shape and this launcher's exact binary.
         const local = relative(home, path).split(sep).join("/");
@@ -60,7 +133,18 @@ function assertIndependentTree(home: string, allowedAuthOrigin?: string, codexEx
 }
 
 /** Reuse operator configuration, never the desktop's databases, sessions or writer locks. */
-export function prepareRuntimeHome(stateDir: string, source = process.env.CODEX_HOME || join(homedir(), ".codex"), mode: CodexHomeMode = "linked", codexBin = "codex") {
+export function prepareRuntimeHome(
+  stateDir: string,
+  source = process.env.CODEX_HOME || join(homedir(), ".codex"),
+  mode: CodexHomeMode = "linked",
+  codexBin = "codex",
+  deps: RuntimeHomeLinkDeps = {},
+) {
+  const linkDeps: Required<RuntimeHomeLinkDeps> = {
+    platform: deps.platform ?? process.platform,
+    symlinkSync: deps.symlinkSync ?? symlinkSync,
+    linkSync: deps.linkSync ?? linkSync,
+  };
   if (mode !== "linked" && mode !== "isolated" && mode !== "auth-only") throw new Error("Invalid Codex home mode");
   if (typeof stateDir !== "string" || !stateDir.trim() || stateDir.length > 4096 || RUNTIME_CTRL_RE.test(stateDir)) {
     throw new Error("Invalid bot state directory");
@@ -70,7 +154,7 @@ export function prepareRuntimeHome(stateDir: string, source = process.env.CODEX_
   if (mode === "isolated") {
     const home = join(stateDir, "codex-home-isolated");
     prepareHomeDirectory(stateDir, home);
-    assertIndependentTree(home, undefined, executablePath(codexBin));
+    assertIndependentTree(home, undefined, executablePath(codexBin), linkDeps.platform);
     return { home: realpathSync(home) };
   }
   if (typeof source !== "string" || !source.trim() || source.length > 4096 || RUNTIME_CTRL_RE.test(source)) {
@@ -97,12 +181,18 @@ export function prepareRuntimeHome(stateDir: string, source = process.env.CODEX_
     const skillsInfo = lstatSync(skills, { throwIfNoEntry: false });
     if (skillsInfo && (skillsInfo.isSymbolicLink() || !skillsInfo.isDirectory() || readdirSync(skills).some(name => name !== ".system")))
       throw new Error("auth-only home contains unexpected custom skills");
-    assertIndependentTree(home, origin, executablePath(codexBin));
+    assertIndependentTree(home, origin, executablePath(codexBin), linkDeps.platform);
     const target = join(home, "auth.json");
-    try {
-      if (!lstatSync(target).isSymbolicLink() || resolve(home, readlinkSync(target)) !== origin) throw new Error("Unexpected auth-only login binding");
-    } catch (e: any) { if (e.code !== "ENOENT") throw e; symlinkSync(origin, target); }
-    assertIndependentTree(home, origin, executablePath(codexBin));
+    let current;
+    try { current = lstatSync(target); } catch (e: any) { if (e.code !== "ENOENT") throw e; }
+    if (current) {
+      if (!isExpectedRuntimeLink(current, home, target, origin, false, linkDeps.platform)) {
+        throw new Error("Unexpected auth-only login binding");
+      }
+    } else {
+      createRuntimeLink(origin, target, "auth.json", false, linkDeps);
+    }
+    assertIndependentTree(home, origin, executablePath(codexBin), linkDeps.platform);
     return { home: realpathSync(home) };
   }
   const legacyHome = existsSync(source) ? realpathSync(source) : resolve(source);
@@ -113,12 +203,13 @@ export function prepareRuntimeHome(stateDir: string, source = process.env.CODEX_
   for (const name of ["config.toml", "auth.json", "AGENTS.md", "skills", "rules", "plugins", "hooks.json", "models_cache.json"]) {
     const origin = join(legacyHome, name), target = join(home, name);
     if (!existsSync(origin)) continue;
+    const isDir = statSync(origin).isDirectory();
     let current;
     try { current = lstatSync(target); } catch (e: any) { if (e.code !== "ENOENT") throw e; }
     if (current) {
-      if (!current.isSymbolicLink() || resolve(home, readlinkSync(target)) !== origin)
+      if (!isExpectedRuntimeLink(current, home, target, origin, isDir, linkDeps.platform))
         throw new Error(`Unexpected bot runtime configuration: ${name}`);
-    } else symlinkSync(origin, target);
+    } else createRuntimeLink(origin, target, name, isDir, linkDeps);
   }
   return {home, legacyHome};
 }

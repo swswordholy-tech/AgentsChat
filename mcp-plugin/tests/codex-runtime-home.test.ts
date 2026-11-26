@@ -1,6 +1,6 @@
 /** Bot persistence must not share the desktop database or writer-lock namespace. */
 import {test,expect,afterEach} from "bun:test";
-import {mkdtempSync,mkdirSync,writeFileSync,chmodSync,readlinkSync,existsSync,statSync,rmSync,symlinkSync,realpathSync} from "node:fs";
+import {mkdtempSync,mkdirSync,writeFileSync,chmodSync,readlinkSync,existsSync,statSync,rmSync,symlinkSync,linkSync,realpathSync} from "node:fs";
 import {spawnSync} from "node:child_process";
 import {join} from "node:path";
 import {tmpdir} from "node:os";
@@ -184,4 +184,76 @@ test("independent homes bound directory traversal and auth-only rejects dangling
  const {root,source}=fixture();writeFileSync(join(source,"auth.json"),"{}");const state=join(root,"bot");
  const {home}=prepareRuntimeHome(state,source,"auth-only");symlinkSync(join(root,"absent"),join(home,"skills"));
  expect(()=>prepareRuntimeHome(state,source,"auth-only")).toThrow("custom skills");
+});
+
+test("win32 linked mode uses directory junctions and file hard-link fallback without weakening verification",()=>{
+ const {root,source}=fixture();
+ writeFileSync(join(source,"auth.json"),"win-login");
+ writeFileSync(join(source,"config.toml"),"win-config");
+ mkdirSync(join(source,"skills"));
+ mkdirSync(join(source,"plugins"));
+ const calls:{kind:"symlink"|"link";origin:string;target:string;type?:string}[]=[];
+ const eperm=()=>{const err:any=new Error("EPERM: operation not permitted");err.code="EPERM";return err;};
+ const winDeps={
+  platform:"win32" as const,
+  symlinkSync:(origin:any,target:any,type?:any)=>{
+   calls.push({kind:"symlink",origin:String(origin),target:String(target),type});
+   if(type==="junction"){symlinkSync(origin,target);return;}
+   throw eperm();
+  },
+  linkSync:(origin:any,target:any)=>{
+   calls.push({kind:"link",origin:String(origin),target:String(target)});
+   linkSync(origin,target);
+  },
+ };
+ const state=join(root,"bot");
+ const runtime=prepareRuntimeHome(state,source,"linked","codex",winDeps);
+ expect(calls.filter(c=>c.kind==="symlink"&&c.type==="junction").map(c=>c.target).sort()).toEqual([
+  join(runtime.home,"plugins"),
+  join(runtime.home,"skills"),
+ ]);
+ expect(calls.filter(c=>c.kind==="symlink"&&c.type==="file").length).toBe(2);
+ expect(calls.filter(c=>c.kind==="link").map(c=>c.target).sort()).toEqual([
+  join(runtime.home,"auth.json"),
+  join(runtime.home,"config.toml"),
+ ]);
+ const beforeCount=calls.length;
+ expect(prepareRuntimeHome(state,source,"linked","codex",winDeps)).toEqual(runtime);
+ expect(calls.length).toBe(beforeCount);
+ // POSIX must never accept a hard-linked file where a symlink is expected.
+ expect(()=>prepareRuntimeHome(state,source,"linked","codex",{platform:"linux"})).toThrow("Unexpected bot runtime configuration: config.toml");
+ rmSync(join(runtime.home,"auth.json"));
+ writeFileSync(join(runtime.home,"auth.json"),"unrelated-file");
+ expect(()=>prepareRuntimeHome(state,source,"linked","codex",winDeps)).toThrow("Unexpected bot runtime configuration: auth.json");
+});
+
+test("win32 auth-only falls back to hard-link and surfaces actionable cross-drive errors",()=>{
+ const {root,source}=fixture();
+ writeFileSync(join(source,"auth.json"),"win-auth-only");
+ const eperm=()=>{const err:any=new Error("EPERM");err.code="EPERM";return err;};
+ const exdev=()=>{const err:any=new Error("EXDEV");err.code="EXDEV";return err;};
+ const winDeps={
+  platform:"win32" as const,
+  symlinkSync:()=>{throw eperm();},
+  linkSync:(origin:any,target:any)=>{linkSync(origin,target);},
+ };
+ const state=join(root,"bot-auth");
+ const runtime=prepareRuntimeHome(state,source,"auth-only","codex",winDeps);
+ expect(prepareRuntimeHome(state,source,"auth-only","codex",winDeps)).toEqual(runtime);
+ expect(()=>prepareRuntimeHome(state,source,"auth-only","codex",{platform:"linux"})).toThrow("Unexpected auth-only login binding");
+ rmSync(join(runtime.home,"auth.json"));
+ writeFileSync(join(runtime.home,"auth.json"),"win-auth-only");
+ expect(()=>prepareRuntimeHome(state,source,"auth-only","codex",winDeps)).toThrow("Unexpected auth-only login binding");
+
+ expect(()=>prepareRuntimeHome(join(root,"bot-exdev"),source,"auth-only","codex",{
+  platform:"win32",
+  symlinkSync:()=>{throw eperm();},
+  linkSync:()=>{throw exdev();},
+ })).toThrow(/Windows Developer Mode.*--codex-home-mode isolated/);
+
+ mkdirSync(join(source,"skills"));
+ expect(()=>prepareRuntimeHome(join(root,"bot-dir-eperm"),source,"linked","codex",{
+  platform:"win32",
+  symlinkSync:()=>{throw eperm();},
+ })).toThrow(/directory junction.*--codex-home-mode isolated/);
 });

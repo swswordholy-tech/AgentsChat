@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // codex/runtime-home.ts
-import { existsSync, mkdirSync, readdirSync, accessSync, constants, lstatSync as lstatSync2, readlinkSync, realpathSync as realpathSync2, symlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, accessSync, constants, lstatSync as lstatSync2, readlinkSync, realpathSync as realpathSync2, symlinkSync, linkSync, statSync } from "node:fs";
 
 // codex/config.ts
 import { copyFileSync, lstatSync, readFileSync, realpathSync, renameSync, unlinkSync } from "node:fs";
@@ -1300,6 +1300,73 @@ function resolveConfig(opts, env = process.env, home = homedir()) {
 import { homedir as homedir2 } from "node:os";
 import { delimiter, isAbsolute as isAbsolute2, join as join2, relative, resolve as resolve2, sep } from "node:path";
 var RUNTIME_CTRL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+function normalizeOrigin(origin, platform) {
+  if (platform !== "win32")
+    return origin;
+  return origin.replace(/^\\\\\?\\(?=[A-Za-z]:\\)/, "").replace(/[\\/]+$/, "").toLowerCase();
+}
+function normalizeLinkTarget(baseDir, linkValue, platform) {
+  if (platform !== "win32")
+    return resolve2(baseDir, linkValue);
+  const stripped = linkValue.replace(/^\\\\\?\\(?=[A-Za-z]:\\)/, "");
+  return resolve2(baseDir, stripped).replace(/[\\/]+$/, "").toLowerCase();
+}
+function sameResolvedLink(baseDir, linkValue, origin, platform) {
+  return normalizeLinkTarget(baseDir, linkValue, platform) === normalizeOrigin(origin, platform);
+}
+function sameHardLinkFile(targetPath, originPath) {
+  try {
+    const targetStat = lstatSync2(targetPath, { bigint: true });
+    if (targetStat.isSymbolicLink() || !targetStat.isFile())
+      return false;
+    const originStat = statSync(originPath, { bigint: true });
+    if (!originStat.isFile())
+      return false;
+    return targetStat.dev === originStat.dev && targetStat.ino === originStat.ino && targetStat.ino > 0n && targetStat.nlink >= 2n;
+  } catch {
+    return false;
+  }
+}
+function isExpectedRuntimeLink(current, home, target, origin, isDir, platform) {
+  if (current.isSymbolicLink())
+    return sameResolvedLink(home, readlinkSync(target), origin, platform);
+  if (platform === "win32" && !isDir && current.isFile())
+    return sameHardLinkFile(target, origin);
+  return false;
+}
+function createRuntimeLink(origin, target, name, isDir, deps) {
+  if (deps.platform !== "win32") {
+    deps.symlinkSync(origin, target);
+    return;
+  }
+  if (isDir) {
+    try {
+      deps.symlinkSync(origin, target, "junction");
+      return;
+    } catch (e) {
+      if (e?.code === "EPERM" || e?.code === "EACCES") {
+        throw new Error(`Windows could not create a directory junction for Codex ${name}; check permissions or use --codex-home-mode isolated`);
+      }
+      throw e;
+    }
+  }
+  try {
+    deps.symlinkSync(origin, target, "file");
+    return;
+  } catch (e) {
+    if (e?.code !== "EPERM" && e?.code !== "EACCES")
+      throw e;
+  }
+  const linkSource = lstatSync2(origin).isSymbolicLink() ? realpathSync2(origin) : origin;
+  try {
+    deps.linkSync(linkSource, target);
+  } catch (linkErr) {
+    if (linkErr?.code === "EXDEV" || linkErr?.code === "EPERM" || linkErr?.code === "EACCES") {
+      throw new Error(`Windows could not link Codex ${name} without symlink privilege or same-drive hard link; enable Windows Developer Mode, keep state_root on the same drive as CODEX_HOME, or use --codex-home-mode isolated`);
+    }
+    throw linkErr;
+  }
+}
 function executablePath(bin) {
   if (!bin || RUNTIME_CTRL_RE.test(bin))
     return;
@@ -1329,7 +1396,7 @@ function prepareHomeDirectory(stateDir, home) {
   assertDirectoryAncestors(home);
   mkdirSync(home, { recursive: true, mode: 448 });
 }
-function assertIndependentTree(home, allowedAuthOrigin, codexExecutable) {
+function assertIndependentTree(home, allowedAuthOrigin, codexExecutable, platform = process.platform) {
   if (lstatSync2(home).isSymbolicLink())
     throw new Error("Independent Codex home must not be a symlink");
   const inspect = (dir, depth = 0) => {
@@ -1338,7 +1405,7 @@ function assertIndependentTree(home, allowedAuthOrigin, codexExecutable) {
     for (const name of readdirSync(dir)) {
       const path = join2(dir, name), info = lstatSync2(path);
       if (info.isSymbolicLink()) {
-        if (dir === home && name === "auth.json" && allowedAuthOrigin && resolve2(home, readlinkSync(path)) === allowedAuthOrigin)
+        if (dir === home && name === "auth.json" && allowedAuthOrigin && sameResolvedLink(home, readlinkSync(path), allowedAuthOrigin, platform))
           continue;
         const local = relative(home, path).split(sep).join("/");
         if (codexExecutable && /^tmp\/arg0\/codex-arg0[A-Za-z0-9_-]+\/(apply_patch|applypatch|codex-execve-wrapper|codex-linux-sandbox)$/.test(local)) {
@@ -1357,7 +1424,12 @@ function assertIndependentTree(home, allowedAuthOrigin, codexExecutable) {
   };
   inspect(home);
 }
-function prepareRuntimeHome(stateDir, source = process.env.CODEX_HOME || join2(homedir2(), ".codex"), mode = "linked", codexBin = "codex") {
+function prepareRuntimeHome(stateDir, source = process.env.CODEX_HOME || join2(homedir2(), ".codex"), mode = "linked", codexBin = "codex", deps = {}) {
+  const linkDeps = {
+    platform: deps.platform ?? process.platform,
+    symlinkSync: deps.symlinkSync ?? symlinkSync,
+    linkSync: deps.linkSync ?? linkSync
+  };
   if (mode !== "linked" && mode !== "isolated" && mode !== "auth-only")
     throw new Error("Invalid Codex home mode");
   if (typeof stateDir !== "string" || !stateDir.trim() || stateDir.length > 4096 || RUNTIME_CTRL_RE.test(stateDir)) {
@@ -1366,7 +1438,7 @@ function prepareRuntimeHome(stateDir, source = process.env.CODEX_HOME || join2(h
   if (mode === "isolated") {
     const home2 = join2(stateDir, "codex-home-isolated");
     prepareHomeDirectory(stateDir, home2);
-    assertIndependentTree(home2, undefined, executablePath(codexBin));
+    assertIndependentTree(home2, undefined, executablePath(codexBin), linkDeps.platform);
     return { home: realpathSync2(home2) };
   }
   if (typeof source !== "string" || !source.trim() || source.length > 4096 || RUNTIME_CTRL_RE.test(source)) {
@@ -1399,17 +1471,23 @@ function prepareRuntimeHome(stateDir, source = process.env.CODEX_HOME || join2(h
     const skillsInfo = lstatSync2(skills, { throwIfNoEntry: false });
     if (skillsInfo && (skillsInfo.isSymbolicLink() || !skillsInfo.isDirectory() || readdirSync(skills).some((name) => name !== ".system")))
       throw new Error("auth-only home contains unexpected custom skills");
-    assertIndependentTree(home2, origin, executablePath(codexBin));
+    assertIndependentTree(home2, origin, executablePath(codexBin), linkDeps.platform);
     const target = join2(home2, "auth.json");
+    let current;
     try {
-      if (!lstatSync2(target).isSymbolicLink() || resolve2(home2, readlinkSync(target)) !== origin)
-        throw new Error("Unexpected auth-only login binding");
+      current = lstatSync2(target);
     } catch (e) {
       if (e.code !== "ENOENT")
         throw e;
-      symlinkSync(origin, target);
     }
-    assertIndependentTree(home2, origin, executablePath(codexBin));
+    if (current) {
+      if (!isExpectedRuntimeLink(current, home2, target, origin, false, linkDeps.platform)) {
+        throw new Error("Unexpected auth-only login binding");
+      }
+    } else {
+      createRuntimeLink(origin, target, "auth.json", false, linkDeps);
+    }
+    assertIndependentTree(home2, origin, executablePath(codexBin), linkDeps.platform);
     return { home: realpathSync2(home2) };
   }
   const legacyHome = existsSync(source) ? realpathSync2(source) : resolve2(source);
@@ -1423,6 +1501,7 @@ function prepareRuntimeHome(stateDir, source = process.env.CODEX_HOME || join2(h
     const origin = join2(legacyHome, name), target = join2(home, name);
     if (!existsSync(origin))
       continue;
+    const isDir = statSync(origin).isDirectory();
     let current;
     try {
       current = lstatSync2(target);
@@ -1431,10 +1510,10 @@ function prepareRuntimeHome(stateDir, source = process.env.CODEX_HOME || join2(h
         throw e;
     }
     if (current) {
-      if (!current.isSymbolicLink() || resolve2(home, readlinkSync(target)) !== origin)
+      if (!isExpectedRuntimeLink(current, home, target, origin, isDir, linkDeps.platform))
         throw new Error(`Unexpected bot runtime configuration: ${name}`);
     } else
-      symlinkSync(origin, target);
+      createRuntimeLink(origin, target, name, isDir, linkDeps);
   }
   return { home, legacyHome };
 }
@@ -1951,6 +2030,17 @@ var APP_SERVER_CTRL_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
 function validThreadId(id) {
   return typeof id === "string" && id.trim().length > 0 && id.length <= 256 && !APP_SERVER_CTRL_RE.test(id);
 }
+function buildDisabledMcpEntry(raw) {
+  const cfg = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : undefined;
+  const transport = cfg?.transport && typeof cfg.transport === "object" && !Array.isArray(cfg.transport) ? cfg.transport : undefined;
+  const url = typeof cfg?.url === "string" && cfg.url.trim() ? cfg.url : typeof transport?.url === "string" && transport.url.trim() ? transport.url : undefined;
+  if (url)
+    return { url, enabled: false };
+  const command = typeof cfg?.command === "string" && cfg.command.trim() ? cfg.command : typeof transport?.command === "string" && transport.command.trim() ? transport.command : undefined;
+  if (command)
+    return { command, enabled: false };
+  return { enabled: false };
+}
 
 class AppServer {
   bin;
@@ -2127,7 +2217,7 @@ class AppServer {
         this.pending.delete(message.id);
         if (message.error) {
           const detail = typeof message.error.message === "string" ? message.error.message : "";
-          const error = waiter.method === "thread/resume" && /already has an active writer/i.test(detail) ? new ThreadBusyError : /app-server socket directory must be a user-owned directory with mode 0700/i.test(detail) ? new Error("Host sandbox rejected the app-server socket directory ownership or mode 0700. This executor may protect the fixed daemon socket directory; use a supported executor or host configuration. Do not weaken the sandbox or change existing host directory permissions. Model execution is not verified.") : /fs sandbox helper failed/i.test(detail) ? new Error("Host filesystem sandbox helper failed. Initialization and authentication do not prove model execution; use a supported host without bypassing sandbox restrictions.") : new Error(`App-server request rejected (${message.error.code})`);
+          const error = waiter.method === "thread/resume" && /already has an active writer/i.test(detail) ? new ThreadBusyError : /app-server socket directory must be a user-owned directory with mode 0700/i.test(detail) ? new Error("Host sandbox rejected the app-server socket directory ownership or mode 0700. This executor may protect the fixed daemon socket directory; use a supported executor or host configuration. Do not weaken the sandbox or change existing host directory permissions. Model execution is not verified.") : /fs sandbox helper failed/i.test(detail) ? new Error("Host filesystem sandbox helper failed. Initialization and authentication do not prove model execution; use a supported host without bypassing sandbox restrictions.") : /failed to load configuration|invalid transport/i.test(detail) ? new Error(`App-server configuration rejected (${waiter.method}, ${message.error.code}): ${detail.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g, " ").trim().slice(0, 160)}`) : new Error(`App-server request rejected (${message.error.code})`);
           waiter.reject(error);
         } else
           waiter.resolve(message.result);
@@ -2174,9 +2264,13 @@ class AppServer {
     }
     const result = await this.request("config/read", { includeLayers: false, cwd });
     this.disabledMcp = {};
-    for (const name of Object.keys(result.config?.mcp_servers ?? {})) {
-      if (!/^(?:__proto__|constructor|prototype)$/i.test(name))
-        this.disabledMcp[name] = { enabled: false };
+    const rawMcpServers = result.config?.mcp_servers;
+    if (rawMcpServers && typeof rawMcpServers === "object" && !Array.isArray(rawMcpServers)) {
+      for (const [name, serverCfg] of Object.entries(rawMcpServers)) {
+        if (!/^(?:__proto__|constructor|prototype)$/i.test(name)) {
+          this.disabledMcp[name] = buildDisabledMcpEntry(serverCfg);
+        }
+      }
     }
     const r = await this.request(existing ? "thread/resume" : "thread/start", {
       ...existing ? { threadId: existing } : { ephemeral },
@@ -2547,7 +2641,7 @@ async function verifyLoopTick(raw, config, owner, list, opts) {
 
 // src/session-bind.ts
 import { createHash as createHash3 } from "node:crypto";
-import { closeSync, lstatSync as lstatSync9, mkdirSync as mkdirSync6, openSync, readFileSync as readFileSync8, readSync, readdirSync as readdirSync4, readlinkSync as readlinkSync3, realpathSync as realpathSync5, statSync, unlinkSync as unlinkSync5 } from "node:fs";
+import { closeSync, lstatSync as lstatSync9, mkdirSync as mkdirSync6, openSync, readFileSync as readFileSync8, readSync, readdirSync as readdirSync4, readlinkSync as readlinkSync3, realpathSync as realpathSync5, statSync as statSync2, unlinkSync as unlinkSync5 } from "node:fs";
 import { homedir as homedir5, tmpdir } from "node:os";
 import { isAbsolute as isAbsolute5, join as join9, parse as parse3, resolve as resolve6 } from "node:path";
 
@@ -2847,7 +2941,7 @@ function isAllowedDarwinSystemLink(dirPath) {
     return false;
   try {
     const expected = `/private${dirPath}`;
-    return readlinkSync3(dirPath) === `private${dirPath}` && realpathSync5(dirPath) === expected && !lstatSync9("/private").isSymbolicLink() && lstatSync9("/private").isDirectory() && !lstatSync9(expected).isSymbolicLink() && statSync(expected).isDirectory();
+    return readlinkSync3(dirPath) === `private${dirPath}` && realpathSync5(dirPath) === expected && !lstatSync9("/private").isSymbolicLink() && lstatSync9("/private").isDirectory() && !lstatSync9(expected).isSymbolicLink() && statSync2(expected).isDirectory();
   } catch {
     return false;
   }
@@ -3376,8 +3470,9 @@ AgentsChat message:
         }
         e.error = this.redact(error instanceof Error ? error.message : "Bridge operation failed").slice(0, 240);
         e.status = e.status === "sending" ? "uncertain" : "failed";
+        const reason = e.error.trim() || "Bridge operation failed";
         this.save();
-        this.log(cleanBridgeLog(`Message ${JSON.stringify(e.message.id)} ${e.status}; inspect private state before retrying`));
+        this.log(cleanBridgeLog(`Message ${JSON.stringify(e.message.id)} ${e.status} (${reason}); inspect private state before retrying`));
       } finally {
         this.activity(e.message.channel_id, false);
       }
