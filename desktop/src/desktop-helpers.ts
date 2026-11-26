@@ -426,6 +426,44 @@ export function buildSelectionLookupInfo(selectionText: unknown): SelectionLooku
   return { label, searchUrl };
 }
 
+/**
+ * Compute clamped top-right floating bounds for the native Find-in-Page bar
+ * rendered above the active Cloud / Local WebContentsView.
+ */
+export function computeFindBarBounds(
+  contentWidth: number,
+  contentHeight: number,
+  railWidth: number,
+): { x: number; y: number; width: number; height: number } {
+  const safeContentW = Number.isFinite(contentWidth) ? Math.max(320, Math.round(contentWidth)) : 1200;
+  const safeContentH = Number.isFinite(contentHeight) ? Math.max(200, Math.round(contentHeight)) : 800;
+  const safeRail = Number.isFinite(railWidth) ? Math.max(0, Math.round(railWidth)) : 0;
+  const availW = Math.max(240, safeContentW - safeRail - 24);
+  const width = Math.min(368, availW);
+  const height = Math.min(48, Math.max(40, safeContentH - 24));
+  const x = Math.max(safeRail + 12, safeContentW - width - 16);
+  const y = 12;
+  return { x, y, width, height };
+}
+
+/**
+ * Format Chromium `found-in-page` ordinal & total count for the floating Find bar.
+ */
+export function formatFindMatchCounter(
+  activeMatchOrdinal: number,
+  matches: number,
+  hasQuery: boolean,
+): string {
+  if (!hasQuery) return "";
+  const safeTotal = Number.isFinite(matches) && matches > 0 ? Math.floor(matches) : 0;
+  if (safeTotal === 0) return "0 / 0";
+  const safeActive =
+    Number.isFinite(activeMatchOrdinal) && activeMatchOrdinal > 0
+      ? Math.min(safeTotal, Math.floor(activeMatchOrdinal))
+      : 1;
+  return `${safeActive} / ${safeTotal}`;
+}
+
 const ALLOWED_WEB_PERMISSIONS = new Set([
   "media",
   "audioCapture",

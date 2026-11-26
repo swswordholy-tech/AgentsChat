@@ -16,11 +16,13 @@ import {
   computeCenteredWindowBounds,
   computeDisplayReclampedBounds,
   computeDownloadProgress,
+  computeFindBarBounds,
   createSerialTaskQueue,
   formatCopyableCloudUrl,
   formatDesktopDiagnostics,
   formatDesktopWindowTitle,
   formatDownloadCompleteNotice,
+  formatFindMatchCounter,
   formatLocalMcpCommand,
   formatTrayTooltip,
   formatZoomBadge,
@@ -1845,5 +1847,60 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     expect(settingsScript).toContain("prefThemeLight,");
     expect(settingsScript).toContain("btnZoomOut,");
     expect(settingsScript).toContain('String(ev.key || "").toLowerCase() === "w"');
+  });
+
+  test("Desktop 2.23 adds native floating Find-in-Page bar (Cmd/Ctrl+F, Cmd/Ctrl+G, Shift+Cmd/Ctrl+G), topmost WebContentsView with Light/Dark sync, IME/drag-drop guards, sender-verified IPCs & static-server 404 isolation", () => {
+    // 1. Pure helpers: computeFindBarBounds & formatFindMatchCounter
+    const wide = computeFindBarBounds(1320, 860, 74);
+    expect(wide).toEqual({ x: 936, y: 12, width: 368, height: 48 });
+
+    const narrow = computeFindBarBounds(360, 560, 74);
+    expect(narrow.x).toBeGreaterThanOrEqual(86);
+    expect(narrow.width).toBeGreaterThanOrEqual(240);
+    expect(narrow.height).toBe(48);
+
+    expect(formatFindMatchCounter(0, 0, false)).toBe("");
+    expect(formatFindMatchCounter(0, 0, true)).toBe("0 / 0");
+    expect(formatFindMatchCounter(3, 12, true)).toBe("3 / 12");
+    expect(formatFindMatchCounter(99, 5, true)).toBe("5 / 5");
+    expect(formatFindMatchCounter(0, 4, true)).toBe("1 / 4");
+
+    // 2. Main process: Edit menu shortcuts, topmost findView, found-in-page results, auto-close on workspace/nav & sender-verified IPCs
+    const mainTs = readFileSync(join(import.meta.dir, "..", "src", "main.ts"), "utf8");
+    expect(mainTs).toContain('accelerator: "CmdOrCtrl+F"');
+    expect(mainTs).toContain('accelerator: "CmdOrCtrl+G"');
+    expect(mainTs).toContain('accelerator: "CmdOrCtrl+Shift+G"');
+    expect(mainTs).toContain("mainWindow.contentView.addChildView(findView);");
+    expect(mainTs).toContain('wc.on("found-in-page"');
+    expect(mainTs).toContain('wc.stopFindInPage("clearSelection")');
+    expect(mainTs).toContain("computeFindBarBounds(width, height, RAIL_WIDTH)");
+    expect(mainTs).toContain('ipcMain.handle("desktop:find-query"');
+    expect(mainTs).toContain('ipcMain.handle("desktop:find-step"');
+    expect(mainTs).toContain('ipcMain.handle("desktop:find-close"');
+
+    // 3. Sandboxed preload & find.html: strict CSP, zero HTML-injection sinks, IME guard, Aa toggle, Esc/Enter/Cmd+F/G & anti-drop
+    const findPreload = readFileSync(join(import.meta.dir, "..", "ui", "find-preload.cjs"), "utf8");
+    expect(findPreload).toContain('contextBridge.exposeInMainWorld("agentschatFind"');
+    expect(findPreload).toContain('ipcRenderer.invoke("desktop:find-query"');
+    expect(findPreload).toContain('ipcRenderer.invoke("desktop:find-step"');
+    expect(findPreload).toContain('ipcRenderer.invoke("desktop:find-close"');
+
+    const findHtml = readFileSync(join(import.meta.dir, "..", "ui", "find.html"), "utf8");
+    const findScript = findHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1] || "";
+    expect(() => new Function(findScript)).not.toThrow();
+    expect(findScript).not.toMatch(/\.(?:innerHTML|outerHTML)\s*=|insertAdjacentHTML|document\.write\s*\(/);
+    expect(findHtml).toContain('id="find-input"');
+    expect(findHtml).toContain('id="btn-case"');
+    expect(findHtml).toContain('id="btn-prev"');
+    expect(findHtml).toContain('id="btn-next"');
+    expect(findHtml).toContain('id="btn-close"');
+    expect(findHtml).toContain("prefers-reduced-motion");
+    expect(findScript).toContain("composing || ev.isComposing || ev.keyCode === 229");
+    expect(findScript).toContain('window.addEventListener("drop", (ev) => ev.preventDefault());');
+
+    // 4. LocalMiniServer static allowlist MUST keep find.html & find-preload.cjs private (never served over HTTP)
+    const localServerTs = readFileSync(join(import.meta.dir, "..", "src", "local-server.ts"), "utf8");
+    expect(localServerTs).not.toContain("find.html");
+    expect(localServerTs).not.toContain("find-preload.cjs");
   });
 });

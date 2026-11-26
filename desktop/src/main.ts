@@ -32,11 +32,13 @@ import {
   computeCenteredWindowBounds,
   computeDisplayReclampedBounds,
   computeDownloadProgress,
+  computeFindBarBounds,
   createSerialTaskQueue,
   formatCopyableCloudUrl,
   formatDesktopDiagnostics,
   formatDesktopWindowTitle,
   formatDownloadCompleteNotice,
+  formatFindMatchCounter,
   formatLocalMcpCommand,
   formatTrayTooltip,
   isAllowedLocalViewNavigation,
@@ -133,6 +135,12 @@ async function captureScreenshotToChat(): Promise<{ ok: boolean; pasted?: boolea
   }
 }
 let boundsSaveTimer: NodeJS.Timeout | null = null;
+let findView: WebContentsView | null = null;
+let findBarOpen = false;
+let findQueryText = "";
+let findMatchCase = false;
+let findActiveOrdinal = 0;
+let findTotalMatches = 0;
 const smokeRendererErrors: string[] = [];
 
 const isSmokeTest = process.env.AGENTSCHAT_DESKTOP_SMOKE_TEST === "1";
@@ -685,6 +693,12 @@ function applyDesktopTheme(nextTheme: "light" | "dark", opts?: { skipCloudSync?:
       settingsWindow.setBackgroundColor(nextTheme === "dark" ? "#1c1c1e" : "#f3f4f6");
     } catch {}
   }
+  if (findView && !findView.webContents.isDestroyed()) {
+    try {
+      findView.setBackgroundColor(nextTheme === "dark" ? "#262629" : "#ffffff");
+    } catch {}
+    syncFindBarState();
+  }
   syncThemeToLocalView(nextTheme);
   if (!opts?.skipCloudSync) {
     syncThemeToCloudView(nextTheme);
@@ -718,6 +732,114 @@ function broadcastState(): void {
   rebuildDockMenu();
 }
 
+function getActiveWorkspaceWebContents(): Electron.WebContents | null {
+  const showLocal = settings.showLocalWorkspace === true;
+  const target = settings.activeWorkspace === "local" && showLocal ? localView : cloudView;
+  if (!target || target.webContents.isDestroyed()) return null;
+  return target.webContents;
+}
+
+function syncFindBarState(): void {
+  if (!findView || findView.webContents.isDestroyed()) return;
+  try {
+    findView.webContents.send("desktop:find-state", {
+      theme: settings.theme || "light",
+      matches: findTotalMatches,
+      counterText: formatFindMatchCounter(findActiveOrdinal, findTotalMatches, findQueryText.length > 0),
+    });
+  } catch {}
+}
+
+function openFindBar(): boolean {
+  if (!mainWindow || mainWindow.isDestroyed() || !findView || findView.webContents.isDestroyed()) return false;
+  if (!isSmokeTest) showMainWindow();
+  findBarOpen = true;
+  layoutViews();
+  try {
+    findView.webContents.focus();
+    findView.webContents.send("desktop:find-focus", {
+      theme: settings.theme || "light",
+      matches: findTotalMatches,
+      counterText: formatFindMatchCounter(findActiveOrdinal, findTotalMatches, findQueryText.length > 0),
+    });
+  } catch {}
+  return true;
+}
+
+function closeFindBar(opts?: { restoreFocus?: boolean }): boolean {
+  const wasOpen = findBarOpen;
+  findBarOpen = false;
+  findActiveOrdinal = 0;
+  findTotalMatches = 0;
+  for (const view of [cloudView, localView]) {
+    if (view && !view.webContents.isDestroyed()) {
+      try {
+        view.webContents.stopFindInPage("clearSelection");
+      } catch {}
+    }
+  }
+  layoutViews();
+  syncFindBarState();
+  if (wasOpen && opts?.restoreFocus !== false) {
+    const activeWc = getActiveWorkspaceWebContents();
+    if (activeWc) {
+      try { activeWc.focus(); } catch {}
+    }
+  }
+  return wasOpen;
+}
+
+function runFindInPage(rawQuery: unknown, matchCase: boolean): boolean {
+  const query = typeof rawQuery === "string" ? rawQuery.slice(0, 500) : "";
+  findQueryText = query;
+  findMatchCase = Boolean(matchCase);
+  const wc = getActiveWorkspaceWebContents();
+  if (!wc) return false;
+  if (!query) {
+    findActiveOrdinal = 0;
+    findTotalMatches = 0;
+    try { wc.stopFindInPage("clearSelection"); } catch {}
+    syncFindBarState();
+    return true;
+  }
+  try {
+    wc.findInPage(query, { forward: true, findNext: false, matchCase: findMatchCase });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function stepFindInPage(forward: boolean): boolean {
+  if (!findQueryText) {
+    return openFindBar();
+  }
+  const wc = getActiveWorkspaceWebContents();
+  if (!wc) return false;
+  if (!findBarOpen) {
+    findBarOpen = true;
+    layoutViews();
+  }
+  try {
+    wc.findInPage(findQueryText, { forward: Boolean(forward), findNext: true, matchCase: findMatchCase });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function attachFindInPageResults(wc: Electron.WebContents, workspace: "cloud" | "local"): void {
+  wc.on("found-in-page", (_ev, result) => {
+    if (!findBarOpen) return;
+    const activeWs: "cloud" | "local" =
+      settings.activeWorkspace === "local" && settings.showLocalWorkspace === true ? "local" : "cloud";
+    if (workspace !== activeWs) return;
+    findActiveOrdinal = Number(result?.activeMatchOrdinal || 0);
+    findTotalMatches = Number(result?.matches || 0);
+    syncFindBarState();
+  });
+}
+
 function layoutViews(): void {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   const [width, height] = mainWindow.getContentSize();
@@ -734,6 +856,15 @@ function layoutViews(): void {
   if (localView) {
     localView.setBounds(settings.activeWorkspace === "local" ? bounds : { x: RAIL_WIDTH, y: 0, width: 0, height: 0 });
     localView.setVisible(settings.activeWorkspace === "local");
+  }
+  if (findView) {
+    if (findBarOpen) {
+      findView.setBounds(computeFindBarBounds(width, height, RAIL_WIDTH));
+      findView.setVisible(true);
+    } else {
+      findView.setBounds({ x: RAIL_WIDTH, y: 0, width: 0, height: 0 });
+      findView.setVisible(false);
+    }
   }
 }
 
@@ -755,6 +886,7 @@ async function readCloudTokenIfSameOrigin(): Promise<string | null> {
 }
 
 async function switchWorkspace(target: "cloud" | "local"): Promise<void> {
+  if (findBarOpen) closeFindBar({ restoreFocus: false });
   const effectiveTarget: "cloud" | "local" =
     target === "local" && settings.showLocalWorkspace ? "local" : "cloud";
   settings = settingsStore.save({ activeWorkspace: effectiveTarget });
@@ -1130,6 +1262,22 @@ function setupApplicationMenu(): void {
         { role: "pasteAndMatchStyle" },
         { type: "separator" },
         { role: "selectAll" },
+        { type: "separator" },
+        {
+          label: "Find in Page…",
+          accelerator: "CmdOrCtrl+F",
+          click: () => { openFindBar(); },
+        },
+        {
+          label: "Find Next",
+          accelerator: "CmdOrCtrl+G",
+          click: () => { stepFindInPage(true); },
+        },
+        {
+          label: "Find Previous",
+          accelerator: "CmdOrCtrl+Shift+G",
+          click: () => { stepFindInPage(false); },
+        },
       ],
     },
     {
@@ -1730,8 +1878,26 @@ async function createDesktopWindow(): Promise<void> {
     },
   });
 
+  findView = new WebContentsView({
+    webPreferences: {
+      preload: join(UI_DIR, "find-preload.cjs"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  });
+  try {
+    findView.setBackgroundColor(settings.theme === "dark" ? "#262629" : "#ffffff");
+  } catch {}
+  findView.setVisible(false);
+
   mainWindow.contentView.addChildView(cloudView);
   mainWindow.contentView.addChildView(localView);
+  mainWindow.contentView.addChildView(findView);
+  findView.webContents.on("will-navigate", (ev) => ev.preventDefault());
+  findView.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  await findView.webContents.loadFile(join(UI_DIR, "find.html"));
+  syncFindBarState();
 
   if (isSmokeTest) {
     const captureErrors = (label: string, wc: Electron.WebContents) => {
@@ -1742,6 +1908,7 @@ async function createDesktopWindow(): Promise<void> {
     };
     captureErrors("shell", mainWindow.webContents);
     captureErrors("local", localView.webContents);
+    captureErrors("find", findView.webContents);
   }
 
   const remoteOrigin = new URL(settings.remoteServerUrl).origin;
@@ -1820,6 +1987,8 @@ async function createDesktopWindow(): Promise<void> {
   attachNativeContextMenu(localView.webContents);
   attachDownloadFeedback(cloudView.webContents);
   attachDownloadFeedback(localView.webContents);
+  attachFindInPageResults(cloudView.webContents, "cloud");
+  attachFindInPageResults(localView.webContents, "local");
 
   cloudView.webContents.on("did-start-loading", () => {
     cloudLoading = true;
@@ -1834,7 +2003,10 @@ async function createDesktopWindow(): Promise<void> {
     try { cloudView?.webContents.setZoomFactor(clampDesktopZoomFactor(settings.zoomFactor ?? 1)); } catch {}
     broadcastState();
   });
-  cloudView.webContents.on("did-navigate", () => broadcastState());
+  cloudView.webContents.on("did-navigate", () => {
+    if (findBarOpen) closeFindBar({ restoreFocus: false });
+    broadcastState();
+  });
   cloudView.webContents.on("did-navigate-in-page", () => broadcastState());
   localView.webContents.on("dom-ready", () => {
     try { localView?.webContents.setZoomFactor(clampDesktopZoomFactor(settings.zoomFactor ?? 1)); } catch {}
@@ -2200,6 +2372,24 @@ function registerIpcHandlers(): void {
     const isSettingsWin = Boolean(settingsWindow && !settingsWindow.isDestroyed() && ev.sender === settingsWindow.webContents);
     if (!isSettingsWin) return false;
     return resetWindowSizeAndCenter();
+  });
+
+  ipcMain.handle("desktop:find-query", (ev, query: unknown, opts: any) => {
+    const isFindBar = Boolean(findView && !findView.webContents.isDestroyed() && ev.sender === findView.webContents);
+    if (!isFindBar) return false;
+    return runFindInPage(query, Boolean(opts?.matchCase));
+  });
+
+  ipcMain.handle("desktop:find-step", (ev, forward: unknown) => {
+    const isFindBar = Boolean(findView && !findView.webContents.isDestroyed() && ev.sender === findView.webContents);
+    if (!isFindBar) return false;
+    return stepFindInPage(Boolean(forward));
+  });
+
+  ipcMain.handle("desktop:find-close", (ev) => {
+    const isFindBar = Boolean(findView && !findView.webContents.isDestroyed() && ev.sender === findView.webContents);
+    if (!isFindBar) return false;
+    return closeFindBar({ restoreFocus: true });
   });
 
   ipcMain.handle("desktop:toggle-local-server", async (_ev, enabled: unknown) => {
@@ -2591,6 +2781,31 @@ if (!gotSingleInstanceLock) {
           !settingsProbe?.hasSettingsPath
         ) {
           throw new Error(`Settings window smoke check failed: ${JSON.stringify(settingsProbe)}`);
+        }
+
+        // 2b. Verify floating Find-in-Page WebContentsView opens, exposes scoped bridge, and closes cleanly
+        const openedFind = openFindBar();
+        const findProbe = await findView?.webContents.executeJavaScript(
+          `({
+            hasFindBridge: Boolean(window.agentschatFind),
+            hasInput: Boolean(document.getElementById("find-input")),
+            hasCaseToggle: Boolean(document.getElementById("btn-case")),
+            hasPrevNext: Boolean(document.getElementById("btn-prev") && document.getElementById("btn-next")),
+            hasClose: Boolean(document.getElementById("btn-close")),
+          })`,
+          true,
+        );
+        const closedFind = closeFindBar({ restoreFocus: false });
+        if (
+          !openedFind ||
+          !closedFind ||
+          !findProbe?.hasFindBridge ||
+          !findProbe?.hasInput ||
+          !findProbe?.hasCaseToggle ||
+          !findProbe?.hasPrevNext ||
+          !findProbe?.hasClose
+        ) {
+          throw new Error(`Find bar smoke check failed: ${JSON.stringify(findProbe)}`);
         }
 
         // 3. Opt-in to Local Workspace and verify LocalMiniServer + Rail reveal + Local Chat DOM/modal
