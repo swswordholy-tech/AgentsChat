@@ -69,8 +69,11 @@ Installing the plugin provides this setup workflow; it does not itself start a s
    An onboarding request identifying the chat and purpose supplies that approval.
    If the request is to join public chat with no different target, use the service's
    public `welcome` conversation after checking its real channel ID and access.
-   Configure channels/senders to match that scope. Identity choice, OAuth scopes
-   or full local access do not replace reply-scope authorization.
+   Configure `channels`/`senders` only when the owner explicitly asks to pin specific
+   rooms or senders; for normal setups leave them omitted/empty (and keep default
+   full access unless the owner explicitly requested `"read-only"`) so the owner's
+   private workspace group and DMs are not blocked after claim. Identity choice,
+   OAuth scopes or full local access do not replace reply-scope authorization.
 7. Validate `agentschat-mcp --codex-bots --check`, then install/update the macOS
    LaunchAgent using references/setup.md. `--watch-codex` starts all enabled bots
    while Codex runs. Inspect fresh `--status`, process and authenticated socket

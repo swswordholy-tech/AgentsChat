@@ -14,6 +14,28 @@ function validThreadId(id: unknown): id is string {
   return typeof id === "string" && id.trim().length > 0 && id.length <= 256 && !APP_SERVER_CTRL_RE.test(id);
 }
 
+type DisabledMcpEntry = { command?: string; url?: string; enabled: false };
+
+function buildDisabledMcpEntry(raw: unknown): DisabledMcpEntry {
+  const cfg = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : undefined;
+  const transport = cfg?.transport && typeof cfg.transport === "object" && !Array.isArray(cfg.transport)
+    ? cfg.transport as Record<string, unknown>
+    : undefined;
+  const url = typeof cfg?.url === "string" && cfg.url.trim()
+    ? cfg.url
+    : typeof transport?.url === "string" && transport.url.trim()
+      ? transport.url
+      : undefined;
+  if (url) return { url, enabled: false };
+  const command = typeof cfg?.command === "string" && cfg.command.trim()
+    ? cfg.command
+    : typeof transport?.command === "string" && transport.command.trim()
+      ? transport.command
+      : undefined;
+  if (command) return { command, enabled: false };
+  return { enabled: false };
+}
+
 /** Official JSON-RPC stdio client. One active generation per bridge. */
 export class AppServer {
   onFatal?: () => void;
@@ -29,7 +51,7 @@ export class AppServer {
   private initialized = false;
   private readonlyFilesystemReported = false;
   private diagnosticTail = "";
-  private disabledMcp: Record<string, { enabled: boolean }> = {};
+  private disabledMcp: Record<string, DisabledMcpEntry> = {};
   // Keep the legacy positional argument for callers; turns have no time limit.
   constructor(private bin = "codex", private args = ["app-server", "--listen", "stdio://"], _legacyTurnTimeoutMs?: number, private permissions: PermissionMode = "full-access", private runtime?: {home: string; legacyHome?: string}, private effort?: ReasoningEffort, private model?: string, private toolIdentity?: { profileFile: string; agentId: string; apiUrl: string; wsUrl: string }, private requestTimeoutMs = 30_000) {}
   get namespace() { return this.runtime?.home; }
@@ -159,7 +181,9 @@ export class AppServer {
               ? new Error("Host sandbox rejected the app-server socket directory ownership or mode 0700. This executor may protect the fixed daemon socket directory; use a supported executor or host configuration. Do not weaken the sandbox or change existing host directory permissions. Model execution is not verified.")
               : /fs sandbox helper failed/i.test(detail)
                 ? new Error("Host filesystem sandbox helper failed. Initialization and authentication do not prove model execution; use a supported host without bypassing sandbox restrictions.")
-                : new Error(`App-server request rejected (${message.error.code})`);
+                : /failed to load configuration|invalid transport/i.test(detail)
+                  ? new Error(`App-server configuration rejected (${waiter.method}, ${message.error.code}): ${detail.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g, " ").trim().slice(0, 160)}`)
+                  : new Error(`App-server request rejected (${message.error.code})`);
           waiter.reject(error);
         } else waiter.resolve(message.result); }
       return;
@@ -195,8 +219,13 @@ export class AppServer {
     }
     const result = await this.request("config/read", { includeLayers: false, cwd });
     this.disabledMcp = {};
-    for (const name of Object.keys(result.config?.mcp_servers ?? {})) {
-      if (!/^(?:__proto__|constructor|prototype)$/i.test(name)) this.disabledMcp[name] = { enabled: false };
+    const rawMcpServers = result.config?.mcp_servers;
+    if (rawMcpServers && typeof rawMcpServers === "object" && !Array.isArray(rawMcpServers)) {
+      for (const [name, serverCfg] of Object.entries(rawMcpServers)) {
+        if (!/^(?:__proto__|constructor|prototype)$/i.test(name)) {
+          this.disabledMcp[name] = buildDisabledMcpEntry(serverCfg);
+        }
+      }
     }
     const r = await this.request(existing ? "thread/resume" : "thread/start", {
       ...(existing ? { threadId: existing } : { ephemeral }), cwd, ...(this.model ? { model: this.model } : {}),

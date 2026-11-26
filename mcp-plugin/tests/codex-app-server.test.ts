@@ -102,18 +102,38 @@ test("malformed completion collections reject empty replies cleanly", async () =
     } finally { app.close(); }
   }
 });
-test("read-only MCP overrides skip prototype keys and retain ordinary servers", async () => {
+test("read-only MCP overrides skip prototype keys, preserve stdio/http transport, and strip nullable/secret fields", async () => {
   const app = new AppServer(); let params: any;
   (app as any).request = async (method: string, p: any) => {
-    if (method === "config/read") return { config: { mcp_servers: JSON.parse('{"__proto__":{},"constructor":{},"prototype":{},"__PROTO__":{},"Constructor":{},"PROTOTYPE":{},"agentschat":{},"toString":{}}') } };
+    if (method === "config/read") {
+      return {
+        config: {
+          mcp_servers: JSON.parse(
+            '{"__proto__":{},"constructor":{},"prototype":{},"__PROTO__":{},"Constructor":{},"PROTOTYPE":{},"agentschat":{"command":"/usr/bin/node","args":["cli.mjs"],"env":{"AGENTSCHAT_TOKEN":"secret"},"tool_timeout_sec":null},"dot.http":{"url":"https://mcp.example.invalid/mcp","bearer_token_env_var":"TOKEN_ENV","http_headers":{"Authorization":"Bearer x"}},"toString":{}}',
+          ),
+        },
+      };
+    }
     params = p; return { thread: { id: "readonly" } };
   };
   try {
     expect(await app.thread("/tmp", undefined, false, "read-only")).toBe("readonly");
     const mcp = params.config.mcp_servers;
-    expect(Object.keys(mcp)).toEqual(["agentschat", "toString"]);
+    expect(Object.keys(mcp)).toEqual(["agentschat", "dot.http", "toString"]);
     expect(Object.getPrototypeOf(mcp)).toBe(Object.prototype);
-    expect(mcp.agentschat).toEqual({ enabled: false }); expect(mcp.toString).toEqual({ enabled: false });
+    expect(mcp.agentschat).toEqual({ command: "/usr/bin/node", enabled: false });
+    expect(mcp["dot.http"]).toEqual({ url: "https://mcp.example.invalid/mcp", enabled: false });
+    expect(mcp.toString).toEqual({ enabled: false });
+  } finally { app.close(); }
+});
+test("config rejection errors surface sanitized transport diagnostics instead of opaque codes", async () => {
+  const app = new AppServer("node", [
+    "-e",
+    `require('node:readline').createInterface({input:process.stdin}).on('line',l=>{const m=JSON.parse(l);if(m.method==='initialize')console.log(JSON.stringify({id:m.id,result:{}}));else if(m.method==='config/read')console.log(JSON.stringify({id:m.id,result:{config:{mcp_servers:{}}}}));else if(m.method==='thread/start')console.log(JSON.stringify({id:m.id,error:{code:-32600,message:'failed to load configuration: invalid transport\\nin \`mcp_servers.agentschat\`\\n'}}));});`,
+  ], undefined, "read-only");
+  try {
+    await app.start();
+    await expect(app.thread("/tmp")).rejects.toThrow("App-server configuration rejected (thread/start, -32600): failed to load configuration: invalid transport in `mcp_servers.agentschat`");
   } finally { app.close(); }
 });
 test("thread permission cache retains 1024 entries and evicts oldest on overflow", async () => {

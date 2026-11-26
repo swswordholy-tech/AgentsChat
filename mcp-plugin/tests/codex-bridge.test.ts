@@ -104,10 +104,11 @@ rl.on('line', line => {
  if(m.method==='thread/read') return emit({id:m.id,result:{thread:{id:p.threadId,turns:[{id:'001',items:[{type:'agentMessage',phase:'final_answer',text:'history from '+p.threadId}]}]}}});
  if(m.method==='thread/name/set') return emit({id:m.id,result:{}});
  if(m.method==='initialize') emit({id:m.id,result:{}});
- if(m.method==='config/read') { configCwd=p.cwd; emit({id:m.id,result:{config:{mcp_servers:{agentschat:{command:'must-disable',tool_timeout_sec:null},filesystem:{command:'also-disable'}}}}}); }
+ if(m.method==='config/read') { configCwd=p.cwd; emit({id:m.id,result:{config:{mcp_servers:{agentschat:{command:'must-disable',tool_timeout_sec:null},filesystem:{command:'also-disable'},remote:{url:'https://mcp.example.invalid/mcp',bearer_token_env_var:'SECRET_ENV'}}}}}); }
  if(m.method==='thread/start'||m.method==='thread/resume') {
   const full=p.sandbox==='danger-full-access';
-  const configOK=full ? p.config===undefined : p.config?.mcp_servers?.agentschat?.enabled===false && p.config?.mcp_servers?.filesystem?.enabled===false;
+  const cfgMcp=p.config?.mcp_servers;
+  const configOK=full ? p.config===undefined : cfgMcp?.agentschat?.enabled===false && cfgMcp?.agentschat?.command==='must-disable' && cfgMcp?.filesystem?.enabled===false && cfgMcp?.filesystem?.command==='also-disable' && cfgMcp?.remote?.enabled===false && cfgMcp?.remote?.url==='https://mcp.example.invalid/mcp' && cfgMcp?.remote?.command===undefined;
   const instructionsOK=typeof p.developerInstructions==='string' && (full
     ? p.developerInstructions.includes('all accepted messages') && !p.developerInstructions.includes('not local user authorization')
     : p.developerInstructions.includes('read-only'));
@@ -322,7 +323,13 @@ test("create and resume both apply permissions and each turn preserves them", as
           expect(params.config).toBeUndefined();
           expect(params.developerInstructions).toContain("all accepted messages");
           expect(params.developerInstructions).not.toContain("not local user authorization");
-        } else expect(params.config).toEqual({mcp_servers:{agentschat:{enabled:false},filesystem:{enabled:false}}});
+        } else expect(params.config).toEqual({
+          mcp_servers: {
+            agentschat: { command: "must-disable", enabled: false },
+            filesystem: { command: "also-disable", enabled: false },
+            remote: { url: "https://mcp.example.invalid/mcp", enabled: false },
+          },
+        });
       }
       expect(trace.find((entry: any) => entry.method === "turn/start").params.sandboxPolicy.type).toBe(mode === "full-access" ? "dangerFullAccess" : "readOnly");
     } finally { app.close(); }
@@ -926,5 +933,45 @@ test("busy retry timer is unreferenced and cleared by stop", async () => {
     expect(timer).toBeDefined(); expect(timer.hasRef()).toBe(false);
     expect((bridge as any).state.entries[0].status).toBe("pending");
     await bridge.stop(); expect((bridge as any).retry).toBeUndefined();
+  } finally { await bridge.stop(); }
+});
+
+test("bridge failure logs include sanitized reason without leaking secrets or controls", async () => {
+  const { c } = fixture();
+  const logs: string[] = [];
+  let mode: "secret" | "empty" | "send-fail" = "secret";
+  const bridge = ownedBridge(
+    c,
+    {
+      thread: async () => "t1",
+      generate: async () => {
+        if (mode === "secret") throw new Error(`Codex turn failed\r\n${c.token} sk-proj-secret1234567890abcdef`);
+        if (mode === "empty") throw new Error("   ");
+        return "ok";
+      },
+    },
+    async () => {
+      if (mode === "send-fail") throw new Error("HTTP 502 bad gateway");
+    },
+    msg => logs.push(msg),
+  );
+  try {
+    expect(bridge.accept(message("m1"))).toBe(true);
+    await bridge.drain();
+    mode = "empty";
+    expect(bridge.accept(message("m2"))).toBe(true);
+    await bridge.drain();
+    mode = "send-fail";
+    expect(bridge.accept(message("m3"))).toBe(true);
+    await bridge.drain();
+
+    expect(logs).toEqual([
+      'Message "m1" failed (Codex turn failed [REDACTED] sk-***REDACTED***); inspect private state before retrying',
+      'Message "m2" failed (Bridge operation failed); inspect private state before retrying',
+      'Message "m3" uncertain (HTTP 502 bad gateway); inspect private state before retrying',
+    ]);
+    const stateText = readFileSync(join(c.stateDir, "state.json"), "utf8");
+    expect(stateText).not.toContain(c.token);
+    expect(stateText).not.toContain("sk-proj-secret1234567890abcdef");
   } finally { await bridge.stop(); }
 });
