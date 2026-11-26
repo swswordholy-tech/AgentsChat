@@ -311,7 +311,7 @@ export class LocalMiniServer {
       sendJson(res, 200, {
         status: "ok",
         mode: "desktop_local_minimal",
-        version: "0.2.0",
+        version: "0.2.1",
         build: "desktop-local",
         agents: st.connectedAgents.length,
         channels: st.channelCount,

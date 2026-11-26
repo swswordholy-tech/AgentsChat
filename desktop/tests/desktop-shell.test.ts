@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync as fsReadFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+
+/** Normalize CRLF checkouts on Windows CI runners so multi-line source checks are OS-independent. */
+const readFileSync = (filePath: string, encoding: BufferEncoding = "utf8"): string =>
+  fsReadFileSync(filePath, encoding).replace(/\r\n/g, "\n");
 import {
   aggregateDownloadProgress,
   buildCloudThemeSyncScript,
