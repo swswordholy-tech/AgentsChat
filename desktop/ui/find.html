@@ -267,7 +267,14 @@
         void api?.close?.();
         return;
       }
-      if (key === "Enter") {
+      if (key === "Enter" && document.activeElement === input) {
+        ev.preventDefault();
+        if (input && input.value.length > 0) {
+          void api?.step?.(!ev.shiftKey);
+        }
+        return;
+      }
+      if (key === "F3" && !ev.metaKey && !ev.ctrlKey && !ev.altKey) {
         ev.preventDefault();
         if (input && input.value.length > 0) {
           void api?.step?.(!ev.shiftKey);

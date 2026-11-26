@@ -174,16 +174,19 @@ function syncUnreadBadge(): void {
     }
   } catch {}
   if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.setTitle(
-      formatDesktopWindowTitle({
-        activeWorkspace: settings.activeWorkspace,
-        cloudSection: getCloudNavState().section,
-        cloudUnread: cloudUnreadCount,
-        localUnread: effectiveLocalUnread,
-        localRunning: Boolean(st?.running),
-        localPort: st?.port,
-      }),
-    );
+    try {
+      mainWindow.setTitle(
+        formatDesktopWindowTitle({
+          activeWorkspace: settings.activeWorkspace,
+          cloudSection: getCloudNavState().section,
+          cloudUnread: cloudUnreadCount,
+          localUnread: effectiveLocalUnread,
+          localRunning: Boolean(st?.running),
+          localPort: st?.port,
+          audioMuted: settings.audioMuted === true,
+        }),
+      );
+    } catch {}
   }
   if (tray) {
     try {
@@ -666,6 +669,24 @@ function syncThemeToCloudView(nextTheme: "light" | "dark"): void {
   } catch {}
 }
 
+function safeSendToWebContents(
+  wc: Electron.WebContents | null | undefined,
+  channel: string,
+  payload?: unknown,
+): boolean {
+  if (!wc || wc.isDestroyed() || wc.isCrashed()) return false;
+  try {
+    if (payload === undefined) {
+      wc.send(channel);
+    } else {
+      wc.send(channel, payload);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function syncThemeToLocalView(nextTheme: "light" | "dark"): void {
   if (!localView || localView.webContents.isDestroyed()) return;
   try {
@@ -674,7 +695,7 @@ function syncThemeToLocalView(nextTheme: "light" | "dark"): void {
       void localView.webContents.executeJavaScript(buildOfflineThemeSyncScript(nextTheme), true).catch(() => {});
       return;
     }
-    localView.webContents.send("desktop:theme-changed", nextTheme);
+    safeSendToWebContents(localView.webContents, "desktop:theme-changed", nextTheme);
   } catch {}
 }
 
@@ -718,22 +739,26 @@ function applyDesktopTheme(nextTheme: "light" | "dark", opts?: { skipCloudSync?:
 }
 
 function broadcastState(): void {
+  if (isQuitting) return;
   const snapshot = getCombinedState();
   if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send("desktop:state-changed", snapshot);
-    mainWindow.setTitle(
-      formatDesktopWindowTitle({
-        activeWorkspace: settings.activeWorkspace,
-        cloudSection: snapshot.cloudNav.section,
-        cloudUnread: cloudUnreadCount,
-        localUnread: snapshot.localUnreadCount,
-        localRunning: Boolean(snapshot.localServer?.running),
-        localPort: snapshot.localServer?.port,
-      }),
-    );
+    safeSendToWebContents(mainWindow.webContents, "desktop:state-changed", snapshot);
+    try {
+      mainWindow.setTitle(
+        formatDesktopWindowTitle({
+          activeWorkspace: settings.activeWorkspace,
+          cloudSection: snapshot.cloudNav.section,
+          cloudUnread: cloudUnreadCount,
+          localUnread: snapshot.localUnreadCount,
+          localRunning: Boolean(snapshot.localServer?.running),
+          localPort: snapshot.localServer?.port,
+          audioMuted: settings.audioMuted === true,
+        }),
+      );
+    } catch {}
   }
   if (settingsWindow && !settingsWindow.isDestroyed()) {
-    settingsWindow.webContents.send("desktop:settings-state-changed", {
+    safeSendToWebContents(settingsWindow.webContents, "desktop:settings-state-changed", {
       ...snapshot,
       settingsFilePath,
       appVersion: app.getVersion() || "0.1.0",
@@ -751,15 +776,12 @@ function getActiveWorkspaceWebContents(): Electron.WebContents | null {
 }
 
 function syncFindBarState(): void {
-  if (!findView || findView.webContents.isDestroyed()) return;
-  try {
-    findView.webContents.send("desktop:find-state", {
-      theme: settings.theme || "light",
-      matches: findTotalMatches,
-      matchCase: findMatchCase,
-      counterText: formatFindMatchCounter(findActiveOrdinal, findTotalMatches, findQueryText.length > 0),
-    });
-  } catch {}
+  safeSendToWebContents(findView?.webContents, "desktop:find-state", {
+    theme: settings.theme || "light",
+    matches: findTotalMatches,
+    matchCase: findMatchCase,
+    counterText: formatFindMatchCounter(findActiveOrdinal, findTotalMatches, findQueryText.length > 0),
+  });
 }
 
 function openFindBar(opts?: { seedQuery?: string | null; triggerSearch?: boolean }): boolean {
@@ -777,14 +799,14 @@ function openFindBar(opts?: { seedQuery?: string | null; triggerSearch?: boolean
   }
   try {
     findView.webContents.focus();
-    findView.webContents.send("desktop:find-focus", {
-      theme: settings.theme || "light",
-      matches: findTotalMatches,
-      matchCase: findMatchCase,
-      counterText: formatFindMatchCounter(findActiveOrdinal, findTotalMatches, findQueryText.length > 0),
-      ...(seed ? { seedQuery: seed, alreadySearched } : {}),
-    });
   } catch {}
+  safeSendToWebContents(findView.webContents, "desktop:find-focus", {
+    theme: settings.theme || "light",
+    matches: findTotalMatches,
+    matchCase: findMatchCase,
+    counterText: formatFindMatchCounter(findActiveOrdinal, findTotalMatches, findQueryText.length > 0),
+    ...(seed ? { seedQuery: seed, alreadySearched } : {}),
+  });
   return true;
 }
 
@@ -937,7 +959,7 @@ async function switchWorkspace(target: "cloud" | "local"): Promise<void> {
       if (!currentUrl.startsWith(st.httpUrl)) {
         await localView.webContents.loadURL(st.httpUrl);
       } else {
-        localView.webContents.send("desktop:workspace-activated");
+        safeSendToWebContents(localView.webContents, "desktop:workspace-activated");
       }
     } else if (!st && localView && !localView.webContents.isDestroyed()) {
       if (!isLocalStoppedPageUrl(localView.webContents.getURL())) {
@@ -2082,10 +2104,12 @@ async function createDesktopWindow(): Promise<void> {
   attachFindInPageResults(localView.webContents, "local");
 
   cloudView.webContents.on("did-start-loading", () => {
+    if (isQuitting) return;
     cloudLoading = true;
     broadcastState();
   });
   cloudView.webContents.on("did-stop-loading", () => {
+    if (isQuitting) return;
     cloudLoading = false;
     broadcastState();
   });
@@ -2131,7 +2155,7 @@ async function createDesktopWindow(): Promise<void> {
     }
   });
   cloudView.webContents.on("render-process-gone", (_ev, details) => {
-    if (isSmokeTest || details.reason === "clean-exit") return;
+    if (isQuitting || isSmokeTest || details.reason === "clean-exit") return;
     cloudLoading = false;
     const retryUrl = resolveOfflineRetryUrl(cloudView?.webContents.getURL() || lastCloudFailedUrl, settings.remoteServerUrl);
     lastCloudFailedUrl = retryUrl;
@@ -2146,7 +2170,7 @@ async function createDesktopWindow(): Promise<void> {
     broadcastState();
   });
   localView.webContents.on("render-process-gone", (_ev, details) => {
-    if (isSmokeTest || details.reason === "clean-exit" || !settings.showLocalWorkspace) return;
+    if (isQuitting || isSmokeTest || details.reason === "clean-exit" || !settings.showLocalWorkspace) return;
     const runningStatus = localServer?.getStatus();
     if (runningStatus?.running) {
       void localView?.webContents.loadURL(runningStatus.httpUrl);
@@ -2174,6 +2198,7 @@ async function createDesktopWindow(): Promise<void> {
   applyAudioMutedToViews(settings.audioMuted === true);
 
   cloudView.webContents.on("did-fail-load", (_ev, errorCode, errorDescription, validatedURL, isMainFrame) => {
+    if (isQuitting) return;
     if (isMainFrame) {
       cloudLoading = false;
       broadcastState();
@@ -2287,6 +2312,20 @@ async function createDesktopWindow(): Promise<void> {
       ev.preventDefault();
       mainWindow?.hide();
     }
+  });
+  mainWindow.on("closed", () => {
+    if (boundsSaveTimer) {
+      clearTimeout(boundsSaveTimer);
+      boundsSaveTimer = null;
+    }
+    findBarOpen = false;
+    findActiveOrdinal = 0;
+    findTotalMatches = 0;
+    cloudLoading = false;
+    mainWindow = null;
+    cloudView = null;
+    localView = null;
+    findView = null;
   });
 
   broadcastState();

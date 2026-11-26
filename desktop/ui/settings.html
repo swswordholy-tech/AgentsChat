@@ -280,6 +280,13 @@
       outline-offset: 1px;
       border-color: var(--green);
     }
+    .port-input.invalid {
+      border-color: var(--danger);
+    }
+    .port-input.invalid:focus-visible {
+      outline-color: var(--danger);
+      border-color: var(--danger);
+    }
 
     .btn {
       border: 1px solid var(--border-strong);
@@ -504,7 +511,7 @@
           <label class="row" for="pref-mute-audio">
             <span class="row-copy">
               <span class="row-title">静音工作区音频</span>
-              <span class="row-desc">静默云端与本机页面的语音播报与网页提示音（⌘⇧U）</span>
+              <span class="row-desc" id="desc-mute-audio">静默云端与本机页面的语音播报与网页提示音（⌘⇧U）</span>
             </span>
             <span class="switch">
               <input type="checkbox" id="pref-mute-audio" />
@@ -528,7 +535,7 @@
           <div class="row">
             <span class="row-copy">
               <span class="row-title">主窗口布局</span>
-              <span class="row-desc">将主窗口恢复至默认尺寸并居中显示（⌘⇧0）</span>
+              <span class="row-desc" id="desc-reset-window">将主窗口恢复至默认尺寸并居中显示（⌘⇧0）</span>
             </span>
             <button type="button" class="btn" id="btn-reset-window">还原位置</button>
           </div>
@@ -578,6 +585,8 @@
     const prefAlwaysOnTop = document.getElementById("pref-always-on-top");
     const prefMuteNotifications = document.getElementById("pref-mute-notifications");
     const prefMuteAudio = document.getElementById("pref-mute-audio");
+    const descMuteAudio = document.getElementById("desc-mute-audio");
+    const descResetWindow = document.getElementById("desc-reset-window");
     const btnClearCache = document.getElementById("btn-clear-cache");
     const btnResetWindow = document.getElementById("btn-reset-window");
     const appVersionBadge = document.getElementById("app-version-badge");
@@ -590,6 +599,18 @@
     let currentState = null;
     let saving = false;
     let statusTimer = null;
+    let updateBtnTimer = null;
+
+    function applyPlatformShortcuts(platform) {
+      const isMac = platform === "darwin";
+      const mod = isMac ? "⌘" : "Ctrl+";
+      const modShift = isMac ? "⌘⇧" : "Ctrl+Shift+";
+      if (btnZoomOut) btnZoomOut.title = `缩小 (${mod}-)`;
+      if (btnZoomValue) btnZoomValue.title = `点击还原 100% (${mod}0)`;
+      if (btnZoomIn) btnZoomIn.title = `放大 (${mod}=)`;
+      if (descMuteAudio) descMuteAudio.textContent = `静默云端与本机页面的语音播报与网页提示音（${modShift}U）`;
+      if (descResetWindow) descResetWindow.textContent = `将主窗口恢复至默认尺寸并居中显示（${modShift}0）`;
+    }
 
     function showStatus(text, isError) {
       if (!statusPill) return;
@@ -605,14 +626,19 @@
     function syncPortApplyButton() {
       if (!prefLocalPort || !btnApplyPort) return;
       const savedPort = Number(currentState?.settings?.localServerPort || 8787);
-      const raw = Number(prefLocalPort.value);
-      const valid = Number.isInteger(raw) && raw >= 1024 && raw <= 65535;
+      const rawText = String(prefLocalPort.value || "").trim();
+      const raw = Number(rawText);
+      const valid = rawText.length > 0 && Number.isInteger(raw) && raw >= 1024 && raw <= 65535;
+      const invalid = rawText.length > 0 && !valid;
+      prefLocalPort.classList.toggle("invalid", invalid);
+      prefLocalPort.setAttribute("aria-invalid", String(invalid));
       btnApplyPort.disabled = saving || !valid || raw === savedPort;
     }
 
     function render(state) {
       if (!state || !state.settings) return;
       currentState = state;
+      applyPlatformShortcuts(state.platform);
       const s = state.settings;
       const isDark = s.theme === "dark";
       document.body.classList.toggle("dark", isDark);
@@ -800,7 +826,11 @@
       try {
         await api.checkForUpdates();
       } finally {
-        setTimeout(() => { btnCheckUpdates.disabled = false; }, 1200);
+        clearTimeout(updateBtnTimer);
+        updateBtnTimer = setTimeout(() => {
+          updateBtnTimer = null;
+          btnCheckUpdates.disabled = false;
+        }, 1200);
       }
     });
     btnCopyDiag?.addEventListener("click", async () => {
@@ -816,12 +846,30 @@
 
     window.addEventListener("dragover", (ev) => ev.preventDefault());
     window.addEventListener("drop", (ev) => ev.preventDefault());
+    window.addEventListener("pagehide", () => {
+      clearTimeout(statusTimer);
+      clearTimeout(updateBtnTimer);
+    });
 
     document.addEventListener("keydown", (ev) => {
       if (ev.isComposing || ev.keyCode === 229) return;
-      if (ev.key === "Escape" || ((ev.metaKey || ev.ctrlKey) && !ev.altKey && !ev.shiftKey && String(ev.key || "").toLowerCase() === "w")) {
+      const key = String(ev.key || "");
+      if (key === "Escape" || ((ev.metaKey || ev.ctrlKey) && !ev.altKey && !ev.shiftKey && String(ev.key || "").toLowerCase() === "w")) {
         ev.preventDefault();
         void api?.closeWindow?.();
+        return;
+      }
+      if ((ev.metaKey || ev.ctrlKey) && !ev.altKey) {
+        if ((key === "=" || key === "+") && !btnZoomIn?.disabled) {
+          ev.preventDefault();
+          btnZoomIn?.click();
+        } else if (key === "-" && !ev.shiftKey && !btnZoomOut?.disabled) {
+          ev.preventDefault();
+          btnZoomOut?.click();
+        } else if (key === "0" && !ev.shiftKey && !btnZoomValue?.disabled) {
+          ev.preventDefault();
+          btnZoomValue?.click();
+        }
       }
     });
 

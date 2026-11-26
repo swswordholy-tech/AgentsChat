@@ -990,6 +990,10 @@
 
     window.addEventListener("dragover", (ev) => ev.preventDefault());
     window.addEventListener("drop", (ev) => ev.preventDefault());
+    window.addEventListener("pagehide", () => {
+      clearTimeout(copyTimer);
+      clearTimeout(localReloadSpinTimer);
+    });
 
     if (api) {
       api.getState().then(render);

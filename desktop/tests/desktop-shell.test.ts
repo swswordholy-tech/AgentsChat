@@ -2037,4 +2037,67 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     expect(stoppedHtml).toContain("[hidden] { display: none !important; }");
     expect(stoppedScript).toContain('window.addEventListener("pagehide"');
   });
+
+  test("Desktop 2.26 fixes WebFrameMain teardown IPC crash, adds mainWindow closed cleanup & isQuitting guards, shows Audio Off in native window title, upgrades Preferences platform shortcuts/port validation/keyboard zoom, and fixes Find bar button Enter & F3", () => {
+    // 1. Pure helper: formatDesktopWindowTitle keeps default titles unchanged and appends Audio Off when audioMuted is true
+    expect(
+      formatDesktopWindowTitle({
+        activeWorkspace: "cloud",
+        cloudSection: "lobby",
+        audioMuted: false,
+      }),
+    ).toBe("AgentsChat");
+    expect(
+      formatDesktopWindowTitle({
+        activeWorkspace: "cloud",
+        cloudSection: "lobby",
+        cloudUnread: 4,
+        audioMuted: true,
+      }),
+    ).toBe("(4) AgentsChat · Audio Off");
+    expect(
+      formatDesktopWindowTitle({
+        activeWorkspace: "local",
+        localRunning: true,
+        localPort: 8787,
+        audioMuted: true,
+      }),
+    ).toBe("AgentsChat · Local :8787 · Audio Off");
+
+    // 2. Main process: safeSendToWebContents prevents disposed-frame crashes, mainWindow closed resets dangling views, isQuitting guards teardown
+    const mainTs = readFileSync(join(import.meta.dir, "..", "src", "main.ts"), "utf8");
+    expect(mainTs).toContain("function safeSendToWebContents(");
+    expect(mainTs).toContain("if (!wc || wc.isDestroyed() || wc.isCrashed()) return false;");
+    expect(mainTs).toContain('safeSendToWebContents(mainWindow.webContents, "desktop:state-changed", snapshot);');
+    expect(mainTs).toContain('safeSendToWebContents(settingsWindow.webContents, "desktop:settings-state-changed"');
+    expect(mainTs).toContain('safeSendToWebContents(findView?.webContents, "desktop:find-state"');
+    expect(mainTs).toContain('mainWindow.on("closed", () => {');
+    expect(mainTs).toContain("if (isQuitting) return;");
+    expect(mainTs).toContain("audioMuted: settings.audioMuted === true,");
+
+    // 3. Preferences UI: dynamic platform shortcuts, port aria-invalid feedback, keyboard zoom shortcuts & pagehide cleanup
+    const settingsHtml = readFileSync(join(import.meta.dir, "..", "ui", "settings.html"), "utf8");
+    const settingsScript = settingsHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1] || "";
+    expect(() => new Function(settingsScript)).not.toThrow();
+    expect(settingsScript).not.toMatch(/\.(?:innerHTML|outerHTML)\s*=|insertAdjacentHTML|document\.write\s*\(/);
+    expect(settingsHtml).toContain(".port-input.invalid");
+    expect(settingsScript).toContain("function applyPlatformShortcuts(platform)");
+    expect(settingsScript).toContain('prefLocalPort.setAttribute("aria-invalid", String(invalid));');
+    expect(settingsScript).toContain('window.addEventListener("pagehide"');
+    expect(settingsScript).toContain('if ((key === "=" || key === "+") && !btnZoomIn?.disabled)');
+
+    // 4. Find bar & Shell rail: button-safe Enter (only steps when #find-input is focused), F3 / Shift+F3 support, and shell pagehide timer cleanup
+    const findHtml = readFileSync(join(import.meta.dir, "..", "ui", "find.html"), "utf8");
+    const findScript = findHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1] || "";
+    expect(() => new Function(findScript)).not.toThrow();
+    expect(findScript).not.toMatch(/\.(?:innerHTML|outerHTML)\s*=|insertAdjacentHTML|document\.write\s*\(/);
+    expect(findScript).toContain('if (key === "Enter" && document.activeElement === input)');
+    expect(findScript).toContain('if (key === "F3" && !ev.metaKey && !ev.ctrlKey && !ev.altKey)');
+
+    const shellHtml = readFileSync(join(import.meta.dir, "..", "ui", "shell.html"), "utf8");
+    const shellScript = shellHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1] || "";
+    expect(() => new Function(shellScript)).not.toThrow();
+    expect(shellScript).not.toMatch(/\.(?:innerHTML|outerHTML)\s*=|insertAdjacentHTML|document\.write\s*\(/);
+    expect(shellScript).toContain('window.addEventListener("pagehide"');
+  });
 });
