@@ -313,6 +313,31 @@
       border-color: transparent;
     }
 
+    .zoom-stepper {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      flex-shrink: 0;
+    }
+    .zoom-step-btn {
+      width: 28px;
+      height: 28px;
+      padding: 0;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 14px;
+      font-weight: 600;
+    }
+    .zoom-value-btn {
+      min-width: 54px;
+      height: 28px;
+      padding: 0 8px;
+      font-family: "SF Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-variant-numeric: tabular-nums;
+      text-align: center;
+    }
+
     .footer {
       flex-shrink: 0;
       display: flex;
@@ -414,9 +439,21 @@
               <span class="row-title">外观模式</span>
               <span class="row-desc">与云端页面及菜单栏双向实时同步</span>
             </span>
-            <div class="segmented" role="radiogroup" aria-label="外观模式">
-              <button type="button" class="seg-btn" id="pref-theme-light" role="radio" aria-checked="true">浅色</button>
-              <button type="button" class="seg-btn" id="pref-theme-dark" role="radio" aria-checked="false">深色</button>
+            <div class="segmented" id="pref-theme-group" role="radiogroup" aria-label="外观模式">
+              <button type="button" class="seg-btn" id="pref-theme-light" role="radio" aria-checked="true" tabindex="0">浅色</button>
+              <button type="button" class="seg-btn" id="pref-theme-dark" role="radio" aria-checked="false" tabindex="-1">深色</button>
+            </div>
+          </div>
+
+          <div class="row">
+            <span class="row-copy">
+              <span class="row-title">页面缩放</span>
+              <span class="row-desc">调整云端与本机工作区显示比例（75% - 175%），点击百分比可还原 100%</span>
+            </span>
+            <div class="zoom-stepper" role="group" aria-label="页面缩放">
+              <button type="button" class="btn zoom-step-btn" id="btn-zoom-out" title="缩小 (⌘-)" aria-label="缩小页面">−</button>
+              <button type="button" class="btn zoom-value-btn" id="btn-zoom-value" title="点击还原 100% (⌘0)" aria-label="当前缩放比例，点击还原 100%">100%</button>
+              <button type="button" class="btn zoom-step-btn" id="btn-zoom-in" title="放大 (⌘=)" aria-label="放大页面">+</button>
             </div>
           </div>
 
@@ -470,6 +507,7 @@
     <footer class="footer">
       <span class="config-path" id="config-path-label" title="桌面端配置文件路径">settings.json</span>
       <div class="footer-actions">
+        <button type="button" class="btn" id="btn-copy-diag" title="复制运行环境与配置诊断信息（不含敏感凭证）">复制诊断</button>
         <button type="button" class="btn" id="btn-open-data-dir">打开配置目录</button>
         <button type="button" class="btn btn-primary" id="btn-done">完成</button>
       </div>
@@ -486,13 +524,18 @@
     const prefLocalPort = document.getElementById("pref-local-port");
     const btnApplyPort = document.getElementById("btn-apply-port");
     const prefAllowLan = document.getElementById("pref-allow-lan");
+    const prefThemeGroup = document.getElementById("pref-theme-group");
     const prefThemeLight = document.getElementById("pref-theme-light");
     const prefThemeDark = document.getElementById("pref-theme-dark");
+    const btnZoomOut = document.getElementById("btn-zoom-out");
+    const btnZoomValue = document.getElementById("btn-zoom-value");
+    const btnZoomIn = document.getElementById("btn-zoom-in");
     const prefMinimizeTray = document.getElementById("pref-minimize-tray");
     const prefLaunchLogin = document.getElementById("pref-launch-login");
     const prefAlwaysOnTop = document.getElementById("pref-always-on-top");
     const prefMuteNotifications = document.getElementById("pref-mute-notifications");
     const configPathLabel = document.getElementById("config-path-label");
+    const btnCopyDiag = document.getElementById("btn-copy-diag");
     const btnOpenDataDir = document.getElementById("btn-open-data-dir");
     const btnDone = document.getElementById("btn-done");
 
@@ -547,9 +590,19 @@
       if (prefThemeLight && prefThemeDark) {
         prefThemeLight.classList.toggle("active", !isDark);
         prefThemeLight.setAttribute("aria-checked", String(!isDark));
+        prefThemeLight.tabIndex = !isDark ? 0 : -1;
         prefThemeDark.classList.toggle("active", isDark);
         prefThemeDark.setAttribute("aria-checked", String(isDark));
+        prefThemeDark.tabIndex = isDark ? 0 : -1;
       }
+      const zoomFactor = Number(s.zoomFactor ?? 1);
+      const zoomPct = Math.round((Number.isFinite(zoomFactor) ? zoomFactor : 1) * 100);
+      if (btnZoomValue) {
+        btnZoomValue.textContent = `${zoomPct}%`;
+        btnZoomValue.disabled = saving || zoomPct === 100;
+      }
+      if (btnZoomOut) btnZoomOut.disabled = saving || zoomPct <= 75;
+      if (btnZoomIn) btnZoomIn.disabled = saving || zoomPct >= 175;
       if (prefMinimizeTray) prefMinimizeTray.checked = s.minimizeToTray !== false;
       if (prefLaunchLogin) prefLaunchLogin.checked = s.launchAtLogin === true;
       if (prefAlwaysOnTop) prefAlwaysOnTop.checked = s.alwaysOnTop === true;
@@ -632,12 +685,47 @@
     });
     prefThemeLight?.addEventListener("click", () => void applyPatch({ theme: "light" }));
     prefThemeDark?.addEventListener("click", () => void applyPatch({ theme: "dark" }));
+    prefThemeGroup?.addEventListener("keydown", (ev) => {
+      if (ev.isComposing || ev.keyCode === 229) return;
+      if (ev.key === "ArrowLeft" || ev.key === "ArrowRight" || ev.key === "Home" || ev.key === "End") {
+        ev.preventDefault();
+        const isDark = currentState?.settings?.theme === "dark";
+        const nextTheme =
+          ev.key === "Home" ? "light" :
+          ev.key === "End" ? "dark" :
+          (isDark ? "light" : "dark");
+        void applyPatch({ theme: nextTheme });
+        (nextTheme === "dark" ? prefThemeDark : prefThemeLight)?.focus();
+      }
+    });
+    btnZoomOut?.addEventListener("click", () => {
+      const cur = Number(currentState?.settings?.zoomFactor ?? 1);
+      const next = Math.max(0.75, Math.round((cur - 0.1) * 100) / 100);
+      void applyPatch({ zoomFactor: next });
+    });
+    btnZoomValue?.addEventListener("click", () => void applyPatch({ zoomFactor: 1 }));
+    btnZoomIn?.addEventListener("click", () => {
+      const cur = Number(currentState?.settings?.zoomFactor ?? 1);
+      const next = Math.min(1.75, Math.round((cur + 0.1) * 100) / 100);
+      void applyPatch({ zoomFactor: next });
+    });
     prefMinimizeTray?.addEventListener("change", () => void applyPatch({ minimizeToTray: Boolean(prefMinimizeTray.checked) }));
     prefLaunchLogin?.addEventListener("change", () => void applyPatch({ launchAtLogin: Boolean(prefLaunchLogin.checked) }));
     prefAlwaysOnTop?.addEventListener("change", () => void applyPatch({ alwaysOnTop: Boolean(prefAlwaysOnTop.checked) }));
     prefMuteNotifications?.addEventListener("change", () => void applyPatch({ notificationsMuted: Boolean(prefMuteNotifications.checked) }));
+    btnCopyDiag?.addEventListener("click", async () => {
+      try {
+        const ok = await api?.copyDiagnostics?.();
+        showStatus(ok ? "已复制诊断信息" : "复制失败", !ok);
+      } catch {
+        showStatus("复制失败", true);
+      }
+    });
     btnOpenDataDir?.addEventListener("click", () => void api?.openDataFolder?.());
     btnDone?.addEventListener("click", () => void api?.closeWindow?.());
+
+    window.addEventListener("dragover", (ev) => ev.preventDefault());
+    window.addEventListener("drop", (ev) => ev.preventDefault());
 
     document.addEventListener("keydown", (ev) => {
       if (ev.isComposing || ev.keyCode === 229) return;

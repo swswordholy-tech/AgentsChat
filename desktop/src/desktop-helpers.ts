@@ -337,6 +337,68 @@ export function computeDownloadProgress(receivedBytes: unknown, totalBytes: unkn
   return received > 0 ? 2 : -1;
 }
 
+export interface ActiveDownloadSample {
+  receivedBytes: number;
+  totalBytes: number;
+  state: string;
+}
+
+/**
+ * Aggregate OS taskbar/Dock progress across all concurrent active downloads.
+ * Ignores non-progressing items (e.g. interrupted/paused), returns `0..1` when
+ * all progressing items have known totals, `2` (indeterminate) when any item
+ * has unknown total bytes, and `-1` to clear the bar when none are progressing.
+ */
+export function aggregateDownloadProgress(items: ReadonlyArray<ActiveDownloadSample>): number {
+  let receivedSum = 0;
+  let totalSum = 0;
+  let hasProgressing = false;
+  let hasIndeterminate = false;
+  for (const item of items) {
+    if (!item || item.state !== "progressing") continue;
+    hasProgressing = true;
+    const rec = Number(item.receivedBytes);
+    const tot = Number(item.totalBytes);
+    if (Number.isFinite(rec) && rec > 0) receivedSum += rec;
+    if (Number.isFinite(tot) && tot > 0) {
+      totalSum += tot;
+    } else {
+      hasIndeterminate = true;
+    }
+  }
+  if (!hasProgressing) return -1;
+  if (hasIndeterminate || totalSum <= 0) return receivedSum > 0 ? 2 : 0;
+  return Math.max(0, Math.min(1, receivedSum / totalSum));
+}
+
+export interface BeforeInputKeySample {
+  type?: string;
+  key?: string;
+  alt?: boolean;
+  control?: boolean;
+  meta?: boolean;
+  shift?: boolean;
+  isComposing?: boolean;
+}
+
+/**
+ * Map cross-platform browser navigation keys (`F5`, `Alt+ArrowLeft`, `Alt+ArrowRight`)
+ * inside `before-input-event` while strictly ignoring IME composition and unrelated modifiers.
+ */
+export function resolveBeforeInputShortcut(input: BeforeInputKeySample): "reload" | "back" | "forward" | null {
+  if (!input || input.type !== "keyDown" || input.isComposing) return null;
+  const key = String(input.key || "");
+  const hasPrimaryMod = Boolean(input.control || input.meta);
+  if (key === "F5" && !input.alt && !hasPrimaryMod && !input.shift) {
+    return "reload";
+  }
+  if (input.alt && !hasPrimaryMod && !input.shift) {
+    if (key === "ArrowLeft") return "back";
+    if (key === "ArrowRight") return "forward";
+  }
+  return null;
+}
+
 /**
  * Build the safe Local Mini-Server MCP CLI command for a loopback HTTP base URL.
  */

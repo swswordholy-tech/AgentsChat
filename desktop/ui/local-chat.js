@@ -128,6 +128,7 @@
       Array.from(menu.querySelectorAll('[role="menuitem"]:not(:disabled)'));
 
     menu.addEventListener("keydown", (ev) => {
+      if (isImeComposing(ev)) return;
       const items = getEnabledItems();
       if (!items.length) return;
       const curIdx = items.indexOf(document.activeElement);

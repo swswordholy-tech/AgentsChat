@@ -21,6 +21,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  aggregateDownloadProgress,
   buildCloudThemeSyncScript,
   buildLocalChannelUrl,
   buildOfflineThemeSyncScript,
@@ -43,6 +44,7 @@ import {
   isTrustedCloudThemeOrigin,
   parseDeepLink,
   parseUnreadCountFromTitle,
+  resolveBeforeInputShortcut,
   resolveCloudHistoryCommand,
   resolveCloudQuickRoute,
   resolveOfflineRetryUrl,
@@ -276,26 +278,39 @@ function openCurrentCloudUrlInBrowser(): boolean {
 }
 
 const downloadSessionsAttached = new WeakSet<Electron.Session>();
-let activeDownloadCount = 0;
+const activeDownloadItems = new Set<Electron.DownloadItem>();
+
+function syncDownloadProgressBar(): void {
+  if (isSmokeTest || !mainWindow || mainWindow.isDestroyed()) return;
+  if (activeDownloadItems.size === 0) {
+    try { mainWindow.setProgressBar(-1); } catch {}
+    return;
+  }
+  const samples = Array.from(activeDownloadItems).map((it) => ({
+    receivedBytes: it.getReceivedBytes(),
+    totalBytes: it.getTotalBytes(),
+    state: it.getState(),
+  }));
+  const progress =
+    samples.length === 1 && samples[0].state === "progressing"
+      ? computeDownloadProgress(samples[0].receivedBytes, samples[0].totalBytes)
+      : aggregateDownloadProgress(samples);
+  try { mainWindow.setProgressBar(progress); } catch {}
+}
 
 function attachDownloadFeedback(wc: Electron.WebContents): void {
   const ses = wc.session;
   if (!ses || downloadSessionsAttached.has(ses)) return;
   downloadSessionsAttached.add(ses);
   ses.on("will-download", (_ev, item) => {
-    activeDownloadCount += 1;
-    item.on("updated", (_updEv, state) => {
-      if (isSmokeTest || !mainWindow || mainWindow.isDestroyed()) return;
-      if (state === "progressing") {
-        const progress = computeDownloadProgress(item.getReceivedBytes(), item.getTotalBytes());
-        try { mainWindow.setProgressBar(progress); } catch {}
-      }
+    activeDownloadItems.add(item);
+    syncDownloadProgressBar();
+    item.on("updated", () => {
+      syncDownloadProgressBar();
     });
     item.once("done", (_doneEv, state) => {
-      activeDownloadCount = Math.max(0, activeDownloadCount - 1);
-      if (activeDownloadCount === 0 && mainWindow && !mainWindow.isDestroyed()) {
-        try { mainWindow.setProgressBar(-1); } catch {}
-      }
+      activeDownloadItems.delete(item);
+      syncDownloadProgressBar();
       if (isSmokeTest || state !== "completed") return;
       const savePath = item.getSavePath();
       if (!savePath || !Notification.isSupported()) return;
@@ -517,6 +532,7 @@ function getCombinedState() {
   return {
     platform: process.platform,
     isFullScreen: Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isFullScreen()),
+    settingsWindowOpen: Boolean(settingsWindow && !settingsWindow.isDestroyed()),
     settings,
     localServer: showLocal && localServer ? localServer.getStatus() : null,
     localUnreadCount: showLocal ? localUnreadCount : 0,
@@ -915,7 +931,7 @@ async function openDesktopSettingsWindow(): Promise<void> {
   }
   const isMac = process.platform === "darwin";
   const prefWidth = 480;
-  const prefHeight = 590;
+  const prefHeight = 640;
   let pos: { x?: number; y?: number } = {};
   try {
     const refBounds =
@@ -947,6 +963,9 @@ async function openDesktopSettingsWindow(): Promise<void> {
   });
 
   settingsWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  settingsWindow.webContents.on("will-navigate", (ev) => {
+    ev.preventDefault();
+  });
   if (isSmokeTest) {
     settingsWindow.webContents.on("console-message", (_ev, level, message) => {
       if (level >= 3) smokeRendererErrors.push(`[settings] ${message}`);
@@ -954,9 +973,11 @@ async function openDesktopSettingsWindow(): Promise<void> {
   }
   settingsWindow.on("closed", () => {
     settingsWindow = null;
+    broadcastState();
   });
 
   await settingsWindow.loadFile(join(UI_DIR, "settings.html"));
+  broadcastState();
   if (!isSmokeTest && settingsWindow && !settingsWindow.isDestroyed()) {
     settingsWindow.show();
     settingsWindow.focus();
@@ -1507,6 +1528,10 @@ async function createDesktopWindow(): Promise<void> {
   }
 
   await mainWindow.loadFile(join(UI_DIR, "shell.html"));
+  mainWindow.webContents.on("will-navigate", (ev) => {
+    ev.preventDefault();
+  });
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
 
   cloudView = new WebContentsView({
     webPreferences: {
@@ -1545,11 +1570,22 @@ async function createDesktopWindow(): Promise<void> {
   const remoteOrigin = new URL(settings.remoteServerUrl).origin;
   cloudView.webContents.setWindowOpenHandler(({ url }) => {
     if (isOAuthPopupUrl(url, remoteOrigin)) {
+      let popupPos: { x?: number; y?: number } = {};
+      try {
+        const refBounds =
+          mainWindow && !mainWindow.isDestroyed() ? mainWindow.getBounds() : screen.getPrimaryDisplay().workArea;
+        const disp = screen.getDisplayMatching(refBounds) || screen.getPrimaryDisplay();
+        const centered = computeCenteredWindowBounds(disp.workArea, 540, 700, 540, 700);
+        popupPos = { x: centered.x, y: centered.y };
+      } catch {}
       return {
         action: "allow",
         overrideBrowserWindowOptions: {
           width: 540,
           height: 700,
+          ...popupPos,
+          autoHideMenuBar: true,
+          backgroundColor: settings.theme === "dark" ? "#191919" : "#ffffff",
           webPreferences: {
             partition: "persist:agentschat-cloud",
             contextIsolation: true,
@@ -1565,12 +1601,40 @@ async function createDesktopWindow(): Promise<void> {
     return { action: "deny" };
   });
 
+  cloudView.webContents.on("did-create-window", (childWin) => {
+    try {
+      attachNativeContextMenu(childWin.webContents);
+      childWin.webContents.setWindowOpenHandler(({ url }) => {
+        if (isAllowedExternalUrl(url)) {
+          void shell.openExternal(url);
+        }
+        return { action: "deny" };
+      });
+    } catch {}
+  });
+
   localView.webContents.setWindowOpenHandler(({ url }) => {
     if (isAllowedExternalUrl(url)) {
       void shell.openExternal(url);
     }
     return { action: "deny" };
   });
+
+  const attachBeforeInputShortcuts = (wc: Electron.WebContents, workspace: "cloud" | "local") => {
+    wc.on("before-input-event", (ev, input) => {
+      const cmd = resolveBeforeInputShortcut(input);
+      if (!cmd) return;
+      if (cmd === "reload") {
+        ev.preventDefault();
+        reloadWebContentsSmart(wc, workspace);
+      } else if (workspace === "cloud") {
+        ev.preventDefault();
+        navigateCloudHistory(cmd);
+      }
+    });
+  };
+  attachBeforeInputShortcuts(cloudView.webContents, "cloud");
+  attachBeforeInputShortcuts(localView.webContents, "local");
 
   const initialZoom = clampDesktopZoomFactor(settings.zoomFactor ?? 1);
   attachNativeContextMenu(cloudView.webContents);
@@ -1857,6 +1921,7 @@ function registerIpcHandlers(): void {
     if (patch?.alwaysOnTop !== undefined) safePatch.alwaysOnTop = Boolean(patch.alwaysOnTop);
     if (patch?.notificationsMuted !== undefined) safePatch.notificationsMuted = Boolean(patch.notificationsMuted);
     if (patch?.theme === "light" || patch?.theme === "dark") safePatch.theme = patch.theme;
+    if (patch?.zoomFactor !== undefined) safePatch.zoomFactor = clampDesktopZoomFactor(patch.zoomFactor);
 
     await runLocalServerOp(async () => {
       const prevShowLocal = settings.showLocalWorkspace;
@@ -1867,6 +1932,9 @@ function registerIpcHandlers(): void {
 
       if (safePatch.theme !== undefined) {
         applyDesktopTheme(safePatch.theme);
+      }
+      if (safePatch.zoomFactor !== undefined) {
+        applyDesktopZoom(safePatch.zoomFactor);
       }
       if (safePatch.launchAtLogin !== undefined) {
         applyLaunchAtLoginSetting();
@@ -1902,6 +1970,13 @@ function registerIpcHandlers(): void {
       broadcastState();
     });
     return { ok: true, state: getSettingsWindowState() };
+  });
+
+  ipcMain.handle("desktop:copy-diagnostics", (ev) => {
+    const isSettingsWin = Boolean(settingsWindow && !settingsWindow.isDestroyed() && ev.sender === settingsWindow.webContents);
+    if (!isSettingsWin) return false;
+    copyDesktopDiagnostics();
+    return true;
   });
 
   ipcMain.handle("desktop:open-data-folder", async (ev) => {
@@ -2291,6 +2366,8 @@ if (!gotSingleInstanceLock) {
               hasSettingsBridge: Boolean(window.agentschatSettings),
               showLocalChecked: Boolean(document.getElementById("pref-show-local")?.checked),
               advancedHidden: Boolean(document.getElementById("local-advanced-panel")?.hidden),
+              hasZoomControl: Boolean(document.getElementById("btn-zoom-value")),
+              hasCopyDiagBtn: Boolean(document.getElementById("btn-copy-diag")),
               hasSettingsPath: Boolean(st?.settingsFilePath),
             };
           })()`,
@@ -2300,6 +2377,8 @@ if (!gotSingleInstanceLock) {
           !settingsProbe?.hasSettingsBridge ||
           settingsProbe?.showLocalChecked ||
           !settingsProbe?.advancedHidden ||
+          !settingsProbe?.hasZoomControl ||
+          !settingsProbe?.hasCopyDiagBtn ||
           !settingsProbe?.hasSettingsPath
         ) {
           throw new Error(`Settings window smoke check failed: ${JSON.stringify(settingsProbe)}`);

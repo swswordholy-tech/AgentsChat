@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
+  aggregateDownloadProgress,
   buildCloudThemeSyncScript,
   buildLocalChannelUrl,
   buildOfflineThemeSyncScript,
@@ -29,6 +30,7 @@ import {
   parseDeepLink,
   parseDesktopReleaseTag,
   parseUnreadCountFromTitle,
+  resolveBeforeInputShortcut,
   resolveCloudHistoryCommand,
   resolveCloudQuickRoute,
   resolveOfflineRetryUrl,
@@ -1613,5 +1615,68 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     expect(mainTs).toContain("addWordToSpellCheckerDictionary");
     expect(mainTs).toContain("if (!settings.showLocalWorkspace || !settings.localServerEnabled)");
     expect(mainTs).toContain('ipcMain.handle("desktop:save-desktop-settings"');
+  });
+
+  test("Desktop 2.20 hardens rail/settings drag-drop anti-navigation, OAuth popup child safety, concurrent download progress, F5/Alt navigation, Preferences Zoom/Diagnostics/roving theme & Local menu IME guard", () => {
+    // 1. Pure helper: aggregateDownloadProgress handles concurrent, interrupted, unknown-total & empty sets
+    expect(aggregateDownloadProgress([])).toBe(-1);
+    expect(aggregateDownloadProgress([{ receivedBytes: 50, totalBytes: 100, state: "interrupted" }])).toBe(-1);
+    expect(
+      aggregateDownloadProgress([
+        { receivedBytes: 50, totalBytes: 100, state: "progressing" },
+        { receivedBytes: 150, totalBytes: 300, state: "progressing" },
+      ]),
+    ).toBe(0.5);
+    expect(
+      aggregateDownloadProgress([
+        { receivedBytes: 50, totalBytes: 100, state: "progressing" },
+        { receivedBytes: 256, totalBytes: 0, state: "progressing" },
+      ]),
+    ).toBe(2);
+
+    // 2. Pure helper: resolveBeforeInputShortcut handles F5 & Alt+Left/Right while ignoring IME & wrong modifiers
+    expect(resolveBeforeInputShortcut({ type: "keyDown", key: "F5" })).toBe("reload");
+    expect(resolveBeforeInputShortcut({ type: "keyDown", key: "ArrowLeft", alt: true })).toBe("back");
+    expect(resolveBeforeInputShortcut({ type: "keyDown", key: "ArrowRight", alt: true })).toBe("forward");
+    expect(resolveBeforeInputShortcut({ type: "keyUp", key: "F5" })).toBeNull();
+    expect(resolveBeforeInputShortcut({ type: "keyDown", key: "F5", isComposing: true })).toBeNull();
+    expect(resolveBeforeInputShortcut({ type: "keyDown", key: "ArrowLeft", alt: true, meta: true })).toBeNull();
+    expect(resolveBeforeInputShortcut({ type: "keyDown", key: "ArrowLeft" })).toBeNull();
+
+    // 3. Main process: anti-drop will-navigate guards, OAuth child did-create-window, aggregate downloads, F5/Alt before-input-event & settings diagnostics/zoom
+    const mainTs = readFileSync(join(import.meta.dir, "..", "src", "main.ts"), "utf8");
+    expect(mainTs).toContain("function syncDownloadProgressBar()");
+    expect(mainTs).toContain("aggregateDownloadProgress(samples)");
+    expect(mainTs).toContain('mainWindow.webContents.on("will-navigate"');
+    expect(mainTs).toContain('settingsWindow.webContents.on("will-navigate"');
+    expect(mainTs).toContain('cloudView.webContents.on("did-create-window"');
+    expect(mainTs).toContain('wc.on("before-input-event"');
+    expect(mainTs).toContain("resolveBeforeInputShortcut(input)");
+    expect(mainTs).toContain("settingsWindowOpen: Boolean(settingsWindow && !settingsWindow.isDestroyed())");
+    expect(mainTs).toContain('ipcMain.handle("desktop:copy-diagnostics"');
+
+    // 4. Preferences window: Zoom stepper, roving theme radiogroup, 1-click Copy Diagnostics & drag-drop guard
+    const settingsHtml = readFileSync(join(import.meta.dir, "..", "ui", "settings.html"), "utf8");
+    const settingsScript = settingsHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1] || "";
+    expect(() => new Function(settingsScript)).not.toThrow();
+    expect(settingsScript).not.toMatch(/\.(?:innerHTML|outerHTML)\s*=|insertAdjacentHTML|document\.write\s*\(/);
+    expect(settingsHtml).toContain('id="btn-zoom-out"');
+    expect(settingsHtml).toContain('id="btn-zoom-value"');
+    expect(settingsHtml).toContain('id="btn-zoom-in"');
+    expect(settingsHtml).toContain('id="btn-copy-diag"');
+    expect(settingsHtml).toContain('id="pref-theme-group"');
+    expect(settingsHtml).toContain('window.addEventListener("drop", (ev) => ev.preventDefault());');
+
+    // 5. Shell rail: live aria-expanded on settings gear & drag-drop guard
+    const shellHtml = readFileSync(join(import.meta.dir, "..", "ui", "shell.html"), "utf8");
+    const shellScript = shellHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1] || "";
+    expect(() => new Function(shellScript)).not.toThrow();
+    expect(shellHtml).toContain('btnShellSettings.setAttribute("aria-expanded", String(settingsOpen));');
+    expect(shellHtml).toContain('window.addEventListener("drop", (ev) => ev.preventDefault());');
+
+    // 6. Local Hub JS: IME guard inside context-menu keydown handler
+    const localJs = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.js"), "utf8");
+    expect(() => new Function(localJs)).not.toThrow();
+    expect(localJs).toContain('menu.addEventListener("keydown", (ev) => {\n      if (isImeComposing(ev)) return;');
   });
 });

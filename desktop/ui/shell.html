@@ -548,7 +548,7 @@
           <path d="M17.66 6.34a8 8 0 1 1-11.32 0" />
         </svg>
       </button>
-      <button class="mini-btn" id="btn-shell-settings" type="button" title="桌面端配置 (⌘,)" aria-label="桌面端配置">
+      <button class="mini-btn" id="btn-shell-settings" type="button" title="桌面端配置 (⌘,)" aria-label="桌面端配置" aria-expanded="false">
         <svg viewBox="0 0 24 24" aria-hidden="true">
           <circle cx="12" cy="12" r="3" />
           <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.6.85 1 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z" />
@@ -639,6 +639,11 @@
       document.body.classList.toggle("dark", isDark);
       document.documentElement.style.colorScheme = isDark ? "dark" : "light";
       const isPinned = state.settings?.alwaysOnTop === true;
+      if (btnShellSettings) {
+        const settingsOpen = state.settingsWindowOpen === true;
+        btnShellSettings.classList.toggle("pinned", settingsOpen);
+        btnShellSettings.setAttribute("aria-expanded", String(settingsOpen));
+      }
       if (btnShellPin) {
         btnShellPin.classList.toggle("pinned", isPinned);
         btnShellPin.setAttribute("aria-pressed", String(isPinned));
@@ -897,6 +902,9 @@
         iconCheck.toggleAttribute("hidden", true);
       }, 1400);
     });
+
+    window.addEventListener("dragover", (ev) => ev.preventDefault());
+    window.addEventListener("drop", (ev) => ev.preventDefault());
 
     if (api) {
       api.getState().then(render);
