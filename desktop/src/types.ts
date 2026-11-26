@@ -74,6 +74,7 @@ export interface DesktopSettings {
   launchAtLogin: boolean;
   alwaysOnTop?: boolean;
   notificationsMuted?: boolean;
+  audioMuted?: boolean;
   zoomFactor?: number;
   windowBounds?: DesktopWindowBounds;
 }

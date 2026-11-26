@@ -500,6 +500,17 @@
               <span class="switch-track" aria-hidden="true"></span>
             </span>
           </label>
+
+          <label class="row" for="pref-mute-audio">
+            <span class="row-copy">
+              <span class="row-title">静音工作区音频</span>
+              <span class="row-desc">静默云端与本机页面的语音播报与网页提示音（⌘⇧U）</span>
+            </span>
+            <span class="switch">
+              <input type="checkbox" id="pref-mute-audio" />
+              <span class="switch-track" aria-hidden="true"></span>
+            </span>
+          </label>
         </div>
       </section>
 
@@ -566,6 +577,7 @@
     const prefLaunchLogin = document.getElementById("pref-launch-login");
     const prefAlwaysOnTop = document.getElementById("pref-always-on-top");
     const prefMuteNotifications = document.getElementById("pref-mute-notifications");
+    const prefMuteAudio = document.getElementById("pref-mute-audio");
     const btnClearCache = document.getElementById("btn-clear-cache");
     const btnResetWindow = document.getElementById("btn-reset-window");
     const appVersionBadge = document.getElementById("app-version-badge");
@@ -643,6 +655,7 @@
       if (prefLaunchLogin) prefLaunchLogin.checked = s.launchAtLogin === true;
       if (prefAlwaysOnTop) prefAlwaysOnTop.checked = s.alwaysOnTop === true;
       if (prefMuteNotifications) prefMuteNotifications.checked = s.notificationsMuted === true;
+      if (prefMuteAudio) prefMuteAudio.checked = s.audioMuted === true;
 
       if (configPathLabel && typeof state.settingsFilePath === "string" && state.settingsFilePath) {
         const verPrefix = typeof state.appVersion === "string" && state.appVersion ? `v${state.appVersion} · ` : "";
@@ -667,6 +680,7 @@
         prefLaunchLogin,
         prefAlwaysOnTop,
         prefMuteNotifications,
+        prefMuteAudio,
         prefThemeLight,
         prefThemeDark,
         btnZoomOut,
@@ -757,6 +771,7 @@
     prefLaunchLogin?.addEventListener("change", () => void applyPatch({ launchAtLogin: Boolean(prefLaunchLogin.checked) }));
     prefAlwaysOnTop?.addEventListener("change", () => void applyPatch({ alwaysOnTop: Boolean(prefAlwaysOnTop.checked) }));
     prefMuteNotifications?.addEventListener("change", () => void applyPatch({ notificationsMuted: Boolean(prefMuteNotifications.checked) }));
+    prefMuteAudio?.addEventListener("change", () => void applyPatch({ audioMuted: Boolean(prefMuteAudio.checked) }));
     btnClearCache?.addEventListener("click", async () => {
       if (!api?.clearCloudCache || btnClearCache.disabled) return;
       btnClearCache.disabled = true;

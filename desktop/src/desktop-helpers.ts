@@ -199,6 +199,7 @@ export interface TrayTooltipState {
   localPort?: number;
   localOnlineCount?: number;
   notificationsMuted?: boolean;
+  audioMuted?: boolean;
 }
 
 /**
@@ -211,18 +212,24 @@ export function formatTrayTooltip(state: TrayTooltipState): string {
   const local = showLocal ? Math.max(0, Math.floor(Number(state.localUnread) || 0)) : 0;
   const totalUnread = cloud + local;
   const head = totalUnread > 0 ? `AgentsChat Desktop (${totalUnread} unread)` : "AgentsChat Desktop";
-  const muteSuffix = state.notificationsMuted === true ? " · Muted" : "";
+  const muteSuffix = [
+    state.notificationsMuted === true ? "Muted" : "",
+    state.audioMuted === true ? "Audio Off" : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  const trailingStatus = muteSuffix ? ` · ${muteSuffix}` : "";
   if (!showLocal) {
-    return `${head}${muteSuffix}`;
+    return `${head}${trailingStatus}`;
   }
   if (!state.localRunning) {
-    return `${head} · Local Stopped${muteSuffix}`;
+    return `${head} · Local Stopped${trailingStatus}`;
   }
   const port = Number.isFinite(Number(state.localPort)) && Number(state.localPort) > 0 ? Number(state.localPort) : 8787;
   const online = Math.max(0, Math.floor(Number(state.localOnlineCount) || 0));
   return online > 0
-    ? `${head} · Local :${port} (${online} online)${muteSuffix}`
-    : `${head} · Local :${port}${muteSuffix}`;
+    ? `${head} · Local :${port} (${online} online)${trailingStatus}`
+    : `${head} · Local :${port}${trailingStatus}`;
 }
 
 export interface DesktopWindowTitleState {
@@ -383,14 +390,18 @@ export interface BeforeInputKeySample {
 
 /**
  * Map cross-platform browser navigation keys (`F5`, `Shift/Ctrl+F5`, `Alt+ArrowLeft`, `Alt+ArrowRight`)
- * inside `before-input-event` while strictly ignoring IME composition and unrelated modifiers.
+ * and Escape dismissal of an open Find bar inside `before-input-event` while strictly ignoring IME composition.
  */
 export function resolveBeforeInputShortcut(
   input: BeforeInputKeySample,
-): "reload" | "force-reload" | "back" | "forward" | null {
+  opts?: { findBarOpen?: boolean },
+): "reload" | "force-reload" | "back" | "forward" | "close-find" | null {
   if (!input || input.type !== "keyDown" || input.isComposing) return null;
   const key = String(input.key || "");
   const hasPrimaryMod = Boolean(input.control || input.meta);
+  if (opts?.findBarOpen === true && key === "Escape" && !hasPrimaryMod && !input.alt && !input.shift) {
+    return "close-find";
+  }
   if (key === "F5" && !input.alt) {
     if (input.shift || hasPrimaryMod) return "force-reload";
     return "reload";
@@ -424,6 +435,21 @@ export function buildSelectionLookupInfo(selectionText: unknown): SelectionLooku
   const searchUrl =
     normalized.length <= 300 ? `https://www.google.com/search?q=${encodeURIComponent(normalized)}` : null;
   return { label, searchUrl };
+}
+
+/**
+ * Sanitize selected page text for seeding the native Find-in-Page bar (`Cmd/Ctrl+E` or context menu).
+ * Strips control characters, normalizes whitespace to single spaces, caps at 120 characters,
+ * and rejects empty selections.
+ */
+export function sanitizeFindSeedText(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const normalized = raw
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) return null;
+  return normalized.slice(0, 120);
 }
 
 /**
@@ -852,6 +878,7 @@ export interface DesktopDiagnosticsSnapshot {
   allowLan?: boolean;
   localOnlineCount?: number;
   notificationsMuted?: boolean;
+  audioMuted?: boolean;
 }
 
 /**
@@ -868,10 +895,11 @@ export function formatDesktopDiagnostics(info: DesktopDiagnosticsSnapshot): stri
       : info.localRunning
         ? `Local Mini-Server: running (:${port}, lan=${info.allowLan ? "on" : "off"}, online=${online})`
         : `Local Mini-Server: stopped (port=${port}, lan=${info.allowLan ? "on" : "off"})`;
+  const audioPart = info.audioMuted === true ? " · Audio: muted" : "";
   return [
     `AgentsChat Desktop v${info.appVersion || "0.1.0"}`,
     `Runtime: Electron ${info.electronVersion || "unknown"} / Node ${info.nodeVersion || "unknown"} (${info.platform}${info.arch ? "/" + info.arch : ""})`,
-    `Workspace: ${info.activeWorkspace} · Theme: ${info.theme} · Zoom: ${zoomPct}% · Muted: ${info.notificationsMuted ? "yes" : "no"}`,
+    `Workspace: ${info.activeWorkspace} · Theme: ${info.theme} · Zoom: ${zoomPct}% · Muted: ${info.notificationsMuted ? "yes" : "no"}${audioPart}`,
     localLine,
   ].join("\n");
 }

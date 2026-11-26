@@ -16,6 +16,7 @@ export const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   launchAtLogin: false,
   alwaysOnTop: false,
   notificationsMuted: false,
+  audioMuted: false,
   zoomFactor: 1,
 };
 
@@ -68,6 +69,7 @@ export function sanitizeDesktopSettings(raw: Partial<DesktopSettings> | null | u
     launchAtLogin: s.launchAtLogin === true,
     alwaysOnTop: s.alwaysOnTop === true,
     notificationsMuted: s.notificationsMuted === true,
+    audioMuted: s.audioMuted === true,
     zoomFactor: s.zoomFactor !== undefined ? clampDesktopZoomFactor(s.zoomFactor) : 1,
     ...(windowBounds ? { windowBounds } : {}),
   };

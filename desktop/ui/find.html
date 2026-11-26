@@ -146,6 +146,9 @@
       <path d="m20 20-3.5-3.5" />
     </svg>
     <input type="text" class="find-input" id="find-input" placeholder="在当前页面查找…" aria-label="在当前页面查找" autocomplete="off" spellcheck="false" />
+    <button type="button" class="icon-btn" id="btn-clear" title="清空查找词" aria-label="清空查找词" hidden>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="m15 9-6 6M9 9l6 6" /></svg>
+    </button>
     <span class="find-count" id="find-count" role="status" aria-live="polite"></span>
     <button type="button" class="icon-btn" id="btn-case" title="区分大小写" aria-label="区分大小写" aria-pressed="false">Aa</button>
     <span class="find-sep" aria-hidden="true"></span>
@@ -163,6 +166,7 @@
   <script>
     const api = window.agentschatFind;
     const input = document.getElementById("find-input");
+    const btnClear = document.getElementById("btn-clear");
     const countEl = document.getElementById("find-count");
     const btnCase = document.getElementById("btn-case");
     const btnPrev = document.getElementById("btn-prev");
@@ -172,6 +176,18 @@
     let matchCase = false;
     let composing = false;
 
+    function syncClearVisibility() {
+      if (btnClear) {
+        btnClear.hidden = !(input && input.value.length > 0);
+      }
+    }
+
+    function syncCaseButton() {
+      if (!btnCase) return;
+      btnCase.classList.toggle("active", matchCase);
+      btnCase.setAttribute("aria-pressed", String(matchCase));
+    }
+
     function applyState(state) {
       if (!state) return;
       if (state.theme === "dark" || state.theme === "light") {
@@ -179,6 +195,11 @@
         document.body.classList.toggle("dark", isDark);
         document.documentElement.style.colorScheme = isDark ? "dark" : "light";
       }
+      if (typeof state.matchCase === "boolean") {
+        matchCase = state.matchCase;
+        syncCaseButton();
+      }
+      syncClearVisibility();
       const hasQuery = Boolean(input && input.value.length > 0);
       const total = Number(state.matches || 0);
       const label = typeof state.counterText === "string" ? state.counterText : "";
@@ -192,6 +213,7 @@
     }
 
     function runSearch() {
+      syncClearVisibility();
       const q = input ? input.value : "";
       if (!q) {
         applyState({ matches: 0, counterText: "" });
@@ -207,14 +229,21 @@
       runSearch();
     });
     input?.addEventListener("input", () => {
+      syncClearVisibility();
       if (composing) return;
       runSearch();
     });
 
+    btnClear?.addEventListener("click", () => {
+      if (input) {
+        input.value = "";
+        input.focus();
+      }
+      runSearch();
+    });
     btnCase?.addEventListener("click", () => {
       matchCase = !matchCase;
-      btnCase.classList.toggle("active", matchCase);
-      btnCase.setAttribute("aria-pressed", String(matchCase));
+      syncCaseButton();
       runSearch();
       input?.focus();
     });
@@ -267,13 +296,21 @@
     if (api) {
       api.onState(applyState);
       api.onFocus((payload) => {
-        if (payload && (payload.theme === "dark" || payload.theme === "light")) {
-          applyState({ theme: payload.theme, matches: payload.matches ?? 0, counterText: payload.counterText ?? "" });
+        if (payload && typeof payload.seedQuery === "string" && input) {
+          input.value = payload.seedQuery;
+        }
+        if (payload) {
+          applyState({
+            theme: payload.theme,
+            matches: payload.matches ?? 0,
+            counterText: payload.counterText ?? "",
+            matchCase: payload.matchCase,
+          });
         }
         if (input) {
           input.focus();
           input.select();
-          if (input.value.length > 0) {
+          if (input.value.length > 0 && payload?.alreadySearched !== true) {
             runSearch();
           }
         }

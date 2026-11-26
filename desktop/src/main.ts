@@ -55,6 +55,7 @@ import {
   resolveRestoredWindowBounds,
   resolveSmartReloadAction,
   resolveWorkspaceCopyAction,
+  sanitizeFindSeedText,
   sanitizeLocalProfileName,
   shouldGrantWebPermission,
   type CloudQuickRoute,
@@ -195,6 +196,7 @@ function syncUnreadBadge(): void {
           localPort: st?.port,
           localOnlineCount: st?.connectedAgents?.length || 0,
           notificationsMuted: settings.notificationsMuted === true,
+          audioMuted: settings.audioMuted === true,
         }),
       );
     } catch {}
@@ -451,6 +453,15 @@ function attachNativeContextMenu(wc: Electron.WebContents): void {
           items.push({
             label: "Search with Google",
             click: () => void shell.openExternal(searchUrl),
+          });
+        }
+        const findSeed = sanitizeFindSeedText(params.selectionText);
+        if (findSeed) {
+          items.push({
+            label: `Find “${lookup.label}” on Page`,
+            click: () => {
+              openFindBar({ seedQuery: findSeed, triggerSearch: true });
+            },
           });
         }
         if (items.length > 0) items.push({ type: "separator" });
@@ -745,25 +756,52 @@ function syncFindBarState(): void {
     findView.webContents.send("desktop:find-state", {
       theme: settings.theme || "light",
       matches: findTotalMatches,
+      matchCase: findMatchCase,
       counterText: formatFindMatchCounter(findActiveOrdinal, findTotalMatches, findQueryText.length > 0),
     });
   } catch {}
 }
 
-function openFindBar(): boolean {
+function openFindBar(opts?: { seedQuery?: string | null; triggerSearch?: boolean }): boolean {
   if (!mainWindow || mainWindow.isDestroyed() || !findView || findView.webContents.isDestroyed()) return false;
   if (!isSmokeTest) showMainWindow();
+  const seed = opts?.seedQuery !== undefined ? sanitizeFindSeedText(opts.seedQuery) : null;
   findBarOpen = true;
   layoutViews();
+  let alreadySearched = false;
+  if (seed) {
+    findQueryText = seed;
+    if (opts?.triggerSearch !== false) {
+      alreadySearched = runFindInPage(seed, findMatchCase);
+    }
+  }
   try {
     findView.webContents.focus();
     findView.webContents.send("desktop:find-focus", {
       theme: settings.theme || "light",
       matches: findTotalMatches,
+      matchCase: findMatchCase,
       counterText: formatFindMatchCounter(findActiveOrdinal, findTotalMatches, findQueryText.length > 0),
+      ...(seed ? { seedQuery: seed, alreadySearched } : {}),
     });
   } catch {}
   return true;
+}
+
+async function useSelectionForFind(): Promise<boolean> {
+  const wc = getActiveWorkspaceWebContents();
+  if (!wc) return openFindBar();
+  try {
+    const raw = await wc.executeJavaScript(
+      `(() => { try { return String(window.getSelection?.() || ""); } catch { return ""; } })()`,
+      true,
+    );
+    const seed = sanitizeFindSeedText(raw);
+    if (seed) {
+      return openFindBar({ seedQuery: seed, triggerSearch: true });
+    }
+  } catch {}
+  return openFindBar();
 }
 
 function closeFindBar(opts?: { restoreFocus?: boolean }): boolean {
@@ -1017,6 +1055,7 @@ function copyDesktopDiagnostics(): string {
     allowLan: settings.allowLan === true,
     localOnlineCount: st?.connectedAgents?.length || 0,
     notificationsMuted: settings.notificationsMuted === true,
+    audioMuted: settings.audioMuted === true,
   });
   clipboard.writeText(text);
   if (!isSmokeTest && Notification.isSupported()) {
@@ -1106,6 +1145,26 @@ function applyAlwaysOnTop(enabled: boolean): boolean {
 function applyNotificationsMuted(muted: boolean): boolean {
   const next = Boolean(muted);
   settings = settingsStore.save({ notificationsMuted: next });
+  setupApplicationMenu();
+  syncUnreadBadge();
+  broadcastState();
+  return next;
+}
+
+function applyAudioMutedToViews(muted: boolean): void {
+  for (const view of [cloudView, localView]) {
+    if (view && !view.webContents.isDestroyed()) {
+      try {
+        view.webContents.setAudioMuted(muted);
+      } catch {}
+    }
+  }
+}
+
+function applyAudioMuted(muted: boolean): boolean {
+  const next = Boolean(muted);
+  settings = settingsStore.save({ audioMuted: next });
+  applyAudioMutedToViews(next);
   setupApplicationMenu();
   syncUnreadBadge();
   broadcastState();
@@ -1278,6 +1337,11 @@ function setupApplicationMenu(): void {
           accelerator: "CmdOrCtrl+Shift+G",
           click: () => { stepFindInPage(false); },
         },
+        {
+          label: "Use Selection for Find",
+          accelerator: "CmdOrCtrl+E",
+          click: () => { void useSelectionForFind(); },
+        },
       ],
     },
     {
@@ -1386,6 +1450,13 @@ function setupApplicationMenu(): void {
           checked: settings.notificationsMuted === true,
           accelerator: "CmdOrCtrl+Shift+M",
           click: () => applyNotificationsMuted(!(settings.notificationsMuted === true)),
+        },
+        {
+          label: "Mute Workspace Audio",
+          type: "checkbox",
+          checked: settings.audioMuted === true,
+          accelerator: "CmdOrCtrl+Shift+U",
+          click: () => applyAudioMuted(!(settings.audioMuted === true)),
         },
         ...(isMac
           ? [
@@ -1501,6 +1572,7 @@ function rebuildTrayMenu(): void {
       localPort: st?.port,
       localOnlineCount: st?.connectedAgents?.length || 0,
       notificationsMuted: settings.notificationsMuted === true,
+      audioMuted: settings.audioMuted === true,
     }),
   );
   const menu = Menu.buildFromTemplate([
@@ -1531,6 +1603,14 @@ function rebuildTrayMenu(): void {
       checked: settings.notificationsMuted === true,
       click: () => {
         applyNotificationsMuted(!(settings.notificationsMuted === true));
+      },
+    },
+    {
+      label: "Mute Workspace Audio",
+      type: "checkbox",
+      checked: settings.audioMuted === true,
+      click: () => {
+        applyAudioMuted(!(settings.audioMuted === true));
       },
     },
     { type: "separator" },
@@ -1705,6 +1785,12 @@ function rebuildDockMenu(): void {
       type: "checkbox",
       checked: settings.notificationsMuted === true,
       click: () => applyNotificationsMuted(!(settings.notificationsMuted === true)),
+    },
+    {
+      label: "Mute Workspace Audio",
+      type: "checkbox",
+      checked: settings.audioMuted === true,
+      click: () => applyAudioMuted(!(settings.audioMuted === true)),
     },
     { type: "separator" },
     {
@@ -1966,9 +2052,14 @@ async function createDesktopWindow(): Promise<void> {
 
   const attachBeforeInputShortcuts = (wc: Electron.WebContents, workspace: "cloud" | "local") => {
     wc.on("before-input-event", (ev, input) => {
-      const cmd = resolveBeforeInputShortcut(input);
+      const cmd = findBarOpen
+        ? resolveBeforeInputShortcut(input, { findBarOpen: true })
+        : resolveBeforeInputShortcut(input);
       if (!cmd) return;
-      if (cmd === "reload" || cmd === "force-reload") {
+      if (cmd === "close-find") {
+        ev.preventDefault();
+        closeFindBar({ restoreFocus: true });
+      } else if (cmd === "reload" || cmd === "force-reload") {
         ev.preventDefault();
         reloadWebContentsSmart(wc, workspace, cmd === "force-reload");
       } else if (workspace === "cloud") {
@@ -2011,6 +2102,9 @@ async function createDesktopWindow(): Promise<void> {
   localView.webContents.on("dom-ready", () => {
     try { localView?.webContents.setZoomFactor(clampDesktopZoomFactor(settings.zoomFactor ?? 1)); } catch {}
     syncThemeToLocalView(settings.theme || "light");
+  });
+  localView.webContents.on("did-navigate", () => {
+    if (findBarOpen) closeFindBar({ restoreFocus: false });
   });
   localView.webContents.on("will-navigate", (ev, navUrl) => {
     const currentUrl = localView?.webContents.getURL() || "";
@@ -2075,6 +2169,7 @@ async function createDesktopWindow(): Promise<void> {
     cloudView.webContents.setZoomFactor(initialZoom);
     localView.webContents.setZoomFactor(initialZoom);
   } catch {}
+  applyAudioMutedToViews(settings.audioMuted === true);
 
   cloudView.webContents.on("did-fail-load", (_ev, errorCode, errorDescription, validatedURL, isMainFrame) => {
     if (isMainFrame) {
@@ -2282,6 +2377,7 @@ function registerIpcHandlers(): void {
     if (patch?.launchAtLogin !== undefined) safePatch.launchAtLogin = Boolean(patch.launchAtLogin);
     if (patch?.alwaysOnTop !== undefined) safePatch.alwaysOnTop = Boolean(patch.alwaysOnTop);
     if (patch?.notificationsMuted !== undefined) safePatch.notificationsMuted = Boolean(patch.notificationsMuted);
+    if (patch?.audioMuted !== undefined) safePatch.audioMuted = Boolean(patch.audioMuted);
     if (patch?.theme === "light" || patch?.theme === "dark") safePatch.theme = patch.theme;
     if (patch?.zoomFactor !== undefined) safePatch.zoomFactor = clampDesktopZoomFactor(patch.zoomFactor);
 
@@ -2300,6 +2396,9 @@ function registerIpcHandlers(): void {
       }
       if (safePatch.launchAtLogin !== undefined) {
         applyLaunchAtLoginSetting();
+      }
+      if (safePatch.audioMuted !== undefined) {
+        applyAudioMutedToViews(settings.audioMuted === true);
       }
       if (safePatch.alwaysOnTop !== undefined && mainWindow && !mainWindow.isDestroyed()) {
         try {
@@ -2766,6 +2865,7 @@ if (!gotSingleInstanceLock) {
               showLocalChecked: Boolean(document.getElementById("pref-show-local")?.checked),
               advancedHidden: Boolean(document.getElementById("local-advanced-panel")?.hidden),
               hasZoomControl: Boolean(document.getElementById("btn-zoom-value")),
+              hasMuteAudioToggle: Boolean(document.getElementById("pref-mute-audio")),
               hasCopyDiagBtn: Boolean(document.getElementById("btn-copy-diag")),
               hasSettingsPath: Boolean(st?.settingsFilePath),
             };
@@ -2777,6 +2877,7 @@ if (!gotSingleInstanceLock) {
           settingsProbe?.showLocalChecked ||
           !settingsProbe?.advancedHidden ||
           !settingsProbe?.hasZoomControl ||
+          !settingsProbe?.hasMuteAudioToggle ||
           !settingsProbe?.hasCopyDiagBtn ||
           !settingsProbe?.hasSettingsPath
         ) {
@@ -2789,6 +2890,7 @@ if (!gotSingleInstanceLock) {
           `({
             hasFindBridge: Boolean(window.agentschatFind),
             hasInput: Boolean(document.getElementById("find-input")),
+            hasClear: Boolean(document.getElementById("btn-clear")),
             hasCaseToggle: Boolean(document.getElementById("btn-case")),
             hasPrevNext: Boolean(document.getElementById("btn-prev") && document.getElementById("btn-next")),
             hasClose: Boolean(document.getElementById("btn-close")),
@@ -2801,6 +2903,7 @@ if (!gotSingleInstanceLock) {
           !closedFind ||
           !findProbe?.hasFindBridge ||
           !findProbe?.hasInput ||
+          !findProbe?.hasClear ||
           !findProbe?.hasCaseToggle ||
           !findProbe?.hasPrevNext ||
           !findProbe?.hasClose

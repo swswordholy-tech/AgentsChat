@@ -41,6 +41,7 @@ import {
   resolveRestoredWindowBounds,
   resolveSmartReloadAction,
   resolveWorkspaceCopyAction,
+  sanitizeFindSeedText,
   sanitizeLocalProfileName,
   shouldGrantWebPermission,
 } from "../src/desktop-helpers.js";
@@ -1902,5 +1903,83 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     const localServerTs = readFileSync(join(import.meta.dir, "..", "src", "local-server.ts"), "utf8");
     expect(localServerTs).not.toContain("find.html");
     expect(localServerTs).not.toContain("find-preload.cjs");
+  });
+
+  test("Desktop 2.24 adds Use Selection for Find (Cmd/Ctrl+E), context-menu Find on Page, page-level Escape dismissal of Find bar, inline Clear button & matchCase sync, and persisted Workspace Audio Mute (Cmd/Ctrl+Shift+U)", () => {
+    // 1. Pure helpers: sanitizeFindSeedText, Escape close-find guard, audioMuted settings/tooltip/diagnostics
+    expect(sanitizeFindSeedText("")).toBeNull();
+    expect(sanitizeFindSeedText("   \n\t\r  ")).toBeNull();
+    expect(sanitizeFindSeedText("  hello\n\tworld\u0007  ")).toBe("hello world");
+    expect(sanitizeFindSeedText("a".repeat(200))?.length).toBe(120);
+
+    expect(resolveBeforeInputShortcut({ type: "keyDown", key: "Escape" })).toBeNull();
+    expect(resolveBeforeInputShortcut({ type: "keyDown", key: "Escape" }, { findBarOpen: false })).toBeNull();
+    expect(resolveBeforeInputShortcut({ type: "keyDown", key: "Escape" }, { findBarOpen: true })).toBe("close-find");
+    expect(resolveBeforeInputShortcut({ type: "keyDown", key: "Escape", isComposing: true }, { findBarOpen: true })).toBeNull();
+    expect(resolveBeforeInputShortcut({ type: "keyDown", key: "Escape", meta: true }, { findBarOpen: true })).toBeNull();
+
+    expect(DEFAULT_DESKTOP_SETTINGS.audioMuted).toBe(false);
+    expect(sanitizeDesktopSettings({ audioMuted: true }).audioMuted).toBe(true);
+    expect(sanitizeDesktopSettings({ audioMuted: "yes" as any }).audioMuted).toBe(false);
+
+    expect(
+      formatTrayTooltip({
+        showLocalWorkspace: false,
+        localRunning: false,
+        notificationsMuted: false,
+        audioMuted: true,
+      }),
+    ).toBe("AgentsChat Desktop · Audio Off");
+    expect(
+      formatTrayTooltip({
+        showLocalWorkspace: false,
+        localRunning: false,
+        notificationsMuted: true,
+        audioMuted: true,
+      }),
+    ).toBe("AgentsChat Desktop · Muted · Audio Off");
+
+    const diagMuted = formatDesktopDiagnostics({
+      appVersion: "0.2.4",
+      platform: "darwin",
+      activeWorkspace: "cloud",
+      showLocalWorkspace: false,
+      theme: "light",
+      localRunning: false,
+      notificationsMuted: false,
+      audioMuted: true,
+    });
+    expect(diagMuted).toContain("Audio: muted");
+
+    // 2. Main process: Cmd/Ctrl+E, context-menu Find on Page, page-level Escape dismissal, localView nav auto-close & Workspace Audio Mute across Menu/Tray/Dock/Settings
+    const mainTs = readFileSync(join(import.meta.dir, "..", "src", "main.ts"), "utf8");
+    expect(mainTs).toContain('label: "Use Selection for Find"');
+    expect(mainTs).toContain('accelerator: "CmdOrCtrl+E"');
+    expect(mainTs).toContain("async function useSelectionForFind()");
+    expect(mainTs).toContain("label: `Find “${lookup.label}” on Page`");
+    expect(mainTs).toContain("resolveBeforeInputShortcut(input, { findBarOpen: true })");
+    expect(mainTs).toContain('if (cmd === "close-find")');
+    expect(mainTs).toContain('localView.webContents.on("did-navigate"');
+    expect(mainTs).toContain("function applyAudioMuted(muted: boolean)");
+    expect(mainTs).toContain("view.webContents.setAudioMuted(muted);");
+    expect(mainTs).toContain('label: "Mute Workspace Audio"');
+    expect(mainTs).toContain('accelerator: "CmdOrCtrl+Shift+U"');
+
+    // 3. Find bar UI & Preferences UI: inline Clear button, matchCase & seedQuery sync, audio mute switch
+    const findHtml = readFileSync(join(import.meta.dir, "..", "ui", "find.html"), "utf8");
+    const findScript = findHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1] || "";
+    expect(() => new Function(findScript)).not.toThrow();
+    expect(findScript).not.toMatch(/\.(?:innerHTML|outerHTML)\s*=|insertAdjacentHTML|document\.write\s*\(/);
+    expect(findHtml).toContain('id="btn-clear"');
+    expect(findScript).toContain("payload.seedQuery");
+    expect(findScript).toContain('typeof state.matchCase === "boolean"');
+
+    const settingsHtml = readFileSync(join(import.meta.dir, "..", "ui", "settings.html"), "utf8");
+    const settingsScript = settingsHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1] || "";
+    expect(() => new Function(settingsScript)).not.toThrow();
+    expect(settingsScript).not.toMatch(/\.(?:innerHTML|outerHTML)\s*=|insertAdjacentHTML|document\.write\s*\(/);
+    expect(settingsHtml).toContain('id="pref-mute-audio"');
+    expect(settingsScript).toContain("prefMuteAudio");
+    expect(settingsScript).toContain("audioMuted: Boolean(prefMuteAudio.checked)");
   });
 });
