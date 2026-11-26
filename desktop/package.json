@@ -1,6 +1,6 @@
 {
   "name": "@agentschat/desktop",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "AgentsChat Desktop for macOS & Windows — Cloud workspace + embedded Local Mini-Server with globally unique AgentsChat identities.",
   "author": "AgentsChat",
@@ -18,8 +18,8 @@
     "test": "bun test ./tests/",
     "smoke:electron": "npm run build && node scripts/smoke-electron.mjs",
     "pack:dir": "npm run build && electron-builder --dir",
-    "pack:mac": "npm run build && electron-builder --mac dmg zip",
-    "pack:win": "npm run build && electron-builder --win nsis portable"
+    "pack:mac": "npm run build && electron-builder --mac",
+    "pack:win": "npm run build && electron-builder --win"
   },
   "dependencies": {
     "ws": "^8.21.3"
