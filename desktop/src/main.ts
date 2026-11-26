@@ -39,6 +39,7 @@ import {
   formatTrayTooltip,
   isCloudOfflinePageUrl,
   isLocalStoppedPageUrl,
+  isOAuthPopupUrl,
   isTrustedCloudThemeOrigin,
   parseDeepLink,
   parseUnreadCountFromTitle,
@@ -66,6 +67,7 @@ const TRAY_ICON_DATA_URL =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAWklEQVQ4T2NkoBAwUqifYdQABgZGBv8MDAz/yWLD////GXG5DF0DsiF4XYYugM9l2AxgxOcybAbgcxk2Awi5DFcAIZfhCiDkMlwBhFyGK2B0GDAyMDAwAABnTRkR6z51AAAAAElFTkSuQmCC";
 
 let mainWindow: BrowserWindow | null = null;
+let settingsWindow: BrowserWindow | null = null;
 let cloudView: WebContentsView | null = null;
 let localView: WebContentsView | null = null;
 let tray: Tray | null = null;
@@ -133,7 +135,8 @@ const startHidden = !isSmokeTest && process.argv.includes("--hidden");
 const desktopDataDir =
   process.env.AGENTSCHAT_DESKTOP_DATA_DIR?.trim() ||
   join(resolveHomeDir(), ".agentschat", "desktop");
-const settingsStore = new DesktopSettingsStore(join(desktopDataDir, "settings.json"));
+const settingsFilePath = join(desktopDataDir, "settings.json");
+const settingsStore = new DesktopSettingsStore(settingsFilePath);
 let settings: DesktopSettings = settingsStore.load();
 let localServer: LocalMiniServer | null = null;
 const runLocalServerOp = createSerialTaskQueue();
@@ -147,25 +150,10 @@ function isAllowedExternalUrl(rawUrl: string): boolean {
   }
 }
 
-function isOAuthPopupUrl(rawUrl: string, remoteOrigin: string): boolean {
-  try {
-    const parsed = new URL(rawUrl);
-    if (parsed.origin === remoteOrigin) return true;
-    const h = parsed.hostname.toLowerCase();
-    return (
-      h === "accounts.google.com" ||
-      h.endsWith(".google.com") ||
-      h === "appleid.apple.com" ||
-      h === "github.com"
-    );
-  } catch {
-    return false;
-  }
-}
-
 function syncUnreadBadge(): void {
-  const totalUnread = Math.max(0, localUnreadCount + cloudUnreadCount);
-  const st = localServer?.getStatus();
+  const effectiveLocalUnread = settings.showLocalWorkspace ? localUnreadCount : 0;
+  const totalUnread = Math.max(0, effectiveLocalUnread + cloudUnreadCount);
+  const st = settings.showLocalWorkspace ? localServer?.getStatus() : null;
   try {
     if (typeof app.setBadgeCount === "function") {
       app.setBadgeCount(totalUnread);
@@ -177,7 +165,7 @@ function syncUnreadBadge(): void {
         activeWorkspace: settings.activeWorkspace,
         cloudSection: getCloudNavState().section,
         cloudUnread: cloudUnreadCount,
-        localUnread: localUnreadCount,
+        localUnread: effectiveLocalUnread,
         localRunning: Boolean(st?.running),
         localPort: st?.port,
       }),
@@ -188,7 +176,8 @@ function syncUnreadBadge(): void {
       tray.setToolTip(
         formatTrayTooltip({
           cloudUnread: cloudUnreadCount,
-          localUnread: localUnreadCount,
+          localUnread: effectiveLocalUnread,
+          showLocalWorkspace: settings.showLocalWorkspace,
           localRunning: Boolean(st?.running),
           localPort: st?.port,
           localOnlineCount: st?.connectedAgents?.length || 0,
@@ -329,21 +318,33 @@ function attachNativeContextMenu(wc: Electron.WebContents): void {
     const items: Electron.MenuItemConstructorOptions[] = [];
     const hasSelection = Boolean(params.selectionText && params.selectionText.trim().length > 0);
     const hasSafeLink = Boolean(params.linkURL && isAllowedExternalUrl(params.linkURL));
-    const hasSafeImage = Boolean(params.mediaType === "image" && params.srcURL && isAllowedExternalUrl(params.srcURL));
+    const hasImage = params.mediaType === "image";
+    const hasSafeImageUrl = Boolean(hasImage && params.srcURL && isAllowedExternalUrl(params.srcURL));
 
     if (params.isEditable) {
-      if (params.misspelledWord && Array.isArray(params.dictionarySuggestions) && params.dictionarySuggestions.length > 0) {
-        for (const suggestion of params.dictionarySuggestions.slice(0, 5)) {
-          items.push({
-            label: suggestion,
-            click: () => {
-              try { wc.replaceMisspelling(suggestion); } catch {}
-            },
-          });
+      if (params.misspelledWord) {
+        if (Array.isArray(params.dictionarySuggestions) && params.dictionarySuggestions.length > 0) {
+          for (const suggestion of params.dictionarySuggestions.slice(0, 5)) {
+            items.push({
+              label: suggestion,
+              click: () => {
+                try { wc.replaceMisspelling(suggestion); } catch {}
+              },
+            });
+          }
         }
+        items.push({
+          label: "Add to Dictionary",
+          click: () => {
+            try { wc.session.addWordToSpellCheckerDictionary(params.misspelledWord); } catch {}
+          },
+        });
         items.push({ type: "separator" });
       }
       items.push(
+        { role: "undo" },
+        { role: "redo" },
+        { type: "separator" },
         { role: "cut", enabled: hasSelection },
         { role: "copy", enabled: hasSelection },
         { role: "paste" },
@@ -369,26 +370,28 @@ function attachNativeContextMenu(wc: Electron.WebContents): void {
       );
     }
 
-    if (hasSafeImage) {
+    if (hasImage) {
       if (items.length > 0) items.push({ type: "separator" });
-      items.push(
-        {
-          label: "Copy Image",
-          click: () => {
-            try { wc.copyImageAt(params.x, params.y); } catch {}
+      items.push({
+        label: "Copy Image",
+        click: () => {
+          try { wc.copyImageAt(params.x, params.y); } catch {}
+        },
+      });
+      if (hasSafeImageUrl) {
+        items.push(
+          {
+            label: "Copy Image Link",
+            click: () => clipboard.writeText(params.srcURL),
           },
-        },
-        {
-          label: "Copy Image Link",
-          click: () => clipboard.writeText(params.srcURL),
-        },
-        {
-          label: "Save Image As…",
-          click: () => {
-            try { wc.downloadURL(params.srcURL); } catch {}
+          {
+            label: "Save Image As…",
+            click: () => {
+              try { wc.downloadURL(params.srcURL); } catch {}
+            },
           },
-        },
-      );
+        );
+      }
     }
 
     if (items.length === 0) {
@@ -442,7 +445,7 @@ function clearLocalUnread(): void {
 }
 
 async function ensureLocalServerStarted(): Promise<LocalServerStatus | null> {
-  if (!settings.localServerEnabled) {
+  if (!settings.showLocalWorkspace || !settings.localServerEnabled) {
     if (localServer) {
       await localServer.closeAll();
       localServer = null;
@@ -510,15 +513,23 @@ function getCloudNavState() {
 }
 
 function getCombinedState() {
+  const showLocal = settings.showLocalWorkspace === true;
   return {
     platform: process.platform,
     isFullScreen: Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isFullScreen()),
     settings,
-    localServer: localServer ? localServer.getStatus() : null,
-    localUnreadCount,
+    localServer: showLocal && localServer ? localServer.getStatus() : null,
+    localUnreadCount: showLocal ? localUnreadCount : 0,
     cloudUnreadCount,
     cloudNav: getCloudNavState(),
-    discoveredProfiles: GlobalIdentityAuthority.discoverLocalAgentProfiles(),
+    discoveredProfiles: showLocal ? GlobalIdentityAuthority.discoverLocalAgentProfiles() : [],
+  };
+}
+
+function getSettingsWindowState() {
+  return {
+    ...getCombinedState(),
+    settingsFilePath,
   };
 }
 
@@ -569,6 +580,11 @@ function applyDesktopTheme(nextTheme: "light" | "dark", opts?: { skipCloudSync?:
       mainWindow.setBackgroundColor(bg);
     } catch {}
   }
+  if (settingsWindow && !settingsWindow.isDestroyed()) {
+    try {
+      settingsWindow.setBackgroundColor(nextTheme === "dark" ? "#1c1c1e" : "#f3f4f6");
+    } catch {}
+  }
   syncThemeToLocalView(nextTheme);
   if (!opts?.skipCloudSync) {
     syncThemeToCloudView(nextTheme);
@@ -585,11 +601,17 @@ function broadcastState(): void {
         activeWorkspace: settings.activeWorkspace,
         cloudSection: snapshot.cloudNav.section,
         cloudUnread: cloudUnreadCount,
-        localUnread: localUnreadCount,
+        localUnread: snapshot.localUnreadCount,
         localRunning: Boolean(snapshot.localServer?.running),
         localPort: snapshot.localServer?.port,
       }),
     );
+  }
+  if (settingsWindow && !settingsWindow.isDestroyed()) {
+    settingsWindow.webContents.send("desktop:settings-state-changed", {
+      ...snapshot,
+      settingsFilePath,
+    });
   }
   rebuildTrayMenu();
 }
@@ -631,8 +653,10 @@ async function readCloudTokenIfSameOrigin(): Promise<string | null> {
 }
 
 async function switchWorkspace(target: "cloud" | "local"): Promise<void> {
-  settings = settingsStore.save({ activeWorkspace: target });
-  if (target === "local") {
+  const effectiveTarget: "cloud" | "local" =
+    target === "local" && settings.showLocalWorkspace ? "local" : "cloud";
+  settings = settingsStore.save({ activeWorkspace: effectiveTarget });
+  if (effectiveTarget === "local") {
     localUnreadCount = 0;
     syncUnreadBadge();
     const st = await runLocalServerOp(() => ensureLocalServerStarted());
@@ -651,7 +675,7 @@ async function switchWorkspace(target: "cloud" | "local"): Promise<void> {
   }
   layoutViews();
   if (!isSmokeTest) {
-    const activeView = target === "local" ? localView : cloudView;
+    const activeView = effectiveTarget === "local" ? localView : cloudView;
     if (activeView && !activeView.webContents.isDestroyed()) {
       try { activeView.webContents.focus(); } catch {}
     }
@@ -718,6 +742,11 @@ async function handleDeepLinkUrl(rawUrl: string): Promise<void> {
   }
   showMainWindow();
   if (parsed.workspace === "local") {
+    if (!settings.showLocalWorkspace) {
+      await switchWorkspace("cloud");
+      await openDesktopSettingsWindow();
+      return;
+    }
     await openLocalChannel(parsed.channelId);
     return;
   }
@@ -738,7 +767,7 @@ async function showDesktopMessageBox(options: Electron.MessageBoxOptions): Promi
 }
 
 function copyDesktopDiagnostics(): string {
-  const st = localServer?.getStatus();
+  const st = settings.showLocalWorkspace ? localServer?.getStatus() : null;
   const text = formatDesktopDiagnostics({
     appVersion: app.getVersion() || "0.1.0",
     electronVersion: process.versions.electron,
@@ -746,6 +775,7 @@ function copyDesktopDiagnostics(): string {
     platform: process.platform,
     arch: process.arch,
     activeWorkspace: settings.activeWorkspace,
+    showLocalWorkspace: settings.showLocalWorkspace,
     theme: settings.theme === "dark" ? "dark" : "light",
     zoomFactor: settings.zoomFactor ?? 1,
     localRunning: Boolean(st?.running),
@@ -851,27 +881,93 @@ function applyNotificationsMuted(muted: boolean): boolean {
 function resetWindowSizeAndCenter(): boolean {
   if (!mainWindow || mainWindow.isDestroyed()) return false;
   try {
-    if (mainWindow.isFullScreen()) mainWindow.setFullScreen(false);
-    if (mainWindow.isMaximized()) mainWindow.unmaximize();
-    if (mainWindow.isMinimized()) mainWindow.restore();
-    const curBounds = mainWindow.getBounds();
-    const disp = screen.getDisplayMatching(curBounds);
-    const nextBounds = computeCenteredWindowBounds(disp.workArea, 1320, 860, 880, 560);
-    mainWindow.setBounds(nextBounds, true);
-    mainWindow.show();
-    mainWindow.focus();
-    layoutViews();
-    settings = settingsStore.save({ windowBounds: nextBounds });
+    const applyCenteredBounds = () => {
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      if (mainWindow.isMaximized()) mainWindow.unmaximize();
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      const curBounds = mainWindow.getBounds();
+      const disp = screen.getDisplayMatching(curBounds);
+      const nextBounds = computeCenteredWindowBounds(disp.workArea, 1320, 860, 880, 560);
+      mainWindow.setBounds(nextBounds, true);
+      mainWindow.show();
+      mainWindow.focus();
+      layoutViews();
+      settings = settingsStore.save({ windowBounds: nextBounds });
+    };
+    if (mainWindow.isFullScreen()) {
+      mainWindow.once("leave-full-screen", applyCenteredBounds);
+      mainWindow.setFullScreen(false);
+    } else {
+      applyCenteredBounds();
+    }
     return true;
   } catch {
     return false;
   }
 }
 
+async function openDesktopSettingsWindow(): Promise<void> {
+  if (settingsWindow && !settingsWindow.isDestroyed()) {
+    if (settingsWindow.isMinimized()) settingsWindow.restore();
+    settingsWindow.show();
+    settingsWindow.focus();
+    return;
+  }
+  const isMac = process.platform === "darwin";
+  const prefWidth = 480;
+  const prefHeight = 590;
+  let pos: { x?: number; y?: number } = {};
+  try {
+    const refBounds =
+      mainWindow && !mainWindow.isDestroyed() ? mainWindow.getBounds() : screen.getPrimaryDisplay().workArea;
+    const disp = screen.getDisplayMatching(refBounds) || screen.getPrimaryDisplay();
+    const centered = computeCenteredWindowBounds(disp.workArea, prefWidth, prefHeight, prefWidth, prefHeight);
+    pos = { x: centered.x, y: centered.y };
+  } catch {}
+
+  settingsWindow = new BrowserWindow({
+    width: prefWidth,
+    height: prefHeight,
+    ...pos,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    show: !isSmokeTest,
+    title: "桌面端配置",
+    parent: mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined,
+    backgroundColor: settings.theme === "dark" ? "#1c1c1e" : "#f3f4f6",
+    ...(isMac ? { titleBarStyle: "hiddenInset", trafficLightPosition: { x: 14, y: 14 } } : { autoHideMenuBar: true }),
+    webPreferences: {
+      preload: join(UI_DIR, "settings-preload.cjs"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  });
+
+  settingsWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  if (isSmokeTest) {
+    settingsWindow.webContents.on("console-message", (_ev, level, message) => {
+      if (level >= 3) smokeRendererErrors.push(`[settings] ${message}`);
+    });
+  }
+  settingsWindow.on("closed", () => {
+    settingsWindow = null;
+  });
+
+  await settingsWindow.loadFile(join(UI_DIR, "settings.html"));
+  if (!isSmokeTest && settingsWindow && !settingsWindow.isDestroyed()) {
+    settingsWindow.show();
+    settingsWindow.focus();
+  }
+}
+
 function setupApplicationMenu(): void {
   const isMac = process.platform === "darwin";
+  const showLocal = settings.showLocalWorkspace === true;
   const toggleActiveDevTools = () => {
-    const target = settings.activeWorkspace === "local" ? localView : cloudView;
+    const target = settings.activeWorkspace === "local" && showLocal ? localView : cloudView;
     if (target && !target.webContents.isDestroyed()) {
       if (target.webContents.isDevToolsOpened()) target.webContents.closeDevTools();
       else target.webContents.openDevTools({ mode: "detach" });
@@ -888,6 +984,15 @@ function setupApplicationMenu(): void {
               {
                 label: "Check for Updates…",
                 click: () => void promptCheckForUpdates(),
+              },
+              { type: "separator" as const },
+              {
+                label: "Settings…",
+                accelerator: "CmdOrCtrl+,",
+                click: () => {
+                  showMainWindow();
+                  void openDesktopSettingsWindow();
+                },
               },
               { type: "separator" as const },
               { role: "hide" as const },
@@ -928,11 +1033,15 @@ function setupApplicationMenu(): void {
           accelerator: "CmdOrCtrl+1",
           click: () => void navigateCloudQuickRoute("lobby"),
         },
-        {
-          label: "Local Mini-Server",
-          accelerator: "CmdOrCtrl+2",
-          click: () => void switchWorkspace("local"),
-        },
+        ...(showLocal
+          ? [
+              {
+                label: "Local Mini-Server",
+                accelerator: "CmdOrCtrl+2",
+                click: () => void switchWorkspace("local"),
+              },
+            ]
+          : []),
         { type: "separator" },
         {
           label: "Cloud Studio (算力工坊)",
@@ -966,7 +1075,7 @@ function setupApplicationMenu(): void {
           click: () => void navigateCloudHistory("forward"),
         },
         {
-          label: "Copy Current Link / Local MCP Command",
+          label: showLocal ? "Copy Current Link / Local MCP Command" : "Copy Current Page Link",
           accelerator: "CmdOrCtrl+Shift+C",
           click: () => { copyActiveWorkspaceLinkOrCommand(true); },
         },
@@ -975,25 +1084,42 @@ function setupApplicationMenu(): void {
           accelerator: "CmdOrCtrl+Shift+O",
           click: () => { openCurrentCloudUrlInBrowser(); },
         },
+        ...(showLocal
+          ? [
+              { type: "separator" as const },
+              {
+                label: "Local Mini-Server Running",
+                type: "checkbox" as const,
+                checked: settings.localServerEnabled === true,
+                accelerator: "CmdOrCtrl+Shift+L",
+                click: () => {
+                  void setLocalServerEnabled(!(settings.localServerEnabled === true));
+                },
+              },
+              {
+                label: "Allow LAN Access (0.0.0.0)",
+                type: "checkbox" as const,
+                checked: settings.allowLan === true,
+                click: () => {
+                  void setAllowLan(!settings.allowLan);
+                },
+              },
+            ]
+          : []),
         { type: "separator" },
-        {
-          label: "Local Mini-Server Running",
-          type: "checkbox",
-          checked: settings.localServerEnabled !== false,
-          accelerator: "CmdOrCtrl+Shift+L",
-          click: () => {
-            void setLocalServerEnabled(!(settings.localServerEnabled !== false));
-          },
-        },
-        {
-          label: "Allow LAN Access (0.0.0.0)",
-          type: "checkbox",
-          checked: settings.allowLan === true,
-          click: () => {
-            void setAllowLan(!settings.allowLan);
-          },
-        },
-        { type: "separator" },
+        ...(!isMac
+          ? [
+              {
+                label: "Settings…",
+                accelerator: "CmdOrCtrl+,",
+                click: () => {
+                  showMainWindow();
+                  void openDesktopSettingsWindow();
+                },
+              },
+              { type: "separator" as const },
+            ]
+          : []),
         {
           label: "Toggle Light / Dark Appearance",
           accelerator: "CmdOrCtrl+Shift+D",
@@ -1049,6 +1175,7 @@ function setupApplicationMenu(): void {
       submenu: [
         { role: "minimize" },
         { role: "close" },
+        { role: "togglefullscreen" },
         { type: "separator" },
         {
           label: "Keep Window on Top",
@@ -1101,12 +1228,15 @@ function setupApplicationMenu(): void {
 function rebuildTrayMenu(): void {
   if (!tray) return;
   const isMac = process.platform === "darwin";
-  const st = localServer?.getStatus();
-  const totalUnread = cloudUnreadCount + localUnreadCount;
+  const showLocal = settings.showLocalWorkspace === true;
+  const st = showLocal ? localServer?.getStatus() : null;
+  const effectiveLocalUnread = showLocal ? localUnreadCount : 0;
+  const totalUnread = cloudUnreadCount + effectiveLocalUnread;
   tray.setToolTip(
     formatTrayTooltip({
       cloudUnread: cloudUnreadCount,
-      localUnread: localUnreadCount,
+      localUnread: effectiveLocalUnread,
+      showLocalWorkspace: showLocal,
       localRunning: Boolean(st?.running),
       localPort: st?.port,
       localOnlineCount: st?.connectedAgents?.length || 0,
@@ -1149,7 +1279,7 @@ function rebuildTrayMenu(): void {
         ? `Cloud Workspace (${cloudUnreadCount} unread)`
         : "Cloud Workspace (agents-chat.com)",
       type: "radio",
-      checked: settings.activeWorkspace === "cloud",
+      checked: !showLocal || settings.activeWorkspace === "cloud",
       click: () => {
         showMainWindow();
         void switchWorkspace("cloud");
@@ -1183,37 +1313,49 @@ function rebuildTrayMenu(): void {
         void navigateCloudQuickRoute("dashboard");
       },
     },
-    {
-      label: st
-        ? `Local Server (${st.httpUrl} · ${st.connectedAgents.length} online${localUnreadCount > 0 ? ` · ${localUnreadCount} unread` : ""})`
-        : "Local Server (Stopped)",
-      type: "radio",
-      checked: settings.activeWorkspace === "local",
-      click: () => {
-        showMainWindow();
-        void switchWorkspace("local");
-      },
-    },
+    ...(showLocal
+      ? [
+          {
+            label: st
+              ? `Local Server (${st.httpUrl} · ${st.connectedAgents.length} online${localUnreadCount > 0 ? ` · ${localUnreadCount} unread` : ""})`
+              : "Local Server (Stopped)",
+            type: "radio" as const,
+            checked: settings.activeWorkspace === "local",
+            click: () => {
+              showMainWindow();
+              void switchWorkspace("local");
+            },
+          },
+          { type: "separator" as const },
+          {
+            label: "Copy Local MCP Command",
+            enabled: Boolean(st?.running),
+            click: () => {
+              clipboard.writeText(formatLocalMcpCommand(st?.httpUrl || `http://127.0.0.1:${settings.localServerPort}`));
+            },
+          },
+          {
+            label: settings.localServerEnabled ? "Stop Local Server" : "Start Local Server",
+            click: () => {
+              void setLocalServerEnabled(!settings.localServerEnabled);
+            },
+          },
+          {
+            label: "Allow LAN Access (0.0.0.0)",
+            type: "checkbox" as const,
+            checked: settings.allowLan,
+            click: () => {
+              void setAllowLan(!settings.allowLan);
+            },
+          },
+        ]
+      : []),
     { type: "separator" },
     {
-      label: "Copy Local MCP Command",
-      enabled: Boolean(st?.running),
+      label: isMac ? "Settings… (⌘,)" : "Settings… (Ctrl+,)",
       click: () => {
-        clipboard.writeText(formatLocalMcpCommand(st?.httpUrl || `http://127.0.0.1:${settings.localServerPort}`));
-      },
-    },
-    {
-      label: settings.localServerEnabled ? "Stop Local Server" : "Start Local Server",
-      click: () => {
-        void setLocalServerEnabled(!settings.localServerEnabled);
-      },
-    },
-    {
-      label: "Allow LAN Access (0.0.0.0)",
-      type: "checkbox",
-      checked: settings.allowLan,
-      click: () => {
-        void setAllowLan(!settings.allowLan);
+        showMainWindow();
+        void openDesktopSettingsWindow();
       },
     },
     {
@@ -1232,13 +1374,48 @@ function rebuildTrayMenu(): void {
   tray.setContextMenu(menu);
 }
 
+async function setShowLocalWorkspace(enabled: boolean): Promise<LocalServerStatus | null> {
+  return runLocalServerOp(async () => {
+    const nextEnabled = Boolean(enabled);
+    if (nextEnabled) {
+      settings = settingsStore.save({
+        showLocalWorkspace: true,
+        localServerEnabled: true,
+      });
+      const st = await ensureLocalServerStarted();
+      if (st && localView && !localView.webContents.isDestroyed()) {
+        await localView.webContents.loadURL(st.httpUrl);
+      } else if (!st) {
+        await loadLocalStoppedPage();
+      }
+      setupApplicationMenu();
+      syncUnreadBadge();
+      broadcastState();
+      return st;
+    }
+    localUnreadCount = 0;
+    settings = settingsStore.save({
+      showLocalWorkspace: false,
+      localServerEnabled: false,
+      activeWorkspace: "cloud",
+    });
+    await ensureLocalServerStarted();
+    layoutViews();
+    setupApplicationMenu();
+    syncUnreadBadge();
+    broadcastState();
+    return null;
+  });
+}
+
 async function setLocalServerEnabled(enabled: boolean): Promise<LocalServerStatus | null> {
   return runLocalServerOp(async () => {
-    settings = settingsStore.save({ localServerEnabled: Boolean(enabled) });
+    const nextEnabled = settings.showLocalWorkspace && Boolean(enabled);
+    settings = settingsStore.save({ localServerEnabled: nextEnabled });
     const nextStatus = await ensureLocalServerStarted();
     if (nextStatus && localView && !localView.webContents.isDestroyed()) {
       await localView.webContents.loadURL(nextStatus.httpUrl);
-    } else if (!nextStatus) {
+    } else if (!nextStatus && settings.showLocalWorkspace) {
       await loadLocalStoppedPage();
     }
     setupApplicationMenu();
@@ -1441,12 +1618,13 @@ async function createDesktopWindow(): Promise<void> {
         remote: retryUrl,
         reason: `RENDERER_${String(details.reason || "GONE").toUpperCase()}`,
         theme: settings.theme || "light",
+        local: settings.showLocalWorkspace ? "1" : "0",
       },
     });
     broadcastState();
   });
   localView.webContents.on("render-process-gone", (_ev, details) => {
-    if (isSmokeTest || details.reason === "clean-exit") return;
+    if (isSmokeTest || details.reason === "clean-exit" || !settings.showLocalWorkspace) return;
     const runningStatus = localServer?.getStatus();
     if (runningStatus?.running) {
       void localView?.webContents.loadURL(runningStatus.httpUrl);
@@ -1455,7 +1633,7 @@ async function createDesktopWindow(): Promise<void> {
     }
   });
   localView.webContents.on("did-fail-load", (_ev, errorCode, _errorDescription, validatedURL, isMainFrame) => {
-    if (!isMainFrame || errorCode === -3 || isSmokeTest) return;
+    if (!isMainFrame || errorCode === -3 || isSmokeTest || !settings.showLocalWorkspace) return;
     if (validatedURL && isLocalStoppedPageUrl(validatedURL)) return;
     void loadLocalStoppedPage();
   });
@@ -1486,6 +1664,7 @@ async function createDesktopWindow(): Promise<void> {
         remote: retryUrl,
         reason: errorDescription || `ERR_${errorCode}`,
         theme: settings.theme || "light",
+        local: settings.showLocalWorkspace ? "1" : "0",
       },
     });
   });
@@ -1506,18 +1685,22 @@ async function createDesktopWindow(): Promise<void> {
       void cloudView?.webContents.loadURL(targetUrl);
     } else if (navUrl === "agentschat-action://switch-local") {
       ev.preventDefault();
-      void switchWorkspace("local");
+      if (settings.showLocalWorkspace) {
+        void switchWorkspace("local");
+      }
     }
   });
 
   if (!isSmokeTest) {
     void cloudView.webContents.loadURL(settings.remoteServerUrl);
   }
-  const st = await ensureLocalServerStarted();
-  if (st) {
-    await localView.webContents.loadURL(st.httpUrl);
-  } else {
-    await loadLocalStoppedPage();
+  if (settings.showLocalWorkspace) {
+    const st = await ensureLocalServerStarted();
+    if (st) {
+      await localView.webContents.loadURL(st.httpUrl);
+    } else {
+      await loadLocalStoppedPage();
+    }
   }
 
   const scheduleBoundsSave = () => {
@@ -1577,7 +1760,7 @@ async function createDesktopWindow(): Promise<void> {
   });
 
   mainWindow.on("close", (ev) => {
-    if (!isQuitting && settings.minimizeToTray && settings.localServerEnabled) {
+    if (!isQuitting && settings.minimizeToTray) {
       ev.preventDefault();
       mainWindow?.hide();
     }
@@ -1630,12 +1813,119 @@ function registerIpcHandlers(): void {
     applyDesktopTheme(rawTheme, { skipCloudSync: true });
   });
 
+  ipcMain.handle("desktop:open-settings-window", async (ev) => {
+    const isShell = Boolean(mainWindow && !mainWindow.isDestroyed() && ev.sender === mainWindow.webContents);
+    if (!isShell) return false;
+    await openDesktopSettingsWindow();
+    return true;
+  });
+
+  ipcMain.handle("desktop:get-settings-state", (ev) => {
+    const isSettingsWin = Boolean(settingsWindow && !settingsWindow.isDestroyed() && ev.sender === settingsWindow.webContents);
+    if (!isSettingsWin) return null;
+    return getSettingsWindowState();
+  });
+
+  ipcMain.handle("desktop:save-desktop-settings", async (ev, patch: any) => {
+    const isSettingsWin = Boolean(settingsWindow && !settingsWindow.isDestroyed() && ev.sender === settingsWindow.webContents);
+    if (!isSettingsWin) return { ok: false, error: "Forbidden" };
+
+    const safePatch: Partial<DesktopSettings> = {};
+    if (patch?.showLocalWorkspace !== undefined) {
+      safePatch.showLocalWorkspace = Boolean(patch.showLocalWorkspace);
+      if (!safePatch.showLocalWorkspace) {
+        safePatch.localServerEnabled = false;
+        safePatch.activeWorkspace = "cloud";
+      } else if (patch?.localServerEnabled === undefined) {
+        safePatch.localServerEnabled = true;
+      }
+    }
+    if (patch?.localServerEnabled !== undefined) {
+      const targetShow = safePatch.showLocalWorkspace ?? settings.showLocalWorkspace;
+      safePatch.localServerEnabled = targetShow && Boolean(patch.localServerEnabled);
+    }
+    if (patch?.localServerPort !== undefined) {
+      const port = Number(patch.localServerPort);
+      if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+        return { ok: false, error: "端口范围须为 1024 - 65535" };
+      }
+      safePatch.localServerPort = port;
+    }
+    if (patch?.allowLan !== undefined) safePatch.allowLan = Boolean(patch.allowLan);
+    if (patch?.minimizeToTray !== undefined) safePatch.minimizeToTray = Boolean(patch.minimizeToTray);
+    if (patch?.launchAtLogin !== undefined) safePatch.launchAtLogin = Boolean(patch.launchAtLogin);
+    if (patch?.alwaysOnTop !== undefined) safePatch.alwaysOnTop = Boolean(patch.alwaysOnTop);
+    if (patch?.notificationsMuted !== undefined) safePatch.notificationsMuted = Boolean(patch.notificationsMuted);
+    if (patch?.theme === "light" || patch?.theme === "dark") safePatch.theme = patch.theme;
+
+    await runLocalServerOp(async () => {
+      const prevShowLocal = settings.showLocalWorkspace;
+      const portOrHostChanged =
+        (safePatch.localServerPort !== undefined && safePatch.localServerPort !== settings.localServerPort) ||
+        (safePatch.allowLan !== undefined && safePatch.allowLan !== settings.allowLan);
+      settings = settingsStore.save(safePatch);
+
+      if (safePatch.theme !== undefined) {
+        applyDesktopTheme(safePatch.theme);
+      }
+      if (safePatch.launchAtLogin !== undefined) {
+        applyLaunchAtLoginSetting();
+      }
+      if (safePatch.alwaysOnTop !== undefined && mainWindow && !mainWindow.isDestroyed()) {
+        try {
+          if (settings.alwaysOnTop) mainWindow.setAlwaysOnTop(true, "floating");
+          else mainWindow.setAlwaysOnTop(false);
+        } catch {}
+      }
+      if (!settings.showLocalWorkspace) {
+        localUnreadCount = 0;
+      }
+      if (portOrHostChanged && localServer) {
+        await localServer.closeAll();
+        localServer = null;
+      }
+      const st = await ensureLocalServerStarted();
+      if (settings.showLocalWorkspace) {
+        if (st && localView && !localView.webContents.isDestroyed()) {
+          const cur = localView.webContents.getURL();
+          if (!cur.startsWith(st.httpUrl)) {
+            await localView.webContents.loadURL(st.httpUrl);
+          }
+        } else if (!st && localView && !localView.webContents.isDestroyed()) {
+          await loadLocalStoppedPage();
+        }
+      } else if (prevShowLocal) {
+        layoutViews();
+      }
+      setupApplicationMenu();
+      syncUnreadBadge();
+      broadcastState();
+    });
+    return { ok: true, state: getSettingsWindowState() };
+  });
+
+  ipcMain.handle("desktop:open-data-folder", async (ev) => {
+    const isSettingsWin = Boolean(settingsWindow && !settingsWindow.isDestroyed() && ev.sender === settingsWindow.webContents);
+    if (!isSettingsWin) return false;
+    await shell.openPath(desktopDataDir);
+    return true;
+  });
+
+  ipcMain.handle("desktop:close-settings-window", (ev) => {
+    const isSettingsWin = Boolean(settingsWindow && !settingsWindow.isDestroyed() && ev.sender === settingsWindow.webContents);
+    if (!isSettingsWin) return false;
+    settingsWindow?.close();
+    return true;
+  });
+
   ipcMain.handle("desktop:toggle-local-server", async (_ev, enabled: unknown) => {
     await setLocalServerEnabled(Boolean(enabled));
     return getCombinedState();
   });
 
-  ipcMain.handle("desktop:update-settings", async (_ev, patch: any) => {
+  ipcMain.handle("desktop:update-settings", async (ev, patch: any) => {
+    const isShell = Boolean(mainWindow && !mainWindow.isDestroyed() && ev.sender === mainWindow.webContents);
+    if (!isShell) return getCombinedState();
     await runLocalServerOp(async () => {
       const portOrHostChanged =
         (patch?.localServerPort !== undefined && Number(patch.localServerPort) !== settings.localServerPort) ||
@@ -1646,10 +1936,14 @@ function registerIpcHandlers(): void {
         localServer = null;
       }
       const st = await ensureLocalServerStarted();
-      if (st && localView && !localView.webContents.isDestroyed()) {
+      if (settings.showLocalWorkspace && st && localView && !localView.webContents.isDestroyed()) {
         await localView.webContents.loadURL(st.httpUrl);
+      } else if (!settings.showLocalWorkspace) {
+        localUnreadCount = 0;
+        layoutViews();
       }
       setupApplicationMenu();
+      syncUnreadBadge();
       broadcastState();
     });
     return getCombinedState();
@@ -1953,24 +2247,81 @@ if (!gotSingleInstanceLock) {
     }
 
     if (isSmokeTest) {
-      const st = localServer?.getStatus();
-      if (!st || !st.running) {
-        console.error("[desktop-smoke] LocalMiniServer failed to start");
-        app.exit(1);
-        return;
-      }
       try {
-        const healthRes = await fetch(`${st.httpUrl}/health`);
-        const health = (await healthRes.json()) as any;
-        const shellProbe = await mainWindow?.webContents.executeJavaScript(
+        // 1. Verify Cloud-only default on fresh startup (Local UI hidden & LocalMiniServer stopped)
+        const startedLocalByDefault = Boolean(localServer);
+        const defaultShellProbe = await mainWindow?.webContents.executeJavaScript(
           `(async () => {
             const st = await window.agentschatShell?.getState?.();
             return {
               hasShellBridge: Boolean(window.agentschatShell),
+              showLocalWorkspace: Boolean(st?.settings?.showLocalWorkspace),
               running: Boolean(st?.localServer?.running),
-              hasLocalBtn: Boolean(document.getElementById("btn-local")),
+              localBtnHidden: Boolean(document.getElementById("btn-local")?.hidden),
+              portBadgeHidden: Boolean(document.getElementById("local-port-badge")?.hidden),
+              powerBtnHidden: Boolean(document.getElementById("btn-power")?.hidden),
+              hasSettingsBtn: Boolean(document.getElementById("btn-shell-settings")),
               hasUnreadBadge: Boolean(document.getElementById("local-unread-badge")),
               hasCloudUnreadBadge: Boolean(document.getElementById("cloud-unread-badge")),
+            };
+          })()`,
+          true,
+        );
+        if (
+          startedLocalByDefault ||
+          !defaultShellProbe?.hasShellBridge ||
+          defaultShellProbe?.showLocalWorkspace ||
+          defaultShellProbe?.running ||
+          !defaultShellProbe?.localBtnHidden ||
+          !defaultShellProbe?.portBadgeHidden ||
+          !defaultShellProbe?.powerBtnHidden ||
+          !defaultShellProbe?.hasSettingsBtn ||
+          !defaultShellProbe?.hasUnreadBadge ||
+          !defaultShellProbe?.hasCloudUnreadBadge
+        ) {
+          throw new Error(`Cloud-only default smoke check failed: ${JSON.stringify(defaultShellProbe)}`);
+        }
+
+        // 2. Open Preferences window and verify default state
+        await openDesktopSettingsWindow();
+        const settingsProbe = await settingsWindow?.webContents.executeJavaScript(
+          `(async () => {
+            const st = await window.agentschatSettings?.getState?.();
+            return {
+              hasSettingsBridge: Boolean(window.agentschatSettings),
+              showLocalChecked: Boolean(document.getElementById("pref-show-local")?.checked),
+              advancedHidden: Boolean(document.getElementById("local-advanced-panel")?.hidden),
+              hasSettingsPath: Boolean(st?.settingsFilePath),
+            };
+          })()`,
+          true,
+        );
+        if (
+          !settingsProbe?.hasSettingsBridge ||
+          settingsProbe?.showLocalChecked ||
+          !settingsProbe?.advancedHidden ||
+          !settingsProbe?.hasSettingsPath
+        ) {
+          throw new Error(`Settings window smoke check failed: ${JSON.stringify(settingsProbe)}`);
+        }
+
+        // 3. Opt-in to Local Workspace and verify LocalMiniServer + Rail reveal + Local Chat DOM/modal
+        const st = await setShowLocalWorkspace(true);
+        if (!st || !st.running) {
+          throw new Error("LocalMiniServer failed to start after enabling showLocalWorkspace");
+        }
+        const healthRes = await fetch(`${st.httpUrl}/health`);
+        const health = (await healthRes.json()) as any;
+        const enabledShellProbe = await mainWindow?.webContents.executeJavaScript(
+          `(async () => {
+            await new Promise((r) => setTimeout(r, 80));
+            const st = await window.agentschatShell?.getState?.();
+            return {
+              showLocalWorkspace: Boolean(st?.settings?.showLocalWorkspace),
+              running: Boolean(st?.localServer?.running),
+              localBtnVisible: !document.getElementById("btn-local")?.hidden,
+              portBadgeVisible: !document.getElementById("local-port-badge")?.hidden,
+              powerBtnVisible: !document.getElementById("btn-power")?.hidden,
             };
           })()`,
           true,
@@ -2003,11 +2354,11 @@ if (!gotSingleInstanceLock) {
         if (
           healthRes.status !== 200 ||
           health?.mode !== "desktop_local_minimal" ||
-          !shellProbe?.hasShellBridge ||
-          !shellProbe?.running ||
-          !shellProbe?.hasLocalBtn ||
-          !shellProbe?.hasUnreadBadge ||
-          !shellProbe?.hasCloudUnreadBadge ||
+          !enabledShellProbe?.showLocalWorkspace ||
+          !enabledShellProbe?.running ||
+          !enabledShellProbe?.localBtnVisible ||
+          !enabledShellProbe?.portBadgeVisible ||
+          !enabledShellProbe?.powerBtnVisible ||
           localProbe?.title !== "AgentsChat Local Server" ||
           !localProbe?.hasLocalBridge ||
           !localProbe?.ipcOk ||
@@ -2017,19 +2368,21 @@ if (!gotSingleInstanceLock) {
           smokeRendererErrors.length > 0
         ) {
           throw new Error(
-            `Smoke audit failed: shell=${JSON.stringify(shellProbe)} local=${JSON.stringify(localProbe)} errors=${JSON.stringify(smokeRendererErrors)}`,
+            `Smoke audit failed: shell=${JSON.stringify(enabledShellProbe)} local=${JSON.stringify(localProbe)} errors=${JSON.stringify(smokeRendererErrors)}`,
           );
         }
         console.log(
-          `[desktop-smoke] OK: Electron ${process.versions.electron}, LocalMiniServer=${st.httpUrl}, shell+local bridges & DOM modal verified (0 console/CSP errors)`,
+          `[desktop-smoke] OK: Electron ${process.versions.electron}, Cloud-only default + Preferences window + LocalMiniServer=${st.httpUrl} verified (0 console/CSP errors)`,
         );
         isQuitting = true;
+        if (settingsWindow && !settingsWindow.isDestroyed()) settingsWindow.close();
         await localServer?.closeAll();
         localServer = null;
         app.exit(0);
       } catch (err: any) {
         console.error("[desktop-smoke] FAILED:", err?.message || err);
         isQuitting = true;
+        if (settingsWindow && !settingsWindow.isDestroyed()) settingsWindow.close();
         await localServer?.closeAll();
         localServer = null;
         app.exit(1);
@@ -2102,6 +2455,10 @@ if (!gotSingleInstanceLock) {
 
   app.on("before-quit", () => {
     isQuitting = true;
+    if (settingsWindow && !settingsWindow.isDestroyed()) {
+      settingsWindow.close();
+      settingsWindow = null;
+    }
     if (localServer) {
       void localServer.closeAll();
       localServer = null;

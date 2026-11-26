@@ -64,6 +64,7 @@ export type DesktopTheme = "light" | "dark";
 
 export interface DesktopSettings {
   activeWorkspace: "cloud" | "local";
+  showLocalWorkspace: boolean;
   theme: DesktopTheme;
   remoteServerUrl: string;
   localServerEnabled: boolean;

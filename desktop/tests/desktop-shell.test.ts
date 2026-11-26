@@ -24,6 +24,7 @@ import {
   formatZoomBadge,
   isCloudOfflinePageUrl,
   isLocalStoppedPageUrl,
+  isOAuthPopupUrl,
   isTrustedCloudThemeOrigin,
   parseDeepLink,
   parseDesktopReleaseTag,
@@ -58,8 +59,16 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     const store = new DesktopSettingsStore(settingsPath);
 
     expect(store.load()).toEqual(DEFAULT_DESKTOP_SETTINGS);
+    expect(DEFAULT_DESKTOP_SETTINGS.showLocalWorkspace).toBe(false);
+    expect(DEFAULT_DESKTOP_SETTINGS.localServerEnabled).toBe(false);
+
+    // Without showLocalWorkspace=true, activeWorkspace falls back to "cloud"
+    const cloudOnlySaved = store.save({ activeWorkspace: "local" });
+    expect(cloudOnlySaved.showLocalWorkspace).toBe(false);
+    expect(cloudOnlySaved.activeWorkspace).toBe("cloud");
 
     const saved = store.save({
+      showLocalWorkspace: true,
       activeWorkspace: "local",
       remoteServerUrl: "http://evil-insecure.example.com",
       localServerPort: 80,
@@ -68,6 +77,7 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     });
 
     // Insecure HTTP remoteServerUrl and privileged port < 1024 fall back safely
+    expect(saved.showLocalWorkspace).toBe(true);
     expect(saved.activeWorkspace).toBe("local");
     expect(saved.remoteServerUrl).toBe("https://agents-chat.com");
     expect(saved.localServerPort).toBe(8787);
@@ -174,7 +184,7 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
       expect(themeInitRes.headers.get("content-type")).toContain("javascript");
 
       // Internal Electron preloads & shell files must NEVER be exposed over HTTP
-      for (const secretPath of ["/preload.cjs", "/local-preload.cjs", "/shell.html", "/cloud-offline.html", "/local-stopped.html"]) {
+      for (const secretPath of ["/preload.cjs", "/local-preload.cjs", "/settings-preload.cjs", "/shell.html", "/settings.html", "/cloud-offline.html", "/local-stopped.html"]) {
         const res = await fetch(`${status.httpUrl}${secretPath}`);
         expect(res.status).toBe(404);
       }
@@ -1509,5 +1519,99 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     expect(localJs).toContain("const prevToken = authToken;");
     expect(localJs).toContain("authToken = prevToken;");
     expect(localJs).toContain("bmp.close?.();");
+  });
+
+  test("Desktop 2.19 defaults to Cloud-only workspace with native Preferences window (Cmd+,), opt-in Local Mini-Server toggle, strict OAuth popup filtering, async fullscreen reset & context menu polish", () => {
+    // 1. Settings defaults & sanitization enforce Cloud-only default and safe opt-in/opt-out
+    expect(DEFAULT_DESKTOP_SETTINGS.showLocalWorkspace).toBe(false);
+    expect(DEFAULT_DESKTOP_SETTINGS.localServerEnabled).toBe(false);
+    expect(sanitizeDesktopSettings({}).showLocalWorkspace).toBe(false);
+    expect(sanitizeDesktopSettings({}).localServerEnabled).toBe(false);
+    expect(sanitizeDesktopSettings({ activeWorkspace: "local" }).activeWorkspace).toBe("cloud");
+    expect(sanitizeDesktopSettings({ showLocalWorkspace: true }).localServerEnabled).toBe(true);
+    expect(sanitizeDesktopSettings({ showLocalWorkspace: true, localServerEnabled: false }).localServerEnabled).toBe(false);
+    expect(sanitizeDesktopSettings({ showLocalWorkspace: true, activeWorkspace: "local" }).activeWorkspace).toBe("local");
+
+    // 2. Tray tooltip & diagnostics stay clean in Cloud-only mode (no Local Stopped noise)
+    expect(
+      formatTrayTooltip({ showLocalWorkspace: false, cloudUnread: 2, localUnread: 5, localRunning: false }),
+    ).toBe("AgentsChat Desktop (2 unread)");
+    expect(
+      formatTrayTooltip({ showLocalWorkspace: false, cloudUnread: 0, localRunning: false, notificationsMuted: true }),
+    ).toBe("AgentsChat Desktop · Muted");
+    const cloudOnlyDiag = formatDesktopDiagnostics({
+      appVersion: "0.2.19",
+      platform: "darwin",
+      activeWorkspace: "cloud",
+      showLocalWorkspace: false,
+      theme: "dark",
+      localRunning: false,
+    });
+    expect(cloudOnlyDiag).toContain("Local Workspace: hidden (Cloud-only mode)");
+    expect(cloudOnlyDiag).not.toContain("Local Mini-Server:");
+
+    // 3. OAuth popup filter allows real auth providers while letting GitHub repos & Google Docs open in default browser
+    const remoteOrigin = "https://agents-chat.com";
+    expect(isOAuthPopupUrl("https://agents-chat.com/api/auth/google", remoteOrigin)).toBe(true);
+    expect(isOAuthPopupUrl("https://accounts.google.com/o/oauth2/v2/auth", remoteOrigin)).toBe(true);
+    expect(isOAuthPopupUrl("https://appleid.apple.com/auth/authorize", remoteOrigin)).toBe(true);
+    expect(isOAuthPopupUrl("https://github.com/login/oauth/authorize", remoteOrigin)).toBe(true);
+    expect(isOAuthPopupUrl("https://github.com/sessions/two-factor", remoteOrigin)).toBe(true);
+    expect(isOAuthPopupUrl("https://github.com/swswordholy-tech/AgentsChat", remoteOrigin)).toBe(false);
+    expect(isOAuthPopupUrl("https://docs.google.com/document/d/123", remoteOrigin)).toBe(false);
+    expect(isOAuthPopupUrl("https://mail.google.com/mail/u/0/", remoteOrigin)).toBe(false);
+    expect(isOAuthPopupUrl("javascript:alert(1)", remoteOrigin)).toBe(false);
+
+    // 4. Native Preferences UI (`settings.html` + `settings-preload.cjs`): valid JS, zero HTML injection sinks, strict CSP & opt-in toggle
+    const settingsHtml = readFileSync(join(import.meta.dir, "..", "ui", "settings.html"), "utf8");
+    const settingsScript = settingsHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1] || "";
+    expect(settingsScript.length).toBeGreaterThan(0);
+    expect(() => new Function(settingsScript)).not.toThrow();
+    expect(settingsScript).not.toMatch(/\.(?:innerHTML|outerHTML)\s*=|insertAdjacentHTML|document\.write\s*\(/);
+    expect(settingsHtml).toContain('id="pref-show-local"');
+    expect(settingsHtml).toContain('id="local-advanced-panel" hidden');
+    expect(settingsHtml).toContain('document.documentElement.style.colorScheme = isDark ? "dark" : "light"');
+    expect(settingsHtml).toContain("ev.isComposing || ev.keyCode === 229");
+    expect(settingsHtml).toContain("@media (prefers-reduced-motion: reduce)");
+
+    const settingsPreload = readFileSync(join(import.meta.dir, "..", "ui", "settings-preload.cjs"), "utf8");
+    expect(settingsPreload).toContain("desktop:get-settings-state");
+    expect(settingsPreload).toContain("desktop:save-desktop-settings");
+    expect(settingsPreload).toContain("desktop:open-data-folder");
+    expect(settingsPreload).toContain("desktop:close-settings-window");
+
+    // 5. Shell rail hides Local controls by default & wires Settings button (Cmd+,)
+    const shellHtml = readFileSync(join(import.meta.dir, "..", "ui", "shell.html"), "utf8");
+    const shellScript = shellHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1] || "";
+    expect(() => new Function(shellScript)).not.toThrow();
+    expect(shellHtml).toContain('id="btn-shell-settings"');
+    expect(shellHtml).toContain('id="btn-local" type="button" title="本机 Server (⌘2) — 本机低延迟多 Agent 群聊与私聊" aria-label="本机聊天" hidden');
+    expect(shellHtml).toContain('const showLocal = state.settings?.showLocalWorkspace === true;');
+    expect(shellHtml).toContain("btnLocal.hidden = !showLocal;");
+    expect(shellHtml).toContain("portBadge.hidden = !showLocal;");
+    expect(shellHtml).toContain("btnPower.hidden = !showLocal;");
+    expect(shellHtml).toContain("api?.openSettings?.();");
+
+    const preloadJs = readFileSync(join(import.meta.dir, "..", "ui", "preload.cjs"), "utf8");
+    expect(preloadJs).toContain('openSettings: () => ipcRenderer.invoke("desktop:open-settings-window")');
+
+    // 6. Offline fallback respects `?local=0` (Cloud-only mode hides Switch to Local button & L shortcut)
+    const offlineHtml = readFileSync(join(import.meta.dir, "..", "ui", "cloud-offline.html"), "utf8");
+    const offlineScript = offlineHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1] || "";
+    expect(() => new Function(offlineScript)).not.toThrow();
+    expect(offlineHtml).toContain("[hidden] { display: none !important; }");
+    expect(offlineHtml).toContain('const localEnabledInUi = params.get("local") !== "0";');
+    expect(offlineHtml).toContain('else if ((ev.key === "l" || ev.key === "L") && localEnabledInUi)');
+
+    // 7. Main process wiring: Preferences window, Cmd+,, togglefullscreen, async fullscreen reset, Add to Dictionary & Cloud-only guard
+    const mainTs = readFileSync(join(import.meta.dir, "..", "src", "main.ts"), "utf8");
+    expect(mainTs).toContain("async function openDesktopSettingsWindow()");
+    expect(mainTs).toContain("async function setShowLocalWorkspace(enabled: boolean)");
+    expect(mainTs).toContain('accelerator: "CmdOrCtrl+,"');
+    expect(mainTs).toContain('{ role: "togglefullscreen" }');
+    expect(mainTs).toContain('mainWindow.once("leave-full-screen", applyCenteredBounds)');
+    expect(mainTs).toContain("addWordToSpellCheckerDictionary");
+    expect(mainTs).toContain("if (!settings.showLocalWorkspace || !settings.localServerEnabled)");
+    expect(mainTs).toContain('ipcMain.handle("desktop:save-desktop-settings"');
   });
 });

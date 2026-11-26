@@ -6,9 +6,10 @@ import type { DesktopSettings } from "./types.js";
 
 export const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   activeWorkspace: "cloud",
+  showLocalWorkspace: false,
   theme: "light",
   remoteServerUrl: DEFAULT_UPSTREAM_SERVER_URL,
-  localServerEnabled: true,
+  localServerEnabled: false,
   localServerPort: 8787,
   allowLan: false,
   minimizeToTray: true,
@@ -51,11 +52,16 @@ export function sanitizeDesktopSettings(raw: Partial<DesktopSettings> | null | u
     }
   }
 
+  const showLocalWorkspace = s.showLocalWorkspace === true;
+  const localServerEnabled =
+    s.localServerEnabled === true || (showLocalWorkspace && s.localServerEnabled !== false);
+
   return {
-    activeWorkspace: s.activeWorkspace === "local" ? "local" : "cloud",
+    activeWorkspace: showLocalWorkspace && s.activeWorkspace === "local" ? "local" : "cloud",
+    showLocalWorkspace,
     theme: s.theme === "dark" ? "dark" : "light",
     remoteServerUrl,
-    localServerEnabled: s.localServerEnabled !== false,
+    localServerEnabled,
     localServerPort,
     allowLan: s.allowLan === true,
     minimizeToTray: s.minimizeToTray !== false,

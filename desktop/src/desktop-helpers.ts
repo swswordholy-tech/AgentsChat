@@ -194,6 +194,7 @@ export function buildLocalChannelUrl(httpUrl: string, channelId: unknown): strin
 export interface TrayTooltipState {
   cloudUnread?: number;
   localUnread?: number;
+  showLocalWorkspace?: boolean;
   localRunning: boolean;
   localPort?: number;
   localOnlineCount?: number;
@@ -202,14 +203,18 @@ export interface TrayTooltipState {
 
 /**
  * Format a compact, live tray tooltip summarizing unread notifications and
- * embedded Local Mini-Server status.
+ * embedded Local Mini-Server status (omitting Local status in Cloud-only mode).
  */
 export function formatTrayTooltip(state: TrayTooltipState): string {
   const cloud = Math.max(0, Math.floor(Number(state.cloudUnread) || 0));
-  const local = Math.max(0, Math.floor(Number(state.localUnread) || 0));
+  const showLocal = state.showLocalWorkspace !== false;
+  const local = showLocal ? Math.max(0, Math.floor(Number(state.localUnread) || 0)) : 0;
   const totalUnread = cloud + local;
   const head = totalUnread > 0 ? `AgentsChat Desktop (${totalUnread} unread)` : "AgentsChat Desktop";
   const muteSuffix = state.notificationsMuted === true ? " · Muted" : "";
+  if (!showLocal) {
+    return `${head}${muteSuffix}`;
+  }
   if (!state.localRunning) {
     return `${head} · Local Stopped${muteSuffix}`;
   }
@@ -652,6 +657,7 @@ export interface DesktopDiagnosticsSnapshot {
   platform: string;
   arch?: string;
   activeWorkspace: "cloud" | "local";
+  showLocalWorkspace?: boolean;
   theme: "light" | "dark";
   zoomFactor?: number;
   localRunning: boolean;
@@ -669,15 +675,41 @@ export function formatDesktopDiagnostics(info: DesktopDiagnosticsSnapshot): stri
   const zoomPct = Math.round(clampDesktopZoomFactor(info.zoomFactor ?? 1) * 100);
   const port = Number.isFinite(Number(info.localPort)) && Number(info.localPort) > 0 ? Number(info.localPort) : 8787;
   const online = Math.max(0, Math.floor(Number(info.localOnlineCount) || 0));
-  const localLine = info.localRunning
-    ? `running (:${port}, lan=${info.allowLan ? "on" : "off"}, online=${online})`
-    : `stopped (port=${port}, lan=${info.allowLan ? "on" : "off"})`;
+  const localLine =
+    info.showLocalWorkspace === false
+      ? "Local Workspace: hidden (Cloud-only mode)"
+      : info.localRunning
+        ? `Local Mini-Server: running (:${port}, lan=${info.allowLan ? "on" : "off"}, online=${online})`
+        : `Local Mini-Server: stopped (port=${port}, lan=${info.allowLan ? "on" : "off"})`;
   return [
     `AgentsChat Desktop v${info.appVersion || "0.1.0"}`,
     `Runtime: Electron ${info.electronVersion || "unknown"} / Node ${info.nodeVersion || "unknown"} (${info.platform}${info.arch ? "/" + info.arch : ""})`,
     `Workspace: ${info.activeWorkspace} · Theme: ${info.theme} · Zoom: ${zoomPct}% · Muted: ${info.notificationsMuted ? "yes" : "no"}`,
-    `Local Mini-Server: ${localLine}`,
+    localLine,
   ].join("\n");
+}
+
+/**
+ * Decide whether a `window.open` URL from the Cloud WebView is an OAuth sign-in
+ * popup (which should stay in an Electron popup sharing the Cloud session partition)
+ * vs. a regular external link (which should open in the user's default browser).
+ */
+export function isOAuthPopupUrl(rawUrl: unknown, remoteOrigin: string): boolean {
+  if (typeof rawUrl !== "string" || !rawUrl.trim()) return false;
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return false;
+    if (parsed.origin === remoteOrigin) return true;
+    const h = parsed.hostname.toLowerCase();
+    if (h === "accounts.google.com" || h === "appleid.apple.com") return true;
+    if (h === "github.com") {
+      const p = parsed.pathname.toLowerCase();
+      return p === "/login" || p.startsWith("/login/") || p === "/sessions" || p.startsWith("/sessions/");
+    }
+    return false;
+  } catch {
+    return false;
+  }
 }
 
 /**
