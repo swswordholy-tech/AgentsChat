@@ -2092,6 +2092,7 @@ async function createDesktopWindow(): Promise<void> {
   cloudView.webContents.on("dom-ready", () => {
     syncThemeToCloudView(settings.theme || "light");
     try { cloudView?.webContents.setZoomFactor(clampDesktopZoomFactor(settings.zoomFactor ?? 1)); } catch {}
+    try { cloudView?.webContents.setAudioMuted(settings.audioMuted === true); } catch {}
     broadcastState();
   });
   cloudView.webContents.on("did-navigate", () => {
@@ -2101,6 +2102,7 @@ async function createDesktopWindow(): Promise<void> {
   cloudView.webContents.on("did-navigate-in-page", () => broadcastState());
   localView.webContents.on("dom-ready", () => {
     try { localView?.webContents.setZoomFactor(clampDesktopZoomFactor(settings.zoomFactor ?? 1)); } catch {}
+    try { localView?.webContents.setAudioMuted(settings.audioMuted === true); } catch {}
     syncThemeToLocalView(settings.theme || "light");
   });
   localView.webContents.on("did-navigate", () => {
@@ -2326,6 +2328,13 @@ function registerIpcHandlers(): void {
     return { ok: true, notificationsMuted: nextMuted };
   });
 
+  ipcMain.handle("desktop:set-audio-muted", (ev, muted: unknown) => {
+    const isShell = Boolean(mainWindow && !mainWindow.isDestroyed() && ev.sender === mainWindow.webContents);
+    if (!isShell) return { ok: false };
+    const nextMuted = applyAudioMuted(Boolean(muted));
+    return { ok: true, audioMuted: nextMuted };
+  });
+
   ipcMain.on("desktop:cloud-theme-observed", (ev, rawTheme: unknown) => {
     if (rawTheme !== "light" && rawTheme !== "dark") return;
     if (!cloudView || cloudView.webContents.isDestroyed() || ev.sender !== cloudView.webContents) return;
@@ -2549,6 +2558,12 @@ function registerIpcHandlers(): void {
     const isShell = Boolean(mainWindow && !mainWindow.isDestroyed() && ev.sender === mainWindow.webContents);
     if (!isShell) return false;
     return reloadActiveView();
+  });
+
+  ipcMain.handle("desktop:force-reload-active", (ev) => {
+    const isShell = Boolean(mainWindow && !mainWindow.isDestroyed() && ev.sender === mainWindow.webContents);
+    if (!isShell) return false;
+    return forceReloadActiveView();
   });
 
   ipcMain.handle("desktop:reset-zoom", (ev) => {
@@ -2828,11 +2843,16 @@ if (!gotSingleInstanceLock) {
             const st = await window.agentschatShell?.getState?.();
             return {
               hasShellBridge: Boolean(window.agentschatShell),
+              hasForceReloadBridge: typeof window.agentschatShell?.forceReloadActiveView === "function",
+              hasAudioMuteBridge: typeof window.agentschatShell?.setAudioMuted === "function",
               showLocalWorkspace: Boolean(st?.settings?.showLocalWorkspace),
               running: Boolean(st?.localServer?.running),
               localBtnHidden: Boolean(document.getElementById("btn-local")?.hidden),
               portBadgeHidden: Boolean(document.getElementById("local-port-badge")?.hidden),
               powerBtnHidden: Boolean(document.getElementById("btn-power")?.hidden),
+              audioMutedChipHidden:
+                Boolean(document.getElementById("btn-audio-muted")?.hidden) &&
+                getComputedStyle(document.getElementById("btn-audio-muted")).display === "none",
               hasSettingsBtn: Boolean(document.getElementById("btn-shell-settings")),
               hasUnreadBadge: Boolean(document.getElementById("local-unread-badge")),
               hasCloudUnreadBadge: Boolean(document.getElementById("cloud-unread-badge")),
@@ -2843,11 +2863,14 @@ if (!gotSingleInstanceLock) {
         if (
           startedLocalByDefault ||
           !defaultShellProbe?.hasShellBridge ||
+          !defaultShellProbe?.hasForceReloadBridge ||
+          !defaultShellProbe?.hasAudioMuteBridge ||
           defaultShellProbe?.showLocalWorkspace ||
           defaultShellProbe?.running ||
           !defaultShellProbe?.localBtnHidden ||
           !defaultShellProbe?.portBadgeHidden ||
           !defaultShellProbe?.powerBtnHidden ||
+          !defaultShellProbe?.audioMutedChipHidden ||
           !defaultShellProbe?.hasSettingsBtn ||
           !defaultShellProbe?.hasUnreadBadge ||
           !defaultShellProbe?.hasCloudUnreadBadge
@@ -2891,6 +2914,9 @@ if (!gotSingleInstanceLock) {
             hasFindBridge: Boolean(window.agentschatFind),
             hasInput: Boolean(document.getElementById("find-input")),
             hasClear: Boolean(document.getElementById("btn-clear")),
+            clearHiddenByDefault:
+              Boolean(document.getElementById("btn-clear")?.hidden) &&
+              getComputedStyle(document.getElementById("btn-clear")).display === "none",
             hasCaseToggle: Boolean(document.getElementById("btn-case")),
             hasPrevNext: Boolean(document.getElementById("btn-prev") && document.getElementById("btn-next")),
             hasClose: Boolean(document.getElementById("btn-close")),
@@ -2904,6 +2930,7 @@ if (!gotSingleInstanceLock) {
           !findProbe?.hasFindBridge ||
           !findProbe?.hasInput ||
           !findProbe?.hasClear ||
+          !findProbe?.clearHiddenByDefault ||
           !findProbe?.hasCaseToggle ||
           !findProbe?.hasPrevNext ||
           !findProbe?.hasClose

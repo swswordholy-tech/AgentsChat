@@ -312,6 +312,47 @@
     }
     .zoom-chip:focus-visible { outline: 2px solid var(--wechat-green); outline-offset: 1px; }
 
+    .audio-chip {
+      -webkit-app-region: no-drag;
+      border: 1px solid rgba(217, 119, 6, 0.36);
+      background: rgba(217, 119, 6, 0.14);
+      color: #9a3412;
+      padding: 1px 6px;
+      border-radius: 999px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+      font-size: 9.5px;
+      font-weight: 600;
+      line-height: 15px;
+      transition: background-color 140ms var(--ease), color 140ms var(--ease), border-color 140ms var(--ease);
+    }
+    .audio-chip svg {
+      width: 10px;
+      height: 10px;
+      stroke: currentColor;
+      fill: none;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      flex-shrink: 0;
+    }
+    .audio-chip:hover {
+      border-color: #d97706;
+      background: rgba(217, 119, 6, 0.22);
+    }
+    body.dark .audio-chip {
+      border-color: rgba(251, 191, 36, 0.36);
+      background: rgba(251, 191, 36, 0.16);
+      color: #fbbf24;
+    }
+    body.dark .audio-chip:hover {
+      border-color: #fbbf24;
+      background: rgba(251, 191, 36, 0.24);
+    }
+    .audio-chip:focus-visible { outline: 2px solid var(--wechat-green); outline-offset: 1px; }
+
     .mini-btn {
       -webkit-app-region: no-drag;
       width: 36px;
@@ -480,6 +521,13 @@
       <div class="rail-sep" aria-hidden="true"></div>
       <button class="lan-chip" id="lan-chip" type="button" title="局域网接入已开启 (0.0.0.0) — 点击切换到本机" aria-label="局域网已开启，切换到本机 Server" hidden>LAN</button>
       <button class="zoom-chip" id="btn-zoom-reset" type="button" title="当前缩放比例 — 点击还原 100% (⌘0)" aria-label="还原 100% 缩放" hidden>100%</button>
+      <button class="audio-chip" id="btn-audio-muted" type="button" title="工作区音频已静音 — 点击恢复声音 (⌘⇧U)" aria-label="恢复工作区音频" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M11 5 6 9H2v6h4l5 4V5Z" />
+          <path d="m22 9-6 6M16 9l6 6" />
+        </svg>
+        <span>静音</span>
+      </button>
       <button class="badge" id="local-port-badge" type="button" title="本机 Server 监听端口 — 点击切换到本机" hidden>:8787</button>
       <div class="history-row" id="cloud-history-row">
         <button class="history-btn" id="btn-cloud-back" type="button" title="返回上一页 (⌘[)" aria-label="返回上一页" disabled>
@@ -573,6 +621,7 @@
     const btnActiveReload = document.getElementById("btn-active-reload");
     const btnCloudForward = document.getElementById("btn-cloud-forward");
     const btnZoomReset = document.getElementById("btn-zoom-reset");
+    const btnAudioMuted = document.getElementById("btn-audio-muted");
     const localDot = document.getElementById("local-dot");
     const localUnreadBadge = document.getElementById("local-unread-badge");
     const lanChip = document.getElementById("lan-chip");
@@ -607,7 +656,7 @@
       if (btnCloudOkr) btnCloudOkr.title = `OKR 协同看板 (${mod}4)`;
       if (btnCloudMarket) btnCloudMarket.title = `Bot 租赁市场 (${mod}5)`;
       if (btnCloudBack) btnCloudBack.title = `返回上一页 (${mod}[)`;
-      if (btnActiveReload) btnActiveReload.title = `刷新当前页面 (${mod}R)`;
+      if (btnActiveReload) btnActiveReload.title = `刷新当前页面 (${mod}R) · 按住 Shift 忽略缓存强刷 (${modShift}R)`;
       if (btnCloudForward) btnCloudForward.title = `前进下一页 (${mod}])`;
       if (btnShellTheme) btnShellTheme.title = `切换浅色 / 深色模式 (${modShift}D)`;
       if (btnShellPin) {
@@ -616,7 +665,14 @@
       }
       if (btnShellMute) {
         const muted = Boolean(latestState?.settings?.notificationsMuted);
-        btnShellMute.title = muted ? `恢复本机通知提醒 (${modShift}M)` : `静音本机通知提醒 (${modShift}M)`;
+        const audioMuted = Boolean(latestState?.settings?.audioMuted);
+        const audioHint = audioMuted ? `右键恢复工作区音频 (${modShift}U)` : `右键静音工作区音频 (${modShift}U)`;
+        btnShellMute.title = muted
+          ? `恢复本机通知提醒 (${modShift}M) · ${audioHint}`
+          : `静音本机通知提醒 (${modShift}M) · ${audioHint}`;
+      }
+      if (btnAudioMuted) {
+        btnAudioMuted.title = `工作区音频已静音 — 点击恢复声音 (${modShift}U)`;
       }
       if (btnShellScreenshot) {
         btnShellScreenshot.hidden = !isMac;
@@ -650,10 +706,18 @@
         btnShellPin.title = isPinned ? `取消窗口置顶 (${modShift}T)` : `置顶窗口 (${modShift}T)`;
       }
       const isMuted = state.settings?.notificationsMuted === true;
+      const isAudioMuted = state.settings?.audioMuted === true;
       if (btnShellMute) {
         btnShellMute.classList.toggle("muted", isMuted);
         btnShellMute.setAttribute("aria-pressed", String(isMuted));
-        btnShellMute.title = isMuted ? `恢复本机通知提醒 (${modShift}M)` : `静音本机通知提醒 (${modShift}M)`;
+        const audioHint = isAudioMuted ? `右键恢复工作区音频 (${modShift}U)` : `右键静音工作区音频 (${modShift}U)`;
+        btnShellMute.title = isMuted
+          ? `恢复本机通知提醒 (${modShift}M) · ${audioHint}`
+          : `静音本机通知提醒 (${modShift}M) · ${audioHint}`;
+      }
+      if (btnAudioMuted) {
+        btnAudioMuted.hidden = !isAudioMuted;
+        btnAudioMuted.title = `工作区音频已静音 — 点击恢复声音 (${modShift}U)`;
       }
       if (iconBell && iconBellOff) {
         iconBell.toggleAttribute("hidden", isMuted);
@@ -775,11 +839,15 @@
     portBadge?.addEventListener("click", () => api?.switchWorkspace("local"));
     lanChip?.addEventListener("click", () => api?.switchWorkspace("local"));
     btnZoomReset?.addEventListener("click", () => api?.resetZoom?.());
+    btnAudioMuted?.addEventListener("click", () => {
+      btnAudioMuted.hidden = true;
+      api?.setAudioMuted?.(false);
+    });
     btnCloudStudio?.addEventListener("click", () => api?.navigateCloudRoute?.("cloud-agents"));
     btnCloudOkr?.addEventListener("click", () => api?.navigateCloudRoute?.("okr-board"));
     btnCloudMarket?.addEventListener("click", () => api?.navigateCloudRoute?.("marketplace"));
     btnCloudBack?.addEventListener("click", () => api?.cloudHistory?.("back"));
-    btnActiveReload?.addEventListener("click", () => {
+    btnActiveReload?.addEventListener("click", (ev) => {
       const active = latestState?.settings?.activeWorkspace || "cloud";
       if (active === "local") {
         localReloadSpinning = true;
@@ -793,7 +861,11 @@
           btnActiveReload.setAttribute("aria-busy", String(isCloudLoading));
         }, 450);
       }
-      api?.reloadActiveView?.();
+      if ((ev.shiftKey || ev.altKey) && api?.forceReloadActiveView) {
+        api.forceReloadActiveView();
+      } else {
+        api?.reloadActiveView?.();
+      }
     });
     btnCloudForward?.addEventListener("click", () => api?.cloudHistory?.("forward"));
     const railNavGroup = document.getElementById("rail-nav-group");
@@ -831,13 +903,25 @@
       btnShellPin.setAttribute("aria-pressed", String(next));
       api?.setAlwaysOnTop?.(next);
     });
-    btnShellMute?.addEventListener("click", () => {
+    btnShellMute?.addEventListener("click", (ev) => {
+      if (ev.shiftKey) {
+        const nextAudio = !(latestState?.settings?.audioMuted === true);
+        if (btnAudioMuted) btnAudioMuted.hidden = !nextAudio;
+        api?.setAudioMuted?.(nextAudio);
+        return;
+      }
       const next = !(latestState?.settings?.notificationsMuted === true);
       btnShellMute.classList.toggle("muted", next);
       btnShellMute.setAttribute("aria-pressed", String(next));
       iconBell?.toggleAttribute("hidden", next);
       iconBellOff?.toggleAttribute("hidden", !next);
       api?.setNotificationsMuted?.(next);
+    });
+    btnShellMute?.addEventListener("contextmenu", (ev) => {
+      ev.preventDefault();
+      const nextAudio = !(latestState?.settings?.audioMuted === true);
+      if (btnAudioMuted) btnAudioMuted.hidden = !nextAudio;
+      api?.setAudioMuted?.(nextAudio);
     });
     let powerToggling = false;
     btnPower.addEventListener("click", async () => {
@@ -860,7 +944,8 @@
       api?.openSettings?.();
     });
     btnCopyUrl.addEventListener("contextmenu", (ev) => {
-      const isCloud = (latestState?.settings?.activeWorkspace || "cloud") === "cloud";
+      const showLocal = latestState?.settings?.showLocalWorkspace === true;
+      const isCloud = !showLocal || (latestState?.settings?.activeWorkspace || "cloud") === "cloud";
       if (!isCloud || !api?.openCurrentCloudInBrowser) return;
       ev.preventDefault();
       api.openCurrentCloudInBrowser();

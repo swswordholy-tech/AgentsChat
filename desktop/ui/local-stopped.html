@@ -31,6 +31,7 @@
     body.dark .btn-secondary:hover { background: #363636; }
 
     * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
     html, body {
       margin: 0;
       width: 100%;
@@ -261,6 +262,10 @@
     });
     window.addEventListener("dragover", (ev) => ev.preventDefault());
     window.addEventListener("drop", (ev) => ev.preventDefault());
+    window.addEventListener("pagehide", () => {
+      clearTimeout(startWatchdogTimer);
+      startWatchdogTimer = null;
+    });
 
     document.addEventListener("keydown", (ev) => {
       if (ev.isComposing || ev.keyCode === 229 || ev.metaKey || ev.ctrlKey || ev.altKey) return;

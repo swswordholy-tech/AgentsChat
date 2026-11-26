@@ -1982,4 +1982,59 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     expect(settingsScript).toContain("prefMuteAudio");
     expect(settingsScript).toContain("audioMuted: Boolean(prefMuteAudio.checked)");
   });
+
+  test("Desktop 2.25 fixes Find bar [hidden] display override, re-applies Workspace Audio Mute on dom-ready, adds rail Audio-Muted chip + Shift/right-click shortcuts & Shift+Reload force-refresh, and hardens offline/local-stopped fallback lifecycle", () => {
+    // 1. Find bar fixes [hidden] override so #btn-clear is truly hidden when empty
+    const findHtml = readFileSync(join(import.meta.dir, "..", "ui", "find.html"), "utf8");
+    const findScript = findHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1] || "";
+    expect(() => new Function(findScript)).not.toThrow();
+    expect(findScript).not.toMatch(/\.(?:innerHTML|outerHTML)\s*=|insertAdjacentHTML|document\.write\s*\(/);
+    expect(findHtml).toContain("[hidden] { display: none !important; }");
+
+    // 2. Main process re-applies setAudioMuted on dom-ready & exposes sender-verified force-reload / set-audio-muted IPCs
+    const mainTs = readFileSync(join(import.meta.dir, "..", "src", "main.ts"), "utf8");
+    expect(mainTs).toContain("try { cloudView?.webContents.setAudioMuted(settings.audioMuted === true); } catch {}");
+    expect(mainTs).toContain("try { localView?.webContents.setAudioMuted(settings.audioMuted === true); } catch {}");
+    expect(mainTs).toContain('ipcMain.handle("desktop:set-audio-muted"');
+    expect(mainTs).toContain('ipcMain.handle("desktop:force-reload-active"');
+    expect(mainTs).toContain("clearHiddenByDefault:");
+    expect(mainTs).toContain("audioMutedChipHidden:");
+
+    // 3. Preload bridge exposes setAudioMuted & forceReloadActiveView
+    const preloadJs = readFileSync(join(import.meta.dir, "..", "ui", "preload.cjs"), "utf8");
+    expect(preloadJs).toContain('setAudioMuted: (muted) => ipcRenderer.invoke("desktop:set-audio-muted", Boolean(muted))');
+    expect(preloadJs).toContain('forceReloadActiveView: () => ipcRenderer.invoke("desktop:force-reload-active")');
+
+    // 4. Shell rail: #btn-audio-muted chip (hidden by default), Shift/contextmenu audio-mute toggle, Shift/Alt force reload & Cloud-only contextmenu parity
+    const shellHtml = readFileSync(join(import.meta.dir, "..", "ui", "shell.html"), "utf8");
+    const shellScript = shellHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1] || "";
+    expect(() => new Function(shellScript)).not.toThrow();
+    expect(shellScript).not.toMatch(/\.(?:innerHTML|outerHTML)\s*=|insertAdjacentHTML|document\.write\s*\(/);
+    expect(shellHtml).toContain('id="btn-audio-muted"');
+    expect(shellScript).toContain("btnAudioMuted.hidden = !isAudioMuted;");
+    expect(shellScript).toContain("api?.setAudioMuted?.(false);");
+    expect(shellScript).toContain('btnShellMute?.addEventListener("contextmenu"');
+    expect(shellScript).toContain("api.forceReloadActiveView();");
+    expect(shellScript).toContain('const showLocal = latestState?.settings?.showLocalWorkspace === true;\n      const isCloud = !showLocal || (latestState?.settings?.activeWorkspace || "cloud") === "cloud";');
+
+    // 5. Offline & Local-Stopped fallback pages: visibility-aware countdown pause, aria-pressed, hardened textarea copy & pagehide cleanup
+    const offlineHtml = readFileSync(join(import.meta.dir, "..", "ui", "cloud-offline.html"), "utf8");
+    const offlineScript = offlineHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1] || "";
+    expect(() => new Function(offlineScript)).not.toThrow();
+    expect(offlineScript).not.toMatch(/\.(?:innerHTML|outerHTML)\s*=|insertAdjacentHTML|document\.write\s*\(/);
+    expect(offlineHtml).toContain('id="btn-toggle-auto" aria-pressed="false"');
+    expect(offlineScript).toContain('toggleBtn.setAttribute("aria-pressed", String(paused));');
+    expect(offlineScript).toContain('document.visibilityState === "hidden"');
+    expect(offlineScript).toContain('document.addEventListener("visibilitychange"');
+    expect(offlineScript).toContain('window.addEventListener("pagehide"');
+    expect(offlineScript).toContain('ta.setAttribute("readonly", "");');
+    expect(offlineScript).toContain("finally {\n          if (ta) ta.remove();");
+
+    const stoppedHtml = readFileSync(join(import.meta.dir, "..", "ui", "local-stopped.html"), "utf8");
+    const stoppedScript = stoppedHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1] || "";
+    expect(() => new Function(stoppedScript)).not.toThrow();
+    expect(stoppedScript).not.toMatch(/\.(?:innerHTML|outerHTML)\s*=|insertAdjacentHTML|document\.write\s*\(/);
+    expect(stoppedHtml).toContain("[hidden] { display: none !important; }");
+    expect(stoppedScript).toContain('window.addEventListener("pagehide"');
+  });
 });

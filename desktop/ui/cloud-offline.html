@@ -259,7 +259,7 @@
     </div>
     <div class="auto-row" role="status" aria-live="polite">
       <span id="auto-retry-status">将在 10 秒后自动重试 · 网络恢复时立即重连</span>
-      <button type="button" class="auto-toggle" id="btn-toggle-auto">暂停</button>
+      <button type="button" class="auto-toggle" id="btn-toggle-auto" aria-pressed="false">暂停</button>
     </div>
     <div class="kbd-hint" id="offline-kbd-hint">快捷键：<kbd>Enter</kbd> / <kbd>R</kbd> 立即重试 · <kbd>P</kbd> 暂停/继续<span id="kbd-local-hint"> · <kbd>L</kbd> 切换本机 Server</span></div>
   </main>
@@ -332,6 +332,7 @@
 
     function updateCountdownLabel() {
       if (!autoStatus || !toggleBtn) return;
+      toggleBtn.setAttribute("aria-pressed", String(paused));
       if (paused) {
         autoStatus.textContent = "自动重试已暂停 · 网络恢复时将自动重连";
         toggleBtn.textContent = "继续";
@@ -357,16 +358,24 @@
         }
       } catch {}
       if (!copied) {
+        let ta = null;
         try {
-          const ta = document.createElement("textarea");
+          ta = document.createElement("textarea");
           ta.value = diagText;
+          ta.setAttribute("readonly", "");
           ta.style.position = "fixed";
+          ta.style.left = "-9999px";
           ta.style.opacity = "0";
+          ta.style.pointerEvents = "none";
           document.body.appendChild(ta);
+          ta.focus();
           ta.select();
-          copied = document.execCommand("copy");
-          ta.remove();
-        } catch {}
+          copied = Boolean(document.execCommand("copy"));
+        } catch {
+          copied = false;
+        } finally {
+          if (ta) ta.remove();
+        }
       }
       if (copyDiagBtn) {
         copyDiagBtn.textContent = copied ? "✓ 已复制" : "复制失败";
@@ -382,7 +391,7 @@
     }
 
     const countdownTimer = setInterval(() => {
-      if (paused || retrying) return;
+      if (paused || retrying || document.visibilityState === "hidden") return;
       remaining -= 1;
       if (remaining <= 0) {
         triggerRetry();
@@ -390,6 +399,22 @@
       }
       updateCountdownLabel();
     }, 1000);
+
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible" && !paused && !retrying) {
+        if (remaining <= 0) {
+          triggerRetry();
+        } else {
+          updateCountdownLabel();
+        }
+      }
+    });
+
+    window.addEventListener("pagehide", () => {
+      clearInterval(countdownTimer);
+      clearTimeout(retryWatchdogTimer);
+      clearTimeout(copyResetTimer);
+    });
 
     retryLink?.addEventListener("click", (ev) => {
       ev.preventDefault();
