@@ -12,6 +12,7 @@ import {
   CLOUD_THEME_TOGGLE_SELECTOR,
   compareSemver,
   computeCenteredWindowBounds,
+  computeDisplayReclampedBounds,
   computeDownloadProgress,
   createSerialTaskQueue,
   formatCopyableCloudUrl,
@@ -1457,5 +1458,56 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     expect(localJs).toContain("if (!dlg || dlg.open) return Promise.resolve(false);");
     expect(localJs).toContain('if (!dlg || typeof dlg.showModal !== "function" || dlg.open) return;');
     expect(localJs).not.toContain("else await navigator.clipboard?.writeText(");
+  });
+
+  test("Desktop 2.18 adds live multi-monitor undock reclamping, macOS fullscreen rail padding, localView did-fail-load fallback, pasteAndMatchStyle, zero-FOUC colorScheme & Local Hub WS/scroll/token/bitmap hardening", () => {
+    // 1. Pure helper: computeDisplayReclampedBounds leaves in-bounds windows untouched and clamps oversized/off-screen windows cleanly
+    const laptopWorkArea = { x: 0, y: 25, width: 1440, height: 875 };
+    expect(computeDisplayReclampedBounds({ x: 60, y: 40, width: 1320, height: 840 }, laptopWorkArea)).toBeNull();
+    expect(computeDisplayReclampedBounds({ x: 2400, y: 120, width: 1800, height: 1100 }, laptopWorkArea)).toEqual({
+      x: 0,
+      y: 25,
+      width: 1440,
+      height: 875,
+    });
+    expect(computeDisplayReclampedBounds({ x: -200, y: 10, width: 1000, height: 700 }, laptopWorkArea)).toEqual({
+      x: 0,
+      y: 25,
+      width: 1000,
+      height: 700,
+    });
+
+    // 2. Main process: display-removed/metrics reclamp, fullscreen state/listeners, localView did-fail-load fallback & pasteAndMatchStyle
+    const mainTs = readFileSync(join(import.meta.dir, "..", "src", "main.ts"), "utf8");
+    expect(mainTs).toContain('screen.on("display-removed", clampMainWindowToVisibleDisplay);');
+    expect(mainTs).toContain('screen.on("display-metrics-changed", clampMainWindowToVisibleDisplay);');
+    expect(mainTs).toContain("isFullScreen: Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isFullScreen())");
+    expect(mainTs).toContain('mainWindow.on("enter-full-screen"');
+    expect(mainTs).toContain('mainWindow.on("leave-full-screen"');
+    expect(mainTs).toContain('localView.webContents.on("did-fail-load"');
+    expect((mainTs.match(/role:\s*"pasteAndMatchStyle"/g) || []).length).toBeGreaterThanOrEqual(2);
+
+    // 3. Shell rail: collapses macOS traffic-light top padding in native fullscreen
+    const shellHtml = readFileSync(join(import.meta.dir, "..", "ui", "shell.html"), "utf8");
+    const shellScript = shellHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1] || "";
+    expect(() => new Function(shellScript)).not.toThrow();
+    expect(shellHtml).toContain(".rail.mac.fullscreen { padding-top: 16px; }");
+    expect(shellHtml).toContain('rail.classList.toggle("fullscreen", Boolean(state.isFullScreen));');
+
+    // 4. Zero-FOUC local-theme-init.js sets colorScheme synchronously on first paint
+    const themeInitJs = readFileSync(join(import.meta.dir, "..", "ui", "local-theme-init.js"), "utf8");
+    expect(() => new Function(themeInitJs)).not.toThrow();
+    expect(themeInitJs).toContain('document.documentElement.style.colorScheme = isDark ? "dark" : "light";');
+
+    // 5. Local Hub JS: WS socket-identity guards, scroll-preserving edit/delete, non-destructive token rollback & GPU bitmap cleanup
+    const localJs = readFileSync(join(import.meta.dir, "..", "ui", "local-chat.js"), "utf8");
+    expect(localJs).not.toMatch(/\.(?:innerHTML|outerHTML)\s*=|insertAdjacentHTML|document\.write\s*\(/);
+    expect(() => new Function(localJs)).not.toThrow();
+    expect(localJs).toContain("if (sock !== ws) return;");
+    expect(localJs).toContain("if (sock !== ws || sock._manualClose || !authToken) return;");
+    expect(localJs).toContain("renderMessages(isNearBottom() ? undefined : { keepScrollTop: elMessages.scrollTop });");
+    expect(localJs).toContain("const prevToken = authToken;");
+    expect(localJs).toContain("authToken = prevToken;");
+    expect(localJs).toContain("bmp.close?.();");
   });
 });

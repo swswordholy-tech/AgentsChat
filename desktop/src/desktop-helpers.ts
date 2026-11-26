@@ -551,6 +551,53 @@ export function resolveRestoredWindowBounds(
   return { width, height };
 }
 
+/**
+ * Check whether an already-open window's bounds need clamping after a live
+ * display-removal or display-metrics change (e.g. undocking an external monitor).
+ * Returns `null` when the window already fits cleanly within `workArea`, or the
+ * minimal clamped/centered `RectBounds` when it overflows or lies off-screen.
+ */
+export function computeDisplayReclampedBounds(
+  current: RectBounds,
+  workArea: RectBounds,
+  minWidth = 880,
+  minHeight = 560,
+): RectBounds | null {
+  if (
+    !Number.isFinite(workArea.width) ||
+    !Number.isFinite(workArea.height) ||
+    workArea.width <= 0 ||
+    workArea.height <= 0
+  ) {
+    return null;
+  }
+  const waX = Number.isFinite(workArea.x) ? Math.round(workArea.x) : 0;
+  const waY = Number.isFinite(workArea.y) ? Math.round(workArea.y) : 0;
+  const waW = Math.max(320, Math.round(workArea.width));
+  const waH = Math.max(240, Math.round(workArea.height));
+
+  const curX = Math.round(Number(current.x) || 0);
+  const curY = Math.round(Number(current.y) || 0);
+  const curW = Math.max(1, Math.round(Number(current.width) || 1320));
+  const curH = Math.max(1, Math.round(Number(current.height) || 860));
+
+  const fitsWidth = curW <= waW;
+  const fitsHeight = curH <= waH;
+  const insideX = curX >= waX && curX + curW <= waX + waW;
+  const insideY = curY >= waY && curY + curH <= waY + waH;
+  if (fitsWidth && fitsHeight && insideX && insideY) {
+    return null;
+  }
+
+  const clampedMinW = Math.min(minWidth, waW);
+  const clampedMinH = Math.min(minHeight, waH);
+  const nextW = Math.min(waW, Math.max(clampedMinW, curW));
+  const nextH = Math.min(waH, Math.max(clampedMinH, curH));
+  const nextX = Math.min(waX + waW - nextW, Math.max(waX, curX));
+  const nextY = Math.min(waY + waH - nextH, Math.max(waY, curY));
+  return { x: nextX, y: nextY, width: nextW, height: nextH };
+}
+
 const RESERVED_LOCAL_PROFILE_NAMES = new Set([
   "profile",
   "config",

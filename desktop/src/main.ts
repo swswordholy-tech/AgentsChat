@@ -28,6 +28,7 @@ import {
   clampDesktopZoomFactor,
   classifyCloudRailSection,
   computeCenteredWindowBounds,
+  computeDisplayReclampedBounds,
   computeDownloadProgress,
   createSerialTaskQueue,
   formatCopyableCloudUrl,
@@ -346,6 +347,7 @@ function attachNativeContextMenu(wc: Electron.WebContents): void {
         { role: "cut", enabled: hasSelection },
         { role: "copy", enabled: hasSelection },
         { role: "paste" },
+        { role: "pasteAndMatchStyle" },
         { type: "separator" },
         { role: "selectAll" },
       );
@@ -510,6 +512,7 @@ function getCloudNavState() {
 function getCombinedState() {
   return {
     platform: process.platform,
+    isFullScreen: Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isFullScreen()),
     settings,
     localServer: localServer ? localServer.getStatus() : null,
     localUnreadCount,
@@ -912,6 +915,8 @@ function setupApplicationMenu(): void {
         { role: "cut" },
         { role: "copy" },
         { role: "paste" },
+        { role: "pasteAndMatchStyle" },
+        { type: "separator" },
         { role: "selectAll" },
       ],
     },
@@ -1449,6 +1454,11 @@ async function createDesktopWindow(): Promise<void> {
       void loadLocalStoppedPage();
     }
   });
+  localView.webContents.on("did-fail-load", (_ev, errorCode, _errorDescription, validatedURL, isMainFrame) => {
+    if (!isMainFrame || errorCode === -3 || isSmokeTest) return;
+    if (validatedURL && isLocalStoppedPageUrl(validatedURL)) return;
+    void loadLocalStoppedPage();
+  });
   cloudView.webContents.on("page-title-updated", (_ev, title) => {
     const nextCloudUnread = parseUnreadCountFromTitle(title);
     if (nextCloudUnread !== cloudUnreadCount) {
@@ -1548,6 +1558,14 @@ async function createDesktopWindow(): Promise<void> {
     if (settings.activeWorkspace === "local") {
       clearLocalUnread();
     }
+  });
+  mainWindow.on("enter-full-screen", () => {
+    layoutViews();
+    broadcastState();
+  });
+  mainWindow.on("leave-full-screen", () => {
+    layoutViews();
+    broadcastState();
   });
   mainWindow.on("swipe", (_ev, direction) => {
     const dir = resolveCloudHistoryCommand(direction);
@@ -2028,6 +2046,30 @@ if (!gotSingleInstanceLock) {
     });
 
     if (!isSmokeTest) {
+      const clampMainWindowToVisibleDisplay = () => {
+        if (
+          !mainWindow ||
+          mainWindow.isDestroyed() ||
+          mainWindow.isMinimized() ||
+          mainWindow.isFullScreen() ||
+          mainWindow.isMaximized()
+        ) {
+          return;
+        }
+        try {
+          const curBounds = mainWindow.getBounds();
+          const disp = screen.getDisplayMatching(curBounds) || screen.getPrimaryDisplay();
+          const reclamped = computeDisplayReclampedBounds(curBounds, disp.workArea, 880, 560);
+          if (reclamped) {
+            mainWindow.setBounds(reclamped, true);
+            layoutViews();
+            settings = settingsStore.save({ windowBounds: reclamped });
+          }
+        } catch {}
+      };
+      screen.on("display-removed", clampMainWindowToVisibleDisplay);
+      screen.on("display-metrics-changed", clampMainWindowToVisibleDisplay);
+
       let resumeTimer: ReturnType<typeof setTimeout> | null = null;
       powerMonitor.on("resume", () => {
         if (resumeTimer) clearTimeout(resumeTimer);

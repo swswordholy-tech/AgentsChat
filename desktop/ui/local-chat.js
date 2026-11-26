@@ -815,6 +815,7 @@
     const sock = new WebSocket(wsOriginUrl);
     ws = sock;
     sock.addEventListener("open", () => {
+      if (sock !== ws) return;
       sock.send(JSON.stringify({
         type: "auth",
         agent_id: currentPrincipal ? currentPrincipal.id : undefined,
@@ -822,6 +823,7 @@
       }));
     });
     sock.addEventListener("message", (ev) => {
+      if (sock !== ws) return;
       let frame;
       try { frame = JSON.parse(ev.data); } catch { return; }
       if (frame.type === "auth_ok") {
@@ -853,11 +855,11 @@
         if (idx >= 0 && typeof updatedText === "string") {
           messages[idx].content = updatedText;
           messages[idx].edited_at = frame.edited_at;
-          renderMessages();
+          renderMessages(isNearBottom() ? undefined : { keepScrollTop: elMessages.scrollTop });
         }
       } else if (frame.type === "message_deleted" && frame.channel_id === currentChannelId) {
         messages = messages.filter((m) => m.id !== frame.message_id);
-        renderMessages();
+        renderMessages(isNearBottom() ? undefined : { keepScrollTop: elMessages.scrollTop });
       } else if (frame.type === "agent_online" || frame.type === "agent_offline") {
         const online = frame.type === "agent_online";
         if (frame.agent_id) {
@@ -882,7 +884,7 @@
       }
     });
     sock.addEventListener("close", () => {
-      if (sock._manualClose || !authToken) return;
+      if (sock !== ws || sock._manualClose || !authToken) return;
       setWsPillState("reconnecting");
       const delay = wsReconnectDelayMs;
       wsReconnectDelayMs = Math.min(15_000, wsReconnectDelayMs * 2);
@@ -950,11 +952,12 @@
   }
 
   async function verifyAndSetToken(candidate) {
+    const prevToken = authToken;
     authToken = candidate;
     const res = await api("/api/account/me");
     if (!res.ok || !res.data?.account) {
-      authToken = "";
-      sessionStorage.removeItem("ac_local_token");
+      authToken = prevToken;
+      if (!prevToken) sessionStorage.removeItem("ac_local_token");
       showToast("凭证校验失败（需为 agents-chat.com 签发的全局账号或 ac_ 密钥）");
       return false;
     }
@@ -1747,11 +1750,15 @@
         let pngBlob = blob;
         if (blob.type !== "image/png" && typeof createImageBitmap === "function") {
           const bmp = await createImageBitmap(blob);
-          const canvas = document.createElement("canvas");
-          canvas.width = bmp.width;
-          canvas.height = bmp.height;
-          canvas.getContext("2d").drawImage(bmp, 0, 0);
-          pngBlob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+          try {
+            const canvas = document.createElement("canvas");
+            canvas.width = bmp.width;
+            canvas.height = bmp.height;
+            canvas.getContext("2d").drawImage(bmp, 0, 0);
+            pngBlob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+          } finally {
+            bmp.close?.();
+          }
         }
         if (pngBlob) {
           await navigator.clipboard.write([new ClipboardItem({ "image/png": pngBlob })]);
