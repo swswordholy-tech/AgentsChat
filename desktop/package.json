@@ -1,6 +1,6 @@
 {
   "name": "@agentschat/desktop",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "description": "AgentsChat Desktop for macOS & Windows — Cloud workspace + embedded Local Mini-Server with globally unique AgentsChat identities.",
   "author": "AgentsChat",
@@ -19,6 +19,7 @@
     "smoke:electron": "npm run build && node scripts/smoke-electron.mjs",
     "pack:dir": "npm run build && electron-builder --dir",
     "pack:mac": "npm run build && electron-builder --mac",
+    "pack:mac:signed": "AGENTSCHAT_REQUIRE_NOTARIZE=1 npm run pack:mac",
     "pack:win": "npm run build && electron-builder --win"
   },
   "dependencies": {
@@ -52,9 +53,15 @@
       "buildResources": "assets",
       "output": "release"
     },
+    "afterSign": "./scripts/notarize.cjs",
+    "afterAllArtifactBuild": "./scripts/notarize-dmg.cjs",
     "mac": {
       "icon": "assets/icon.icns",
-      "hardenedRuntime": false,
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "notarize": false,
+      "entitlements": "assets/entitlements.mac.plist",
+      "entitlementsInherit": "assets/entitlements.mac.plist",
       "category": "public.app-category.developer-tools",
       "artifactName": "AgentsChat-${version}-mac-${arch}.${ext}",
       "target": [
@@ -75,7 +82,8 @@
       ]
     },
     "dmg": {
-      "title": "AgentsChat Desktop"
+      "title": "AgentsChat Desktop",
+      "sign": true
     },
     "win": {
       "icon": "assets/icon.ico",

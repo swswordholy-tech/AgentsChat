@@ -2104,4 +2104,41 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     expect(shellScript).not.toMatch(/\.(?:innerHTML|outerHTML)\s*=|insertAdjacentHTML|document\.write\s*\(/);
     expect(shellScript).toContain('window.addEventListener("pagehide"');
   });
+
+  test("macOS Developer ID Hardened Runtime entitlements, notarization hooks, and auth resolution are wired safely", () => {
+    const pkg = JSON.parse(readFileSync(join(import.meta.dir, "..", "package.json"), "utf8"));
+    expect(pkg.build.afterSign).toBe("./scripts/notarize.cjs");
+    expect(pkg.build.afterAllArtifactBuild).toBe("./scripts/notarize-dmg.cjs");
+    expect(pkg.build.mac.hardenedRuntime).toBe(true);
+    expect(pkg.build.mac.gatekeeperAssess).toBe(false);
+    expect(pkg.build.mac.notarize).toBe(false);
+    expect(pkg.build.mac.entitlements).toBe("assets/entitlements.mac.plist");
+    expect(pkg.build.mac.entitlementsInherit).toBe("assets/entitlements.mac.plist");
+    expect(pkg.build.dmg.sign).toBe(true);
+
+    const plist = readFileSync(join(import.meta.dir, "..", "assets", "entitlements.mac.plist"), "utf8");
+    expect(plist).toContain("com.apple.security.cs.allow-jit");
+    expect(plist).toContain("com.apple.security.cs.allow-unsigned-executable-memory");
+    expect(plist).toContain("com.apple.security.cs.disable-library-validation");
+    expect(plist).toContain("com.apple.security.network.client");
+    expect(plist).toContain("com.apple.security.network.server");
+
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { resolveNotaryAuth } = require(join(import.meta.dir, "..", "scripts", "notarize-common.cjs"));
+    expect(resolveNotaryAuth({ CSC_IDENTITY_AUTO_DISCOVERY: "false", APPLE_NOTARY_KEYCHAIN_PROFILE: "p" }).mode).toBe("skip");
+    expect(resolveNotaryAuth({ APPLE_NOTARY_KEYCHAIN_PROFILE: "autoseek-notary" })).toEqual({
+      mode: "keychain-profile",
+      label: "keychain-profile(autoseek-notary)",
+      args: ["--keychain-profile", "autoseek-notary"],
+    });
+    expect(
+      resolveNotaryAuth({
+        APPLE_ID: "dev@example.com",
+        APPLE_APP_SPECIFIC_PASSWORD: "xxxx-xxxx-xxxx-xxxx",
+        APPLE_TEAM_ID: "TEAM123456",
+      }).mode,
+    ).toBe("apple-id");
+    expect(resolveNotaryAuth({}).mode).toBe("skip");
+    expect(() => resolveNotaryAuth({ AGENTSCHAT_REQUIRE_NOTARIZE: "1" })).toThrow(/AGENTSCHAT_REQUIRE_NOTARIZE/);
+  });
 });
