@@ -25,6 +25,7 @@ import {
   buildCloudThemeSyncScript,
   buildLocalChannelUrl,
   buildOfflineThemeSyncScript,
+  buildSelectionLookupInfo,
   checkLatestDesktopRelease,
   clampDesktopZoomFactor,
   classifyCloudRailSection,
@@ -204,7 +205,11 @@ function applyDesktopZoom(nextFactor: number): void {
   broadcastState();
 }
 
-function reloadWebContentsSmart(wc: Electron.WebContents, workspace: "cloud" | "local"): boolean {
+function reloadWebContentsSmart(
+  wc: Electron.WebContents,
+  workspace: "cloud" | "local",
+  ignoreCache = false,
+): boolean {
   if (!wc || wc.isDestroyed()) return false;
   const st = localServer?.getStatus();
   const action = resolveSmartReloadAction({
@@ -219,7 +224,11 @@ function reloadWebContentsSmart(wc: Electron.WebContents, workspace: "cloud" | "
     void wc.loadURL(action.url);
     return true;
   }
-  wc.reload();
+  if (ignoreCache) {
+    wc.reloadIgnoringCache();
+  } else {
+    wc.reload();
+  }
   return true;
 }
 
@@ -230,6 +239,26 @@ function reloadActiveView(): boolean {
     return reloadWebContentsSmart(target.webContents, workspace);
   }
   return false;
+}
+
+function forceReloadActiveView(): boolean {
+  const workspace = settings.activeWorkspace === "local" ? "local" : "cloud";
+  const target = workspace === "local" ? localView : cloudView;
+  if (target && !target.webContents.isDestroyed()) {
+    return reloadWebContentsSmart(target.webContents, workspace, true);
+  }
+  return false;
+}
+
+async function clearCloudWebCache(): Promise<boolean> {
+  if (!cloudView || cloudView.webContents.isDestroyed()) return false;
+  try {
+    await cloudView.webContents.session.clearCache();
+    reloadWebContentsSmart(cloudView.webContents, "cloud", true);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function getCurrentSafeCloudUrl(): string | null {
@@ -399,6 +428,25 @@ function attachNativeContextMenu(wc: Electron.WebContents): void {
         { role: "selectAll" },
       );
     } else if (hasSelection) {
+      const lookup = buildSelectionLookupInfo(params.selectionText);
+      if (lookup) {
+        if (process.platform === "darwin") {
+          items.push({
+            label: `Look Up “${lookup.label}”`,
+            click: () => {
+              try { wc.showDefinitionForSelection(); } catch {}
+            },
+          });
+        }
+        if (lookup.searchUrl) {
+          const searchUrl = lookup.searchUrl;
+          items.push({
+            label: "Search with Google",
+            click: () => void shell.openExternal(searchUrl),
+          });
+        }
+        if (items.length > 0) items.push({ type: "separator" });
+      }
       items.push({ role: "copy" });
     }
 
@@ -435,6 +483,10 @@ function attachNativeContextMenu(wc: Electron.WebContents): void {
             click: () => {
               try { wc.downloadURL(params.srcURL); } catch {}
             },
+          },
+          {
+            label: "Open Image in Browser",
+            click: () => void shell.openExternal(params.srcURL),
           },
         );
       }
@@ -1216,7 +1268,12 @@ function setupApplicationMenu(): void {
         {
           label: "Reload Active View",
           accelerator: "CmdOrCtrl+R",
-          click: reloadActiveView,
+          click: () => { reloadActiveView(); },
+        },
+        {
+          label: "Force Reload (Ignore Cache)",
+          accelerator: "CmdOrCtrl+Shift+R",
+          click: () => { forceReloadActiveView(); },
         },
         {
           label: "Toggle Developer Tools",
@@ -1744,9 +1801,9 @@ async function createDesktopWindow(): Promise<void> {
     wc.on("before-input-event", (ev, input) => {
       const cmd = resolveBeforeInputShortcut(input);
       if (!cmd) return;
-      if (cmd === "reload") {
+      if (cmd === "reload" || cmd === "force-reload") {
         ev.preventDefault();
-        reloadWebContentsSmart(wc, workspace);
+        reloadWebContentsSmart(wc, workspace, cmd === "force-reload");
       } else if (workspace === "cloud") {
         ev.preventDefault();
         navigateCloudHistory(cmd);
@@ -2124,6 +2181,25 @@ function registerIpcHandlers(): void {
     if (!isSettingsWin) return false;
     settingsWindow?.close();
     return true;
+  });
+
+  ipcMain.handle("desktop:clear-cloud-cache", async (ev) => {
+    const isSettingsWin = Boolean(settingsWindow && !settingsWindow.isDestroyed() && ev.sender === settingsWindow.webContents);
+    if (!isSettingsWin) return false;
+    return await clearCloudWebCache();
+  });
+
+  ipcMain.handle("desktop:check-updates", async (ev) => {
+    const isSettingsWin = Boolean(settingsWindow && !settingsWindow.isDestroyed() && ev.sender === settingsWindow.webContents);
+    if (!isSettingsWin) return false;
+    void promptCheckForUpdates();
+    return true;
+  });
+
+  ipcMain.handle("desktop:reset-window-layout", (ev) => {
+    const isSettingsWin = Boolean(settingsWindow && !settingsWindow.isDestroyed() && ev.sender === settingsWindow.webContents);
+    if (!isSettingsWin) return false;
+    return resetWindowSizeAndCenter();
   });
 
   ipcMain.handle("desktop:toggle-local-server", async (_ev, enabled: unknown) => {

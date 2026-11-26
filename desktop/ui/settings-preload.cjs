@@ -6,6 +6,9 @@ contextBridge.exposeInMainWorld("agentschatSettings", {
   getState: () => ipcRenderer.invoke("desktop:get-settings-state"),
   saveSettings: (patch) => ipcRenderer.invoke("desktop:save-desktop-settings", patch),
   copyDiagnostics: () => ipcRenderer.invoke("desktop:copy-diagnostics"),
+  clearCloudCache: () => ipcRenderer.invoke("desktop:clear-cloud-cache"),
+  checkForUpdates: () => ipcRenderer.invoke("desktop:check-updates"),
+  resetWindowLayout: () => ipcRenderer.invoke("desktop:reset-window-layout"),
   openDataFolder: () => ipcRenderer.invoke("desktop:open-data-folder"),
   closeWindow: () => ipcRenderer.invoke("desktop:close-settings-window"),
   onStateChanged: (cb) => {

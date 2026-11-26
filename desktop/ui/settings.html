@@ -502,6 +502,38 @@
           </label>
         </div>
       </section>
+
+      <section aria-label="维护与更新">
+        <h2 class="section-label">维护与更新</h2>
+        <div class="card">
+          <div class="row">
+            <span class="row-copy">
+              <span class="row-title">云端页面缓存</span>
+              <span class="row-desc">清理静态资源缓存并强制刷新云端页面，保留当前登录状态</span>
+            </span>
+            <button type="button" class="btn" id="btn-clear-cache">清理缓存</button>
+          </div>
+
+          <div class="row">
+            <span class="row-copy">
+              <span class="row-title">主窗口布局</span>
+              <span class="row-desc">将主窗口恢复至默认尺寸并居中显示（⌘⇧0）</span>
+            </span>
+            <button type="button" class="btn" id="btn-reset-window">还原位置</button>
+          </div>
+
+          <div class="row">
+            <span class="row-copy">
+              <span class="row-title">
+                <span>桌面端版本</span>
+                <span class="live-badge" id="app-version-badge">v0.1.0</span>
+              </span>
+              <span class="row-desc">检测 GitHub Releases 是否有新的 macOS / Windows 安装包</span>
+            </span>
+            <button type="button" class="btn" id="btn-check-updates">检查更新</button>
+          </div>
+        </div>
+      </section>
     </main>
 
     <footer class="footer">
@@ -534,6 +566,10 @@
     const prefLaunchLogin = document.getElementById("pref-launch-login");
     const prefAlwaysOnTop = document.getElementById("pref-always-on-top");
     const prefMuteNotifications = document.getElementById("pref-mute-notifications");
+    const btnClearCache = document.getElementById("btn-clear-cache");
+    const btnResetWindow = document.getElementById("btn-reset-window");
+    const appVersionBadge = document.getElementById("app-version-badge");
+    const btnCheckUpdates = document.getElementById("btn-check-updates");
     const configPathLabel = document.getElementById("config-path-label");
     const btnCopyDiag = document.getElementById("btn-copy-diag");
     const btnOpenDataDir = document.getElementById("btn-open-data-dir");
@@ -613,6 +649,9 @@
         configPathLabel.textContent = `${verPrefix}${state.settingsFilePath}`;
         configPathLabel.title = `${verPrefix}${state.settingsFilePath}`;
       }
+      if (appVersionBadge && typeof state.appVersion === "string" && state.appVersion) {
+        appVersionBadge.textContent = `v${state.appVersion}`;
+      }
       syncPortApplyButton();
     }
 
@@ -628,6 +667,11 @@
         prefLaunchLogin,
         prefAlwaysOnTop,
         prefMuteNotifications,
+        prefThemeLight,
+        prefThemeDark,
+        btnZoomOut,
+        btnZoomValue,
+        btnZoomIn,
         btnApplyPort,
       ];
       for (const c of controls) {
@@ -636,21 +680,20 @@
       try {
         const res = await api.saveSettings(patch);
         if (res && res.ok && res.state) {
-          render(res.state);
+          currentState = res.state;
           showStatus("已保存", false);
         } else {
-          if (currentState) render(currentState);
           showStatus(res?.error || "保存失败", true);
         }
       } catch {
-        if (currentState) render(currentState);
         showStatus("保存失败", true);
       } finally {
         saving = false;
         for (const c of controls) {
           if (c && c !== btnApplyPort) c.disabled = false;
         }
-        syncPortApplyButton();
+        if (currentState) render(currentState);
+        else syncPortApplyButton();
       }
     }
 
@@ -714,6 +757,37 @@
     prefLaunchLogin?.addEventListener("change", () => void applyPatch({ launchAtLogin: Boolean(prefLaunchLogin.checked) }));
     prefAlwaysOnTop?.addEventListener("change", () => void applyPatch({ alwaysOnTop: Boolean(prefAlwaysOnTop.checked) }));
     prefMuteNotifications?.addEventListener("change", () => void applyPatch({ notificationsMuted: Boolean(prefMuteNotifications.checked) }));
+    btnClearCache?.addEventListener("click", async () => {
+      if (!api?.clearCloudCache || btnClearCache.disabled) return;
+      btnClearCache.disabled = true;
+      showStatus("正在清理缓存…", false);
+      try {
+        const ok = await api.clearCloudCache();
+        showStatus(ok ? "已清理缓存并刷新" : "清理失败", !ok);
+      } catch {
+        showStatus("清理失败", true);
+      } finally {
+        btnClearCache.disabled = false;
+      }
+    });
+    btnResetWindow?.addEventListener("click", async () => {
+      try {
+        const ok = await api?.resetWindowLayout?.();
+        showStatus(ok ? "已还原窗口位置" : "操作失败", !ok);
+      } catch {
+        showStatus("操作失败", true);
+      }
+    });
+    btnCheckUpdates?.addEventListener("click", async () => {
+      if (!api?.checkForUpdates || btnCheckUpdates.disabled) return;
+      btnCheckUpdates.disabled = true;
+      showStatus("正在检查更新…", false);
+      try {
+        await api.checkForUpdates();
+      } finally {
+        setTimeout(() => { btnCheckUpdates.disabled = false; }, 1200);
+      }
+    });
     btnCopyDiag?.addEventListener("click", async () => {
       try {
         const ok = await api?.copyDiagnostics?.();
@@ -730,7 +804,7 @@
 
     document.addEventListener("keydown", (ev) => {
       if (ev.isComposing || ev.keyCode === 229) return;
-      if (ev.key === "Escape") {
+      if (ev.key === "Escape" || ((ev.metaKey || ev.ctrlKey) && !ev.altKey && !ev.shiftKey && String(ev.key || "").toLowerCase() === "w")) {
         ev.preventDefault();
         void api?.closeWindow?.();
       }

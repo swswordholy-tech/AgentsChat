@@ -7,6 +7,7 @@ import {
   buildCloudThemeSyncScript,
   buildLocalChannelUrl,
   buildOfflineThemeSyncScript,
+  buildSelectionLookupInfo,
   checkLatestDesktopRelease,
   clampDesktopZoomFactor,
   classifyCloudRailSection,
@@ -1772,5 +1773,77 @@ describe("AgentsChat Desktop M2 — Settings, Profile Discovery & Static Local U
     expect(() => new Function(localJs)).not.toThrow();
     expect(localJs).toContain('showToast(ok ? "已复制图片链接" : "复制失败");');
     expect(localJs).toContain('window.addEventListener("drop", (ev) => ev.preventDefault());');
+  });
+
+  test("Desktop 2.22 adds Force Reload (Cmd/Ctrl+Shift+R & Shift/Ctrl+F5), secret-safe native Look Up & Google Search context menu, Open Image in Browser, and Preferences Maintenance & Updates (Clear Cloud Cache, Reset Window Layout, Check Updates, Cmd+W & theme/zoom save lock)", () => {
+    // 1. Pure helper: buildSelectionLookupInfo truncates labels, encodes search URLs, and blocks secrets / long dumps
+    const simple = buildSelectionLookupInfo("  AgentsChat   Desktop  ");
+    expect(simple).toEqual({
+      label: "AgentsChat Desktop",
+      searchUrl: "https://www.google.com/search?q=AgentsChat%20Desktop",
+    });
+    const longText = buildSelectionLookupInfo("This is a very long selection label for testing truncation");
+    expect(longText?.label.endsWith("…")).toBe(true);
+    expect(longText?.label.length).toBe(28);
+    expect(longText?.searchUrl).toContain("https://www.google.com/search?q=");
+
+    // Over 300 chars still allows local macOS Look Up label, but never emits an external search URL
+    const huge = buildSelectionLookupInfo("word ".repeat(80));
+    expect(huge?.label.length).toBe(28);
+    expect(huge?.searchUrl).toBeNull();
+
+    // Secrets / tokens / JWTs must never be sent to external search or lookup
+    for (const secret of [
+      "sk-proj-1234567890abcdef",
+      "ac_secret_1234567890",
+      "agent_key_1234567890",
+      "ghp_1234567890abcdefghij",
+      "AIzaSyA1234567890abcdefghijk",
+      "AKIAIOSFODNN7EXAMPLE",
+      "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyMSJ9.abcdef123456",
+      "Bearer secretTokenValue123456",
+      "   \n\t  ",
+    ]) {
+      expect(buildSelectionLookupInfo(secret)).toBeNull();
+    }
+
+    // 2. Pure helper: resolveBeforeInputShortcut handles Shift/Ctrl+F5 force-reload while preserving IME guard
+    expect(resolveBeforeInputShortcut({ type: "keyDown", key: "F5", shift: true })).toBe("force-reload");
+    expect(resolveBeforeInputShortcut({ type: "keyDown", key: "F5", control: true })).toBe("force-reload");
+    expect(resolveBeforeInputShortcut({ type: "keyDown", key: "F5", meta: true })).toBe("force-reload");
+    expect(resolveBeforeInputShortcut({ type: "keyDown", key: "F5", shift: true, isComposing: true })).toBeNull();
+    expect(resolveBeforeInputShortcut({ type: "keyDown", key: "F5", alt: true })).toBeNull();
+
+    // 3. Main process: Force Reload, Clear Cloud Cache (session.clearCache only, never clears storage/cookies), native Look Up / Search, Open Image in Browser & sender-verified Preferences IPCs
+    const mainTs = readFileSync(join(import.meta.dir, "..", "src", "main.ts"), "utf8");
+    expect(mainTs).toContain("wc.reloadIgnoringCache();");
+    expect(mainTs).toContain('accelerator: "CmdOrCtrl+Shift+R"');
+    expect(mainTs).toContain("async function clearCloudWebCache()");
+    expect(mainTs).toContain("await cloudView.webContents.session.clearCache();");
+    expect(mainTs).not.toContain("clearStorageData");
+    expect(mainTs).toContain("wc.showDefinitionForSelection()");
+    expect(mainTs).toContain('label: "Search with Google"');
+    expect(mainTs).toContain('label: "Open Image in Browser"');
+    expect(mainTs).toContain('ipcMain.handle("desktop:clear-cloud-cache"');
+    expect(mainTs).toContain('ipcMain.handle("desktop:check-updates"');
+    expect(mainTs).toContain('ipcMain.handle("desktop:reset-window-layout"');
+
+    // 4. Settings preload & Preferences HTML: syntax, zero HTML-injection sinks, Maintenance controls, theme/zoom save lock & Cmd/Ctrl+W close
+    const settingsPreload = readFileSync(join(import.meta.dir, "..", "ui", "settings-preload.cjs"), "utf8");
+    expect(settingsPreload).toContain('ipcRenderer.invoke("desktop:clear-cloud-cache")');
+    expect(settingsPreload).toContain('ipcRenderer.invoke("desktop:check-updates")');
+    expect(settingsPreload).toContain('ipcRenderer.invoke("desktop:reset-window-layout")');
+
+    const settingsHtml = readFileSync(join(import.meta.dir, "..", "ui", "settings.html"), "utf8");
+    const settingsScript = settingsHtml.match(/<script>([\s\S]*?)<\/script>/i)?.[1] || "";
+    expect(() => new Function(settingsScript)).not.toThrow();
+    expect(settingsScript).not.toMatch(/\.(?:innerHTML|outerHTML)\s*=|insertAdjacentHTML|document\.write\s*\(/);
+    expect(settingsHtml).toContain('id="btn-clear-cache"');
+    expect(settingsHtml).toContain('id="btn-reset-window"');
+    expect(settingsHtml).toContain('id="btn-check-updates"');
+    expect(settingsHtml).toContain('id="app-version-badge"');
+    expect(settingsScript).toContain("prefThemeLight,");
+    expect(settingsScript).toContain("btnZoomOut,");
+    expect(settingsScript).toContain('String(ev.key || "").toLowerCase() === "w"');
   });
 });

@@ -382,14 +382,17 @@ export interface BeforeInputKeySample {
 }
 
 /**
- * Map cross-platform browser navigation keys (`F5`, `Alt+ArrowLeft`, `Alt+ArrowRight`)
+ * Map cross-platform browser navigation keys (`F5`, `Shift/Ctrl+F5`, `Alt+ArrowLeft`, `Alt+ArrowRight`)
  * inside `before-input-event` while strictly ignoring IME composition and unrelated modifiers.
  */
-export function resolveBeforeInputShortcut(input: BeforeInputKeySample): "reload" | "back" | "forward" | null {
+export function resolveBeforeInputShortcut(
+  input: BeforeInputKeySample,
+): "reload" | "force-reload" | "back" | "forward" | null {
   if (!input || input.type !== "keyDown" || input.isComposing) return null;
   const key = String(input.key || "");
   const hasPrimaryMod = Boolean(input.control || input.meta);
-  if (key === "F5" && !input.alt && !hasPrimaryMod && !input.shift) {
+  if (key === "F5" && !input.alt) {
+    if (input.shift || hasPrimaryMod) return "force-reload";
     return "reload";
   }
   if (input.alt && !hasPrimaryMod && !input.shift) {
@@ -397,6 +400,30 @@ export function resolveBeforeInputShortcut(input: BeforeInputKeySample): "reload
     if (key === "ArrowRight") return "forward";
   }
   return null;
+}
+
+const SELECTION_SECRET_RE =
+  /(?:(?:^|[^A-Za-z0-9])(?:mcp_(?:at|rt|code)_|ac_|agent_key_|whsec_|sk[-_]|rk_(?:live|test)_|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|(?:hf|npm)_)[A-Za-z0-9_-]{6,}|\b(?:AKIA|ASIA)[0-9A-Z]{16}\b|\bAIza[0-9A-Za-z_-]{20,}\b|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b|\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}|-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----)/i;
+
+export interface SelectionLookupInfo {
+  label: string;
+  searchUrl: string | null;
+}
+
+/**
+ * Build a secret-safe label and external search URL for selected text in native context menus.
+ * Never emits an external search URL for credentials/tokens or overly long selections (>300 chars).
+ */
+export function buildSelectionLookupInfo(selectionText: unknown): SelectionLookupInfo | null {
+  if (typeof selectionText !== "string") return null;
+  const normalized = selectionText.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").replace(/\s+/g, " ").trim();
+  if (!normalized) return null;
+  const isSecret = SELECTION_SECRET_RE.test(normalized);
+  if (isSecret) return null;
+  const label = normalized.length > 28 ? `${normalized.slice(0, 27)}…` : normalized;
+  const searchUrl =
+    normalized.length <= 300 ? `https://www.google.com/search?q=${encodeURIComponent(normalized)}` : null;
+  return { label, searchUrl };
 }
 
 const ALLOWED_WEB_PERMISSIONS = new Set([
