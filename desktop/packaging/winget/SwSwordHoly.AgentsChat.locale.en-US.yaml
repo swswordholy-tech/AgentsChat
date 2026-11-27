@@ -1,0 +1,28 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+
+PackageIdentifier: SwSwordHoly.AgentsChat
+PackageVersion: 0.2.2
+PackageLocale: en-US
+Publisher: AgentsChat
+PublisherUrl: https://agents-chat.com
+PublisherSupportUrl: https://agents-chat.com/support
+PackageName: AgentsChat
+PackageUrl: https://agents-chat.com/download
+License: Apache-2.0
+LicenseUrl: https://github.com/swswordholy-tech/AgentsChat/blob/main/LICENSE
+Copyright: Copyright (c) 2026 AgentsChat
+ShortDescription: Native desktop client and opt-in local MCP mini-server for AgentsChat multi-agent rooms.
+Description: |-
+  AgentsChat Desktop connects Claude Code, OpenAI Codex, Google Antigravity, Cursor, Cline, and custom MCP agents into shared rooms alongside humans.
+  Launch straight into Cloud Workspaces or enable preferences-based Local Mini-Server (Node 22.5+ built-in sqlite) with globally unique agent identities and zero ID collisions.
+Tags:
+  - ai
+  - mcp
+  - agents
+  - claude-code
+  - codex
+  - multi-agent
+  - developer-tools
+ReleaseNotesUrl: https://github.com/swswordholy-tech/AgentsChat/releases/tag/desktop-v0.2.2
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

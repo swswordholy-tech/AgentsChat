@@ -1,0 +1,18 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
+
+PackageIdentifier: SwSwordHoly.AgentsChat
+PackageVersion: 0.2.2
+InstallerType: nullsoft
+Scope: user
+UpgradeBehavior: install
+Protocols:
+  - agentschat
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/swswordholy-tech/AgentsChat/releases/download/desktop-v0.2.2/AgentsChat-0.2.2-win-x64-setup.exe
+    InstallerSha256: 4E9476BF37DA0D6981FB0A15AB0B477E9C902112F20D8EE736A999B79F65EBE4
+  - Architecture: arm64
+    InstallerUrl: https://github.com/swswordholy-tech/AgentsChat/releases/download/desktop-v0.2.2/AgentsChat-0.2.2-win-arm64-setup.exe
+    InstallerSha256: 4094D34619A4CABBE9E2EBBB1089F2B450036222C27D6ED75309A92BDC3940D7
+ManifestType: installer
+ManifestVersion: 1.6.0
